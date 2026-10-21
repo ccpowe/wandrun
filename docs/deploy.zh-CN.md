@@ -52,7 +52,12 @@ sudo apt install -y xvfb curl wget
 wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 sudo apt install -y ./google-chrome-stable_current_amd64.deb
 npm install -g agent-browser@0.38.1
+sudo install -d /etc/opt/chrome/policies/managed
+echo '{"ExtensionInstallForcelist": ["ddkjiahejlhfcafbddmgiahcphecmpfh"]}' |
+  sudo tee /etc/opt/chrome/policies/managed/wandrun-adblock.json
 ```
+
+最后三行用 Chrome 策略给这台机器上的 Chrome 强制安装 [uBlock Origin Lite](https://chromewebstore.google.com/detail/ddkjiahejlhfcafbddmgiahcphecmpfh)。浏览器任务的内存主要花在页面上，广告和跟踪脚本占了不少，本机实测屏蔽广告后几个新闻站同时打开的内存降了约 22%。个别网站因此异常时，在扩展里给该站点放行。
 
 ## 3. Codex 登录
 
@@ -197,21 +202,6 @@ sudo loginctl enable-linger "$USER"   # 退出登录后服务继续运行
 until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/agents)" = 401 ]; do sleep 2; done
 journalctl --user -u wandrun-gateway -n 100 --no-pager
 ```
-
-### 可选：广告过滤
-
-浏览器任务的内存主要花在页面上，广告和跟踪脚本占了不少：本机实测屏蔽广告域名后，几个新闻站同时打开的
-内存降了约 22%。推荐给专用 Chrome 装 [uBlock Origin Lite](https://chromewebstore.google.com/detail/ddkjiahejlhfcafbddmgiahcphecmpfh)。
-Chrome 137 起不能再用命令行加载扩展，用 Chrome 策略强制安装（需要 sudo，作用于本机所有 Chrome）：
-
-```bash
-sudo install -d /etc/opt/chrome/policies/managed
-echo '{"ExtensionInstallForcelist": ["ddkjiahejlhfcafbddmgiahcphecmpfh"]}' |
-  sudo tee /etc/opt/chrome/policies/managed/wandrun-adblock.json
-systemctl --user restart wandrun-chrome
-```
-
-可以自己执行，也可以让有命令权限的 Agent 照这段操作。广告过滤可能让个别网站功能异常，遇到时在扩展里给该站点放行。
 
 ## 6. HTTPS
 

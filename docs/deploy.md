@@ -54,7 +54,12 @@ sudo apt install -y xvfb curl wget
 wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 sudo apt install -y ./google-chrome-stable_current_amd64.deb
 npm install -g agent-browser@0.38.1
+sudo install -d /etc/opt/chrome/policies/managed
+echo '{"ExtensionInstallForcelist": ["ddkjiahejlhfcafbddmgiahcphecmpfh"]}' |
+  sudo tee /etc/opt/chrome/policies/managed/wandrun-adblock.json
 ```
+
+The last three lines force-install [uBlock Origin Lite](https://chromewebstore.google.com/detail/ddkjiahejlhfcafbddmgiahcphecmpfh) into every Chrome on this machine through a policy. Most of a browser task's memory goes to the page, and ads and trackers are a large share: blocking them cut memory by about 22% with several news sites open in local tests. If a site breaks, allow it in the extension.
 
 ## 3. Codex login
 
@@ -205,24 +210,6 @@ sudo loginctl enable-linger "$USER"   # keep services running after logout
 until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/agents)" = 401 ]; do sleep 2; done
 journalctl --user -u wandrun-gateway -n 100 --no-pager
 ```
-
-### Optional: ad filtering
-
-Most of a browser task's memory goes to the page, and ads and trackers are a large share: blocking ad
-domains cut memory by about 22% with several news sites open in local tests. Installing
-[uBlock Origin Lite](https://chromewebstore.google.com/detail/ddkjiahejlhfcafbddmgiahcphecmpfh) in the
-dedicated Chrome is recommended. Chrome 137+ no longer loads extensions from the command line, so
-force-install it with a Chrome policy (needs sudo and applies to every Chrome on the machine):
-
-```bash
-sudo install -d /etc/opt/chrome/policies/managed
-echo '{"ExtensionInstallForcelist": ["ddkjiahejlhfcafbddmgiahcphecmpfh"]}' |
-  sudo tee /etc/opt/chrome/policies/managed/wandrun-adblock.json
-systemctl --user restart wandrun-chrome
-```
-
-Run it yourself or ask an agent with shell access to follow these steps. Filtering can break a few sites;
-allow the site in the extension when that happens.
 
 ## 6. HTTPS
 
