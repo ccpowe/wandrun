@@ -62,23 +62,23 @@ class UsageStoreTests(unittest.TestCase):
             "fetched_at": 124.0,
         }
         with closing(GatewayStore(self.path)) as store:
-            store.save_subscription_snapshot("models", "opaque-a", "0.157.1", snapshot)
-            store.save_subscription_snapshot("usage", "opaque-a", "0.157.1", usage)
-            self.assertIsNone(store.load_subscription_snapshot("models", "opaque-b", "0.157.1"))
+            store.save_subscription_snapshot("models", "opaque-a", "0.163.0", snapshot)
+            store.save_subscription_snapshot("usage", "opaque-a", "0.163.0", usage)
+            self.assertIsNone(store.load_subscription_snapshot("models", "opaque-b", "0.163.0"))
             self.assertIsNone(store.load_subscription_snapshot("models", "opaque-a", "0.158.0"))
-            self.assertIsNone(store.load_subscription_snapshot("usage", "opaque-b", "0.157.1"))
+            self.assertIsNone(store.load_subscription_snapshot("usage", "opaque-b", "0.163.0"))
             self.assertEqual(
-                store.load_subscription_snapshot("models", "opaque-a", "0.157.1"), snapshot
+                store.load_subscription_snapshot("models", "opaque-a", "0.163.0"), snapshot
             )
-            store.save_subscription_snapshot("models", "opaque-a", "0.157.1", {
+            store.save_subscription_snapshot("models", "opaque-a", "0.163.0", {
                 "fetched_at": 125.0, "models": [],
             })
         with closing(GatewayStore(self.path)) as store:
-            self.assertEqual(store.load_subscription_snapshot("models", "opaque-a", "0.157.1"), {
+            self.assertEqual(store.load_subscription_snapshot("models", "opaque-a", "0.163.0"), {
                 "fetched_at": 125.0, "models": [],
             })
             self.assertEqual(
-                store.load_subscription_snapshot("usage", "opaque-a", "0.157.1"), usage
+                store.load_subscription_snapshot("usage", "opaque-a", "0.163.0"), usage
             )
 
     @patch("wandrun.gateway.store.date")

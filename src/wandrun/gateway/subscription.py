@@ -166,7 +166,7 @@ class SubscriptionData:
         self,
         store,
         *,
-        client_version: str = "0.157.1",
+        client_version: str = "0.163.0",
         transport: httpx.AsyncBaseTransport | None = None,
         timeout: float = 30.0,
         credentials: CodexCredentials | None = None,

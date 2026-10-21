@@ -238,7 +238,7 @@ async def serve(
     agents_config: Path | None = None,
     mcps_config: Path | None = None,
     environments_config: Path | None = None,
-    codex_client_version: str = "0.157.1",
+    codex_client_version: str = "0.163.0",
     codex_home: Path | None = None,
     allow_shared_codex_home: bool = False,
     max_upload_size: int = 1024 ** 3,
@@ -440,7 +440,7 @@ def main(argv: list[str] | None = None) -> None:
         help="仅供开发过渡：允许共享目录，只读凭据且永不刷新",
     )
     parser.add_argument(
-        "--codex-client-version", default=os.environ.get("WANDRUN_CODEX_CLIENT_VERSION", "0.157.1"),
+        "--codex-client-version", default=os.environ.get("WANDRUN_CODEX_CLIENT_VERSION", "0.163.0"),
         help="Codex 目录兼容版本；不使用 Wandrun 自身版本",
     )
     parser.add_argument(

@@ -42,7 +42,7 @@ def codex_upstream(request):
     assert request.headers["Authorization"] == "Bearer x.e30.x"
     assert request.headers["ChatGPT-Account-ID"] == "mobile-test"
     if request.url.path == "/backend-api/codex/models":
-        assert request.url.params["client_version"] == "0.157.1"
+        assert request.url.params["client_version"] == "0.163.0"
         return httpx.Response(200, json={"models": [{
             "slug": "offline",
             "display_name": "Offline fixture",

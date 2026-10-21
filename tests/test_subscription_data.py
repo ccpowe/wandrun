@@ -219,7 +219,7 @@ class SubscriptionDataTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("SECRET-INSTRUCTIONS", persisted)
         self.assertNotIn("secret@example.test", persisted)
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.calls[0].url.params["client_version"], "0.157.1")
+        self.assertEqual(self.calls[0].url.params["client_version"], "0.163.0")
         self.assertEqual(await self.service.models(), first)
         self.assertEqual(len(self.calls), 1)
         self.catalog = {"models": []}
