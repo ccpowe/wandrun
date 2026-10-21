@@ -34,7 +34,7 @@ Chrome、systemd 用户服务、HTTPS 和手机配对。已在 Ubuntu 24.04 和 
 
 ## 2. 代码与依赖
 
-先装好 git、uv 和 Node.js 20+。
+先装好 git、uv 和 Node.js 20+；`swapon --show` 没有输出时先建一个 swap 文件并写进 `/etc/fstab`。
 
 ```bash
 git clone https://github.com/ccpowe/wandrun.git ~/wandrun
@@ -218,6 +218,8 @@ journalctl --user -u wandrun-gateway -n 100 --no-pager
       }
   }
   ```
+
+配置写进 `/etc/caddy/Caddyfile` 后 `sudo systemctl reload caddy`。证书签发要几秒，刚改完出现 TLS 错误时先看 `journalctl -u caddy`；从外部 `curl https://<域名>/agents` 返回 401 才算就绪。
 
 代理不要记录完整请求 URL 和查询参数；公网机器上不要把网关绑定到 `0.0.0.0`。
 要使用应用 OAuth（Notion），把 `WANDRUN_PUBLIC_URL`（或 `--public-url`）设为手机访问网关的地址，

@@ -36,7 +36,7 @@ The paths below use:
 
 ## 2. Code and dependencies
 
-Install git, uv and Node.js 20+ first.
+Install git, uv and Node.js 20+ first. If `swapon --show` prints nothing, create a swap file and add it to `/etc/fstab`.
 
 ```bash
 git clone https://github.com/ccpowe/wandrun.git ~/wandrun
@@ -228,6 +228,8 @@ Pick one:
       }
   }
   ```
+
+Put the config in `/etc/caddy/Caddyfile` and run `sudo systemctl reload caddy`. Issuing the certificate takes a few seconds; on a TLS error right after the change, check `journalctl -u caddy`. It is ready when `curl https://<domain>/agents` from outside returns 401.
 
 Do not log full request URLs or query strings at the proxy, and do not bind the gateway to
 `0.0.0.0` on a public machine. For app OAuth (Notion), set `WANDRUN_PUBLIC_URL` (or
