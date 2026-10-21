@@ -1,0 +1,34 @@
+# Real PDF upload; the random marker is never included in the user prompt.
+appId: host.exp.exponent
+---
+- extendedWaitUntil:
+    visible:
+      id: agent-row-${UPLOAD_AGENT_ID}
+    timeout: 10000
+- tapOn:
+    id: agent-row-${UPLOAD_AGENT_ID}
+- tapOn:
+    id: composer-add
+- tapOn:
+    id: attachment-picker-file
+# @upload-select-document
+- extendedWaitUntil:
+    visible:
+      id: upload-ready-${UPLOAD_NAME}
+    timeout: 30000
+- tapOn:
+    id: composer-input
+- inputText: ${UPLOAD_PROMPT}
+- tapOn:
+    id: composer-send
+# @upload-message-sent
+# @pdf-reply
+- takeScreenshot: ${ARTIFACTS}/01-pdf-reply-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/01-pdf-reply-dark.png
+# @light-mode
+- tapOn: 返回
+- extendedWaitUntil:
+    visible:
+      id: home-search
+    timeout: 10000

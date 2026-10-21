@@ -1,0 +1,236 @@
+# agent-device 0.21.16 Maestro subset; run via python3 mobile/e2e/run.py.
+# The runner selects actual model IDs and supported reasoning efforts from GET /models.
+appId: host.exp.exponent
+---
+- tapOn: 设置
+- assertVisible:
+    id: settings-models
+- takeScreenshot: ${ARTIFACTS}/01-settings-light.png
+# @settings-entry
+- tapOn:
+    id: settings-about-connection
+- assertVisible: 关于与连接
+- assertVisible: 电脑
+- assertVisible:
+    id: connection-name
+- assertVisible:
+    id: connection-address
+- assertVisible:
+    id: connection-method
+- assertVisible:
+    id: connection-app-version
+- assertVisible:
+    id: connection-gateway-version
+- assertVisible:
+    id: connection-add
+- assertVisible:
+    id: connection-rename
+- assertVisible:
+    id: connection-disconnect
+- takeScreenshot: ${ARTIFACTS}/01-about-connection-light.png
+- tapOn:
+    id: gateway-back
+- assertVisible:
+    id: settings-about-connection
+- tapOn:
+    id: settings-models
+- assertVisible:
+    id: settings-subscription
+# @quota-loaded
+- takeScreenshot: ${ARTIFACTS}/02-subscription-light.png
+- scrollUntilVisible:
+    element:
+      id: settings-usage-${USAGE_AGENT_ID}
+    direction: DOWN
+- assertVisible:
+    id: settings-usage
+- takeScreenshot: ${ARTIFACTS}/02-models-usage-light.png
+- scrollUntilVisible:
+    element:
+      id: settings-model-default
+    direction: UP
+- waitForAnimationToEnd
+- tapOn:
+    id: settings-model-default
+    enabled: true
+- extendedWaitUntil:
+    visible:
+      id: settings-model-back
+    timeout: 10000
+- waitForAnimationToEnd
+- scrollUntilVisible:
+    element:
+      id: model-catalog-updated
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/03-default-picker-updated-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/04-default-picker-updated-dark.png
+- tapOn:
+    id: settings-model-back
+- extendedWaitUntil:
+    visible:
+      id: settings-subscription
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/05-subscription-dark.png
+- scrollUntilVisible:
+    element:
+      id: settings-usage-${USAGE_AGENT_ID}
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/05-models-usage-dark.png
+- back
+- assertVisible:
+    id: settings-models
+- takeScreenshot: ${ARTIFACTS}/06-settings-dark.png
+- tapOn:
+    id: settings-about-connection
+- assertVisible:
+    id: connection-name
+- assertVisible:
+    id: connection-method
+- assertVisible:
+    id: connection-gateway-version
+- takeScreenshot: ${ARTIFACTS}/06-about-connection-dark.png
+- tapOn:
+    id: gateway-back
+- assertVisible:
+    id: settings-about-connection
+- tapOn:
+    id: settings-models
+- waitForAnimationToEnd
+- tapOn:
+    id: settings-model-default
+    enabled: true
+- extendedWaitUntil:
+    visible:
+      id: settings-model-back
+    timeout: 10000
+- waitForAnimationToEnd
+- scrollUntilVisible:
+    element:
+      id: model-catalog-updated
+    direction: DOWN
+# @light-mode
+- scrollUntilVisible:
+    element:
+      id: model-row-${DEFAULT_MODEL}
+    direction: UP
+- tapOn:
+    id: model-row-${DEFAULT_MODEL}
+- scrollUntilVisible:
+    element:
+      id: model-effort-${DEFAULT_EFFORT}
+    direction: DOWN
+- tapOn:
+    id: model-effort-${DEFAULT_EFFORT}
+- tapOn:
+    id: settings-model-save
+- extendedWaitUntil:
+    visible:
+      id: settings-model-default
+    timeout: 10000
+# @settings-saved
+- back
+- back
+- assertVisible: 设置
+- tapOn: 新建 Agent 或查看全部 Agent
+- tapOn: 新建 Agent
+- scrollUntilVisible:
+    element:
+      id: editor-model
+    direction: DOWN
+- extendedWaitUntil:
+    visible:
+      id: editor-reasoning-${DEFAULT_EFFORT}
+    timeout: 10000
+- assertVisible: ${DEFAULT_MODEL_NAME}
+# @new-form-default
+- takeScreenshot: ${ARTIFACTS}/07-new-form-default-light.png
+- tapOn:
+    id: editor-back
+- assertVisible: 设置
+- tapOn:
+    id: agent-row-${MODEL_AGENT_ID}
+- tapOn:
+    id: chat-agent-profile
+# The profile edit button exists before the Agent detail arrives, but is disabled until then.
+- extendedWaitUntil:
+    visible:
+      id: profile-empty-members
+    timeout: 10000
+- tapOn:
+    id: profile-edit
+    enabled: true
+- extendedWaitUntil:
+    visible:
+      id: editor-name
+    timeout: 10000
+- waitForAnimationToEnd
+- scrollUntilVisible:
+    element:
+      id: editor-model
+    direction: DOWN
+- tapOn:
+    id: editor-model
+- scrollUntilVisible:
+    element:
+      id: model-catalog-updated
+    direction: DOWN
+- scrollUntilVisible:
+    element:
+      id: model-row-${CHANGED_MODEL}
+    direction: UP
+- tapOn:
+    id: model-row-${CHANGED_MODEL}
+- scrollUntilVisible:
+    element:
+      id: model-effort-${CHANGED_EFFORT}
+    direction: DOWN
+- tapOn:
+    id: model-effort-${CHANGED_EFFORT}
+- takeScreenshot: ${ARTIFACTS}/08-agent-model-effort-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/09-agent-model-effort-dark.png
+# @light-mode
+- tapOn:
+    id: editor-done
+- tapOn:
+    id: editor-save
+# @agent-model-saved
+- assertVisible:
+    id: profile-edit
+- waitForAnimationToEnd
+- tapOn:
+    id: profile-edit
+    enabled: true
+- extendedWaitUntil:
+    visible:
+      id: editor-name
+    timeout: 10000
+- waitForAnimationToEnd
+- scrollUntilVisible:
+    element:
+      id: editor-model
+    direction: DOWN
+- tapOn:
+    id: editor-model
+- scrollUntilVisible:
+    element:
+      id: model-row-${ORIGINAL_MODEL}
+    direction: DOWN
+- tapOn:
+    id: model-row-${ORIGINAL_MODEL}
+- scrollUntilVisible:
+    element:
+      id: model-effort-${ORIGINAL_EFFORT}
+    direction: DOWN
+- tapOn:
+    id: model-effort-${ORIGINAL_EFFORT}
+- tapOn:
+    id: editor-done
+- tapOn:
+    id: editor-save
+# @agent-model-restored
+- tapOn:
+    id: profile-close
+- tapOn: 返回
+- assertVisible: 设置

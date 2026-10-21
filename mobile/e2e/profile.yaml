@@ -1,0 +1,92 @@
+# agent-device 0.21.16 Maestro subset; run via python3 mobile/e2e/run.py.
+# All gestures resolve an element, never a fixed screen coordinate.
+appId: host.exp.exponent
+---
+- tapOn:
+    id: agent-row-${PROFILE_AGENT_ID}
+- extendedWaitUntil:
+    visible:
+      id: chat-agent-name
+      text: ${PROFILE_NAME}
+    timeout: 10000
+- assertVisible:
+    id: chat-conversation-title
+    text: ${PROFILE_TITLE}
+- takeScreenshot: ${ARTIFACTS}/16-chat-header-light.png
+- tapOn:
+    id: chat-agent-profile
+- extendedWaitUntil:
+    visible:
+      id: profile-name
+      text: ${PROFILE_NAME}
+    timeout: 10000
+- assertVisible:
+    id: profile-tab-members
+- assertVisible:
+    id: profile-member-${MEMBER_ID}
+- takeScreenshot: ${ARTIFACTS}/17-profile-members-light.png
+- tapOn:
+    id: profile-tab-computer
+- extendedWaitUntil:
+    visible:
+      id: profile-computer-empty
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/18-profile-computer-empty-light.png
+- tapOn:
+    id: profile-tab-schedules
+- assertVisible:
+    id: profile-schedule-add
+- tapOn:
+    id: profile-tab-memory
+- extendedWaitUntil:
+    visible:
+      id: profile-memory-modified
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/18-profile-memory-light.png
+- tapOn:
+    id: profile-tab-members
+- tapOn:
+    id: profile-member-${MEMBER_ID}
+- extendedWaitUntil:
+    visible:
+      id: chat-agent-name
+      text: ${MEMBER_NAME}
+    timeout: 10000
+- back
+- assertVisible:
+    id: profile-name
+    text: ${PROFILE_NAME}
+- tapOn:
+    id: profile-close
+- assertVisible:
+    id: chat-agent-name
+    text: ${PROFILE_NAME}
+- tapOn:
+    id: chat-agent-profile
+- assertVisible:
+    id: profile-member-${MEMBER_ID}
+- back
+- assertVisible:
+    id: chat-agent-name
+    text: ${PROFILE_NAME}
+- tapOn: 返回
+- assertVisible: 设置
+- tapOn:
+    id: agent-row-${NO_MEMBERS_ID}
+- assertVisible:
+    id: chat-agent-name
+    text: ${NO_MEMBERS_NAME}
+- tapOn:
+    id: chat-agent-profile
+- extendedWaitUntil:
+    visible:
+      id: profile-empty-members
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/19-profile-empty-members-light.png
+- tapOn:
+    id: profile-close
+- tapOn: 返回
+- assertVisible: 设置
+# @dark-mode
+# @dark-profiles
+# @light-mode

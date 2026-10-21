@@ -1,0 +1,32 @@
+diff --git a/node_modules/expo/android/src/main/java/expo/modules/fetch/NativeRequest.kt b/node_modules/expo/android/src/main/java/expo/modules/fetch/NativeRequest.kt
+index 062f19d..7921c42 100644
+--- a/node_modules/expo/android/src/main/java/expo/modules/fetch/NativeRequest.kt
++++ b/node_modules/expo/android/src/main/java/expo/modules/fetch/NativeRequest.kt
+@@ -66,7 +66,8 @@ internal class NativeRequest(appContext: AppContext, internal val response: Nati
+ 
+   fun cancel() {
+     val task = this.task ?: return
+-    task.cancel()
++    // Mark explicit JS abort before OkHttp can deliver its failure callback.
+     response.emitRequestCanceled()
++    task.cancel()
+   }
+ }
+diff --git a/node_modules/expo/android/src/main/java/expo/modules/fetch/NativeResponse.kt b/node_modules/expo/android/src/main/java/expo/modules/fetch/NativeResponse.kt
+index 2ccdb08..dfe77e5 100644
+--- a/node_modules/expo/android/src/main/java/expo/modules/fetch/NativeResponse.kt
++++ b/node_modules/expo/android/src/main/java/expo/modules/fetch/NativeResponse.kt
+@@ -101,10 +101,9 @@ internal class NativeResponse(appContext: AppContext, private val coroutineScope
+   //region Callback implementations
+ 
+   override fun onFailure(call: Call, e: IOException) {
+-    // Canceled request should be handled by emitRequestCanceled
+-    if (e.message == "Canceled") {
+-      return
+-    }
++    // A transport-owner reset can cancel OkHttp without NativeRequest.cancel().
++    // Deliver that network error too; explicit JS aborts are already terminal and
++    // are excluded by the state guard below, not by an IOException message.
+ 
+     if (isInvalidState(
+         ResponseState.STARTED,

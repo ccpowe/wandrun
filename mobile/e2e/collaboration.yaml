@@ -1,0 +1,90 @@
+appId: host.exp.exponent
+---
+# @collaboration-generate
+- tapOn:
+    id: agent-row-${COLLAB_PARENT}
+- extendedWaitUntil:
+    visible:
+      id: delegation-${COLLAB_TASK}
+    timeout: 15000
+- tapOn:
+    id: delegation-${COLLAB_TASK}
+- extendedWaitUntil:
+    visible:
+      id: task-message-${COLLAB_INCOMING}
+    timeout: 15000
+- assertVisible:
+    id: chat-root-conversation
+- tapOn: 对话列表
+- assertVisible:
+    id: conversation-${COLLAB_TASK}
+    text: '.*，当前对话'
+- takeScreenshot: ${ARTIFACTS}/received-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/received-dark.png
+# @light-mode
+- back
+- tapOn:
+    id: chat-root-conversation
+# Root navigation pushes a different chat; shared drawer controls can still
+# belong to the member while that transition is in progress.
+- extendedWaitUntil:
+    visible:
+      id: chat-agent-name
+      text: ${COLLAB_PARENT_NAME}
+    timeout: 15000
+- tapOn: 对话列表
+- tapOn:
+    id: drawer-tab-collaborations
+- assertVisible: 进行中
+- assertVisible: 已结束
+- assertVisible:
+    id: conversation-${COLLAB_TASK}
+- takeScreenshot: ${ARTIFACTS}/outgoing-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/outgoing-dark.png
+# @light-mode
+- back
+- tapOn:
+    id: task-preview-${COLLAB_PREVIEW}
+- extendedWaitUntil:
+    visible:
+      id: message-target-${COLLAB_MESSAGE}
+    timeout: 15000
+# Expo's warning banner overlaps the composer; dismiss the overlay, not its logs.
+# @collaboration-compose
+- tapOn:
+    id: composer-input
+- inputText: 'Correction: compute 17*19. Send the result to human and your original creator.'
+- tapOn: 发送
+# The device's IME cannot implement hideKeyboard without Back.
+- back
+- assertVisible:
+    id: chat-root-conversation
+# @collaboration-corrected
+- takeScreenshot: ${ARTIFACTS}/corrected-member.png
+# @collaboration-compose
+- tapOn:
+    id: composer-input
+- inputText: 'Continue this same task: compute 23*29 and report to human and the original creator.'
+# On this tablet the IME can cover the sticky composer after the longer reply.
+# Close it before locating the send control; Back after sending would leave the task.
+- back
+- extendedWaitUntil:
+    visible:
+      id: composer-send
+    timeout: 10000
+- tapOn:
+    id: composer-send
+- assertVisible:
+    id: chat-root-conversation
+# @collaboration-resumed
+- takeScreenshot: ${ARTIFACTS}/resumed-member.png
+# @collaboration-delete
+- extendedWaitUntil:
+    notVisible:
+      id: chat-root-conversation
+    timeout: 15000
+# This flow has pushed root/member chats more than once. One Back is not home.
+# @collaboration-home
+- assertVisible: 设置

@@ -1,0 +1,176 @@
+diff --git a/node_modules/@legendapp/list/react-native.js b/node_modules/@legendapp/list/react-native.js
+index 0b730ec..5b3ea4c 100644
+--- a/node_modules/@legendapp/list/react-native.js
++++ b/node_modules/@legendapp/list/react-native.js
+@@ -688,7 +688,7 @@ function resetSharedEdgeGateIfOutsideHysteresis(ctx) {
+     return;
+   }
+   const contentSize = getContentSize(ctx);
+-  const endDistance = contentSize - state.scroll - state.scrollLength - getContentInsetEnd(ctx);
++  const endDistance = contentSize - state.scroll - state.scrollLength;
+   const isContentLess = contentSize < state.scrollLength;
+   const startThreshold = state.props.onStartReachedThreshold * state.scrollLength;
+   const endThreshold = state.props.onEndReachedThreshold * state.scrollLength;
+@@ -747,8 +747,8 @@ function checkAtBottom(ctx, allowedEdge, allowGateCreatedInCurrentCheck) {
+     return;
+   }
+   if (contentSize > 0 && queuedInitialLayout) {
+-    const insetEnd = getContentInsetEnd(ctx);
+-    const distanceFromEnd = contentSize - scroll - scrollLength - insetEnd;
++    // getContentSize already includes the end inset, as does the scroll clamp.
++    const distanceFromEnd = contentSize - scroll - scrollLength;
+     const isContentLess = contentSize < scrollLength;
+     set$(ctx, "isAtEnd", isContentLess || distanceFromEnd <= EDGE_POSITION_EPSILON);
+     set$(ctx, "isNearEnd", isContentLess || distanceFromEnd <= onEndReachedThreshold * scrollLength);
+@@ -1085,6 +1085,10 @@ function finishInitialScroll(ctx, options) {
+       releaseDeferredPublicOnScroll(ctx, finalScrollOffset);
+     }
+     (_f = options == null ? void 0 : options.onFinished) == null ? void 0 : _f.call(options);
++    if (state.pendingMaintainScrollAtEnd) {
++      state.maintainingScrollAtEnd = void 0;
++      doMaintainScrollAtEnd(ctx);
++    }
+   };
+   if (options == null ? void 0 : options.waitForCompletionFrame) {
+     requestAnimationFrame(complete);
+@@ -2063,7 +2067,7 @@ function doMaintainScrollAtEnd(ctx, options) {
+ }
+ 
+ // src/core/finishScrollTo.ts
+-function finishScrollTo(ctx) {
++function finishScrollTo(ctx, interrupted = false) {
+   var _a3, _b, _c;
+   const state = ctx.state;
+   if (state == null ? void 0 : state.scrollingTo) {
+@@ -2080,7 +2084,7 @@ function finishScrollTo(ctx) {
+       addTotalSize(ctx, null, state.pendingTotalSize);
+     }
+     if (PlatformAdjustBreaksScroll) {
+-      state.scrollAdjustHandler.commitPendingAdjust(scrollingTo);
++      state.scrollAdjustHandler.commitPendingAdjust(interrupted ? void 0 : scrollingTo);
+     }
+     if (scrollingTo.isInitialScroll || state.initialScroll) {
+       const isOffsetSession = ((_b = state.initialScrollSession) == null ? void 0 : _b.kind) === "offset";
+@@ -7184,10 +7188,15 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+       startBuffered: state.startBuffered
+     }),
+     reportContentInset: (inset) => {
++      // Native composer insets can change without a list layout.
++      // Capture follow state before the new inset can change end detection.
++      const shouldMaintain = peek$(ctx, "isAtEnd") && state.props.maintainScrollAtEnd?.onLayout;
+       const didChange = setContentInsetOverride(ctx, inset);
+       updateScroll(ctx, state.scroll, true, { markHasScrolled: false });
+       if (didChange) {
+-        retargetActiveInitialScrollAtEnd(ctx);
++        if (!retargetActiveInitialScrollAtEnd(ctx) && shouldMaintain) {
++          doMaintainScrollAtEnd(ctx);
++        }
+       }
+     },
+     scrollIndexIntoView: (options) => runScrollWithPromise(() => scrollIndexIntoView(options)),
+@@ -8090,7 +8099,17 @@ var LegendListInner = typedForwardRef(function LegendListInner2(props, forwarded
+       onScrollBeginDrag: (event) => {
+         var _a4, _b2;
+         state.isDragging = true;
++        if (state.scrollingTo || state.initialScroll || state.initialScrollSession) {
++          const { contentOffset, contentSize } = event.nativeEvent;
++          const offset = state.props.horizontal ? toLogicalHorizontalOffset(state, contentOffset.x, contentSize?.width) : contentOffset.y;
++          syncInitialScrollOffset(state, offset);
++        }
++        // User takeover must finish initialization without preserving its target.
++        supersedeInitialScroll(ctx);
++        // Commit deferred MVCP at the user's position, not the cancelled index.
++        finishScrollTo(ctx, true);
+         interruptMaintainScrollAtEnd(ctx);
++        cancelImperativeScroll(state);
+         prepareReachedEdgeForNextUserScroll(ctx);
+         (_b2 = (_a4 = state.props).onScrollBeginDrag) == null ? void 0 : _b2.call(_a4, event);
+       },
+diff --git a/node_modules/@legendapp/list/react-native.mjs b/node_modules/@legendapp/list/react-native.mjs
+index a3d8d9a..a286525 100644
+--- a/node_modules/@legendapp/list/react-native.mjs
++++ b/node_modules/@legendapp/list/react-native.mjs
+@@ -667,7 +667,7 @@ function resetSharedEdgeGateIfOutsideHysteresis(ctx) {
+     return;
+   }
+   const contentSize = getContentSize(ctx);
+-  const endDistance = contentSize - state.scroll - state.scrollLength - getContentInsetEnd(ctx);
++  const endDistance = contentSize - state.scroll - state.scrollLength;
+   const isContentLess = contentSize < state.scrollLength;
+   const startThreshold = state.props.onStartReachedThreshold * state.scrollLength;
+   const endThreshold = state.props.onEndReachedThreshold * state.scrollLength;
+@@ -726,8 +726,8 @@ function checkAtBottom(ctx, allowedEdge, allowGateCreatedInCurrentCheck) {
+     return;
+   }
+   if (contentSize > 0 && queuedInitialLayout) {
+-    const insetEnd = getContentInsetEnd(ctx);
+-    const distanceFromEnd = contentSize - scroll - scrollLength - insetEnd;
++    // getContentSize already includes the end inset, as does the scroll clamp.
++    const distanceFromEnd = contentSize - scroll - scrollLength;
+     const isContentLess = contentSize < scrollLength;
+     set$(ctx, "isAtEnd", isContentLess || distanceFromEnd <= EDGE_POSITION_EPSILON);
+     set$(ctx, "isNearEnd", isContentLess || distanceFromEnd <= onEndReachedThreshold * scrollLength);
+@@ -1064,6 +1064,10 @@ function finishInitialScroll(ctx, options) {
+       releaseDeferredPublicOnScroll(ctx, finalScrollOffset);
+     }
+     (_f = options == null ? void 0 : options.onFinished) == null ? void 0 : _f.call(options);
++    if (state.pendingMaintainScrollAtEnd) {
++      state.maintainingScrollAtEnd = void 0;
++      doMaintainScrollAtEnd(ctx);
++    }
+   };
+   if (options == null ? void 0 : options.waitForCompletionFrame) {
+     requestAnimationFrame(complete);
+@@ -2042,7 +2046,7 @@ function doMaintainScrollAtEnd(ctx, options) {
+ }
+ 
+ // src/core/finishScrollTo.ts
+-function finishScrollTo(ctx) {
++function finishScrollTo(ctx, interrupted = false) {
+   var _a3, _b, _c;
+   const state = ctx.state;
+   if (state == null ? void 0 : state.scrollingTo) {
+@@ -2059,7 +2063,7 @@ function finishScrollTo(ctx) {
+       addTotalSize(ctx, null, state.pendingTotalSize);
+     }
+     if (PlatformAdjustBreaksScroll) {
+-      state.scrollAdjustHandler.commitPendingAdjust(scrollingTo);
++      state.scrollAdjustHandler.commitPendingAdjust(interrupted ? void 0 : scrollingTo);
+     }
+     if (scrollingTo.isInitialScroll || state.initialScroll) {
+       const isOffsetSession = ((_b = state.initialScrollSession) == null ? void 0 : _b.kind) === "offset";
+@@ -7163,10 +7167,15 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+       startBuffered: state.startBuffered
+     }),
+     reportContentInset: (inset) => {
++      // Native composer insets can change without a list layout.
++      // Capture follow state before the new inset can change end detection.
++      const shouldMaintain = peek$(ctx, "isAtEnd") && state.props.maintainScrollAtEnd?.onLayout;
+       const didChange = setContentInsetOverride(ctx, inset);
+       updateScroll(ctx, state.scroll, true, { markHasScrolled: false });
+       if (didChange) {
+-        retargetActiveInitialScrollAtEnd(ctx);
++        if (!retargetActiveInitialScrollAtEnd(ctx) && shouldMaintain) {
++          doMaintainScrollAtEnd(ctx);
++        }
+       }
+     },
+     scrollIndexIntoView: (options) => runScrollWithPromise(() => scrollIndexIntoView(options)),
+@@ -8069,7 +8078,17 @@ var LegendListInner = typedForwardRef(function LegendListInner2(props, forwarded
+       onScrollBeginDrag: (event) => {
+         var _a4, _b2;
+         state.isDragging = true;
++        if (state.scrollingTo || state.initialScroll || state.initialScrollSession) {
++          const { contentOffset, contentSize } = event.nativeEvent;
++          const offset = state.props.horizontal ? toLogicalHorizontalOffset(state, contentOffset.x, contentSize?.width) : contentOffset.y;
++          syncInitialScrollOffset(state, offset);
++        }
++        // User takeover must finish initialization without preserving its target.
++        supersedeInitialScroll(ctx);
++        // Commit deferred MVCP at the user's position, not the cancelled index.
++        finishScrollTo(ctx, true);
+         interruptMaintainScrollAtEnd(ctx);
++        cancelImperativeScroll(state);
+         prepareReachedEdgeForNextUserScroll(ctx);
+         (_b2 = (_a4 = state.props).onScrollBeginDrag) == null ? void 0 : _b2.call(_a4, event);
+       },

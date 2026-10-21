@@ -1,0 +1,51 @@
+# agent-device 0.21.16 Maestro subset; run via python3 mobile/e2e/run.py.
+# All gestures resolve an element, never a fixed screen coordinate.
+appId: host.exp.exponent
+---
+- assertVisible: 设置
+- assertVisible:
+    id: agent-row-${AGENT_ID}
+- takeScreenshot: ${ARTIFACTS}/01-home-light.png
+- swipe:
+    from:
+      id: agent-row-${AGENT_ID}
+    direction: LEFT
+- assertVisible: 移出首页
+- takeScreenshot: ${ARTIFACTS}/02-home-swipe.png
+- tapOn: 移出首页
+- extendedWaitUntil:
+    notVisible:
+      id: agent-row-${AGENT_ID}
+    timeout: 10000
+- tapOn: 新建 Agent 或查看全部 Agent
+- assertVisible: 新建 Agent
+- assertVisible: 全部 Agent
+- takeScreenshot: ${ARTIFACTS}/03-plus-menu.png
+- tapOn:
+    id: menu-backdrop
+- assertVisible: 设置
+- tapOn: 新建 Agent 或查看全部 Agent
+- tapOn:
+    id: home-menu-all-agents
+- assertVisible: 搜索 Agent
+- assertVisible: 不在首页 · 1
+- assertVisible:
+    id: agent-row-${AGENT_ID}
+- takeScreenshot: ${ARTIFACTS}/04-hidden-agent.png
+- swipe:
+    from:
+      id: agent-row-${AGENT_ID}
+    direction: LEFT
+- assertVisible: 放回首页
+- tapOn: 放回首页
+- extendedWaitUntil:
+    notVisible: 不在首页 · 1
+    timeout: 10000
+- back
+- assertVisible: 设置
+- assertVisible:
+    id: agent-row-${AGENT_ID}
+# @dark-mode
+- assertVisible: 设置
+- takeScreenshot: ${ARTIFACTS}/home-dark.png
+# @light-mode

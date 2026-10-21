@@ -1,0 +1,124 @@
+@import "tailwindcss";
+@import "uniwind";
+
+/* 设计稿 wandrun-ui.css（及 -2.css）迁移；input/ring/popover/accent/*-foreground 为 RNR 组件所需补充：light / dark 两套，Uniwind 默认 system 主题跟随系统。 */
+@theme {
+  /* 圆角：sm 8 / md 14 / lg 20（设计稿 --radius-sm / --radius / --radius-lg） */
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  /* 首页菜单遮罩在浅 / 深色下都为黑色 18%，不同于内容区的 scrim。 */
+
+  /* 字号阶梯（字号/行高）：title 28/36、xl 20/28、lg 17/24、base 16/24、sm 14/20、xs 12/16 */
+  --text-title: 28px;
+  --text-title--line-height: 36px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-lg: 17px;
+  --text-lg--line-height: 24px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+}
+
+@layer theme {
+  :root {
+    @variant light {
+      --color-background: #FAFAF9;
+      --color-foreground: #141414;
+      --color-card: #FFFFFF;
+      --color-card-foreground: #141414;
+      --color-popover: #FFFFFF;
+      --color-popover-foreground: #141414;
+      --color-muted: #F0F0ED;
+      --color-muted-foreground: #6B6B66;
+      --color-border: #E3E3DF;
+      --color-input: #E3E3DF;
+      --color-ring: #6B6B66;
+      --color-primary: #141414;
+      --color-primary-foreground: #FAFAF9;
+      --color-secondary: #EBEBE7;
+      --color-secondary-foreground: #141414;
+      --color-accent: #F0F0ED;
+      --color-accent-foreground: #141414;
+      --color-destructive: #D92D20;
+      --color-live: #141414;
+      --color-scrim: rgba(20, 20, 20, 0.04);
+      /* Rich status tones are semantic; chart series use independent categorical colors. */
+      --color-rich-neutral: #52524E;
+      --color-rich-neutral-bg: #F0F0ED;
+      --color-rich-neutral-border: #73736E;
+      --color-rich-active: #FFFFFF;
+      --color-rich-active-bg: #141414;
+      --color-rich-active-border: #141414;
+      --color-rich-success: #166534;
+      --color-rich-success-bg: #DCFCE7;
+      --color-rich-success-border: #15803D;
+      --color-rich-warning: #854D0E;
+      --color-rich-warning-bg: #FEF9C3;
+      --color-rich-warning-border: #A16207;
+      --color-rich-error: #B91C1C;
+      --color-rich-error-bg: #FEE2E2;
+      --color-rich-error-border: #DC2626;
+      --color-rich-info: #1E40AF;
+      --color-rich-info-bg: #DBEAFE;
+      --color-rich-info-border: #2563EB;
+      --color-chart-1: #1D4ED8;
+      --color-chart-2: #0F766E;
+      --color-chart-3: #92400E;
+      --color-chart-4: #7C3AED;
+      --color-chart-5: #0E7490;
+      --color-chart-6: #475569;
+    }
+
+    @variant dark {
+      --color-background: #0F0F0F;
+      --color-foreground: #F2F2EF;
+      --color-card: #181818;
+      --color-card-foreground: #F2F2EF;
+      --color-popover: #181818;
+      --color-popover-foreground: #F2F2EF;
+      --color-muted: #202020;
+      --color-muted-foreground: #A3A39E;
+      --color-border: #2A2A2A;
+      --color-input: #2A2A2A;
+      --color-ring: #A3A39E;
+      --color-primary: #F2F2EF;
+      --color-primary-foreground: #141414;
+      --color-secondary: #2A2A2A;
+      --color-secondary-foreground: #F2F2EF;
+      --color-accent: #202020;
+      --color-accent-foreground: #F2F2EF;
+      --color-destructive: #FF6B5E;
+      --color-live: #F2F2EF;
+      --color-scrim: rgba(255, 255, 255, 0.04);
+      --color-rich-neutral: #D4D4D0;
+      --color-rich-neutral-bg: #202020;
+      --color-rich-neutral-border: #A3A39E;
+      --color-rich-active: #141414;
+      --color-rich-active-bg: #F2F2EF;
+      --color-rich-active-border: #F2F2EF;
+      --color-rich-success: #86EFAC;
+      --color-rich-success-bg: #143322;
+      --color-rich-success-border: #4ADE80;
+      --color-rich-warning: #FDE047;
+      --color-rich-warning-bg: #352B12;
+      --color-rich-warning-border: #FACC15;
+      --color-rich-error: #FCA5A5;
+      --color-rich-error-bg: #3B1919;
+      --color-rich-error-border: #F87171;
+      --color-rich-info: #93C5FD;
+      --color-rich-info-bg: #172B46;
+      --color-rich-info-border: #60A5FA;
+      --color-chart-1: #82B1FC;
+      --color-chart-2: #5EEAD4;
+      --color-chart-3: #FFD54F;
+      --color-chart-4: #C4B5FD;
+      --color-chart-5: #67E8F9;
+      --color-chart-6: #CBD5E1;
+    }
+  }
+}

@@ -1,0 +1,62 @@
+[
+  {
+    "name": "large_exponent",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"BarChart\",\"props\":{\"labels\":[\"a\"],\"values\":[1e308]},\"children\":[]}},\"state\":{}}",
+    "valid": true
+  },
+  {
+    "name": "negative_large_exponent",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"LineChart\",\"props\":{\"xLabels\":[\"a\",\"b\"],\"series\":[{\"name\":\"n\",\"values\":[-1e308,0]}]},\"children\":[]}},\"state\":{}}",
+    "valid": true
+  },
+  {
+    "name": "max_finite",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"BarChart\",\"props\":{\"labels\":[\"a\"],\"values\":[1.7976931348623157e308]},\"children\":[]}},\"state\":{}}",
+    "valid": true
+  },
+  {
+    "name": "negative_max_finite",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"LineChart\",\"props\":{\"xLabels\":[\"a\",\"b\"],\"series\":[{\"name\":\"n\",\"values\":[-1.7976931348623157e308,0]}]},\"children\":[]}},\"state\":{}}",
+    "valid": true
+  },
+  {
+    "name": "exponent_overflow",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"BarChart\",\"props\":{\"labels\":[\"a\"],\"values\":[1e309]},\"children\":[]}},\"state\":{}}",
+    "valid": false
+  },
+  {
+    "name": "negative_exponent_overflow",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"LineChart\",\"props\":{\"xLabels\":[\"a\",\"b\"],\"series\":[{\"name\":\"n\",\"values\":[-1e309,0]}]},\"children\":[]}},\"state\":{}}",
+    "valid": false
+  },
+  {
+    "name": "integer_overflow",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"BarChart\",\"props\":{\"labels\":[\"a\"],\"values\":[1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000]},\"children\":[]}},\"state\":{}}",
+    "valid": false
+  },
+  {
+    "name": "negative_integer_overflow",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"LineChart\",\"props\":{\"xLabels\":[\"a\",\"b\"],\"series\":[{\"name\":\"n\",\"values\":[-1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000,0]}]},\"children\":[]}},\"state\":{}}",
+    "valid": false
+  },
+  {
+    "name": "finite_integer",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"BarChart\",\"props\":{\"labels\":[\"a\"],\"values\":[100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000]},\"children\":[]}},\"state\":{}}",
+    "valid": true
+  },
+  {
+    "name": "negative_finite_integer",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"LineChart\",\"props\":{\"xLabels\":[\"a\",\"b\"],\"series\":[{\"name\":\"n\",\"values\":[-100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000,0]}]},\"children\":[]}},\"state\":{}}",
+    "valid": true
+  },
+  {
+    "name": "unsafe_integer",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"BarChart\",\"props\":{\"labels\":[\"a\"],\"values\":[9007199254740993]},\"children\":[]}},\"state\":{}}",
+    "valid": true
+  },
+  {
+    "name": "negative_unsafe_integer",
+    "source": "{\"root\":\"chart\",\"elements\":{\"chart\":{\"type\":\"LineChart\",\"props\":{\"xLabels\":[\"a\",\"b\"],\"series\":[{\"name\":\"n\",\"values\":[-9007199254740993,0]}]},\"children\":[]}},\"state\":{}}",
+    "valid": true
+  }
+]

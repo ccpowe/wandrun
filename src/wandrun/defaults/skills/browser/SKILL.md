@@ -1,0 +1,1 @@
+../../../../../workspace/.wandrun/skills/browser/SKILL.md

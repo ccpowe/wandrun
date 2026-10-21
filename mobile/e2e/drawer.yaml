@@ -1,0 +1,99 @@
+# agent-device 0.21.16 Maestro subset; run via python3 mobile/e2e/run.py.
+# All gestures resolve an element, never a fixed screen coordinate.
+appId: host.exp.exponent
+---
+- tapOn:
+    id: agent-row-${AGENT_ID}
+- assertVisible: 对话列表
+- tapOn: 对话列表
+- assertVisible: 最近对话
+- tapOn:
+    id: conversation-${OLD_ID}
+- extendedWaitUntil:
+    notVisible:
+      id: new-conversation
+    timeout: 10000
+- tapOn: 对话列表
+- assertVisible:
+    id: conversation-${OLD_ID}
+    text: '.*，当前对话'
+- takeScreenshot: ${ARTIFACTS}/05-old-drawer.png
+- tapOn:
+    id: new-conversation
+- extendedWaitUntil:
+    notVisible:
+      id: new-conversation
+    timeout: 10000
+- assertVisible: 对话列表
+- tapOn: 对话列表
+- assertVisible: 最近对话
+- assertNotVisible:
+    id: conversation-${OLD_ID}
+    text: '.*，当前对话'
+- assertVisible: 新对话，当前对话
+- takeScreenshot: ${ARTIFACTS}/06-new-drawer.png
+- assertVisible:
+    id: conversation-${MANAGED_ID}
+    text: '.*，当前对话'
+- longPressOn:
+    id: conversation-${MANAGED_ID}
+- assertVisible:
+    id: conversation-menu-rename
+- assertVisible:
+    id: conversation-menu-delete
+- takeScreenshot: ${ARTIFACTS}/10-conversation-menu-light.png
+- tapOn:
+    id: conversation-menu-rename
+- tapOn:
+    id: conversation-rename-input
+- takeScreenshot: ${ARTIFACTS}/11-conversation-rename-keyboard-light.png
+# 输入框聚焦时全选原标题；ASCII 输入直接替换，不切换用户手机的输入法。
+- inputText: E2E renamed conversation
+- tapOn:
+    id: conversation-rename-confirm
+- extendedWaitUntil:
+    visible:
+      id: conversation-${MANAGED_ID}
+      text: 'E2E renamed conversation，当前对话'
+    timeout: 10000
+- back
+- assertVisible: E2E renamed conversation
+- tapOn: 对话列表
+- tapOn:
+    id: conversation-${OLD_ID}
+- extendedWaitUntil:
+    notVisible:
+      id: new-conversation
+    timeout: 10000
+- tapOn: 对话列表
+- assertVisible:
+    id: conversation-${OLD_ID}
+    text: '.*，当前对话'
+- longPressOn:
+    id: conversation-${MANAGED_ID}
+- tapOn:
+    id: conversation-menu-delete
+- assertVisible: 删除这个对话？
+- assertVisible: 正在进行的工作会停止；Agent 发给你的文件仍留在电脑上。
+- takeScreenshot: ${ARTIFACTS}/12-conversation-delete-light.png
+- tapOn:
+    id: conversation-delete-confirm
+- extendedWaitUntil:
+    notVisible:
+      id: conversation-${MANAGED_ID}
+    timeout: 10000
+- back
+- extendedWaitUntil:
+    notVisible:
+      id: new-conversation
+    timeout: 10000
+- assertVisible: 对话列表
+- assertNotVisible: 设置
+- takeScreenshot: ${ARTIFACTS}/07-back-closes-drawer.png
+- tapOn: 返回
+- assertVisible: 设置
+- assertVisible:
+    id: agent-row-${AGENT_ID}
+# @dark-mode
+# @dark-management
+# @light-mode

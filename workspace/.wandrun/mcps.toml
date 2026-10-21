@@ -1,0 +1,5 @@
+# 可被角色引用的 MCP 服务；默认提供 Exa 网页搜索，无需 API key。
+[mcp_servers.exa]
+url = "https://mcp.exa.ai/mcp"
+description = "Exa web search and page content retrieval."
+transport = "streamable-http"

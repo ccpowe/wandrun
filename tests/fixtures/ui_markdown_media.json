@@ -1,0 +1,32 @@
+[
+  {
+    "name": "inline math hides pseudo image even when the real URL repeats",
+    "text": "公式 $![伪图](https://example.org/repeat.png)$，然后 ![真图](https://example.org/repeat.png) 和 ![第二张](https://example.org/two.png)",
+    "urls": ["https://example.org/repeat.png", "https://example.org/two.png"]
+  },
+  {
+    "name": "display math hides multiline pseudo image",
+    "text": "$$\n\\text{图：![伪图](https://example.org/math.png)}\n$$\n\n![真图](https://example.org/display.png)",
+    "urls": ["https://example.org/display.png"]
+  },
+  {
+    "name": "explicit TeX is math while prices stay prose",
+    "text": "价格 $20和$30；公式 $20\\text{元 ![伪图](https://example.org/math.png)}$，再看 ![真图](https://example.org/price.png)",
+    "urls": ["https://example.org/price.png"]
+  },
+  {
+    "name": "code and escaped dollar do not start math",
+    "text": "`$![代码](https://example.org/code.png)$`，\\$![转义后图片](https://example.org/escaped.png)$，![普通](https://example.org/plain.png)",
+    "urls": ["https://example.org/escaped.png", "https://example.org/plain.png"]
+  },
+  {
+    "name": "escaped closing dollar stays inside math",
+    "text": "公式 $a\\$+![伪图](https://example.org/fake.png)$ ![结果](https://example.org/result.png)",
+    "urls": ["https://example.org/result.png"]
+  },
+  {
+    "name": "UI fence across reference and footnote",
+    "text": "![前图][shared]\n\n```wandrun-ui\n{\"root\":\"x\",\"image\":\"![伪图](https://example.org/ignored.png)\"}\n```\n\n公式 $![伪图](https://example.org/math.png)$；![后图][shared] 引用[^n]。\n\n[shared]: https://example.org/shared.png\n[^n]: 附图 ![脚注](https://example.org/footnote.png)",
+    "urls": ["https://example.org/shared.png", "https://example.org/shared.png", "https://example.org/footnote.png"]
+  }
+]

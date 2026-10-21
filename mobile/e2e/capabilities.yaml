@@ -1,0 +1,228 @@
+# agent-device Maestro subset; runner owns the Agent and conversation.
+# Real-device acceptance must hold device.lock and respect the foreground guard.
+appId: host.exp.exponent
+---
+- tapOn:
+    id: agent-row-${CAPABILITY_AGENT_ID}
+- extendedWaitUntil:
+    visible:
+      id: chat-agent-profile
+    timeout: 10000
+- tapOn:
+    id: chat-agent-profile
+- tapOn:
+    id: profile-edit
+# @code-mode-capability-on
+- scrollUntilVisible:
+    element:
+      id: editor-code-mode
+    direction: DOWN
+- assertVisible:
+    id: editor-code-mode
+- takeScreenshot: ${ARTIFACTS}/01-code-mode-default-light.png
+- scrollUntilVisible:
+    element:
+      id: editor-system-capabilities
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/01-agent-capabilities-entry-light.png
+- tapOn:
+    id: editor-system-capabilities
+- extendedWaitUntil:
+    visible:
+      id: capability-files
+    timeout: 10000
+- assertVisible: 已启用
+- scrollUntilVisible:
+    element:
+      id: capability-code_mode
+    direction: DOWN
+- assertVisible:
+    id: capability-code_mode
+- assertNotVisible:
+    id: capability-unavailable-code_mode
+- takeScreenshot: ${ARTIFACTS}/02-capabilities-light.png
+- scrollUntilVisible:
+    element:
+      id: capability-files
+    direction: UP
+- tapOn:
+    id: capability-files
+- assertVisible:
+    id: capability-sheet
+- assertVisible: read_file
+- assertVisible: write_file
+- assertVisible: 所有 Agent 都有
+- takeScreenshot: ${ARTIFACTS}/03-files-sheet-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/04-files-sheet-dark.png
+- tapOn:
+    id: capability-backdrop
+- assertNotVisible:
+    id: capability-sheet
+- tapOn:
+    id: capability-files
+- assertVisible:
+    id: capability-sheet
+- tapOn: 关闭
+- assertNotVisible:
+    id: capability-sheet
+- tapOn:
+    id: capability-files
+- assertVisible:
+    id: capability-sheet
+- back
+- assertNotVisible:
+    id: capability-sheet
+- takeScreenshot: ${ARTIFACTS}/05-capabilities-dark.png
+- scrollUntilVisible:
+    element:
+      id: capability-code_mode
+    direction: DOWN
+- assertNotVisible:
+    id: capability-unavailable-code_mode
+# @light-mode
+- takeScreenshot: ${ARTIFACTS}/07-enabled-light.png
+- tapOn:
+    id: capabilities-back
+- scrollUntilVisible:
+    element:
+      id: editor-code-mode
+    direction: UP
+- tapOn:
+    id: editor-code-mode
+- takeScreenshot: ${ARTIFACTS}/07-code-mode-off-draft-light.png
+# @code-mode-capability-on
+- tapOn:
+    id: editor-back
+- tapOn:
+    id: profile-edit
+- scrollUntilVisible:
+    element:
+      id: editor-code-mode
+    direction: DOWN
+- tapOn:
+    id: editor-code-mode
+- tapOn:
+    id: editor-save
+# @code-mode-capability-off
+- tapOn:
+    id: profile-edit
+- scrollUntilVisible:
+    element:
+      id: editor-code-mode
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/07-code-mode-saved-off-light.png
+- scrollUntilVisible:
+    element:
+      id: editor-system-capabilities
+    direction: DOWN
+- tapOn:
+    id: editor-system-capabilities
+- extendedWaitUntil:
+    visible:
+      id: capabilities-screen
+    timeout: 10000
+- scrollUntilVisible:
+    element:
+      id: capability-unavailable-code_mode
+    direction: DOWN
+- extendedWaitUntil:
+    visible:
+      id: capability-unavailable-code_mode
+    timeout: 10000
+- assertVisible: 未开启
+- assertNotVisible:
+    id: capability-code_mode
+- takeScreenshot: ${ARTIFACTS}/07-code-mode-unavailable-light.png
+- tapOn:
+    id: capabilities-back
+- scrollUntilVisible:
+    element:
+      id: editor-code-mode
+    direction: UP
+- tapOn:
+    id: editor-code-mode
+- tapOn:
+    id: editor-save
+# @code-mode-capability-restored
+- tapOn:
+    id: profile-edit
+- scrollUntilVisible:
+    element:
+      id: editor-system-capabilities
+    direction: DOWN
+- tapOn:
+    id: editor-system-capabilities
+- extendedWaitUntil:
+    visible:
+      id: capabilities-screen
+    timeout: 10000
+- scrollUntilVisible:
+    element:
+      id: capability-code_mode
+    direction: DOWN
+- extendedWaitUntil:
+    visible:
+      id: capability-code_mode
+    timeout: 10000
+- assertNotVisible:
+    id: capability-unavailable-code_mode
+- takeScreenshot: ${ARTIFACTS}/07-code-mode-restored-light.png
+- tapOn:
+    id: capabilities-back
+- tapOn:
+    id: editor-back
+- tapOn:
+    id: profile-close
+- tapOn: 返回
+- tapOn: 设置
+- scrollUntilVisible:
+    element:
+      id: settings-skills
+    direction: DOWN
+- tapOn:
+    id: settings-skills
+- extendedWaitUntil:
+    visible:
+      id: builtin-skill-wandrun-ui
+    timeout: 10000
+- assertVisible: 系统内置
+- assertVisible: '.*我的技能.*'
+- takeScreenshot: ${ARTIFACTS}/08-skills-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/09-skills-dark.png
+- tapOn:
+    id: builtin-skill-wandrun-ui
+- extendedWaitUntil:
+    visible:
+      id: builtin-capability
+    timeout: 10000
+- assertVisible: 交互界面
+- assertNotVisible:
+    id: skill-delete
+- scrollUntilVisible:
+    element:
+      id: builtin-agent-${CAPABILITY_AGENT_ID}
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/10-builtin-detail-dark.png
+# @light-mode
+- takeScreenshot: ${ARTIFACTS}/11-builtin-detail-light.png
+- tapOn:
+    id: builtin-agent-${CAPABILITY_AGENT_ID}
+- assertVisible:
+    id: profile-edit
+- tapOn:
+    id: profile-close
+- scrollUntilVisible:
+    element:
+      id: builtin-skill-content
+    direction: DOWN
+- assertNotVisible:
+    id: skill-delete
+- takeScreenshot: ${ARTIFACTS}/12-builtin-content-light.png
+- tapOn:
+    id: builtin-detail-back
+- tapOn:
+    id: skills-back
+- back
+- assertVisible: 设置

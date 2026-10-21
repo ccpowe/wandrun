@@ -1,0 +1,446 @@
+# Real model messages: source specs travel through /messages; no synthetic Agent events.
+# Accessible chart choices use plotted-point callbacks; viewer controls exercise shared 1–8× zoom bounds.
+appId: host.exp.exponent
+---
+- extendedWaitUntil:
+    visible:
+      id: agent-row-${RICH_AGENT_ID}
+    timeout: 10000
+- tapOn:
+    id: agent-row-${RICH_AGENT_ID}
+# @rich-status
+- scrollUntilVisible:
+    element:
+      text: 发布进展与语义状态
+    direction: UP
+- assertVisible: 发布 v1.4
+- scrollUntilVisible:
+    element:
+      text: 接近上限
+    direction: DOWN
+- assertVisible: 失败
+# @rich-check-status
+- takeScreenshot: ${ARTIFACTS}/01-status-table-colors-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/02-status-table-colors-dark.png
+# @light-mode
+# @rich-form
+- scrollUntilVisible:
+    element:
+      id: rich-choice-plan-mountain
+    direction: UP
+- assertVisible:
+    id: rich-date-date
+- assertVisible:
+    id: rich-select-release
+- takeScreenshot: ${ARTIFACTS}/03-choice-date-select-light.png
+- tapOn:
+    id: rich-select-release
+- extendedWaitUntil:
+    visible:
+      id: rich-select-release-production
+    timeout: 10000
+- tapOn:
+    id: rich-select-release-production
+- scrollUntilVisible:
+    element:
+      id: rich-segment-length-standard
+    direction: DOWN
+- assertVisible:
+    id: rich-segment-length-standard
+- scrollUntilVisible:
+    element:
+      id: rich-multi-sources-official
+    direction: DOWN
+- assertVisible:
+    id: rich-multi-sources-official
+- scrollUntilVisible:
+    element:
+      id: rich-submit
+    direction: DOWN
+- assertVisible:
+    id: rich-switch-screenshots
+- assertVisible:
+    id: rich-slider-tone
+- assertVisible:
+    id: rich-input-extra
+# @rich-check-form
+- assertVisible:
+    id: rich-submit
+- takeScreenshot: ${ARTIFACTS}/04-form-light.png
+- tapOn:
+    id: rich-submit
+# @rich-form-submitted
+- scrollUntilVisible:
+    element:
+      text: 已提交.*
+    direction: DOWN
+- assertNotVisible:
+    id: rich-submit
+# @rich-check-form-submitted
+- takeScreenshot: ${ARTIFACTS}/04-form-readonly-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/05-form-readonly-dark.png
+# @light-mode
+# @rich-line
+- scrollUntilVisible:
+    element:
+      id: rich-line-chart
+    direction: DOWN
+# The selected-value row does not exist until a plotted point or data row is pressed.
+# @rich-check-line
+- tapOn:
+    id: rich-line-points-toggle
+- takeScreenshot: ${ARTIFACTS}/06-line-menu-open.png
+- scrollUntilVisible:
+    element:
+      id: rich-line-point-8
+    direction: DOWN
+- tapOn:
+    id: rich-line-point-8
+- assertVisible:
+    id: rich-chart-selected-value
+    text: 新增 · 周四：19 项
+- takeScreenshot: ${ARTIFACTS}/06-line-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/07-line-dark.png
+# @light-mode
+# @rich-bar
+- scrollUntilVisible:
+    element:
+      id: rich-bar-chart
+    direction: DOWN
+# @rich-check-bar
+- tapOn:
+    id: rich-bar-points-toggle
+# Chart data rows are below the plot; tapping an off-screen accessibility node
+# can leave the menu open without selecting it.
+- scrollUntilVisible:
+    element:
+      id: rich-bar-point-1
+    direction: DOWN
+# @known-dev-overlay
+- takeScreenshot: ${ARTIFACTS}/08-bar-menu-open.png
+- tapOn:
+    id: rich-bar-point-1
+- scrollUntilVisible:
+    element:
+      id: rich-chart-selected-value
+    direction: UP
+- assertVisible:
+    id: rich-chart-selected-value
+    text: 社群：72 次
+- takeScreenshot: ${ARTIFACTS}/08-bar-light.png
+# @rich-pie
+- scrollUntilVisible:
+    element:
+      id: rich-pie-chart
+    direction: DOWN
+- assertVisible:
+    id: rich-pie-legend
+# @rich-check-pie
+- scrollUntilVisible:
+    element:
+      id: rich-pie-point-1
+    direction: DOWN
+- tapOn:
+    id: rich-pie-point-1
+- scrollUntilVisible:
+    element:
+      id: rich-chart-selected-value
+    direction: DOWN
+- assertVisible:
+    id: rich-chart-selected-value
+    text: 交通：1800 元
+- takeScreenshot: ${ARTIFACTS}/09-pie-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/10-pie-dark.png
+# @light-mode
+# @rich-disclosure
+- scrollUntilVisible:
+    element:
+      id: rich-tab-0
+    direction: UP
+- tapOn:
+    id: rich-accordion-toggle
+- assertVisible: 暂无阻塞项
+- takeScreenshot: ${ARTIFACTS}/11-tabs-accordion-open-light.png
+- tapOn:
+    id: rich-tab-1
+- assertVisible: 版本 v1.4，生产环境
+- tapOn:
+    id: rich-tab-2
+- assertVisible: 健康检查已完成
+# @rich-check-disclosure
+- takeScreenshot: ${ARTIFACTS}/12-tabs-third-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/13-tabs-third-dark.png
+# @light-mode
+# @rich-sources
+- scrollUntilVisible:
+    element:
+      id: rich-source-toggle
+    direction: UP
+# @rich-source-collapsed
+- assertNotVisible:
+    id: rich-source-1
+- tapOn:
+    id: rich-source-toggle
+- scrollUntilVisible:
+    element:
+      id: rich-source-1
+    direction: DOWN
+- assertVisible:
+    id: rich-source-1
+- scrollUntilVisible:
+    element:
+      text: '.*Expo 文档.*docs\.expo\.dev.*'
+    direction: DOWN
+- assertVisible:
+    text: '.*Expo 文档.*docs\.expo\.dev.*'
+# @rich-check-sources
+- takeScreenshot: ${ARTIFACTS}/14-sources-linkcard-light.png
+- scrollUntilVisible:
+    element:
+      id: rich-source-toggle
+    direction: UP
+# @rich-source-before-swipe
+- swipe:
+    from:
+      id: rich-source-rail
+    direction: LEFT
+# @rich-source-after-swipe
+- takeScreenshot: ${ARTIFACTS}/14a-sources-swiped-light.png
+- tapOn:
+    id: rich-source-${RICH_SOURCE_OPEN_INDEX}
+# @rich-source-browser-return
+- extendedWaitUntil:
+    visible:
+      id: rich-source-toggle
+    timeout: 10000
+# @rich-source-ready-to-collapse
+- tapOn:
+    id: rich-source-toggle
+# @rich-source-collapsed
+- takeScreenshot: ${ARTIFACTS}/14b-sources-collapsed-light.png
+# @rich-components
+- scrollUntilVisible:
+    element:
+      text: 安全检查
+    direction: UP
+- assertVisible: 先灰度部署
+- assertVisible: 先验证再扩大范围
+- scrollUntilVisible:
+    element:
+      text: 操作前备份
+    direction: DOWN
+# @rich-check-components
+- takeScreenshot: ${ARTIFACTS}/15-icon-list-callout-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/16-icon-list-callout-dark.png
+# @light-mode
+# @rich-math
+- scrollUntilVisible:
+    element:
+      text: 物理公式
+    direction: UP
+# @rich-check-math
+- takeScreenshot: ${ARTIFACTS}/17-inline-block-math-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/18-inline-block-math-dark.png
+# @light-mode
+# @rich-media
+- scrollUntilVisible:
+    element:
+      text: 查看图片 Python 标志
+    direction: UP
+- assertNotVisible:
+    id: media-image-error
+# @rich-check-media
+- takeScreenshot: ${ARTIFACTS}/19-image-url-light.png
+- tapOn:
+    text: 查看图片 Python 标志
+- extendedWaitUntil:
+    visible:
+      id: media-zoom-viewport
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/20-image-url-viewer-light.png
+- tapOn:
+    id: media-zoom-reset
+- tapOn: 返回
+- scrollUntilVisible:
+    element:
+      text: 查看图片 Markdown 标志图片
+    direction: DOWN
+- assertNotVisible:
+    id: media-image-error
+# @rich-reveal-markdown-image
+- tapOn:
+    text: 查看图片 Markdown 标志图片
+- assertVisible:
+    id: media-zoom-viewport
+- takeScreenshot: ${ARTIFACTS}/21-markdown-image-viewer-light.png
+- tapOn: 返回
+- scrollUntilVisible:
+    element:
+      text: 查看图片 横排标志图片
+    direction: UP
+- tapOn:
+    text: 查看图片 横排标志图片
+- assertVisible:
+    id: media-zoom-viewport
+- takeScreenshot: ${ARTIFACTS}/22-media-card-viewer-light.png
+- tapOn: 返回
+- scrollUntilVisible:
+    element:
+      text: 查看图片 竖排标志图片
+    direction: DOWN
+- assertVisible:
+    id: rich-media-card
+# Two gallery images sit side by side; there is no pager to step through.
+- scrollUntilVisible:
+    element:
+      text: 查看图片 第二张标志
+    direction: DOWN
+# @rich-reveal-gallery-second
+- tapOn:
+    text: 查看图片 第二张标志
+- assertVisible:
+    id: media-zoom-viewport
+- assertVisible: 1×
+- tapOn:
+    id: media-zoom-in
+- assertVisible: 2×
+- tapOn:
+    id: media-zoom-in
+- assertVisible: 4×
+- tapOn:
+    id: media-zoom-in
+- assertVisible: 8×
+- takeScreenshot: ${ARTIFACTS}/23a-gallery-zoom-8x-light.png
+- tapOn:
+    id: media-zoom-out
+- assertVisible: 4×
+- tapOn:
+    id: media-zoom-reset
+- assertVisible: 1×
+- takeScreenshot: ${ARTIFACTS}/23-gallery-viewer-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/24-gallery-viewer-dark.png
+# @light-mode
+- tapOn: 返回
+# @rich-gallery-scroll
+- scrollUntilVisible:
+    element:
+      text: 横滑三张图片
+    direction: DOWN
+- extendedWaitUntil:
+    visible:
+      text: 查看图片 横滑第一张标志
+    timeout: 10000
+# @rich-gallery-before-swipe
+- swipe:
+    from:
+      id: rich-gallery
+    direction: LEFT
+# @rich-gallery-after-swipe
+- takeScreenshot: ${ARTIFACTS}/24a-gallery-swiped-light.png
+- tapOn:
+    text: 查看图片 ${RICH_GALLERY_OPEN_ALT}
+- extendedWaitUntil:
+    visible:
+      id: media-image-open
+    timeout: 10000
+# @rich-gallery-viewer
+- takeScreenshot: ${ARTIFACTS}/24b-gallery-swiped-viewer-light.png
+- tapOn: 返回
+- extendedWaitUntil:
+    visible:
+      id: rich-gallery
+    timeout: 10000
+# @rich-mermaid
+- scrollUntilVisible:
+    element:
+      id: rich-mermaid
+    direction: DOWN
+- extendedWaitUntil:
+    visible:
+      id: mermaid-ready
+    timeout: 15000
+- assertNotVisible:
+    id: mermaid-error
+- tapOn:
+    id: mermaid-view-code
+- assertVisible:
+    id: rich-mermaid-source
+# @rich-check-mermaid
+- takeScreenshot: ${ARTIFACTS}/25-mermaid-source-light.png
+- tapOn:
+    id: mermaid-view-preview
+- extendedWaitUntil:
+    visible:
+      id: mermaid-ready
+    timeout: 15000
+- assertNotVisible:
+    id: mermaid-zoom-in
+- assertNotVisible:
+    id: mermaid-reset
+- assertNotVisible:
+    id: mermaid-open-full
+- tapOn:
+    id: mermaid-view-code
+- assertNotVisible:
+    id: mermaid-preview-open
+- assertVisible:
+    id: rich-mermaid-source
+- tapOn:
+    id: mermaid-view-preview
+- extendedWaitUntil:
+    visible:
+      id: mermaid-ready
+    timeout: 15000
+- tapOn:
+    id: mermaid-preview-open
+- extendedWaitUntil:
+    visible:
+      id: mermaid-ready
+    timeout: 15000
+- assertVisible:
+    id: mermaid-full-view-preview
+- assertNotVisible:
+    id: mermaid-preview-open
+- tapOn:
+    id: mermaid-full-zoom-in
+# Wait for the renderer to acknowledge zoom before hiding its WebView.
+- extendedWaitUntil:
+    visible:
+      id: mermaid-full-reset
+    timeout: 15000
+- tapOn:
+    id: mermaid-full-view-code
+- assertVisible: flowchart LR.*
+- assertNotVisible:
+    id: mermaid-ready
+- assertVisible:
+    id: media-viewer-source
+- tapOn:
+    id: mermaid-full-view-preview
+- extendedWaitUntil:
+    visible:
+      id: mermaid-ready
+    timeout: 15000
+- assertVisible:
+    id: mermaid-full-reset
+- tapOn:
+    id: mermaid-full-view-code
+- takeScreenshot: ${ARTIFACTS}/26-mermaid-viewer-source-light.png
+- tapOn: 返回
+- tapOn: 返回
+- extendedWaitUntil:
+    visible:
+      id: home-search
+    timeout: 10000
+# @rich-preview-open
+- assertVisible: 富交互消息 · P0/P1/P2
+# @rich-preview-review
+# @rich-preview-close

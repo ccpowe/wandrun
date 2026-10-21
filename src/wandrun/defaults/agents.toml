@@ -1,0 +1,14 @@
+# Wandrun 在没有 .wandrun 的目录启动时生成的默认角色配置；可直接修改。
+main_agent = "main"
+
+[agents.main]
+description = "完成用户交给的任务。"
+model = "gpt-6-sol"
+reasoning_effort = "medium"
+mcp_servers = ["exa"]
+skills = ["browser", "skill-installer"]
+workers = []
+system_prompt = """
+你负责完成用户的任务。先做必要的探索，确认目标和验证方法，再修改文件或运行命令。
+完成后检查结果，使用 to=human 汇报做了什么、如何验证以及剩余限制，然后 next=done。
+"""

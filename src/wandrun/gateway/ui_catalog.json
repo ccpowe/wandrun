@@ -1,0 +1,199 @@
+{
+  "version": 1,
+  "description": "消息内受控界面组件；展示数据、打开受控 HTTP(S) 来源链接或收集提交值，不执行模型指定的任意操作。",
+  "stringLengthUnit": "Unicode code points",
+  "intents": [
+    {"intent": "汇报进度", "components": ["Card", "Status", "Steps"]},
+    {"intent": "展示数据/周报", "components": ["Metrics", "Table"]},
+    {"intent": "电脑状态/详情", "components": ["Status", "KeyValue", "Badge"]},
+    {"intent": "比较多个对象", "components": ["Card", "Grid", "Table", "ChoiceGroup"]},
+    {"intent": "收集选择或填写", "components": ["Select", "Segmented", "MultiSelect", "Switch", "TextInput", "DateInput", "Submit"]},
+    {"intent": "展示趋势", "components": ["LineChart"]},
+    {"intent": "比较分类数值", "components": ["BarChart"]},
+    {"intent": "展示占比", "components": ["PieChart"]},
+    {"intent": "分组选项卡", "components": ["Tabs"]},
+    {"intent": "渐进展示详情", "components": ["Accordion"]},
+    {"intent": "引用网页来源", "components": ["Source", "LinkCard"]},
+    {"intent": "展示步骤、提示、原话或紧凑列表", "components": ["List", "Callout", "Quote", "Icon"]},
+    {"intent": "展示公式", "components": ["Math"]},
+    {"intent": "展示截图或图片（同条消息附件路径或可靠来源的真实图片 URL）", "components": ["Image"]},
+    {"intent": "并排比较外观与说明", "components": ["MediaCard", "Gallery"]},
+    {"intent": "展示流程或关系图", "components": ["Mermaid"]}
+  ],
+  "examples": [
+    {"title":"对比摘要","chapter":"display.md","spec":{"root":"r","elements":{"r":{"type":"Stack","props":{},"children":["h","t"]},"h":{"type":"Heading","props":{"text":"方案 A 更适合当前需求"},"children":[]},"t":{"type":"Table","props":{"columns":["方案","差异"],"rows":[["A","功能完整"],["B","配置更少"]]},"children":[]}},"state":{}}},
+    {"title":"趋势","chapter":"charts.md","spec":{"root":"r","elements":{"r":{"type":"LineChart","props":{"title":"完成项","xLabels":["周一","周二","周三"],"series":[{"name":"项目","values":[2,3,5]}],"unit":"项"},"children":[]}},"state":{}}},
+    {"title":"收集偏好","chapter":"forms.md","spec":{"root":"r","elements":{"r":{"type":"Stack","props":{},"children":["f","m","n","s"]},"f":{"type":"Segmented","props":{"stateKey":"frequency","label":"频率","options":[{"value":"week","label":"每周"},{"value":"month","label":"每月"}]},"children":[]},"m":{"type":"MultiSelect","props":{"stateKey":"topics","label":"内容","options":[{"value":"progress","label":"进度"},{"value":"risks","label":"风险"}]},"children":[]},"n":{"type":"Switch","props":{"stateKey":"notify","label":"提醒"},"children":[]},"s":{"type":"Submit","props":{"label":"提交偏好"},"children":[]}},"state":{"frequency":"week","topics":["progress"],"notify":true}}},
+    {"title":"流程图","chapter":"media.md","spec":{"root":"r","elements":{"r":{"type":"Mermaid","props":{"source":"flowchart LR\n  A[开始] --> B{检查}\n  B -->|通过| C[完成]","title":"处理流程"},"children":[]}},"state":{}}}
+  ],
+  "$defs": {
+    "identifier": {"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$","not":{"enum":["constructor","prototype","__proto__"]}},
+    "webUrl": {"type":"string","minLength":1,"maxLength":2048,"pattern":"^https?://"}
+  },
+  "components": {
+    "Stack": {
+      "description": "横排或竖排组合内容；justify 仅横排生效，默认 start，between 将多余水平空间分配到子项之间。", "container": true,
+      "props": {"type":"object","properties":{"direction":{"enum":["vertical","horizontal"]},"gap":{"enum":["sm","md"]},"justify":{"enum":["start","between"]}},"additionalProperties":false}
+    },
+    "Card": {
+      "description": "分组展示方案或表单。", "container": true,
+      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80}},"additionalProperties":false}
+    },
+    "Divider": {
+      "description": "分隔内容。", "container": false,
+      "props": {"type":"object","properties":{},"additionalProperties":false}
+    },
+    "Heading": {
+      "description": "简短标题。", "container": false,
+      "props": {"type":"object","properties":{"text":{"type":"string","maxLength":500}},"required":["text"],"additionalProperties":false}
+    },
+    "Text": {
+      "description": "说明文字；text 支持 **粗体**、*斜体*、`行内代码` 和 $公式$／$$公式$$，未闭合标记按原文显示。", "container": false,
+      "props": {"type":"object","properties":{"text":{"type":"string","maxLength":500},"tone":{"enum":["default","muted"]}},"required":["text"],"additionalProperties":false}
+    },
+    "Badge": {
+      "description": "简短状态标记。", "container": false,
+      "props": {"type":"object","properties":{"text":{"type":"string","maxLength":500},"tone":{"enum":["neutral","active","success","warning","error","info"]}},"required":["text"],"additionalProperties":false}
+    },
+    "Status": {
+      "description": "状态摘要、进度及说明。", "container": false,
+      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"badge":{"$ref":"#/$defs/badge"},"progress":{"type":"number","minimum":0,"maximum":100},"caption":{"type":"string","maxLength":500}},"required":["title"],"additionalProperties":false,"$defs":{"badge":{"type":"object","properties":{"text":{"type":"string","maxLength":500},"tone":{"enum":["neutral","active","success","warning","error","info"]}},"required":["text","tone"],"additionalProperties":false}}}
+    },
+    "Metrics": {
+      "description": "并列展示 1～4 个指标。", "container": false,
+      "props": {"type":"object","properties":{"items":{"type":"array","minItems":1,"maxItems":4,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":80},"value":{"type":"string","maxLength":80},"hint":{"type":"string","maxLength":500}},"required":["label","value"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}
+    },
+    "KeyValue": {
+      "description": "展示 1～12 个标签与值。", "container": false,
+      "props": {"type":"object","properties":{"items":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":80},"value":{"type":"string","maxLength":80}},"required":["label","value"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}
+    },
+    "Steps": {
+      "description": "展示 1～10 个步骤的当前状态。", "container": false,
+      "props": {"type":"object","properties":{"items":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":80},"state":{"enum":["done","current","todo","failed"]},"note":{"type":"string","maxLength":500}},"required":["label","state"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}
+    },
+    "Progress": {
+      "description": "展示 0～100 的进度。", "container": false,
+      "props": {"type":"object","properties":{"value":{"type":"number","minimum":0,"maximum":100},"caption":{"type":"string","maxLength":500}},"required":["value"],"additionalProperties":false}
+    },
+    "Table": {
+      "description": "1～5 列、1～12 行的短表格；单元格为字符串或徽标。", "container": false,
+      "props": {"type":"object","properties":{"columns":{"type":"array","minItems":1,"maxItems":5,"items":{"type":"string","maxLength":80}},"rows":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"array","items":{"oneOf":[{"type":"string","maxLength":80},{"type":"object","properties":{"badge":{"type":"object","properties":{"text":{"type":"string","maxLength":500},"tone":{"enum":["neutral","active","success","warning","error","info"]}},"required":["text","tone"],"additionalProperties":false}},"required":["badge"],"additionalProperties":false}]}}}},"required":["columns","rows"],"additionalProperties":false},
+      "relations":[{"items":"rows","lengthEquals":"columns"}]
+    },
+    "ChoiceGroup": {
+      "description": "2～8 项单选；可暂不选择。", "container": false,
+      "props": {"type":"object","properties":{"stateKey":{"$ref":"#/$defs/identifier"},"label":{"type":"string","maxLength":80},"options":{"type":"array","minItems":2,"maxItems":8,"items":{"type":"object","properties":{"value":{"type":"string","minLength":1,"maxLength":80},"label":{"type":"string","maxLength":80},"description":{"type":"string","maxLength":500},"tags":{"type":"array","items":{"type":"string","maxLength":80}},"disabled":{"type":"boolean"}},"required":["value","label"],"additionalProperties":false}}},"required":["stateKey","options"],"additionalProperties":false},
+      "input":{"kind":"choice","value":{"type":"string"},"allowEmpty":true}
+    },
+    "Select": {
+      "description": "2～12 项下拉单选；空串表示未选，禁用项不可新选。", "container": false,
+      "props": {"type":"object","properties":{"stateKey":{"$ref":"#/$defs/identifier"},"label":{"type":"string","maxLength":80},"options":{"type":"array","minItems":2,"maxItems":12,"items":{"type":"object","properties":{"value":{"type":"string","minLength":1,"maxLength":80},"label":{"type":"string","maxLength":80},"disabled":{"type":"boolean"}},"required":["value","label"],"additionalProperties":false}}},"required":["stateKey","options"],"additionalProperties":false},
+      "input":{"kind":"choice","value":{"type":"string"},"allowEmpty":true}
+    },
+    "Segmented": {
+      "description": "2～5 项紧凑单选；可暂不选择。", "container": false,
+      "props": {"type":"object","properties":{"stateKey":{"$ref":"#/$defs/identifier"},"label":{"type":"string","maxLength":80},"options":{"type":"array","minItems":2,"maxItems":5,"items":{"type":"object","properties":{"value":{"type":"string","minLength":1,"maxLength":80},"label":{"type":"string","maxLength":80}},"required":["value","label"],"additionalProperties":false}}},"required":["stateKey","options"],"additionalProperties":false},
+      "input":{"kind":"choice","value":{"type":"string"},"allowEmpty":true}
+    },
+    "MultiSelect": {
+      "description": "2～12 项多选，以标签或清单呈现。", "container": false,
+      "props": {"type":"object","properties":{"stateKey":{"$ref":"#/$defs/identifier"},"label":{"type":"string","maxLength":80},"variant":{"enum":["chips","checklist"]},"options":{"type":"array","minItems":2,"maxItems":12,"items":{"type":"object","properties":{"value":{"type":"string","minLength":1,"maxLength":80},"label":{"type":"string","maxLength":80},"note":{"type":"string","maxLength":500}},"required":["value","label"],"additionalProperties":false}}},"required":["stateKey","options"],"additionalProperties":false},
+      "input":{"kind":"multiple","value":{"type":"array","uniqueItems":true,"items":{"type":"string"}}}
+    },
+    "Switch": {
+      "description": "布尔开关。", "container": false,
+      "props": {"type":"object","properties":{"stateKey":{"$ref":"#/$defs/identifier"},"label":{"type":"string","maxLength":80}},"required":["stateKey","label"],"additionalProperties":false},
+      "input":{"kind":"switch","value":{"type":"boolean"}}
+    },
+    "Slider": {
+      "description": "范围内且与 min 按 step 的十进制网格对齐；不可精确表示的网格点可提交其正确舍入的 JSON 数值。", "container": false,
+      "props": {"type":"object","properties":{"stateKey":{"$ref":"#/$defs/identifier"},"label":{"type":"string","maxLength":80},"min":{"type":"number"},"max":{"type":"number"},"step":{"type":"number","exclusiveMinimum":0}},"required":["stateKey","label","min","max","step"],"additionalProperties":false},
+      "input":{"kind":"slider","value":{"type":"number"}}
+    },
+    "TextInput": {
+      "description": "最多 2000 字的单行或多行输入。", "container": false,
+      "props": {"type":"object","properties":{"stateKey":{"$ref":"#/$defs/identifier"},"label":{"type":"string","maxLength":80},"placeholder":{"type":"string","maxLength":500},"multiline":{"type":"boolean"}},"required":["stateKey","label"],"additionalProperties":false},
+      "input":{"kind":"text","value":{"type":"string","maxLength":2000}}
+    },
+    "DateInput": {
+      "description": "日期输入；空字符串表示未选择。", "container": false,
+      "props": {"type":"object","properties":{"stateKey":{"$ref":"#/$defs/identifier"},"label":{"type":"string","maxLength":80}},"required":["stateKey","label"],"additionalProperties":false},
+      "input":{"kind":"date","value":{"type":"string","pattern":"^$|^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}}
+    },
+    "LineChart": {
+      "description": "展示 2～24 个点、1～3 条序列的趋势。", "container": false,
+      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"xLabels":{"type":"array","minItems":2,"maxItems":24,"items":{"type":"string","maxLength":20}},"series":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":40},"values":{"type":"array","items":{"type":"number"}}},"required":["name","values"],"additionalProperties":false}},"unit":{"type":"string","maxLength":10}},"required":["xLabels","series"],"additionalProperties":false},
+      "relations":[{"items":"series","member":"values","lengthEquals":"xLabels"}]
+    },
+    "BarChart": {
+      "description": "展示 1～12 个非负分类数值。", "container": false,
+      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"labels":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"string","maxLength":20}},"values":{"type":"array","items":{"type":"number","minimum":0}},"unit":{"type":"string","maxLength":10}},"required":["labels","values"],"additionalProperties":false},
+      "relations":[{"prop":"values","lengthEquals":"labels"}]
+    },
+    "PieChart": {
+      "description": "展示 2～6 项正值占比。", "container": false,
+      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"items":{"type":"array","minItems":2,"maxItems":6,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":40},"value":{"type":"number","exclusiveMinimum":0}},"required":["label","value"],"additionalProperties":false}},"unit":{"type":"string","maxLength":10}},"required":["items"],"additionalProperties":false}
+    },
+    "Tabs": {
+      "description": "2～5 个本地切换的选项卡；每项对应一个子节点，不影响表单状态。", "container": true,
+      "props": {"type":"object","properties":{"tabs":{"type":"array","minItems":2,"maxItems":5,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":20}},"required":["label"],"additionalProperties":false}}},"required":["tabs"],"additionalProperties":false},
+      "relations":[{"childrenLengthEquals":"tabs"}]
+    },
+    "Accordion": {
+      "description": "本地展开或收起的详情，不影响表单状态。", "container": true,
+      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"defaultOpen":{"type":"boolean"}},"required":["title"],"additionalProperties":false}
+    },
+    "Grid": {
+      "description": "最多等宽 2～3 列，按内容和可用宽度响应式换列；普通内容最小列宽 96，包含图表、Mermaid、表格或图片媒体时为 280，子节点按阅读顺序排列。", "container": true,
+      "props": {"type":"object","properties":{"columns":{"enum":[2,3]}},"required":["columns"],"additionalProperties":false}
+    },
+    "Source": {
+      "description": "1～8 个网页来源；多条默认折叠为来源数量胶囊，展开为横向滑动的小卡片，显示标题和简短域名；单条直接显示卡片。点击原始 URL 在系统浏览器打开，不自动获取网页内容或网站图标。", "container": false,
+      "props": {"type":"object","properties":{"items":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"url":{"$ref":"#/$defs/webUrl"},"title":{"type":"string","maxLength":80}},"required":["url"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}
+    },
+    "LinkCard": {
+      "description": "模型提供标题与简介，域名由 URL 解析，点击系统浏览器；不抓取 favicon。", "container": false,
+      "props": {"type":"object","properties":{"url":{"$ref":"#/$defs/webUrl"},"title":{"type":"string","maxLength":80},"description":{"type":"string","maxLength":500}},"required":["url","title"],"additionalProperties":false}
+    },
+    "Icon": {
+      "description": "受控 lucide 常用图标名；可给独立语义的图标添加无障碍标签。", "container": false,
+      "props": {"type":"object","properties":{"name":{"type":"string"},"label":{"type":"string","maxLength":80},"size":{"enum":["sm","md","lg"]}},"required":["name"],"additionalProperties":false}
+    },
+    "List": {
+      "description": "有序或无序的短列表；每项可加受控图标，text 支持 **粗体**、*斜体*、`行内代码` 和 $公式$／$$公式$$。", "container": false,
+      "props": {"type":"object","properties":{"ordered":{"type":"boolean"},"items":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"text":{"type":"string","maxLength":500},"icon":{"type":"string"}},"required":["text"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}
+    },
+    "Callout": {
+      "description": "带语义色和文字的信息、成功、警告或错误提示；text 支持 **粗体**、*斜体*、`行内代码` 和 $公式$／$$公式$$。", "container": false,
+      "props": {"type":"object","properties":{"tone":{"enum":["info","success","warning","error"]},"title":{"type":"string","maxLength":80},"text":{"type":"string","maxLength":500}},"required":["tone","text"],"additionalProperties":false}
+    },
+    "Quote": {
+      "description": "短引用和可选出处，普通长引用优先使用 Markdown；text 支持 **粗体**、*斜体*、`行内代码` 和 $公式$／$$公式$$。", "container": false,
+      "props": {"type":"object","properties":{"text":{"type":"string","maxLength":500},"attribution":{"type":"string","maxLength":80}},"required":["text"],"additionalProperties":false}
+    },
+    "Math": {
+      "description": "直接传 TeX 源码，无需 $ 分隔符；JSON 反斜线须转义。", "container": false,
+      "props": {"type":"object","properties":{"tex":{"type":"string","maxLength":2048},"display":{"type":"boolean"}},"required":["tex"],"additionalProperties":false}
+    },
+    "Image": {
+      "description": "同条消息已交付图片附件路径或 http(s) 图片 URL；二选一，网络图片仅经网关代理，缓存非永久。", "container": false,
+      "props": {"oneOf":[{"type":"object","properties":{"attachment":{"type":"string","minLength":1},"alt":{"type":"string","maxLength":200},"caption":{"type":"string","maxLength":200}},"required":["attachment","alt"],"additionalProperties":false},{"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":2048},"alt":{"type":"string","maxLength":200},"caption":{"type":"string","maxLength":200}},"required":["url","alt"],"additionalProperties":false}]}
+    },
+    "MediaCard": {
+      "description": "图片和图文说明；横排或竖排，同一图片来源二选一。", "container": false,
+      "props": {"oneOf":[{"type":"object","properties":{"attachment":{"type":"string","minLength":1},"alt":{"type":"string","maxLength":200},"caption":{"type":"string","maxLength":200},"title":{"type":"string","maxLength":80},"description":{"type":"string","maxLength":500},"tags":{"type":"array","maxItems":6,"items":{"type":"string","maxLength":80}},"direction":{"enum":["horizontal","vertical"]}},"required":["attachment","alt","title"],"additionalProperties":false},{"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":2048},"alt":{"type":"string","maxLength":200},"caption":{"type":"string","maxLength":200},"title":{"type":"string","maxLength":80},"description":{"type":"string","maxLength":500},"tags":{"type":"array","maxItems":6,"items":{"type":"string","maxLength":80}},"direction":{"enum":["horizontal","vertical"]}},"required":["url","alt","title"],"additionalProperties":false}]}
+    },
+    "Gallery": {
+      "description": "1～8 张图片：一张铺满，两张等宽并排，三张及以上横向滑动并对齐吸附，一屏约两张并露出下一张一角；均可点开高清查看。", "container": false,
+      "props": {"type":"object","properties":{"items":{"type":"array","minItems":1,"maxItems":8,"items":{"oneOf":[{"type":"object","properties":{"attachment":{"type":"string","minLength":1},"alt":{"type":"string","maxLength":200},"caption":{"type":"string","maxLength":200}},"required":["attachment","alt"],"additionalProperties":false},{"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":2048},"alt":{"type":"string","maxLength":200},"caption":{"type":"string","maxLength":200}},"required":["url","alt"],"additionalProperties":false}]}}},"required":["items"],"additionalProperties":false}
+    },
+    "Mermaid": {
+      "description": "流程/关系图源码；由应用本地显示，可查看高清图及源码。", "container": false,
+      "props": {"type":"object","properties":{"source":{"type":"string","minLength":1,"maxLength":10000},"title":{"type":"string","maxLength":80}},"required":["source"],"additionalProperties":false}
+    },
+    "Submit": {
+      "description": "提交本块全部表单字段；无表单字段时不可使用。", "container": false,
+      "props": {"type":"object","properties":{"label":{"type":"string","maxLength":80}},"required":["label"],"additionalProperties":false}
+    }
+  }
+}

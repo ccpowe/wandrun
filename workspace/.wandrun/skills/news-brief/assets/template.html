@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>资讯简报</title>
+<style>
+/*__FONTS__*/
+:root {
+  --paper: #F3EEE4;
+  --card: #FFFDF8;
+  --ink: #17140F;
+  --muted: #6E665B;
+  --line: #DDD4C4;
+  --accent: #E0442B;
+  --accent-soft: #F7D9CF;
+  --sans: "Inter", "Noto Sans CJK SC", "Noto Sans SC", "PingFang SC", sans-serif;
+  --serif: "Instrument Serif", "Noto Serif CJK SC", serif;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+p, li, .v, .t { text-wrap: pretty; }
+h1 { text-wrap: balance; }
+h2 { text-wrap: pretty; }
+html { background: #2B2823; }
+body { font-family: var(--sans); color: var(--ink); -webkit-font-smoothing: antialiased; }
+.deck { display: flex; flex-direction: column; align-items: center; gap: 28px; padding: 28px 0; }
+.single .deck { padding: 0; gap: 0; }
+.deck.grid { display: grid; justify-content: center; align-content: center; min-height: 100vh; padding: 16px; }
+.page {
+  width: 540px; height: 720px; position: relative; overflow: hidden;
+  background: var(--paper); padding: 36px 36px 30px; display: flex; flex-direction: column;
+}
+.single .page { display: none; }
+.single .page.show { display: flex; }
+.body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+/* 顶栏 */
+.bar { display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted);
+  padding-bottom: 12px; border-bottom: 1.5px solid var(--ink); }
+.bar b { color: var(--ink); font-weight: 700; letter-spacing: .08em; }
+.foot { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  font-size: 11.5px; color: var(--muted); padding-top: 12px; border-top: 1px solid var(--line); }
+.foot .src { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.foot .brand { white-space: nowrap; letter-spacing: .06em; }
+
+.hl { font-style: normal; color: var(--accent); font-weight: 700; }
+.chip { display: inline-flex; align-items: center; height: 24px; padding: 0 10px; border-radius: 12px;
+  font-size: 12.5px; font-weight: 700; background: var(--ink); color: var(--paper); white-space: nowrap; }
+.chip.soft { background: var(--accent-soft); color: var(--accent); }
+
+/* 封面 */
+.issue { font-family: var(--serif); font-style: italic; font-size: 96px; line-height: .9; color: var(--accent); margin-top: 30px; }
+.cover-title { font-size: 50px; line-height: 1.16; font-weight: 700; letter-spacing: -.01em; margin-top: 10px; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); margin: 26px 0 8px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.stat { padding: 12px 0 10px; }
+.stat + .stat { padding-left: 16px; border-left: 1px solid var(--line); }
+.stat .n { font-size: 34px; font-weight: 800; letter-spacing: -.02em; line-height: 1; }
+.stat .l { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.toc { list-style: none; margin-top: 8px; }
+.toc li { display: grid; grid-template-columns: 40px 1fr auto; align-items: center; gap: 8px; padding: 13px 0; border-bottom: 1px solid var(--line); }
+.toc .i { font-family: var(--serif); font-style: italic; font-size: 28px; color: var(--accent); line-height: 1; }
+.toc .t { font-size: 18.5px; font-weight: 700; line-height: 1.35; }
+.toc .chip { height: 21px; font-size: 11px; padding: 0 8px; }
+.channels { display: flex; flex-wrap: nowrap; overflow: hidden; gap: 6px; margin-top: auto; padding-top: 14px; }
+.channels span { font-size: 11.5px; padding: 3px 9px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); background: var(--card); }
+.channels span b { color: var(--ink); font-weight: 700; margin-left: 4px; }
+
+/* 正文页 */
+.meta { display: flex; align-items: center; gap: 10px; margin-top: 22px; }
+.meta .no { font-family: var(--serif); font-style: italic; font-size: 40px; color: var(--accent); line-height: 1; margin-right: 4px; }
+.meta .ch { font-size: 12px; color: var(--muted); letter-spacing: .04em; }
+.title { font-size: 34px; line-height: 1.24; font-weight: 700; margin-top: 14px; letter-spacing: -.005em; }
+.summary { font-size: 17px; line-height: 1.7; color: #3B362F; margin-top: 12px; }
+.facts { display: grid; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; margin-top: 18px; }
+.facts.c1 { grid-template-columns: 1fr; } .facts.c2 { grid-template-columns: 1fr 1fr; } .facts.c3 { grid-template-columns: 1fr 1fr 1fr; }
+.fact { background: var(--card); padding: 12px 14px; }
+.fact .v { font-size: 25px; font-weight: 800; letter-spacing: -.02em; line-height: 1.1; }
+.fact .k { font-size: 11.5px; color: var(--muted); margin-top: 5px; line-height: 1.35; }
+.points { list-style: none; margin-top: 20px; display: flex; flex-direction: column; gap: 12px; }
+.points li { display: grid; grid-template-columns: 18px 1fr; gap: 8px; font-size: 16px; line-height: 1.6; }
+.points li::before { content: ""; width: 7px; height: 7px; background: var(--accent); border-radius: 2px; margin-top: 10px; }
+.why { margin-top: auto; background: var(--ink); color: var(--paper); border-radius: 16px; padding: 14px 16px 15px; }
+.why .k { font-size: 11.5px; letter-spacing: .16em; color: #CFC6B6; text-transform: uppercase; }
+.why .v { font-size: 16.5px; line-height: 1.62; margin-top: 6px; }
+.why .hl { color: #FF8A70; }
+.body > .why:first-child { margin-top: 0; }
+.spacer { height: 16px; flex: none; }
+
+/* 结尾页 */
+.end-title { font-size: 44px; font-weight: 700; line-height: 1.25; margin-top: 30px; }
+.end-note { font-size: 16px; line-height: 1.7; color: #3B362F; margin-top: 14px; }
+.sources { list-style: none; margin-top: 22px; border-top: 1px solid var(--line); }
+.sources li { display: grid; grid-template-columns: 30px 1fr; gap: 6px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 13px; line-height: 1.45; }
+.sources .i { font-family: var(--serif); font-style: italic; color: var(--accent); font-size: 18px; line-height: 1.1; }
+.sources .d { color: var(--muted); font-size: 11.5px; word-break: break-all; }
+.made { margin-top: auto; display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-radius: 16px; background: var(--card); border: 1px solid var(--line); }
+.made .mark { width: 34px; height: 34px; border-radius: 50%; background: var(--ink); color: var(--paper); display: grid; place-items: center; font-family: var(--serif); font-style: italic; font-size: 22px; flex: none; }
+.made .t { font-size: 12.5px; line-height: 1.55; color: var(--muted); }
+.made .t b { color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="deck" id="deck"></div>
+<script id="brief" type="application/json">/*__DATA__*/</script>
+<script>
+const data = JSON.parse(document.getElementById("brief").textContent);
+const deck = document.getElementById("deck");
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// **重点** 渲染为强调色，其余按纯文字转义。
+const rich = s => esc(s).replace(/\*\*(.+?)\*\*/g, '<em class="hl">$1</em>');
+const pad = n => String(n).padStart(2, "0");
+const total = data.stories.length;
+const brand = esc(data.brand || "");
+const bar = right => `<div class="bar"><b>${esc(data.masthead)}</b><span>${right}</span></div>`;
+const foot = (left) => `<div class="foot"><span class="src">${left}</span><span class="brand">${brand}</span></div>`;
+
+function cover() {
+  const s = data.stats || {};
+  const stat = (n, l) => n == null ? "" : `<div class="stat"><div class="n">${esc(n)}</div><div class="l">${esc(l)}</div></div>`;
+  const toc = data.stories.map((st, i) => `<li><span class="i">${pad(i + 1)}</span><span class="t">${esc(st.short_title || st.title)}</span><span class="chip">${esc(st.tag)}</span></li>`).join("");
+  const ch = (data.channels || []).map(c => `<span>${esc(c.name)}${c.count != null ? `<b>${esc(c.count)}</b>` : ""}</span>`).join("");
+  return `<section class="page">${bar(esc(data.date_label))}<div class="body">
+    <div class="issue">${esc(data.issue)}</div>
+    <h1 class="cover-title">${rich(data.headline)}</h1>
+    <div class="stats">${stat(s.scanned, "条更新已扫描")}${stat(s.channels, "个信息渠道")}${stat(s.picked ?? total, "条精选")}</div>
+    <ol class="toc">${toc}</ol>
+    <div class="channels">${ch}</div>
+  </div></section>`;
+}
+
+function story(st, i) {
+  const facts = (st.facts || []).slice(0, 3);
+  const factHtml = facts.length ? `<div class="facts c${facts.length}">${facts.map(f => `<div class="fact"><div class="v">${esc(f.value)}</div><div class="k">${esc(f.label)}</div></div>`).join("")}</div>` : "";
+  const points = (st.points || []).map(p => `<li><span>${rich(p)}</span></li>`).join("");
+  return `<section class="page">${bar(`${pad(i + 1)} / ${pad(total)}`)}<div class="body">
+    <div class="meta"><span class="no">${pad(i + 1)}</span><span class="chip">${esc(st.tag)}</span><span class="ch">${esc(st.channel || "")}</span></div>
+    <h2 class="title">${rich(st.title)}</h2>
+    ${st.summary ? `<p class="summary">${rich(st.summary)}</p>` : ""}
+    ${factHtml}
+    ${points ? `<ul class="points">${points}</ul>` : ""}
+    <div class="spacer"></div>
+    ${st.why ? `<div class="why"><div class="k">为什么值得关注</div><div class="v">${rich(st.why)}</div></div>` : ""}
+  </div>${foot(`来源 · ${esc(st.source || "")}`)}</section>`;
+}
+
+function ending() {
+  const e = data.ending || {};
+  const src = data.stories.map((st, i) => `<li><span class="i">${pad(i + 1)}</span><span>${esc(st.short_title || st.title)}<div class="d">${esc(st.url || st.source || "")}</div></span></li>`).join("");
+  return `<section class="page">${bar(esc(data.date_label))}<div class="body">
+    <h2 class="end-title">${rich(e.title || "今天就到这里")}</h2>
+    ${e.note ? `<p class="end-note">${rich(e.note)}</p>` : ""}
+    <ol class="sources">${src}</ol>
+    ${e.made ? `<div class="made"><div class="mark">W</div><div class="t">${rich(e.made)}</div></div>` : ""}
+  </div></section>`;
+}
+
+deck.innerHTML = cover() + data.stories.map(story).join("") + (data.ending === false ? "" : ending());
+
+// #page=N 只显示第 N 页（从 1 开始），供截图；#check 原尺寸竖排，供版面检查；
+// 默认是预览：所有页铺成网格并缩放到一屏，手机观看时可双指放大。
+const m = location.hash.match(/page=(\d+)/);
+const pages = [...deck.querySelectorAll(".page")];
+if (m) {
+  document.documentElement.classList.add("single");
+  document.body.classList.add("single");
+  pages[Number(m[1]) - 1]?.classList.add("show");
+} else if (location.hash !== "#check") {
+  const fit = () => {
+    const W = innerWidth, H = innerHeight, gap = 16, n = pages.length;
+    let best = { scale: 0, cols: 1 };
+    for (let cols = 1; cols <= n; cols++) {
+      const rows = Math.ceil(n / cols);
+      const scale = Math.min((W - gap * (cols + 1)) / (cols * 540), (H - gap * (rows + 1)) / (rows * 720));
+      if (scale > best.scale) best = { scale, cols };
+    }
+    deck.classList.add("grid");
+    deck.style.gridTemplateColumns = `repeat(${best.cols}, ${540 * best.scale}px)`;
+    deck.style.gap = `${gap}px`;
+    pages.forEach(p => { p.style.zoom = best.scale; });
+  };
+  fit();
+  addEventListener("resize", fit);
+}
+// 版面检查：内容溢出的页写入 data-overflow，渲染脚本据此报错。
+document.fonts.ready.then(() => {
+  const over = pages.map((p, i) => {
+    const b = p.querySelector(".body");
+    return b && b.scrollHeight > b.clientHeight + 1 ? i + 1 : null;
+  }).filter(Boolean);
+  document.body.dataset.pages = pages.length;
+  document.body.dataset.overflow = over.join(",");
+  document.body.dataset.ready = "1";
+});
+</script>
+</body>
+</html>

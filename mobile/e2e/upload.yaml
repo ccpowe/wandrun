@@ -1,0 +1,73 @@
+# Real DocumentsUI selection, tus transfer and attachment-only user message; not an API-seeded upload.
+appId: host.exp.exponent
+---
+- extendedWaitUntil:
+    visible:
+      id: agent-row-${UPLOAD_AGENT_ID}
+    timeout: 10000
+- tapOn:
+    id: agent-row-${UPLOAD_AGENT_ID}
+# Open from the keyboard-raised composer as well as after outside dismissal.
+- tapOn:
+    id: composer-input
+- tapOn:
+    id: composer-add
+- assertVisible: 相机
+- assertVisible: 照片
+- assertVisible: 视频
+- assertVisible: 文件
+- assertVisible:
+    id: attachment-picker-menu
+- takeScreenshot: ${ARTIFACTS}/01-upload-menu-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/01-upload-menu-dark.png
+# @light-mode
+# Dismiss outside the anchored menu, then reopen before selecting.
+# @tap-outside
+- assertNotVisible:
+    id: attachment-picker-file
+- tapOn:
+    id: composer-add
+- tapOn:
+    id: attachment-picker-file
+# @upload-select-document
+- extendedWaitUntil:
+    visible:
+      id: upload-ready-${UPLOAD_NAME}
+    timeout: 30000
+- takeScreenshot: ${ARTIFACTS}/02-upload-draft-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/02-upload-draft-dark.png
+# @light-mode
+- tapOn:
+    id: composer-send
+# @upload-message-sent
+- extendedWaitUntil:
+    visible:
+      id: attachment-${UPLOAD_FILE_ID}
+    timeout: 10000
+- assertVisible: ${UPLOAD_NAME}
+- assertVisible: "1 KB · 原文件"
+- takeScreenshot: ${ARTIFACTS}/03-user-file-card-light.png
+# @dark-mode
+- assertVisible: ${UPLOAD_NAME}
+- assertVisible: "1 KB · 原文件"
+- takeScreenshot: ${ARTIFACTS}/03-user-file-card-dark.png
+- tapOn:
+    id: attachment-${UPLOAD_FILE_ID}
+- extendedWaitUntil:
+    visible:
+      id: file-text-preview
+    timeout: 10000
+- assertVisible: "E2E upload.*"
+- takeScreenshot: ${ARTIFACTS}/04-upload-preview-dark.png
+# @light-mode
+- takeScreenshot: ${ARTIFACTS}/04-upload-preview-light.png
+- tapOn: 返回
+- assertVisible:
+    id: attachment-${UPLOAD_FILE_ID}
+- tapOn: 返回
+- extendedWaitUntil:
+    visible:
+      id: home-search
+    timeout: 10000

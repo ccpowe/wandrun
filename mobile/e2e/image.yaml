@@ -1,0 +1,36 @@
+# Real billable generation; no API-seeded attachment or synthetic image.
+appId: host.exp.exponent
+---
+- extendedWaitUntil:
+    visible:
+      id: agent-row-${IMAGE_AGENT_ID}
+    timeout: 10000
+- tapOn:
+    id: agent-row-${IMAGE_AGENT_ID}
+# @image-request
+- extendedWaitUntil:
+    visible:
+      id: attachment-${IMAGE_FILE_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/01-image-card-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/01-image-card-dark.png
+- tapOn:
+    id: attachment-${IMAGE_FILE_ID}
+- extendedWaitUntil:
+    visible:
+      id: file-image-preview
+    timeout: 30000
+- takeScreenshot: ${ARTIFACTS}/02-image-preview-dark.png
+# @light-mode
+- assertVisible:
+    id: file-image-preview
+- takeScreenshot: ${ARTIFACTS}/02-image-preview-light.png
+- tapOn: 返回
+- assertVisible:
+    id: attachment-${IMAGE_FILE_ID}
+- tapOn: 返回
+- extendedWaitUntil:
+    visible:
+      id: home-search
+    timeout: 10000

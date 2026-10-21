@@ -1,0 +1,9 @@
+{
+  // Node 测试单独引入 Node 类型；组件生命周期测试沿用 App 的原生样式类型扩展。
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node", "expo/types"]
+  },
+  "include": [".", "../src/uniwind-types.d.ts"],
+  "exclude": []
+}

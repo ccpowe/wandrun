@@ -1,0 +1,90 @@
+# Real Agent writes and delivers one original workspace file. API hooks verify retention and removal.
+appId: host.exp.exponent
+---
+- extendedWaitUntil:
+    visible:
+      id: agent-row-${FILE_AGENT_ID}
+    timeout: 10000
+- tapOn:
+    id: agent-row-${FILE_AGENT_ID}
+- extendedWaitUntil:
+    visible:
+      id: attachment-${FILE_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/01-file-card-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/01-file-card-dark.png
+- tapOn:
+    id: attachment-${FILE_ID}
+- extendedWaitUntil:
+    visible:
+      id: file-text-preview
+    timeout: 10000
+- assertVisible: "E2E original.*"
+- takeScreenshot: ${ARTIFACTS}/02-file-preview-dark.png
+# @light-mode
+- takeScreenshot: ${ARTIFACTS}/02-file-preview-light.png
+- tapOn: 返回
+- assertVisible:
+    id: attachment-${FILE_ID}
+- tapOn: 对话列表
+- tapOn:
+    id: drawer-search
+- tapOn:
+    id: search-input
+- inputText: ${FILE_NAME}
+- extendedWaitUntil:
+    visible:
+      id: search-result-file-${FILE_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/03-scoped-search-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/03-scoped-search-dark.png
+# @light-mode
+- tapOn:
+    id: search-result-file-${FILE_ID}
+- assertVisible:
+    id: file-text-preview
+- tapOn: 返回
+- tapOn: 取消
+- extendedWaitUntil:
+    notVisible:
+      id: new-conversation
+    timeout: 10000
+- tapOn: 返回
+- extendedWaitUntil:
+    visible:
+      id: home-search
+    timeout: 10000
+# @file-conversation-deleted
+- tapOn:
+    id: home-search
+- tapOn:
+    id: search-input
+- inputText: ${FILE_NAME}
+- extendedWaitUntil:
+    visible:
+      id: search-result-file-${FILE_ID}
+    timeout: 10000
+- tapOn:
+    id: search-result-file-${FILE_ID}
+- assertVisible:
+    id: file-text-preview
+- takeScreenshot: ${ARTIFACTS}/04-deleted-source-file-retained-light.png
+- tapOn: 返回
+- tapOn: 取消
+# @file-original-removed
+- tapOn:
+    id: home-search
+- tapOn:
+    id: search-input
+- inputText: ${FILE_NAME}
+- tapOn:
+    id: search-result-file-${FILE_ID}
+- extendedWaitUntil:
+    visible:
+      id: file-unavailable
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/05-original-unavailable-light.png
+- tapOn: 返回
+- tapOn: 取消

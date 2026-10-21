@@ -1,0 +1,166 @@
+# Real browser-skilled Agent, loopback HTTP fixture and owned conversation/lease are cleaned by run.py.
+# Only semantic targets; screenshots in both appearances. Never run without a configured CDP browser.
+appId: host.exp.exponent
+---
+- extendedWaitUntil:
+    visible:
+      id: agent-row-${BROWSER_AGENT_ID}
+    timeout: 10000
+- tapOn:
+    id: agent-row-${BROWSER_AGENT_ID}
+- extendedWaitUntil:
+    visible:
+      id: browser-card-${BROWSER_TASK_ID}
+    timeout: 10000
+- assertVisible:
+    id: browser-watch-${BROWSER_TASK_ID}
+- extendedWaitUntil:
+    visible:
+      id: browser-thumbnail-displayed-${BROWSER_TASK_ID}
+    timeout: 20000
+- takeScreenshot: ${ARTIFACTS}/01-chat-browser-card-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/02-chat-browser-card-dark.png
+# @light-mode
+- tapOn:
+    id: browser-watch-${BROWSER_TASK_ID}
+- extendedWaitUntil:
+    visible:
+      id: viewer-frame
+    timeout: 10000
+- assertVisible:
+    id: viewer-takeover
+- takeScreenshot: ${ARTIFACTS}/03-viewer-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/04-viewer-dark.png
+# @light-mode
+- tapOn:
+    id: viewer-takeover
+- extendedWaitUntil:
+    visible:
+      id: takeover-frame
+    timeout: 10000
+# @browser-taken-over
+- takeScreenshot: ${ARTIFACTS}/05-takeover-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/06-takeover-dark.png
+# @light-mode
+- tapOn:
+    id: takeover-url
+- assertVisible:
+    id: takeover-url-cancel
+- tapOn:
+    id: takeover-pages
+- extendedWaitUntil:
+    visible:
+      id: takeover-new-page
+    timeout: 10000
+- assertNotVisible:
+    id: takeover-url-cancel
+- tapOn: 关闭弹层
+- tapOn:
+    id: takeover-keyboard
+- extendedWaitUntil:
+    visible:
+      id: takeover-key-Tab
+    timeout: 10000
+- inputText: ${BROWSER_INPUT}
+# @browser-input
+- takeScreenshot: ${ARTIFACTS}/07-takeover-input-light.png
+- tapOn:
+    id: takeover-keyboard-hide
+- tapOn:
+    id: takeover-handback
+# @browser-handed-back
+- scrollUntilVisible:
+    element:
+      id: takeover-ended-${TAKEOVER_SEQ}
+    direction: DOWN
+- assertVisible:
+    id: takeover-ended-${TAKEOVER_SEQ}
+- takeScreenshot: ${ARTIFACTS}/08-handback-system-line-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/09-handback-system-line-dark.png
+# @light-mode
+- tapOn:
+    id: chat-agent-profile
+- tapOn:
+    id: profile-tab-computer
+- extendedWaitUntil:
+    visible:
+      id: profile-computer-card-${BROWSER_TASK_ID}
+    timeout: 10000
+- assertVisible:
+    id: profile-computer-watch-${BROWSER_TASK_ID}
+- extendedWaitUntil:
+    visible:
+      id: browser-thumbnail-displayed-${BROWSER_TASK_ID}
+    timeout: 20000
+- takeScreenshot: ${ARTIFACTS}/10-profile-computer-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/11-profile-computer-dark.png
+# @light-mode
+- tapOn:
+    id: profile-computer-watch-${BROWSER_TASK_ID}
+- extendedWaitUntil:
+    visible:
+      id: viewer-frame
+    timeout: 10000
+- tapOn:
+    id: viewer-close
+- assertVisible:
+    id: profile-computer-card-${BROWSER_TASK_ID}
+- tapOn:
+    id: profile-close
+- tapOn: 返回
+- tapOn: 设置
+- extendedWaitUntil:
+    visible:
+      id: settings-computer
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/12-settings-computer-summary-light.png
+- tapOn:
+    id: settings-computer
+- extendedWaitUntil:
+    visible:
+      id: settings-computer-page-${BROWSER_TASK_ID}-${BROWSER_PAGE_ID}
+    timeout: 10000
+- assertVisible:
+    id: settings-computer-cpu
+- assertVisible:
+    id: settings-computer-memory
+- assertVisible:
+    id: settings-computer-pages
+- takeScreenshot: ${ARTIFACTS}/13-settings-computer-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/14-settings-computer-dark.png
+# @light-mode
+- tapOn:
+    id: settings-computer-page-${BROWSER_TASK_ID}-${BROWSER_PAGE_ID}
+- extendedWaitUntil:
+    visible:
+      id: viewer-frame
+    timeout: 10000
+- tapOn:
+    id: viewer-close
+- swipe:
+    from:
+      id: settings-computer-page-${BROWSER_TASK_ID}-${BROWSER_PAGE_ID}
+    direction: LEFT
+- tapOn: 关闭此任务的全部浏览器页面
+- extendedWaitUntil:
+    visible:
+      id: settings-computer-close-${BROWSER_TASK_ID}
+    timeout: 10000
+- tapOn:
+    id: settings-computer-close-${BROWSER_TASK_ID}
+# @browser-closed
+- extendedWaitUntil:
+    notVisible:
+      id: settings-computer-page-${BROWSER_TASK_ID}-${BROWSER_PAGE_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/15-settings-computer-after-close-light.png
+- tapOn:
+    id: settings-computer-back
+- back
+- assertVisible: 设置

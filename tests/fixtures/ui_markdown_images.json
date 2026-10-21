@@ -1,0 +1,18 @@
+[
+  {
+    "text": "前文 ![首张](https://example.org/first.png)\n\n```wandrun-ui\n{\"root\":\"x\",\"image\":\"![fake](https://example.org/ignored.png)\"}\n```\n\n> 引用 ![第二张](https://example.org/quote.jpg)\n\n```txt\n![code](https://example.org/code.png)\n```\n\n![尾张][tail]\n\n[tail]: https://example.org/end.webp",
+    "urls": ["https://example.org/first.png", "https://example.org/quote.jpg", "https://example.org/end.webp"]
+  },
+  {
+    "text": "![危险](ftp://example.org/private.jpg) 和 ![合法](https://example.org/good.png)\n\n[^n]: 参照 ![脚注图片](http://example.org/note.jpg)\n\n引用[^n]。",
+    "urls": ["ftp://example.org/private.jpg", "https://example.org/good.png", "http://example.org/note.jpg"]
+  },
+  {
+    "text": "~~~wandrun-ui\n![隐藏](https://example.org/hidden.png)\n未闭合也不计图片",
+    "urls": []
+  },
+  {
+    "text": "![标题 ![文字](https://example.org/inner.jpg)](https://example.org/outer.jpg)\n\n`![行内代码](https://example.org/not-image.png)`",
+    "urls": ["https://example.org/outer.jpg"]
+  }
+]

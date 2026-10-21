@@ -1,0 +1,187 @@
+# agent-device 0.21.16 Maestro subset; run via python3 mobile/e2e/run.py schedules.
+# Fixture Agent, schedules and their conversations are removed by runner.
+appId: host.exp.exponent
+---
+- tapOn:
+    id: agent-row-${SCHEDULE_AGENT_ID}
+- assertVisible:
+    id: chat-agent-name
+- tapOn:
+    id: chat-agent-profile
+- tapOn:
+    id: profile-tab-schedules
+- assertVisible:
+    id: profile-schedule-add
+- takeScreenshot: ${ARTIFACTS}/01-schedules-empty-light.png
+- tapOn:
+    id: profile-schedule-add
+- assertVisible:
+    id: schedule-name
+- takeScreenshot: ${ARTIFACTS}/02-schedule-fullscreen-light.png
+- tapOn:
+    id: schedule-name
+- inputText: ${SCHEDULE_NAME}
+- back
+- tapOn:
+    id: schedule-content
+- inputText: Reply OK
+- back
+- tapOn:
+    id: schedule-kind-daily
+- assertVisible:
+    id: schedule-time
+- assertVisible:
+    id: schedule-timezone
+- tapOn:
+    id: schedule-timezone
+# @select-all
+- inputText: ${SCHEDULE_ZONE}
+- back
+- tapOn:
+    id: schedule-save
+# @schedule-ui-created
+- extendedWaitUntil:
+    visible:
+      id: profile-schedule-${SCHEDULE_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/03-schedules-list-light.png
+- tapOn:
+    id: profile-schedule-${SCHEDULE_ID}
+- assertVisible:
+    id: schedule-next
+- tapOn:
+    id: schedule-name
+# @select-all
+- inputText: ${SCHEDULE_EDITED_NAME}
+- back
+- tapOn:
+    id: schedule-content
+# @select-all
+- inputText: Reply edited
+- back
+- tapOn:
+    id: schedule-save
+# @schedule-edited
+- tapOn:
+    id: profile-schedule-${SCHEDULE_ID}
+- assertVisible:
+    id: schedule-name
+- tapOn:
+    id: schedule-enabled
+- tapOn:
+    id: schedule-save
+# @schedule-paused
+- assertVisible:
+    id: profile-schedule-${SCHEDULE_ID}
+- tapOn:
+    id: profile-schedule-enabled-${SCHEDULE_ID}
+# @schedule-reenabled
+- assertVisible:
+    id: profile-schedule-add
+- tapOn:
+    id: profile-schedule-enabled-${SCHEDULE_ID}
+# @schedule-paused
+- tapOn:
+    id: profile-schedule-${SCHEDULE_ID}
+- tapOn:
+    id: schedule-kind-weekly
+- tapOn:
+    id: schedule-weekday-5
+- takeScreenshot: ${ARTIFACTS}/04-weekly-editor-light.png
+- tapOn:
+    id: schedule-save
+# @schedule-weekly
+- tapOn:
+    id: profile-schedule-${SCHEDULE_ID}
+- tapOn:
+    id: schedule-kind-cron
+- tapOn:
+    id: schedule-cron
+# @select-all
+- inputText: 0 8 * * 1,5
+- back
+- tapOn:
+    id: schedule-save
+# @schedule-cron
+- tapOn:
+    id: profile-schedule-${SCHEDULE_ID}
+- tapOn:
+    id: schedule-content
+# @select-all
+- inputText: ${SCHEDULE_DRAFT}
+- back
+# @schedule-external-edit
+- extendedWaitUntil:
+    visible:
+      id: schedule-reload
+    timeout: 10000
+# @schedule-draft-retained
+- takeScreenshot: ${ARTIFACTS}/05-external-change-draft-light.png
+- tapOn:
+    id: schedule-save
+# @schedule-draft-saved
+# @schedule-agent-created
+- extendedWaitUntil:
+    visible:
+      id: profile-schedule-${AGENT_SCHEDULE_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/04-agent-created-schedule-light.png
+# @schedule-external
+- extendedWaitUntil:
+    visible:
+      id: profile-schedule-${EXTERNAL_SCHEDULE_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/04-external-schedule-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/06-schedules-list-dark.png
+# @light-mode
+- tapOn:
+    id: profile-schedule-${AGENT_SCHEDULE_ID}
+- takeScreenshot: ${ARTIFACTS}/07-once-editor-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/08-once-editor-dark.png
+# @light-mode
+# @schedule-triggered
+- extendedWaitUntil:
+    visible:
+      id: schedule-run-${SCHEDULE_RUN_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/07-run-history-light.png
+- tapOn:
+    id: schedule-run-${SCHEDULE_RUN_ID}
+- assertVisible:
+    id: chat-conversation-title
+- extendedWaitUntil:
+    visible:
+      id: schedule-triggered-${SCHEDULE_TRIGGER_SEQ}
+    timeout: 10000
+# @schedule-source-header
+- takeScreenshot: ${ARTIFACTS}/08-triggered-conversation-light.png
+- tapOn: 对话列表
+- extendedWaitUntil:
+    visible:
+      id: conversation-${SCHEDULE_CONVERSATION_ID}
+    timeout: 10000
+# @schedule-source-drawer
+- takeScreenshot: ${ARTIFACTS}/09-source-drawer-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/10-source-drawer-dark.png
+# @light-mode
+- back
+- back
+- scrollUntilVisible:
+    element:
+      id: schedule-delete
+    direction: DOWN
+- tapOn:
+    id: schedule-delete
+- assertVisible:
+    id: schedule-delete-confirm
+- tapOn:
+    id: schedule-delete-confirm
+# @schedule-deleted
+- assertVisible:
+    id: profile-schedule-${SCHEDULE_ID}
+- tapOn:
+    id: profile-close
+- tapOn: 返回

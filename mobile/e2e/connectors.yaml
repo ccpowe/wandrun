@@ -1,0 +1,501 @@
+# agent-device 0.21.16 Maestro subset; run via python3 mobile/e2e/run.py connectors.
+# UI owns DeepWiki creation, testing, Agent selection, deletion; runner owns fixture cleanup.
+appId: host.exp.exponent
+---
+- tapOn: 设置
+- scrollUntilVisible:
+    element:
+      id: settings-connectors
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/01-settings-row-light.png
+- tapOn:
+    id: settings-connectors
+- assertVisible:
+    id: connectors-add
+- takeScreenshot: ${ARTIFACTS}/02-connectors-list-light.png
+- tapOn:
+    id: connectors-add
+- assertVisible:
+    id: connector-name
+- tapOn:
+    id: connector-name
+- inputText: ${CONNECTOR_NAME}
+- back
+- tapOn:
+    id: connector-remote
+- tapOn:
+    id: connector-url
+- inputText: https://mcp.deepwiki.com/mcp
+- back
+- takeScreenshot: ${ARTIFACTS}/03-connector-new-light.png
+- tapOn:
+    id: connector-save
+# @connector-created
+- extendedWaitUntil:
+    visible:
+      id: connector-${CONNECTOR_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/03-connectors-list-with-deepwiki-light.png
+- tapOn:
+    id: connector-${CONNECTOR_ID}
+- assertVisible:
+    id: connector-url
+- takeScreenshot: ${ARTIFACTS}/04-connector-remote-editor-light.png
+- scrollUntilVisible:
+    element:
+      id: connector-secret-add
+    direction: DOWN
+- tapOn:
+    id: connector-secret-add
+- scrollUntilVisible:
+    element:
+      id: connector-secret-key-0
+    direction: DOWN
+- tapOn:
+    id: connector-secret-key-0
+- inputText: X-E2E-Check
+- back
+- scrollUntilVisible:
+    element:
+      id: connector-secret-value-0
+    direction: DOWN
+- tapOn:
+    id: connector-secret-value-0
+- inputText: ${CONNECTOR_SECRET}
+- back
+- tapOn:
+    id: connector-save
+# @connector-secret-saved
+- extendedWaitUntil:
+    visible:
+      id: connector-${CONNECTOR_ID}
+    timeout: 10000
+- tapOn:
+    id: connector-${CONNECTOR_ID}
+- scrollUntilVisible:
+    element:
+      id: connector-secret-key-0
+    direction: DOWN
+- assertVisible:
+    id: connector-secret-value-0
+# @connector-secret-redacted
+- takeScreenshot: ${ARTIFACTS}/04-connector-edit-secret-empty-light.png
+- scrollUntilVisible:
+    element:
+      id: connector-test
+    direction: DOWN
+- tapOn:
+    id: connector-test
+- extendedWaitUntil:
+    visible: '.*连接成功.*个工具.*'
+    timeout: 30000
+- assertVisible:
+    id: connector-test-result
+# @connector-tested
+- assertVisible: '.*连接成功.*${TOOL_COUNT}.*工具.*'
+- takeScreenshot: ${ARTIFACTS}/05-connector-test-result-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/06-connector-test-result-dark.png
+- scrollUntilVisible:
+    element:
+      id: connector-secret-value-0
+    direction: UP
+- takeScreenshot: ${ARTIFACTS}/06-connector-edit-secret-empty-dark.png
+- tapOn:
+    id: connector-back
+- assertVisible:
+    id: connector-${CONNECTOR_ID}
+- takeScreenshot: ${ARTIFACTS}/07-connectors-list-dark.png
+- tapOn:
+    id: connectors-back
+- scrollUntilVisible:
+    element:
+      id: settings-connectors
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/08-settings-row-dark.png
+# @light-mode
+- tapOn:
+    id: settings-connectors
+# @external-connector
+- extendedWaitUntil:
+    visible:
+      id: connector-${EXTERNAL_CONNECTOR_ID}
+    timeout: 10000
+- tapOn:
+    id: connector-${EXTERNAL_CONNECTOR_ID}
+- assertVisible:
+    id: connector-name
+- tapOn:
+    id: connector-description
+- inputText: Edited without transport
+- back
+- tapOn:
+    id: connector-save
+# @external-transport-preserved
+- extendedWaitUntil:
+    visible:
+      id: connector-${EXTERNAL_CONNECTOR_ID}
+    timeout: 10000
+- tapOn:
+    id: connector-${EXTERNAL_CONNECTOR_ID}
+- assertVisible:
+    id: connector-url
+# @external-connector-change
+- extendedWaitUntil:
+    visible:
+      id: connector-external-change
+    timeout: 10000
+- assertVisible: ${EXTERNAL_CONNECTOR_RENAMED}
+- takeScreenshot: ${ARTIFACTS}/08-connector-external-change-light.png
+# @external-connector-delete
+- extendedWaitUntil:
+    visible:
+      id: connectors-add
+    timeout: 10000
+- extendedWaitUntil:
+    notVisible:
+      id: connector-${EXTERNAL_CONNECTOR_ID}
+    timeout: 10000
+- tapOn:
+    id: connectors-back
+- back
+- assertVisible: 设置
+- extendedWaitUntil:
+    visible:
+      id: agent-row-${CONNECTOR_AGENT_ID}
+    timeout: 10000
+- tapOn:
+    id: agent-row-${CONNECTOR_AGENT_ID}
+- tapOn:
+    id: chat-agent-profile
+# The profile edit button exists before the Agent detail arrives, but is disabled until then.
+- extendedWaitUntil:
+    visible:
+      id: profile-empty-members
+    timeout: 10000
+- tapOn:
+    id: profile-edit
+    enabled: true
+- extendedWaitUntil:
+    visible:
+      id: editor-name
+    timeout: 10000
+- waitForAnimationToEnd
+- scrollUntilVisible:
+    element:
+      id: editor-connectors
+    direction: DOWN
+- tapOn:
+    id: editor-connectors
+- scrollUntilVisible:
+    element:
+      id: editor-connector-${CONNECTOR_ID}
+    direction: DOWN
+- tapOn:
+    id: editor-connector-${CONNECTOR_ID}
+- assertVisible:
+    id: editor-connector-direct-${CONNECTOR_ID}
+- assertVisible:
+    id: editor-connector-search-${CONNECTOR_ID}
+# @connector-search-disabled
+- takeScreenshot: ${ARTIFACTS}/09-agent-connectors-multiselect-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/10-agent-connectors-multiselect-dark.png
+# @light-mode
+- tapOn:
+    id: editor-done
+- tapOn:
+    id: editor-save
+# @connector-selected
+- extendedWaitUntil:
+    visible:
+      id: profile-close
+    timeout: 10000
+- tapOn:
+    id: profile-close
+- tapOn: 返回
+- tapOn: 设置
+- scrollUntilVisible:
+    element:
+      id: settings-connectors
+    direction: DOWN
+- tapOn:
+    id: settings-connectors
+- assertVisible:
+    id: connector-${CONNECTOR_ID}
+- takeScreenshot: ${ARTIFACTS}/11-connector-used-list-light.png
+- tapOn:
+    id: connector-${CONNECTOR_ID}
+- scrollUntilVisible:
+    element:
+      id: connector-agent-${CONNECTOR_AGENT_ID}
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/12-connector-used-edit-light.png
+- scrollUntilVisible:
+    element:
+      id: connector-delete
+    direction: DOWN
+- scroll
+# @known-dev-overlay
+- tapOn:
+    id: connector-delete
+- assertVisible:
+    id: connector-delete-blocked
+- assertVisible: '.*${CONNECTOR_AGENT_NAME}.*'
+- takeScreenshot: ${ARTIFACTS}/13-connector-delete-blocked-light.png
+# @connector-blocked
+- tapOn:
+    id: connector-delete-blocked
+- tapOn:
+    id: connector-back
+- tapOn:
+    id: connectors-back
+- back
+- tapOn:
+    id: agent-row-${CONNECTOR_AGENT_ID}
+- tapOn:
+    id: chat-agent-profile
+- extendedWaitUntil:
+    visible:
+      id: profile-empty-members
+    timeout: 10000
+- tapOn:
+    id: profile-edit
+    enabled: true
+- extendedWaitUntil:
+    visible:
+      id: editor-name
+    timeout: 10000
+- waitForAnimationToEnd
+- scrollUntilVisible:
+    element:
+      id: editor-connectors
+    direction: DOWN
+- tapOn:
+    id: editor-connectors
+- scrollUntilVisible:
+    element:
+      id: editor-connector-${CONNECTOR_ID}
+    direction: DOWN
+- tapOn:
+    id: editor-connector-${CONNECTOR_ID}
+- takeScreenshot: ${ARTIFACTS}/14-agent-connectors-unselected-light.png
+- tapOn:
+    id: editor-done
+- tapOn:
+    id: editor-save
+# @connector-unselected
+- extendedWaitUntil:
+    visible:
+      id: profile-close
+    timeout: 10000
+- tapOn:
+    id: profile-close
+- tapOn: 返回
+- tapOn: 设置
+- scrollUntilVisible:
+    element:
+      id: settings-connectors
+    direction: DOWN
+- tapOn:
+    id: settings-connectors
+- tapOn:
+    id: connector-${CONNECTOR_ID}
+- scrollUntilVisible:
+    element:
+      id: connector-delete
+    direction: DOWN
+- scroll
+# @known-dev-overlay
+- tapOn:
+    id: connector-delete
+- assertVisible:
+    id: connector-delete-confirm
+- takeScreenshot: ${ARTIFACTS}/15-connector-delete-confirm-light.png
+- tapOn:
+    id: connector-delete-confirm
+# @connector-deleted
+- extendedWaitUntil:
+    visible:
+      id: connectors-back
+    timeout: 10000
+- extendedWaitUntil:
+    notVisible:
+      id: connector-${CONNECTOR_ID}
+    timeout: 10000
+- tapOn:
+    id: connectors-back
+- back
+- assertVisible: 设置
+# @background-connector
+- tapOn: 设置
+- tapOn:
+    id: settings-connectors
+- extendedWaitUntil:
+    visible:
+      id: connector-${BACKGROUND_CONNECTOR_ID}
+    timeout: 10000
+- tapOn:
+    id: connector-${BACKGROUND_CONNECTOR_ID}
+# Scroll to the control below Agent usage so the row clears the gesture bar and Expo overlay.
+- scrollUntilVisible:
+    element:
+      id: connector-delete
+    direction: DOWN
+- assertVisible:
+    id: connector-agent-${CONNECTOR_AGENT_ID}
+- takeScreenshot: ${ARTIFACTS}/16-background-agent-row-visible.png
+- tapOn:
+    id: connector-agent-${CONNECTOR_AGENT_ID}
+- extendedWaitUntil:
+    visible:
+      id: profile-edit
+    timeout: 10000
+- tapOn:
+    id: profile-edit
+- scrollUntilVisible:
+    element:
+      id: editor-connectors
+    direction: DOWN
+- tapOn:
+    id: editor-connectors
+- scrollUntilVisible:
+    element:
+      id: editor-connector-${BACKGROUND_CONNECTOR_ID}
+    direction: DOWN
+- tapOn:
+    id: editor-connector-${BACKGROUND_CONNECTOR_ID}
+# @background-external-unselect
+- tapOn:
+    id: editor-done
+- tapOn:
+    id: editor-save
+- extendedWaitUntil:
+    visible:
+      id: profile-close
+    timeout: 10000
+# @background-no-event-save
+- tapOn:
+    id: profile-close
+- extendedWaitUntil:
+    notVisible:
+      id: connector-agent-${CONNECTOR_AGENT_ID}
+    timeout: 10000
+- assertVisible: 没有 Agent 使用
+- takeScreenshot: ${ARTIFACTS}/16-no-event-usage-refreshed.png
+# @background-reselect
+- extendedWaitUntil:
+    visible:
+      id: connector-agent-${CONNECTOR_AGENT_ID}
+    timeout: 10000
+- scrollUntilVisible:
+    element:
+      id: connector-delete
+    direction: DOWN
+- tapOn:
+    id: connector-agent-${CONNECTOR_AGENT_ID}
+- extendedWaitUntil:
+    visible:
+      id: profile-edit
+    timeout: 10000
+- tapOn:
+    id: profile-edit
+- tapOn:
+    id: editor-description
+- inputText: ${DRAFT_MARKER}
+- back
+- scrollUntilVisible:
+    element:
+      id: editor-connectors
+    direction: DOWN
+- tapOn:
+    id: editor-connectors
+# @background-external-delete
+- extendedWaitUntil:
+    visible: 连接器已不可用，请取消勾选
+    timeout: 10000
+- assertVisible:
+    id: editor-done
+- tapOn:
+    id: editor-done
+- assertVisible:
+    id: editor-description
+# @assert-agent-draft
+- takeScreenshot: ${ARTIFACTS}/17-background-delete-keeps-agent-draft.png
+- tapOn:
+    id: editor-back
+- assertVisible:
+    id: profile-close
+- tapOn:
+    id: profile-close
+- extendedWaitUntil:
+    visible:
+      id: connectors-add
+    timeout: 10000
+- extendedWaitUntil:
+    notVisible:
+      id: connector-${BACKGROUND_CONNECTOR_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/18-deleted-connector-return-list.png
+- tapOn:
+    id: connectors-back
+- back
+- assertVisible: 设置
+- tapOn: 设置
+- tapOn:
+    id: settings-connectors
+- tapOn:
+    id: connectors-add
+- tapOn:
+    id: connector-name
+- inputText: ${LOCAL_CONNECTOR_NAME}
+- back
+- tapOn:
+    id: connector-command
+- inputText: fixture-mcp
+- back
+- scrollUntilVisible:
+    element:
+      id: connector-arg-add
+    direction: DOWN
+- tapOn:
+    id: connector-arg-add
+- tapOn:
+    id: connector-arg-0
+- inputText: ${LOCAL_ARGUMENT}
+- back
+- scrollUntilVisible:
+    element:
+      id: connector-arg-add
+    direction: DOWN
+- tapOn:
+    id: connector-arg-add
+- assertVisible:
+    id: connector-arg-1
+- takeScreenshot: ${ARTIFACTS}/19-local-arguments-new.png
+- tapOn:
+    id: connector-save
+# @local-connector-created
+- extendedWaitUntil:
+    visible:
+      id: connector-${LOCAL_CONNECTOR_ID}
+    timeout: 10000
+- tapOn:
+    id: connector-${LOCAL_CONNECTOR_ID}
+- scrollUntilVisible:
+    element:
+      id: connector-arg-0
+    direction: DOWN
+# @local-argument-value
+- scrollUntilVisible:
+    element:
+      id: connector-arg-1
+    direction: DOWN
+# @local-arguments-roundtrip
+- takeScreenshot: ${ARTIFACTS}/20-local-arguments-saved.png
+- tapOn:
+    id: connector-back
+- tapOn:
+    id: connectors-back
+- back
+- assertVisible: 设置

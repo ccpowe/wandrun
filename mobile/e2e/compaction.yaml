@@ -1,0 +1,83 @@
+# Real model turns and checkpointed gateway events; the runner removes this group's Agent/chat.
+# All interactions use semantic targets, never coordinates.
+appId: host.exp.exponent
+---
+- extendedWaitUntil:
+    visible:
+      id: agent-row-${COMPACTION_AGENT_ID}
+    timeout: 10000
+- tapOn:
+    id: agent-row-${COMPACTION_AGENT_ID}
+- extendedWaitUntil:
+    visible:
+      id: chat-agent-name
+      text: ${COMPACTION_AGENT_NAME}
+    timeout: 10000
+# @compaction-generate
+# Compaction immediately precedes the final ACK. Wait for initial end placement;
+# dragging during mounting cancels LegendList's pending placement.
+- extendedWaitUntil:
+    visible:
+      id: context-compacted-${COMPACTION_SEQ}
+    timeout: 15000
+- assertVisible:
+    id: context-compacted-${COMPACTION_SEQ}
+- takeScreenshot: ${ARTIFACTS}/01-compacted-row-light.png
+- tapOn:
+    id: context-compacted-${COMPACTION_SEQ}
+- extendedWaitUntil:
+    visible:
+      id: context-summary-${COMPACTION_SEQ}
+    timeout: 10000
+- assertVisible:
+    id: context-summary-body-${COMPACTION_SEQ}
+- assertVisible: 上下文摘要 · ${COMPACTION_AGENT_NAME}
+- assertVisible: 模型生成的工作摘要，非原文；聊天记录仍保留。
+- takeScreenshot: ${ARTIFACTS}/02-full-summary-light.png
+- swipe:
+    from:
+      id: context-summary-body-${COMPACTION_SEQ}
+    direction: UP
+- assertVisible:
+    id: context-summary-body-${COMPACTION_SEQ}
+- takeScreenshot: ${ARTIFACTS}/02b-summary-bottom-light.png
+# @dark-mode
+- assertVisible:
+    id: context-summary-body-${COMPACTION_SEQ}
+- takeScreenshot: ${ARTIFACTS}/03-full-summary-dark.png
+- swipe:
+    from:
+      id: context-summary-body-${COMPACTION_SEQ}
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/03b-summary-top-dark.png
+- back
+- assertVisible:
+    id: context-compacted-${COMPACTION_SEQ}
+- takeScreenshot: ${ARTIFACTS}/04-compacted-row-dark.png
+# @light-mode
+- back
+- extendedWaitUntil:
+    visible:
+      id: agent-row-${COMPACTION_AGENT_ID}
+    timeout: 10000
+- tapOn:
+    id: agent-row-${COMPACTION_AGENT_ID}
+# @compaction-reopened
+- extendedWaitUntil:
+    visible:
+      id: context-compacted-${COMPACTION_SEQ}
+    timeout: 15000
+- assertVisible:
+    id: context-compacted-${COMPACTION_SEQ}
+- takeScreenshot: ${ARTIFACTS}/05-reopened-row-light.png
+- tapOn:
+    id: context-compacted-${COMPACTION_SEQ}
+- extendedWaitUntil:
+    visible:
+      id: context-summary-body-${COMPACTION_SEQ}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/06-reopened-summary-light.png
+- back
+- back
+- assertVisible:
+    id: agent-row-${COMPACTION_AGENT_ID}

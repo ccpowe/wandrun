@@ -1,0 +1,55 @@
+[
+  {
+    "text": "前言\n```wandrun-ui\n{\"root\":\"a\"}\n```\n间隔\n  ~~~\t wandrun-ui \t\n{}\n  ~~~\t\n",
+    "blocks": [
+      {"block": 0, "closed": true, "source": "{\"root\":\"a\"}\n"},
+      {"block": 1, "closed": true, "source": "{}\n"}
+    ]
+  },
+  {
+    "text": "````json\n```wandrun-ui\nignored\n```\n````\n```wandrun-ui\nactual\n```\n",
+    "blocks": [{"block": 0, "closed": true, "source": "actual\n"}]
+  },
+  {
+    "text": "```wandrun-ui extra\nignored\n```\n~~~wandrun-ui\n{}\n~~~\n",
+    "blocks": [{"block": 0, "closed": true, "source": "{}\n"}]
+  },
+  {
+    "text": "    ```wandrun-ui\nignored\n    ```\n   ```wandrun-ui\n{}\n   ```\n",
+    "blocks": [{"block": 0, "closed": true, "source": "{}\n"}]
+  },
+  {
+    "text": "- ```wandrun-ui\nignored\n```\n> ```wandrun-ui\nignored\n```\n- list\n  ```wandrun-ui\n{}\n  ```\n",
+    "blocks": [{"block": 0, "closed": true, "source": "{}\n"}]
+  },
+  {
+    "text": "```wandrun-ui\ufeff\nignored\n```\n```wandrun-ui\u001f\nignored\n```\n```wandrun-ui\nreal\n```\n",
+    "blocks": [{"block": 0, "closed": true, "source": "real\n"}]
+  },
+  {
+    "text": "```wandrun-ui\r\nvalue\r\n````\t\r\n~~~wandrun-ui\rmore\r~~~\r",
+    "blocks": [
+      {"block": 0, "closed": true, "source": "value\r\n"},
+      {"block": 1, "closed": true, "source": "more\r"}
+    ]
+  },
+  {
+    "text": "````wandrun-ui\n{}\n```\n",
+    "blocks": [{"block": 0, "closed": false, "source": "{}\n```\n"}]
+  },
+  {
+    "text": "~~~wandrun-ui\n{}\n~~~\ufeff\n~~~\u001f\n",
+    "blocks": [{"block": 0, "closed": false, "source": "{}\n~~~\ufeff\n~~~\u001f\n"}]
+  },
+  {
+    "text": "\ufeff```wandrun-ui\nignored\n```\n\u001f```wandrun-ui\nignored\n```\n```wandrun-ui\n{}\n```",
+    "blocks": [{"block": 0, "closed": true, "source": "{}\n"}]
+  },
+  {
+    "text": "~~~wandrun-ui\u2028{}\u2028~~~\u001e```wandrun-ui\u000b[]\u000c```",
+    "blocks": [
+      {"block": 0, "closed": true, "source": "{}\u2028"},
+      {"block": 1, "closed": true, "source": "[]\u000c"}
+    ]
+  }
+]

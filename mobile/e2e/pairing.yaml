@@ -1,0 +1,136 @@
+# agent-device 0.21.16 Maestro subset; run only through run.py on an isolated gateway.
+# Manual scan acceptance (not automated on a real camera): issue a fresh code with
+# `python -m wandrun.gateway pair --url <phone-reachable-url>`; open the camera,
+# scan its wandrun://pair?url=…&code=… QR; verify automatic pairing reaches home,
+# then 关于与连接 shows 扫码 and a pairing time. Repeat after denying
+# camera permission (manual input remains usable) and after code expiry/reuse
+# (explicit regenerate-code guidance). Verify HTTPS for any public URL.
+appId: host.exp.exponent
+---
+- tapOn: 设置
+- tapOn:
+    id: settings-about-connection
+- assertVisible:
+    id: connection-method
+    text: '.*开发连接.*'
+- assertVisible:
+    id: connection-address
+    text: '.*${DEV_URL}.*'
+# @pairing-original-dev
+# Keep the pre-existing development computer paired throughout this flow.
+- tapOn:
+    id: connection-add
+- extendedWaitUntil:
+    visible:
+      id: pairing-manual
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/01-entry-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/01-entry-dark.png
+# @light-mode
+# @known-dev-overlay
+- tapOn:
+    id: pairing-manual
+- assertVisible:
+    id: pairing-address
+- takeScreenshot: ${ARTIFACTS}/01-manual-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/01-manual-dark.png
+# @light-mode
+- tapOn:
+    id: pairing-address
+- inputText: ${PAIRING_URL}
+- back
+# @pairing-issue
+- tapOn:
+    id: pairing-code
+# The runner substitutes the code in a 0600 TMPDIR step (not --env/fixture/log).
+- inputText: ${PAIR_CODE}
+- back
+- tapOn:
+    id: pairing-submit
+- extendedWaitUntil:
+    visible: 设置
+    timeout: 10000
+# @pairing-exchanged
+- takeScreenshot: ${ARTIFACTS}/02-paired-home-light.png
+- tapOn: 设置
+- tapOn:
+    id: settings-about-connection
+- assertVisible:
+    id: connection-name
+- assertVisible: ${PAIR_COMPUTER_NAME}
+- assertVisible:
+    id: connection-address
+    text: '.*${PAIRING_URL}.*'
+- assertVisible:
+    id: connection-method
+    text: '.*手动输入.*'
+- assertVisible:
+    id: connection-app-version
+- assertVisible:
+    id: connection-gateway-version
+# @pairing-fixture-current
+- takeScreenshot: ${ARTIFACTS}/03-about-paired-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/03-about-paired-dark.png
+# @light-mode
+- tapOn:
+    id: connection-rename
+- tapOn:
+    id: connection-local-name
+- inputText: E2E paired computer
+- tapOn:
+    id: connection-rename-confirm
+- assertVisible: E2E paired computer
+- tapOn: ${DEV_URL}
+# @pairing-dev-selected
+- assertVisible:
+    id: connection-switch
+- tapOn:
+    id: connection-switch
+- extendedWaitUntil:
+    visible: 设置
+    timeout: 10000
+- tapOn: 设置
+- tapOn:
+    id: settings-about-connection
+- assertVisible:
+    id: connection-method
+    text: '.*开发连接.*'
+- assertVisible:
+    id: connection-address
+    text: '.*${DEV_URL}.*'
+# @pairing-dev-current
+- tapOn: E2E paired computer
+# @pairing-fixture-selected
+- tapOn:
+    id: connection-switch
+- extendedWaitUntil:
+    visible: 设置
+    timeout: 10000
+- tapOn: 设置
+- tapOn:
+    id: settings-about-connection
+- assertVisible: E2E paired computer
+# @pairing-fixture-current
+- tapOn:
+    id: connection-disconnect
+- tapOn:
+    id: connection-disconnect-confirm
+- extendedWaitUntil:
+    visible: 设置
+    timeout: 10000
+# @pairing-revoked
+# @pairing-restore-dev
+- takeScreenshot: ${ARTIFACTS}/04-restored-home-light.png
+- tapOn: 设置
+- tapOn:
+    id: settings-about-connection
+- assertVisible:
+    id: connection-method
+    text: '.*开发连接.*'
+- assertVisible:
+    id: connection-address
+    text: '.*${DEV_URL}.*'
+# @pairing-dev-restored

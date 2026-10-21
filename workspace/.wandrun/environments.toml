@@ -1,0 +1,10 @@
+# 执行环境（ADR-0012）。未写 environment 的角色使用 default。
+default = "local"
+
+[environments.local]
+type = "local"          # 根目录是 workspace，使用真实路径；不是安全隔离
+command_timeout = 120   # 单条命令超时（秒）
+
+# 浏览器是基础能力：网关启动时连接这个 Chrome，连不上则启动失败。
+[environments.local.browser]
+cdp_url = "http://127.0.0.1:9222"

@@ -1,0 +1,52 @@
+[project]
+name = "wandrun"
+version = "0.1.0"
+description = "Self-hosted multi-agent runtime you drive from your phone"
+readme = "README.md"
+authors = [
+    { name = "ccpowe" }
+]
+license = "Apache-2.0"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "idna==3.19",
+    "langchain[mcp]>=1.4.0",
+    "langchain-openrouter>=0.2.8",
+    "python-dotenv>=1.2.3",
+    "deepagents>=0.7.13",
+    "langgraph>=1.2.16,<1.3.0",
+    "langgraph-checkpoint>=4.3.0,<5",
+    "langgraph-checkpoint-sqlite>=3.1.2",
+    "pydantic-monty>=1.0.0",
+    "asyncssh>=2.24.0",
+    "starlette>=1.6.0",
+    "uvicorn>=0.52.4",
+    "cronsim==2.7",
+    "tzlocal==5.4.4",
+    "websockets>=16.1.1",
+    "segno>=1.6.6",
+    "wsproto>=1.3.2",
+    "jsonschema>=4.26.0",
+    "aiohttp>=3.13,<4",
+    "pillow>=12,<13",
+    "markdown-it-py>=4,<5",
+    "mdit-py-plugins>=0.5,<0.6",
+    "av>=15,<17",
+    "pypdfium2>=5,<6",
+]
+
+
+[project.scripts]
+wandrun = "wandrun.evaluation.headless:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# The packaged default skills link to the sample workspace's checked-in sources.
+source-include = [
+    "workspace/.wandrun/skills/browser/SKILL.md",
+    "workspace/.wandrun/skills/skill-installer/SKILL.md",
+]

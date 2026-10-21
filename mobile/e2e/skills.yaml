@@ -1,0 +1,125 @@
+# Written for coordinator-run device QA; this worktree must not run this group.
+appId: host.exp.exponent
+---
+- tapOn: 设置
+- scrollUntilVisible:
+    element:
+      id: settings-skills
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/01-settings-skills-light.png
+- tapOn:
+    id: settings-skills
+- assertVisible:
+    id: skills-add
+- scrollUntilVisible:
+    element:
+      id: skill-${BROKEN_SKILL_NAME}
+    direction: DOWN
+- assertVisible: '.*无法加载.*'
+- takeScreenshot: ${ARTIFACTS}/02-skills-list-light.png
+- tapOn:
+    id: skill-${BROKEN_SKILL_NAME}
+- assertVisible:
+    id: skill-detail-error
+- takeScreenshot: ${ARTIFACTS}/03-skills-error-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/04-skills-error-dark.png
+- tapOn:
+    id: skill-back
+- takeScreenshot: ${ARTIFACTS}/05-skills-list-dark.png
+- scrollUntilVisible:
+    element:
+      id: skill-${SKILL_NAME}
+    direction: DOWN
+- tapOn:
+    id: skill-${SKILL_NAME}
+- assertVisible: '.*E2E skill management fixture.*'
+- assertVisible: 最后修改时间
+- scrollUntilVisible:
+    element:
+      id: skill-agent-${SKILL_AGENT_ID}
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/06-skill-detail-dark.png
+# @light-mode
+- takeScreenshot: ${ARTIFACTS}/07-skill-detail-light.png
+- tapOn:
+    id: skill-agent-${SKILL_AGENT_ID}
+- extendedWaitUntil:
+    visible:
+      id: profile-empty-members
+    timeout: 10000
+- assertVisible: ${SKILL_AGENT_NAME}
+- tapOn:
+    id: profile-close
+- scrollUntilVisible:
+    element:
+      id: skill-content
+    direction: DOWN
+- assertVisible: '.*Verified marker.*'
+- scrollUntilVisible:
+    element:
+      id: skill-delete
+    direction: DOWN
+- tapOn:
+    id: skill-delete
+- assertVisible:
+    id: skill-delete-blocked
+- assertVisible: '.*${SKILL_AGENT_NAME}.*'
+- takeScreenshot: ${ARTIFACTS}/08-skill-delete-blocked-light.png
+# @skill-blocked
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/09-skill-delete-blocked-dark.png
+# @light-mode
+- tapOn:
+    id: skill-delete-blocked
+# @skill-unselect
+# Agent resource.changed must refresh used_by while detail remains open.
+- extendedWaitUntil:
+    notVisible:
+      id: skill-agent-${SKILL_AGENT_ID}
+    timeout: 10000
+- tapOn:
+    id: skill-delete
+- assertVisible:
+    id: skill-delete-confirm
+- takeScreenshot: ${ARTIFACTS}/10-skill-delete-confirm-light.png
+- tapOn:
+    id: skill-delete-confirm
+# @skill-deleted
+- extendedWaitUntil:
+    visible:
+      id: skills-add
+    timeout: 10000
+- assertNotVisible:
+    id: skill-${SKILL_NAME}
+# An external gateway delete must refresh the visible list without navigating away.
+# @skill-external-delete
+- extendedWaitUntil:
+    notVisible:
+      id: skill-${BROKEN_SKILL_NAME}
+    timeout: 10000
+- tapOn:
+    id: skills-add
+- extendedWaitUntil:
+    visible:
+      id: composer-input
+    timeout: 10000
+- assertVisible: '.*帮我导入这个技能：.*'
+# @skill-import-draft
+- takeScreenshot: ${ARTIFACTS}/11-skill-import-draft-light.png
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/12-skill-import-draft-dark.png
+# @light-mode
+# Clear this fixture's draft without sending; runner deletes its empty conversation.
+- tapOn:
+    id: composer-input
+# @skill-clear-draft
+- back
+- tapOn: 返回
+- tapOn:
+    id: skills-back
+# @dark-mode
+- takeScreenshot: ${ARTIFACTS}/13-settings-skills-dark.png
+# @light-mode
+- back
+- assertVisible: 设置

@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+/.wandrun/
+/workspace/.wandrun/state/
+/workspace/.wandrun/runs/
+/workspace/.wandrun/evaluations/
+/workspace/.wandrun/artifacts/
+/workspace/conversations/
+/workspace/.wandrun/uploads/

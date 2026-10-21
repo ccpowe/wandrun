@@ -1,0 +1,248 @@
+# agent-device 0.21.16 Maestro subset; run via python3 mobile/e2e/run.py.
+# All gestures resolve an element, never a fixed screen coordinate.
+appId: host.exp.exponent
+---
+- tapOn: 新建 Agent 或查看全部 Agent
+- tapOn: 新建 Agent
+- assertVisible:
+    id: editor-name
+- takeScreenshot: ${ARTIFACTS}/25-agent-new-light.png
+- tapOn:
+    id: editor-name
+# @select-all
+- inputText: ${NEW_NAME}
+- back
+- tapOn:
+    id: editor-description
+- inputText: E2E regression fixture
+- back
+- tapOn:
+    id: editor-prompt
+- assertVisible:
+    id: editor-prompt-input
+- tapOn:
+    id: editor-prompt-input
+- inputText: Follow the user's request.
+- back
+- takeScreenshot: ${ARTIFACTS}/26-agent-prompt-light.png
+- tapOn:
+    id: editor-done
+- scrollUntilVisible:
+    element:
+      id: editor-model
+    direction: DOWN
+- tapOn:
+    id: editor-model
+- scrollUntilVisible:
+    element:
+      id: model-catalog-updated
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/27-agent-model-light.png
+- tapOn:
+    id: editor-back
+- scrollUntilVisible:
+    element:
+      id: editor-code-mode
+    direction: DOWN
+- assertVisible:
+    id: editor-code-mode
+- takeScreenshot: ${ARTIFACTS}/25-agent-code-mode-default-light.png
+- scrollUntilVisible:
+    element:
+      id: editor-skills
+    direction: DOWN
+- tapOn:
+    id: editor-skills
+- takeScreenshot: ${ARTIFACTS}/28-agent-skills-light.png
+- tapOn:
+    id: editor-back
+- scrollUntilVisible:
+    element:
+      id: editor-members
+    direction: DOWN
+- tapOn:
+    id: editor-members
+- takeScreenshot: ${ARTIFACTS}/29-agent-members-light.png
+- tapOn:
+    id: editor-back
+- tapOn:
+    id: editor-save
+# @created-agent
+# @code-mode-created-on
+- extendedWaitUntil:
+    visible:
+      id: chat-agent-name
+      text: ${NEW_NAME}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/30-agent-created-chat-light.png
+- tapOn:
+    id: chat-agent-profile
+- assertVisible:
+    id: profile-name
+    text: ${NEW_NAME}
+- tapOn:
+    id: profile-edit
+- assertVisible:
+    id: editor-name
+- takeScreenshot: ${ARTIFACTS}/41-agent-edit-light.png
+- scrollUntilVisible:
+    element:
+      id: editor-code-mode
+    direction: DOWN
+- tapOn:
+    id: editor-code-mode
+- takeScreenshot: ${ARTIFACTS}/41-agent-code-mode-off-draft-light.png
+- scrollUntilVisible:
+    element:
+      id: editor-name
+    direction: UP
+- tapOn:
+    id: editor-name
+# @select-all
+- inputText: ${RENAMED_NAME}
+- back
+- scrollUntilVisible:
+    element:
+      id: editor-reasoning-${EDIT_EFFORT}
+    direction: DOWN
+- tapOn:
+    id: editor-reasoning-${EDIT_EFFORT}
+- tapOn:
+    id: editor-save
+# @edited-agent
+# @code-mode-agent-off
+- extendedWaitUntil:
+    visible:
+      id: profile-name
+      text: ${RENAMED_NAME}
+    timeout: 10000
+- tapOn:
+    id: profile-close
+- assertVisible:
+    id: chat-agent-name
+    text: ${RENAMED_NAME}
+- tapOn:
+    id: chat-agent-profile
+# @external-rename
+- extendedWaitUntil:
+    visible:
+      id: profile-name
+      text: ${EXTERNAL_NAME}
+    timeout: 10000
+- tapOn:
+    id: profile-close
+- extendedWaitUntil:
+    visible:
+      id: chat-agent-name
+      text: ${EXTERNAL_NAME}
+    timeout: 10000
+- tapOn:
+    id: chat-agent-profile
+- assertVisible:
+    id: profile-name
+    text: ${EXTERNAL_NAME}
+# @reference-agent
+- tapOn:
+    id: profile-edit
+- scrollUntilVisible:
+    element:
+      id: editor-delete
+    direction: DOWN
+# Move the complete button above Android's gesture bar, not merely into the AX viewport.
+- scroll
+- tapOn:
+    id: editor-delete
+- assertVisible:
+    id: editor-delete-blocked-ack
+- assertVisible: '.*${REFERENCE_NAME}.*'
+- takeScreenshot: ${ARTIFACTS}/31-agent-delete-blocked-light.png
+- tapOn:
+    id: editor-delete-blocked-ack
+# @blocked-agent
+- assertVisible:
+    id: editor-name
+- tapOn:
+    id: editor-back
+- tapOn:
+    id: profile-close
+- tapOn: 返回
+- assertVisible: 设置
+# @dark-mode
+- tapOn:
+    id: agent-row-${NEW_AGENT_ID}
+- tapOn:
+    id: chat-agent-profile
+- tapOn:
+    id: profile-edit
+- assertVisible:
+    id: editor-name
+- takeScreenshot: ${ARTIFACTS}/42-agent-edit-dark.png
+- scrollUntilVisible:
+    element:
+      id: editor-delete
+    direction: DOWN
+- scroll
+- tapOn:
+    id: editor-delete
+- assertVisible:
+    id: editor-delete-blocked-ack
+- takeScreenshot: ${ARTIFACTS}/38-agent-delete-blocked-dark.png
+- tapOn:
+    id: editor-delete-blocked-ack
+# Keep this editor mounted: removing the reference elsewhere must unblock deletion.
+# @release-reference
+- tapOn:
+    id: editor-delete
+- assertVisible:
+    id: editor-delete-confirm
+- takeScreenshot: ${ARTIFACTS}/39-agent-delete-confirm-dark.png
+- tapOn:
+    id: editor-delete-cancel
+- tapOn:
+    id: editor-back
+- tapOn:
+    id: profile-close
+- tapOn: 返回
+# @light-mode
+- tapOn:
+    id: agent-row-${NEW_AGENT_ID}
+- tapOn:
+    id: chat-agent-profile
+- tapOn:
+    id: profile-edit
+- scrollUntilVisible:
+    element:
+      id: editor-delete
+    direction: DOWN
+- scroll
+- tapOn:
+    id: editor-delete
+- assertVisible:
+    id: editor-delete-confirm
+- takeScreenshot: ${ARTIFACTS}/40-agent-delete-confirm-light.png
+- tapOn:
+    id: editor-delete-confirm
+- extendedWaitUntil:
+    notVisible:
+      id: agent-row-${NEW_AGENT_ID}
+    timeout: 10000
+- assertVisible: 设置
+# @external-agent
+- extendedWaitUntil:
+    visible:
+      id: agent-row-${REMOTE_ID}
+    timeout: 10000
+- tapOn:
+    id: agent-row-${REMOTE_ID}
+- tapOn:
+    id: chat-agent-profile
+- extendedWaitUntil:
+    visible:
+      id: profile-edit
+    timeout: 10000
+# @external-delete
+- extendedWaitUntil:
+    visible: 设置
+    timeout: 10000
+- assertNotVisible:
+    id: agent-row-${REMOTE_ID}
