@@ -93,6 +93,39 @@ def safe_web_url(value: str) -> bool:
         return False
 
 
+def _file_tree_errors(props: Any, path: str, errors: list[str]) -> None:
+    """Validate flat tree paths and explicit file ancestry, independent of node order."""
+    if not isinstance(props, dict) or not isinstance(props.get("nodes"), list):
+        return
+    nodes_path = f"{path}.props.nodes"
+    paths: dict[str, tuple[int, dict[str, Any]]] = {}
+    for index, node in enumerate(props["nodes"]):
+        if not isinstance(node, dict) or not isinstance(node.get("path"), str):
+            continue
+        raw = node["path"]
+        node_path = f"{nodes_path}[{index}].path"
+        segments = raw.removesuffix("/").split("/")
+        if (raw.startswith("/") or any(not segment or segment in {".", ".."} or len(segment) > 64
+                for segment in segments) or len(segments) > 8
+                or any(char == "\\" or ord(char) < 32 or ord(char) == 127 for char in raw)):
+            _error(errors, node_path, "须为最多 8 层、每段不超过 64 码点的相对路径，且不得含空段、.、..、反斜线或控制字符")
+            continue
+        if node.get("kind") == "file" and raw.endswith("/"):
+            _error(errors, node_path, "文件路径不得以 / 结尾")
+        canonical = raw.removesuffix("/")
+        if canonical in paths:
+            _error(errors, node_path, "路径重复（末尾 / 不区分）")
+        else:
+            paths[canonical] = (index, node)
+    for canonical, (index, _) in paths.items():
+        segments = canonical.split("/")
+        for count in range(1, len(segments)):
+            ancestor = paths.get("/".join(segments[:count]))
+            if ancestor is not None and ancestor[1].get("kind") == "file":
+                _error(errors, f"{nodes_path}[{index}].path", "节点不能挂在文件路径下")
+                break
+
+
 def _special_prop_errors(component: str, props: Any, path: str, errors: list[str]) -> None:
     if not isinstance(props, dict):
         return
@@ -101,8 +134,9 @@ def _special_prop_errors(component: str, props: Any, path: str, errors: list[str
         urls = [(f"items[{index}].url", item["url"])
                 for index, item in enumerate(props["items"])
                 if isinstance(item, dict) and "url" in item]
-    elif component in {"LinkCard", "Image", "MediaCard"} and "url" in props:
-        urls = [("url", props["url"])]
+    elif component in {"LinkCard", "Image", "MediaCard"}:
+        urls = [(name, props[name]) for name in (("url", "image") if component == "LinkCard" else ("url",))
+                if name in props]
     for name, value in urls:
         if isinstance(value, str) and not safe_web_url(value):
             _error(errors, f"{path}.props.{name}", "须为无凭据的绝对 HTTP(S) URL")
@@ -400,6 +434,8 @@ def _validate_spec(spec: Any) -> list[str]:
                         inputs[key] = (component, props)
             _relation_errors(definition, props, children, path, errors)
             _special_prop_errors(component, props, path, errors)
+            if component == "FileTree":
+                _file_tree_errors(props, path, errors)
             if component == "Slider" and isinstance(props, dict):
                 low, high, step = (props.get(key) for key in ("min", "max", "step"))
                 if all(type(v) in (int, float) and (type(v) is int or math.isfinite(v)) for v in (low, high, step)):
@@ -839,7 +875,7 @@ _CHAPTER_COMPONENTS = {
     "display.md": (
         "Stack", "Card", "Divider", "Heading", "Text", "Badge", "Status", "Metrics",
         "KeyValue", "Steps", "Progress", "Table", "Tabs", "Accordion", "Grid",
-        "Source", "LinkCard", "Icon", "List", "Callout", "Quote", "Math",
+        "Source", "LinkCard", "FileTree", "Icon", "List", "Callout", "Quote", "Math",
     ),
     "charts.md": ("LineChart", "BarChart", "PieChart"),
     "forms.md": (
@@ -882,13 +918,13 @@ def skill_files() -> dict[str, str]:
         "SKILL.md": "\n".join([
             "---",
             "name: wandrun-ui",
-            "description: 给 human 主动制作手机优先的受控界面：多项数据汇报、多个对象比较、需要确认/选择/填写，或附多张图片；闲聊、单句事实、纯代码和简单确认用文字。",
+            "description: 给 human 主动呈现日常结构化内容：目录/项目结构 FileTree、学习资料/参考链接 LinkCard、教程 List、方案比较 Table、数字汇报 Metrics/KeyValue、多图 Gallery、选择/确认/填写表单；不必等用户点名组件；闲聊、单句事实、纯代码、简单确认及给其他 Agent 的消息用文字。",
             "---",
             "",
             "# wandrun-ui",
             "",
             "给 human 发 UI 前先读 [design.md](design.md)；再按组件读取所需章节。读取完成后投递完整界面；常见形式以技能中的示例为准。",
-            "- [display.md](display.md)：排版、状态、表格、链接、列表、数学。",
+            "- [display.md](display.md)：排版、状态、表格、链接、目录树、列表、数学。",
             "- [charts.md](charts.md)：趋势、分类与占比图。",
             "- [forms.md](forms.md)：控件、初值与提交值。",
             "- [media.md](media.md)：图片、附件与 Mermaid。",
@@ -898,10 +934,10 @@ def skill_files() -> dict[str, str]:
         "design.md": "\n".join([
             "# 手机优先：设计与协议",
             "",
-            "多项数据汇报、多个对象比较、需要确认/选择/填写，或附多张图片时主动用 UI；闲聊、单句事实、纯代码和简单确认用文字。先写一条核心结论，再给必要证据；不要在卡片外重复表格、图表或控件中已经说过的话。默认单列、依阅读顺序竖排；不强制套根 Card。Card 只用于有意义的分组，避免外卡再套内卡；强调色只给真正需要注意的状态。宽屏也不能以并排为默认，只有并排比较确实增益且手机仍可读时才用 Grid。长标签、长说明与多图优先分行/分段。",
-            "需要跨项目、跨周期比较多个指标及风险时，可用 Metrics/Table，正文不再重复全部数据；短周报和单一事实不强制使用 UI。",
+            "给 human 的呈现按内容选择，不必等用户要求组件或交互：目录/项目结构用 FileTree，不用代码块画树；学习资料/参考链接推荐用连续 LinkCard，不用编号链接列表；分步骤教程用 List，真实执行进度才用 Steps；多方案比较用 Table；多项数字汇报用 Metrics 或 KeyValue；交付多张图片用 Gallery；确需用户选择/确认/填写时用合适控件和 Submit。纯展示不加 Submit，也不凭空要求决定。这些日常展示即使简短也主动用 wandrun-ui；闲聊、单句事实、纯代码和简单确认仍用普通文字。先写一条核心结论，再给必要证据；不要在卡片外重复表格、图表或控件中已经说过的话。默认单列、依阅读顺序竖排；不强制套根 Card。Card 只用于有意义的分组，避免外卡再套内卡；强调色只给真正需要注意的状态。宽屏也不能以并排为默认，只有并排比较确实增益且手机仍可读时才用 Grid。长标签、长说明与多图优先分行/分段。",
+            "需要跨项目、跨周期比较多个指标及风险时，可用 Metrics/Table，正文不再重复全部数据；有多项数字的简短汇报也主动用 Metrics/KeyValue，单一事实用文字。",
             "",
-            "教学步骤用 List，不伪装成执行中的 Steps 或 Status；只有来自真实执行的状态/进度才用状态组件。带简介的多个可点击网页用 LinkCard，短来源标签可用 Source；不要把长 URL 当标题，引用链接不等于已核实内容。不要编造进度、统计、来源或图片地址。",
+            "教学步骤用 List，不伪装成执行中的 Steps 或 Status；只有来自真实执行的状态/进度才用状态组件。链接清单用连续 LinkCard，不包 Card、标题不编号；短来源标签可用 Source；不要把长 URL 当标题，引用链接不等于已核实内容。目录结构用 FileTree，不要用代码块画树。不要编造进度、统计、来源或图片地址。",
             "",
             "## 消息和 Spec",
             "",
@@ -913,7 +949,7 @@ def skill_files() -> dict[str, str]:
         "display.md": "\n".join([
             "# 展示与排版",
             "",
-            "结论先行，单列优先。Metrics 在窄屏可能拥挤，少量指标或 KeyValue 往往更清楚；Table 每行单元格数须与 columns 相同，别把整行在表外重写。Source 用于短引用，带标题和说明的链接清单用 LinkCard，不以长 URL 代替标题。URL 须为无凭据绝对 http(s)，主机是合法 DNS 名或规范 IP、端口有效；不得带控制字符、空格、反斜线、userinfo 或模糊 authority。显示真实域名，在系统浏览器打开；不自动抓网页或 favicon，来源未核实要明说。",
+            "结论先行，单列优先。Metrics 在窄屏可能拥挤，少量指标或 KeyValue 往往更清楚；Table 每行单元格数须与 columns 相同，别把整行在表外重写。Source 用于短引用，带标题和说明的链接清单用连续 LinkCard，不包 Card、标题不编号；只有搜索或抓取工具确实提供该页面的真实图片/缩略图 URL 时才填写 LinkCard.image，否则省略，绝不猜测；未提供时网关仅将链接主机名交给 Google s2 获取第三方站点图标，不抓取原网页，失败仍显示首字母。目录结构用 FileTree，不要用代码块画树；nodes 按给定顺序显示，缺失父目录补全，末尾 / 表目录、显式文件不能有子节点；最多 8 层、每段 ≤64 码点。URL 须为无凭据绝对 http(s)，主机是合法 DNS 名或规范 IP、端口有效；不得带控制字符、空格、反斜线、userinfo 或模糊 authority。显示真实域名，在系统浏览器打开；图片只按已存消息坐标由网关代理，来源未核实要明说。",
             "数学正文可用 `$…$` 或 `$$…$$`；Math.tex 直接传 TeX，不含美元分隔符，JSON 反斜线双写。Icon 与 List.icon 仅能选受控 lucide 图标名：",
             ", ".join(sorted(_ICON_NAMES)) + "。",
             "",
@@ -964,24 +1000,23 @@ def skill_files() -> dict[str, str]:
 
 @lru_cache(maxsize=1)
 def model_instructions() -> str:
-    """Resident policy with common UI examples; detailed protocol stays in the skill files."""
+    """Resident selection policy and directory/link examples; other protocols stay in the skill."""
     return (
-        "给 human 按以下清单选择呈现：多项数据汇报、多个对象比较、需要确认/选择/填写、或附多张图片时主动使用 wandrun-ui；"
-        "闲聊、单句事实、纯代码和简单“收到”用普通文字。先写结论，再给必要证据；只用受控组件。"
-        "表单提交只回传值、不执行操作。校验拒绝时按错误修正被拒绝消息，不重发已成功消息；技能无法读取则用 Markdown。"
-        "给其他 Agent 只发纯文字。常见确认表单、Table/List、已交付附件 Gallery 可直接套用以下完整示例；"
-        "复杂或不确定组件仍先读 wandrun-ui 技能及相关章节。\n"
-        "确认/选择：\n"
+        "给 human 的呈现按内容选择，不必等用户要求组件或交互：目录/项目结构用 FileTree，不用代码块画树；"
+        "学习资料/参考链接推荐用连续 LinkCard，不用编号链接列表；分步骤教程用 List，真实执行进度才用 Steps；"
+        "多方案比较用 Table；多项数字汇报用 Metrics 或 KeyValue；交付多张图片用 Gallery；"
+        "确需用户选择/确认/填写时用合适控件和 Submit。纯展示不加 Submit，也不凭空要求决定。"
+        "这些日常展示即使简短也主动用 wandrun-ui；闲聊、单句事实、纯代码和简单确认仍用普通文字。"
+        "先写结论，再给必要证据，块外不重复块内内容；只用受控组件。表单提交只回传值、不执行操作。"
+        "校验拒绝时按错误修正被拒绝消息，不重发已成功消息；技能无法读取则用 Markdown。给其他 Agent 只发纯文字。"
+        "目录与链接可直接套用以下完整示例；其他组件或属性不确定时先读 wandrun-ui 技能及相关章节。\n"
+        "目录结构：\n"
         "```wandrun-ui\n"
-        "{\"root\":\"r\",\"elements\":{\"r\":{\"type\":\"Stack\",\"props\":{},\"children\":[\"q\",\"s\"]},\"q\":{\"type\":\"ChoiceGroup\",\"props\":{\"stateKey\":\"choice\",\"label\":\"决定\",\"options\":[{\"value\":\"yes\",\"label\":\"确认\"},{\"value\":\"edit\",\"label\":\"需要修改\"}]},\"children\":[]}, \"s\":{\"type\":\"Submit\",\"props\":{\"label\":\"提交\"},\"children\":[]}},\"state\":{\"choice\":\"\"}}\n"
+        "{\"root\":\"r\",\"elements\":{\"r\":{\"type\":\"FileTree\",\"props\":{\"title\":\"项目结构\",\"nodes\":[{\"path\":\"src/components/\",\"note\":\"界面组件\"},{\"path\":\"src/components/App.tsx\",\"note\":\"应用入口\"},{\"path\":\"src/utils/format.ts\",\"kind\":\"file\"}]},\"children\":[]}},\"state\":{}}\n"
         "```\n\n"
-        "表格/列表：\n"
+        "链接清单：\n"
         "```wandrun-ui\n"
-        "{\"root\":\"r\",\"elements\":{\"r\":{\"type\":\"Stack\",\"props\":{},\"children\":[\"t\"]},\"t\":{\"type\":\"Table\",\"props\":{\"columns\":[\"项目\",\"结果\"],\"rows\":[[\"A\",\"通过\"],[\"B\",\"待定\"]]},\"children\":[]}}, \"state\":{}}\n"
-        "```\n\n"
-        "附件图库：\n"
-        "```wandrun-ui\n"
-        "{\"root\":\"r\",\"elements\":{\"r\":{\"type\":\"Stack\",\"props\":{},\"children\":[\"g\"]},\"g\":{\"type\":\"Gallery\",\"props\":{\"items\":[{\"attachment\":\"a.png\",\"alt\":\"预览\"},{\"attachment\":\"b.png\",\"alt\":\"预览\"}]},\"children\":[]}}, \"state\":{}}\n"
+        "{\"root\":\"r\",\"elements\":{\"r\":{\"type\":\"Stack\",\"props\":{},\"children\":[\"a\",\"b\"]},\"a\":{\"type\":\"LinkCard\",\"props\":{\"url\":\"https://example.org/guide\",\"title\":\"入门指南\",\"description\":\"基础用法与示例\",\"tags\":[\"文档\"]},\"children\":[]},\"b\":{\"type\":\"LinkCard\",\"props\":{\"url\":\"https://example.org/api\",\"title\":\"接口参考\",\"description\":\"接口与参数说明\"},\"children\":[]}},\"state\":{}}\n"
         "```"
     )
 

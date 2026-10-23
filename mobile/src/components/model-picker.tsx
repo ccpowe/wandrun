@@ -45,7 +45,6 @@ export function ModelPicker({ api, model, reasoningEffort, onChange, disabled = 
   const current = selectedModel(models, model);
   return (
     <ScrollView keyboardShouldPersistTaps="handled" className="flex-1" contentContainerStyle={{ paddingBottom: 32 }}>
-      <Text className="mx-6 mb-3 mt-2 text-sm text-muted-foreground">{t("选择使用的模型")}</Text>
       {!catalog && model ? <ListGroup>
         <View testID="model-current-unverified" className="min-h-[60px] justify-center px-4 py-2">
           <Text className="text-[15px] font-medium">{model}</Text>

@@ -11,7 +11,7 @@ Agent 在你的机器上使用真实的文件、命令行和 Chrome 工作；你
 
 [English](README.md) · 简体中文
 
-<img src="docs/media/highlights.zh-CN.png" alt="Wandrun 亮点：富交互回复、Agent 团队、浏览器接管、Agent 配置、ChatGPT 订阅" />
+<img src="docs/media/highlights.zh-CN.png" alt="Wandrun 六大亮点：富交互回复、团队并行协作、可接管的浏览器、自己设计 Agent、直接用 ChatGPT 订阅、共享画像与每个 Agent 的工作记忆" />
 
 </div>
 
@@ -29,7 +29,8 @@ Wandrun 跑在**你自己**的 Linux 机器上，手机揣进兜里它也照常�
 
 ## 亮点
 
-- **富交互回复**：Agent 的回复里图文穿插图表、表格、表单和卡片；你提交的表单会作为下一条消息交回。
+- **新的聊天界面**：对话抽屉、调整后的消息布局和更简洁的输入区。
+- **富交互回复**：图文穿插图表、表格、表单、链接列表和可展开的文件树（FileTree），引导 Agent 在适合时主动使用组件；表单提交作为下一条消息交回。链接图标由网关向 Google s2 获取，只发送主机名，不发送页面路径或查询参数。
 - **团队并行协作**：Agent 可以把任务拆给其他 Agent 并行处理，自己继续工作，最后汇总结果；每个成员的进度实时可见。
 - **可接管的浏览器**：Agent 在你的机器上操作真实的 Chrome；你在手机上看实时画面，遇到登录、验证码就接管，处理完交还。
 - **自己设计 Agent**：在 App 里为每个 Agent 设置提示词、模型、推理强度、技能、MCP 连接器和团队成员。
@@ -41,12 +42,14 @@ Wandrun 跑在**你自己**的 Linux 机器上，手机揣进兜里它也照常�
 
 - **双向文件**：发送照片、视频和文档，支持断点续传；Agent 产出的文件以卡片出现，可预览、下载、分享。
 - **定时任务**：单次、每天、每周或 cron，每次触发开一个新对话；Agent 也能替你创建定时。
-- **记忆**：每个 Agent 有一份可编辑的 Markdown 记忆，跨对话保留。
-- **长对话**：自动压缩上下文，原文留在磁盘上，随时可以回查。
+- **共享画像、独立工作记忆**：在“设置 → 关于你”编辑所有 Agent 共享的用户画像，在 Agent 资料页编辑各自的工作记忆；都支持简短 Markdown 索引与按需读取的详情。
+- **长对话**：自动压缩上下文，新增摘要结构与长度校验，并交接已完成工作和下一步；原文留在磁盘上。校验不保证摘要语义正确，也不保证完全避免重复工作。
 - **MCP 与技能**：接入任意 MCP 服务（stdio 或 HTTP），工具多时按需搜索；在手机上通过 OAuth 连接 Notion、GitHub；用 `SKILL.md` 安装技能。
 - **Code Mode**：Agent 可以写一段短脚本，在沙箱解释器里一次调用多个工具。
 - **生图**：Agent 用你的订阅生成图片，作为附件发给你。
 - **搜索、主题、语言**：全局搜索 Agent、对话、消息和文件；浅色 / 深色主题；中英文界面。
+- **可选 LangSmith 追踪**：默认关闭；开启前先看[配置与隐私说明](docs/deploy.zh-CN.md#可选-langsmith-追踪)，了解对话、模型和工具数据的上传范围。
+- **评测**：[Harbor 适配器](src/wandrun/evaluation/harbor_agent.py)支持按需挂接 LangSmith trace；另有[网关回放](src/wandrun/evaluation/memory_eval.py)与[记忆评分器](src/wandrun/evaluation/profile_evaluators.py)用于数据集实验。这些是评测代码，不是 App 功能。
 
 ## 工作原理
 

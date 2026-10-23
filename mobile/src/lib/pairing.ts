@@ -92,9 +92,12 @@ export class PairingCoordinator {
       this.publish({ phase: "idle", error: "" });
       return null;
     } catch (cause) {
-      const message = exchanged
-        ? "无法安全保存设备令牌。请在电脑上重新生成配对码后重试。"
-        : `${pairingErrorMessage(cause)} 现在可以重试；若配对码已使用，请在电脑上重新生成。`;
+      let message = "无法安全保存设备令牌。请在电脑上重新生成配对码后重试。";
+      if (!exchanged) {
+        const reason = pairingErrorMessage(cause);
+        message = reason.includes("重新运行 wandrun pair") || reason.includes("重新生成配对码")
+          ? reason : `${reason} 可重试；若码已使用，请在电脑上重新生成。`;
+      }
       this.publish({ phase: "idle", error: message });
       return message;
     }

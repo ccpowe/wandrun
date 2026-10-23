@@ -14,7 +14,7 @@ function setup(fetcher?: typeof fetch) {
   sessions.push(session);
   session.agents.close();
   session["reset"]([{ id: "root", agent_id: "planner", title: "Root", status: "idle", unread: false,
-    read_seq: 0, created_at: 1, updated_at: 1, last_text: null, source: "user", schedule_origin: null }], 1);
+    read_seq: 0, last_agent_seq: 0, created_at: 1, updated_at: 1, last_text: null, source: "user", schedule_origin: null }], 1);
   session.connection = "open";
   return session;
 }

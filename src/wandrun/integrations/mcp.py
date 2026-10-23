@@ -12,6 +12,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
+from functools import partial
 from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlsplit
 
 import httpx2
@@ -152,7 +153,8 @@ class MCPConnectionPool:
 
     FastMCP 4.0.3 exposes owner liveness through private _session_state.session_task
     and one-server transport through MCPConfigTransport.transport. MCP 2.1.1
-    supplies the HTTP request hook and bounded, shielded courtesy-cancel write;
+    supplies HTTP hooks and bounded, shielded courtesy-cancel writes; session
+    404s are recorded before the SDK reduces them to ordinary JSON-RPC errors;
     revisit these boundaries when upgrading either SDK.
     """
 
@@ -415,8 +417,8 @@ class MCPConnectionPool:
         except Exception:
             logging.getLogger(__name__).error("MCP 会话失效状态发布失败")
 
-    def _http_client(self, **kwargs) -> httpx2.AsyncClient:
-        """Extend only tools/call reads; leave MCP 2.1.1's other clocks intact."""
+    def _http_client(self, *, state: _Service, **kwargs) -> httpx2.AsyncClient:
+        """Preserve session rejection and tool read clocks; never replay requests."""
         kwargs.setdefault("follow_redirects", True)  # MCP SDK's default, including SSE.
         kwargs.setdefault("timeout", httpx2.Timeout(30.0, read=300.0))
 
@@ -424,8 +426,16 @@ class MCPConnectionPool:
             if request.method == "POST" and json.loads(request.content).get("method") == "tools/call":
                 request.extensions["timeout"]["read"] = self._call_timeout
 
+        async def session_rejected(response: httpx2.Response) -> None:
+            if (response.status_code == 404 and response.request.method in {"GET", "POST"}
+                    and response.request.headers.get("mcp-session-id")):
+                # MCP 2.1.1 can return INVALID_REQUEST while keeping its owner alive.
+                # Bind the signal to this owner, never a replacement connection.
+                state.suspect = True
+
         client = httpx2.AsyncClient(**kwargs)
         client.event_hooks.setdefault("request", []).append(tool_read_timeout)
+        client.event_hooks.setdefault("response", []).append(session_rejected)
         return client
 
     async def _serve(self, server: str, state: _Service) -> None:
@@ -436,6 +446,7 @@ class MCPConnectionPool:
             lambda: self.oauth.secret_values(server),
         ) if state.generation is not None else None
         callback_failed = False
+        http_client = partial(self._http_client, state=state)
         try:
             try:
                 if state.generation is None:
@@ -445,7 +456,7 @@ class MCPConnectionPool:
                     # stream read clock beyond the HTTP client's request timeout.
                     underlying = getattr(client.transport, "transport", None)
                     if isinstance(underlying, (StreamableHttpTransport, SSETransport)):
-                        underlying.httpx_client_factory = self._http_client
+                        underlying.httpx_client_factory = http_client
                     if isinstance(underlying, SSETransport):
                         underlying.sse_read_timeout = timedelta(seconds=self._call_timeout)
                     adapter = MCPAdapter(client)
@@ -474,7 +485,7 @@ class MCPConnectionPool:
                     adapter = MCPAdapter(FastMCPClient(
                         StreamableHttpTransport(
                             state.connection["url"], auth=BearerAuth(),
-                            httpx_client_factory=self._http_client,
+                            httpx_client_factory=http_client,
                         ),
                     ))
                 state.client = adapter.client

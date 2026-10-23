@@ -1,18 +1,24 @@
-"""Image fetch security boundaries exercised against an actual local HTTP peer."""
+"""Image fetch security boundaries exercised against local HTTP and TLS peers."""
 
 import asyncio
 import io
 import os
 import socket
+import ssl
 import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import aiohttp.connector
 from aiohttp import web
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from PIL import Image, PngImagePlugin
 
 from wandrun.gateway import rich_media
@@ -60,14 +66,14 @@ class CacheTests(unittest.TestCase):
     def test_shared_size_budget_and_lru(self):
         with patch.object(rich_media, "CACHE_BYTES", 1050):
             self.cache.put("image-v1-a", self.value)
-            self.cache.put("mermaid-v1-b", self.value)
+            self.cache.put("favicon-v1-b", self.value)
             # Deliberate access order, not creation time, controls the eviction.
             old = time.time() - 100
             os.utime(self.root / "image-v1-a", (old, old))
             self.assertEqual(self.cache.get("image-v1-a"), self.value)
             self.cache.put("image-v1-c", self.value)
             self.assertEqual(self.cache.get("image-v1-a"), self.value)
-            self.assertIsNone(self.cache.get("mermaid-v1-b"))
+            self.assertIsNone(self.cache.get("favicon-v1-b"))
             self.assertEqual(self.cache.get("image-v1-c"), self.value)
             self.assertLessEqual(sum(path.stat().st_size for path in self.root.iterdir()), 1050)
 
@@ -79,12 +85,27 @@ class CacheTests(unittest.TestCase):
         self.assertIsNone(self.cache.get("image-v1-a"))
         self.assertFalse(path.exists())
 
+    def test_favicon_failure_namespace_and_integrity(self):
+        key = rich_media._favicon_cache_key("example.test")
+        failure = MediaError(404, "favicon_not_found", "网站没有可用图标")
+        with self.assertRaises(ValueError):
+            self.cache.put_failure("image-v1-old", failure)
+        self.cache.put_failure(key, failure)
+        with self.assertRaises(MediaError) as cached:
+            self.cache.get(key)
+        self.assertEqual(cached.exception.code, "favicon_not_found")
+        self.cache._publish(key, {
+            "fetched": time.time(), "error": failure.code, "status": 502,
+        }, b"")
+        self.assertIsNone(self.cache.get(key))
+
 
 class ImageProxyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.proxy = ImageProxy(MediaCache(Path(self.temp.name)))
+        self.cache_root = Path(self.temp.name) / "cache"
+        self.proxy = ImageProxy(MediaCache(self.cache_root))
         self.handlers = {}
         self.hits = []
         self.dns_calls = []
@@ -100,6 +121,34 @@ class ImageProxyTests(unittest.IsolatedAsyncioTestCase):
         self.site = web.TCPSite(self.runner, "127.0.0.1", 0)
         await self.site.start()
         self.port = self.site._server.sockets[0].getsockname()[1]
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "www.google.com")])
+        now = datetime.now(timezone.utc)
+        certificate = (x509.CertificateBuilder()
+                       .subject_name(subject).issuer_name(subject)
+                       .public_key(private_key.public_key())
+                       .serial_number(x509.random_serial_number())
+                       .not_valid_before(now - timedelta(days=1))
+                       .not_valid_after(now + timedelta(days=1))
+                       .sign(private_key, hashes.SHA256()))
+        cert_path = Path(self.temp.name) / "peer.crt"
+        key_path = Path(self.temp.name) / "peer.key"
+        cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+        key_path.write_bytes(private_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert_path, key_path)
+        self.tls_site = web.TCPSite(self.runner, "127.0.0.1", 0, ssl_context=context)
+        await self.tls_site.start()
+        self.tls_port = self.tls_site._server.sockets[0].getsockname()[1]
+        # The local TLS peer is self-signed; only certificate verification is
+        # disabled in tests, after production DNS/public-address validation.
+        connector = aiohttp.TCPConnector
+        self.tls_patch = patch.object(rich_media.aiohttp, "TCPConnector",
+                                      side_effect=lambda **kw: connector(ssl=False, **kw))
+        self.tls_patch.start()
+        self.addCleanup(self.tls_patch.stop)
         self.loop = asyncio.get_running_loop()
         self.original_connect = aiohttp.connector.aiohappyeyeballs.start_connection
         self.dns_patch = patch.object(self.loop, "getaddrinfo", self.fake_dns)
@@ -135,8 +184,9 @@ class ImageProxyTests(unittest.IsolatedAsyncioTestCase):
         self.connections.extend(info[4][0] for info in addresses)
         # Only the test transport is diverted to localhost. Production receives
         # exactly the original pinned, policy-checked address list.
+        port = self.tls_port if addresses[0][4][1] == 443 else self.port
         kwargs["addr_infos"] = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
-                                 ("127.0.0.1", self.port))]
+                                 ("127.0.0.1", port))]
         return await self.original_connect(*args, **kwargs)
 
     async def assert_error(self, url, code):
@@ -261,6 +311,16 @@ class ImageProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([hit[0] for hit in self.hits], [path])
         self.assertEqual(self.connections, ["8.8.8.8"])
 
+    def test_shared_redirect_validator_blocks_downgrade_credentials_and_controls(self):
+        current, _, _ = rich_media._parse_url("https://example.test/page")
+        for location in ("http://example.test/unsafe", "//user:pass@example.test/image",
+                         "file:///etc/passwd", "/safe\nHost:localhost",
+                         "http://127.0.0.1/private"):
+            with self.subTest(location=location), self.assertRaises(MediaError):
+                rich_media._redirect_target(current, location)
+        self.assertEqual(rich_media._redirect_target(current, "/safe"),
+                         "https://example.test/safe")
+
     async def test_literal_and_ambiguous_host_rejected_before_connection(self):
         for url in (
             "http://127.0.0.1/a", "http://10.0.0.1/a", "http://[::1]/a",
@@ -355,6 +415,14 @@ class ImageProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.started.is_set())
         self.release.set()
 
+    async def test_ico_rejected_for_explicit_images(self):
+        async def icon(request):
+            return web.Response(body=image_bytes("ICO", size=(32, 32)))
+
+        self.handlers["icon"] = icon
+        await self.assert_error(self.url("icon"), "unsupported_media")
+
+
     async def test_animation_html_svg_and_oversize_dimensions_rejected(self):
         frame = Image.new("RGB", (12, 8), "red")
         second = Image.new("RGB", (12, 8), "blue")
@@ -371,7 +439,7 @@ class ImageProxyTests(unittest.IsolatedAsyncioTestCase):
                 return web.Response(body=payload, content_type="image/png")
             self.handlers[name] = reply
             await self.assert_error(self.url(name), "media_too_large" if name == "huge" else "unsupported_media")
-        self.assertEqual(list(Path(self.temp.name).iterdir()), [])
+        self.assertEqual(list(self.cache_root.iterdir()), [])
 
     async def test_metadata_stripped_and_alpha_preserved(self):
         samples = {
@@ -432,6 +500,178 @@ class ImageProxyTests(unittest.IsolatedAsyncioTestCase):
                 await task
         await self.assert_error(self.url("pending"), "media_unavailable")
         self.assertEqual(self.proxy._jobs, {})
+
+    async def assert_favicon_error(self, url, code):
+        with self.assertRaises(MediaError) as failure:
+            await self.proxy.get_favicon(url)
+        self.assertEqual(failure.exception.code, code)
+        self.assertNotIn(url, str(failure.exception))
+
+    async def test_favicon_host_only_google_request_and_shared_cache(self):
+        async def icon(request):
+            self.assertEqual(request.headers["Host"], "www.google.com")
+            self.assertEqual(request.path, "/s2/favicons")
+            self.assertEqual(dict(request.query), {"domain": "sub.example.org", "sz": "128"})
+            self.assertNotIn("SECRET", request.raw_path)
+            return web.Response(body=image_bytes("PNG", metadata=True))
+
+        self.handlers["s2/favicons"] = icon
+        first = "https://Us%65r:Pass@SuB.Example.Org:8443/private/SECRET?q=SECRET#SECRET"
+        result = await self.proxy.get_favicon(first)
+        self.assertEqual((result.width, result.height), (12, 8))
+        self.assertNotIn(b"SECRET-METADATA", result.data)
+        self.assertEqual(await self.proxy.get_favicon("http://sub.example.org/other"), result)
+        self.assertEqual(await self.proxy.get_favicon("https://SUB.EXAMPLE.ORG./other"), result)
+        self.assertEqual(self.dns_calls, [("www.google.com", 443, socket.SOCK_STREAM)])
+        self.assertEqual([hit[0] for hit in self.hits], ["s2/favicons"])
+        self.assertEqual([path.name for path in self.proxy.cache.root.iterdir()],
+                         [rich_media._favicon_cache_key("sub.example.org")])
+
+    async def test_idna_and_query_injection_cannot_escape_domain_parameter(self):
+        async def icon(request):
+            self.assertEqual(dict(request.query),
+                             {"domain": "xn--bcher-kva.example", "sz": "128"})
+            return web.Response(body=image_bytes())
+
+        self.handlers["s2/favicons"] = icon
+        await self.proxy.get_favicon("https://BÜCHER.example:8080/path?domain=attacker&sz=1")
+        self.assertEqual(len(self.hits), 1)
+        self.assertEqual([call[0] for call in self.dns_calls], ["www.google.com"])
+
+    def test_idna2008_keeps_distinct_hostname_identity(self):
+        self.assertEqual(rich_media._favicon_host("https://faß.de/path?private=value"),
+                         "xn--fa-hia.de")
+        self.assertEqual(rich_media._favicon_host("https://fass.de/path"), "fass.de")
+
+    async def test_source_ip_literals_are_data_not_destinations(self):
+        observed = []
+
+        async def icon(request):
+            observed.append(dict(request.query))
+            return web.Response(body=image_bytes())
+
+        self.handlers["s2/favicons"] = icon
+        for source, host in (("http://127.0.0.1:8765/private", "127.0.0.1"),
+                             ("https://[::1]:8443/private", "::1")):
+            await self.proxy.get_favicon(source)
+            self.assertEqual(observed[-1], {"domain": host, "sz": "128"})
+        self.assertEqual([call[0] for call in self.dns_calls],
+                         ["www.google.com", "www.google.com"])
+
+    async def test_favicon_404_image_body_never_decoded_and_failure_expires(self):
+        async def missing(request):
+            return web.Response(status=404, body=image_bytes(), content_type="image/png")
+
+        self.handlers["s2/favicons"] = missing
+        with patch.object(rich_media, "_decode", side_effect=AssertionError("404 decoded")):
+            await self.assert_favicon_error("https://example.org/one", "favicon_not_found")
+            await self.assert_favicon_error("http://example.org/other", "favicon_not_found")
+            self.assertEqual(len(self.hits), 1)
+            now = time.time()
+            with patch.object(rich_media.time, "time", return_value=now + rich_media.FAILURE_AGE + 1):
+                await self.assert_favicon_error("https://example.org/next", "favicon_not_found")
+        self.assertEqual(len(self.hits), 2)
+
+    async def test_favicon_success_persists_30_days_and_failure_categories_cache(self):
+        async def icon(request):
+            return web.Response(body=image_bytes())
+
+        self.handlers["s2/favicons"] = icon
+        result = await self.proxy.get_favicon("https://example.org")
+        await self.proxy.aclose()
+        self.proxy = ImageProxy(MediaCache(self.cache_root))
+        self.assertEqual(await self.proxy.get_favicon("https://example.org/again"), result)
+        self.assertEqual(len(self.hits), 1)
+        now = time.time()
+        with patch.object(rich_media.time, "time", return_value=now + rich_media.CACHE_AGE + 1):
+            await self.proxy.get_favicon("https://example.org/new")
+        self.assertEqual(len(self.hits), 2)
+
+        async def unavailable(request):
+            return web.Response(status=503)
+
+        self.handlers["s2/favicons"] = unavailable
+        await self.assert_favicon_error("https://failure.example", "media_unavailable")
+        await self.assert_favicon_error("https://failure.example/else", "media_unavailable")
+        self.assertEqual(len(self.hits), 3)
+
+    async def test_favicon_ico_is_cached_failure(self):
+        async def unsupported(request):
+            return web.Response(body=image_bytes("ICO", size=(32, 32)),
+                                content_type="image/x-icon")
+
+        self.handlers["s2/favicons"] = unsupported
+        await self.assert_favicon_error("https://icons.example", "unsupported_media")
+        await self.assert_favicon_error("http://icons.example/other", "unsupported_media")
+        self.assertEqual(len(self.hits), 1)
+
+    async def test_favicon_redirect_limit_is_four_real_sends(self):
+        async def redirect(request):
+            hop = int(request.path.rsplit("/", 1)[-1]) if request.path.startswith("/hop/") else 0
+            return web.Response(status=302, headers={"Location": f"/hop/{hop + 1}"})
+
+        self.handlers["s2/favicons"] = redirect
+        for hop in range(1, 4):
+            self.handlers[f"hop/{hop}"] = redirect
+        await self.assert_favicon_error("https://redirect.example", "media_redirect")
+        self.assertEqual([hit[0] for hit in self.hits],
+                         ["s2/favicons", "hop/1", "hop/2", "hop/3"])
+
+    async def test_favicon_redirect_to_gstatic_revalidates_and_rejects_private(self):
+        async def redirect(request):
+            return web.Response(status=302, headers={
+                "Location": "https://favicon.gstatic.com/icon.png"})
+
+        async def icon(request):
+            return web.Response(body=image_bytes())
+
+        self.handlers.update({"s2/favicons": redirect, "icon.png": icon})
+        result = await self.proxy.get_favicon("https://example.org")
+        self.assertEqual(result.width, 12)
+        self.assertEqual([call[0] for call in self.dns_calls],
+                         ["www.google.com", "favicon.gstatic.com"])
+        self.assertEqual(self.connections, ["8.8.8.8", "8.8.8.8"])
+
+        async def private_redirect(request):
+            return web.Response(status=302, headers={"Location": "https://127.0.0.1/private"})
+
+        self.handlers["s2/favicons"] = private_redirect
+        await self.assert_favicon_error("https://other.example", "unsafe_media_address")
+        self.assertEqual([hit[0] for hit in self.hits],
+                         ["s2/favicons", "icon.png", "s2/favicons"])
+
+    async def test_favicon_singleflight_and_cancelled_job_is_not_cached(self):
+        async def pending(request):
+            self.started.set()
+            await self.release.wait()
+            return web.Response(body=image_bytes())
+
+        self.handlers["s2/favicons"] = pending
+        first = asyncio.create_task(self.proxy.get_favicon("https://same.example/one"))
+        second = asyncio.create_task(self.proxy.get_favicon("http://same.example/two"))
+        await asyncio.wait_for(self.started.wait(), 2)
+        self.assertEqual(len(self.hits), 1)
+        first.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        self.release.set()
+        self.assertEqual((await second).width, 12)
+        self.started.clear()
+        self.release.clear()
+        third = asyncio.create_task(self.proxy.get_favicon("https://cancel.example"))
+        await asyncio.wait_for(self.started.wait(), 2)
+        third.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await third
+        self.assertIsNone(self.proxy.cache.get(rich_media._favicon_cache_key("cancel.example")))
+
+    async def test_favicon_rejects_ambiguous_hosts_without_source_dns(self):
+        for url in ("file:///etc/passwd", "https://example.com:bad/",
+                    "https://example..com/", "https://exa%6dple.com/",
+                    "https://foo@bar@baz.example/"):
+            with self.subTest(url=url):
+                await self.assert_favicon_error(url, "invalid_media_url")
+        self.assertEqual(self.dns_calls, [])
 
     async def test_decoder_process_is_killed_on_cancellation(self):
         original = asyncio.create_subprocess_exec

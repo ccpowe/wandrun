@@ -75,7 +75,7 @@ function HomeScreen({ session }: { session: NonNullable<ReturnType<typeof useSes
       {loaded && onHome.length === 0 ? (
         <EmptyState
           title={agents.length === 0 ? t("还没有 Agent") : t("首页没有 Agent")}
-          description={agents.length > 0 ? t("在“全部 Agent”中可放回首页。") : undefined}
+          description={agents.length > 0 ? t("可从“全部 Agent”放回首页。") : undefined}
         >
           {agents.length > 0 && (
             <Button variant="outline" className="min-w-[200px]" onPress={() => router.push("/agents")}>

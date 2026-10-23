@@ -1,6 +1,8 @@
 """Run actual App renderers with RN Web layout; no device or existing service is used."""
 
 import asyncio
+import base64
+import io
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,7 @@ from urllib.request import Request, urlopen
 
 from wandrun.integrations.browser_dev import ChromeDev
 from wandrun.runtime.browser_cdp import CDPSocket
+from PIL import Image
 
 
 async def measure(cdp_url, url):
@@ -62,6 +65,43 @@ async def measure(cdp_url, url):
                 if "exceptionDetails" in result:
                     raise AssertionError(result["exceptionDetails"])
                 results.append(result["result"]["value"])
+        for kind in ("link-grid", "link-card", "link-stack", "link-mixed", "link-list"):
+            for width in (328, 358, 640):
+                result = await client.call("Runtime.evaluate", {
+                    "expression": f"runLinkLayout({json.dumps(kind)}, {width})",
+                    "awaitPromise": True, "returnByValue": True,
+                }, timeout=20)
+                if "exceptionDetails" in result:
+                    raise AssertionError(result["exceptionDetails"])
+                results.append(result["result"]["value"])
+        for width in (104, 114, 180, 358):
+            result = await client.call("Runtime.evaluate", {
+                "expression": f"runLinkTitleLayout({width})",
+                "awaitPromise": True, "returnByValue": True,
+            }, timeout=20)
+            if "exceptionDetails" in result:
+                raise AssertionError(result["exceptionDetails"])
+            results.append(result["result"]["value"])
+        result = await client.call("Runtime.evaluate", {
+            "expression": "runLinkThumbnailLayout()", "awaitPromise": True, "returnByValue": True,
+        }, timeout=20)
+        if "exceptionDetails" in result:
+            raise AssertionError(result["exceptionDetails"])
+        thumbnails = result["result"]["value"]
+        capture = await client.call("Page.captureScreenshot", {"format": "png"})
+        with Image.open(io.BytesIO(base64.b64decode(capture["data"]))) as screenshot:
+            pixels = screenshot.convert("RGBA")
+            thumbnails["explicitEdgeColors"] = [list(pixels.getpixel((round(point["x"]), round(point["y"]))))
+                                                for point in thumbnails.pop("explicitSamples")]
+        results.append(thumbnails)
+        for width, lines in [(320, 4), (390, 4), (320, 80)]:
+            result = await client.call("Runtime.evaluate", {
+                "expression": f"runChatCodeLayout({width}, {lines})",
+                "awaitPromise": True, "returnByValue": True,
+            }, timeout=20)
+            if "exceptionDetails" in result:
+                raise AssertionError(result["exceptionDetails"])
+            results.append(result["result"]["value"])
         return results
     finally:
         await client.close()
@@ -78,9 +118,37 @@ def main():
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
     bundle = f"http://127.0.0.1:{port}/test/fixtures/rich-layout.web.bundle?platform=web&dev=true&hot=false&lazy=false"
+    thumbnails = {}
+    output = io.BytesIO()
+    Image.new("RGB", (128, 128), (200, 40, 40)).save(output, format="PNG")
+    thumbnails["/conversations/thumbnails/messages/7/media/1/one/0"] = (output.getvalue(), 128, 128)
+    default_icon = (output.getvalue(), 128, 128)
+    wide = Image.new("RGB", (300, 100), (40, 200, 40))
+    wide.paste((200, 40, 40), (0, 0, 100, 100))
+    wide.paste((40, 60, 200), (200, 0, 300, 100))
+    output = io.BytesIO()
+    wide.save(output, format="PNG")
+    thumbnails["/conversations/thumbnails/messages/7/media/1/two/0"] = (output.getvalue(), 300, 100)
 
     class Page(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/conversations/"):
+                path = self.path.removesuffix("/content")
+                authorized = self.headers.get("Authorization") == "Bearer thumbnail-test"
+                thumbnail = thumbnails.get(path) if authorized else None
+                # Metadata denial must win even if subsequent content bytes are available.
+                if authorized and self.path == "/conversations/thumbnails/messages/7/media/1/missing/0/content":
+                    thumbnail = default_icon
+                image = thumbnail[0] if thumbnail else None
+                self.send_response(200 if image else 404 if authorized else 401)
+                self.send_header("Content-Type", "image/png" if image and self.path.endswith("/content") else "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(image if image and self.path.endswith("/content") else json.dumps(
+                    {"mime": "image/png", "width": thumbnail[1], "height": thumbnail[2]} if thumbnail else
+                    {"error": {"code": "favicon_not_found", "message": "Website icon unavailable"}},
+                ).encode())
+                return
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()

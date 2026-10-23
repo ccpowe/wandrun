@@ -62,6 +62,7 @@ declare global {
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const exportsAsHosts = (names: string[]) => names.map((name) => `export const ${name} = '${name}';`).join('\n');
 const hosts: Record<string, string> = {
+  '@/components/chat/drawer-horizontal-gesture.tsx': 'export const DrawerHorizontalGesture=({children})=>children;',
   'react-native': `${exportsAsHosts(['View', 'Pressable', 'ScrollView'])}
     export const Platform = { OS: 'android' };
     export const useWindowDimensions = () => ({ fontScale: 1 });
@@ -73,8 +74,9 @@ const hosts: Record<string, string> = {
   '@react-native-community/datetimepicker': "export default 'DateTimePicker'; export const DateTimePickerAndroid = {};",
   '@rn-primitives/select': exportsAsHosts(['Item', 'ItemText', 'ItemIndicator']),
   'uniwind': 'export const useCSSVariable = () => [];',
-  'lucide-react-native': exportsAsHosts(['CalendarDays', 'Check', 'ChevronDown', 'ChevronUp', 'ExternalLink', 'Info', 'CircleCheck', 'TriangleAlert', 'CircleAlert', 'X']),
-  './media.tsx': exportsAsHosts(['MediaCard', 'MediaGallery', 'MediaPicture']),
+  'lucide-react-native': exportsAsHosts(['CalendarDays', 'Check', 'ChevronDown', 'ChevronUp', 'ExternalLink', 'ArrowUpRight', 'Info', 'CircleCheck', 'TriangleAlert', 'CircleAlert', 'X']),
+  './media.tsx': exportsAsHosts(['MediaCard', 'MediaGallery', 'MediaPicture', 'LinkThumbnail']),
+  './file-tree.tsx': exportsAsHosts(['FileTreeDisplay']),
   './mermaid.tsx': exportsAsHosts(['MermaidPicture']),
   './math.tsx': "export const RichText = 'Text'; export const RichMath = 'Math';",
   './icons.tsx': 'export const richIcons = {};',

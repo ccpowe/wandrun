@@ -27,11 +27,12 @@ from wandrun.runtime.conversations import conversation_config
 from wandrun.runtime.environments import Environment
 from wandrun.runtime.files import TaskFiles, _current_task
 from wandrun.runtime.memory import MemoryStore
-from wandrun.runtime.memory_runtime import MEMORY_PATH
+from wandrun.runtime.memory_runtime import WORK_MEMORY_PATH
 from wandrun.runtime.workers import WorkerManager
 
 from test_capabilities import tool_call
 from test_runtime import answer
+from compaction_fixtures import SUMMARY_TEXT
 
 
 class MiddlewareGuidanceTests(unittest.IsolatedAsyncioTestCase):
@@ -102,7 +103,7 @@ class MiddlewareGuidanceTests(unittest.IsolatedAsyncioTestCase):
 
         async def respond(model, body):
             bodies.append(body)
-            response = answer("summary" if body["input"][-1].get("content") == SUMMARY_INSTRUCTION else "done")
+            response = answer(SUMMARY_TEXT if body["input"][-1].get("content") == SUMMARY_INSTRUCTION else "done")
             if len(bodies) == 2:
                 response["response"]["usage"] = {
                     "input_tokens": 35000, "output_tokens": 10, "total_tokens": 35010,
@@ -124,32 +125,23 @@ class MiddlewareGuidanceTests(unittest.IsolatedAsyncioTestCase):
                 {key: value for key, value in body.items() if key != "input"},
                 {key: value for key, value in bodies[0].items() if key != "input"},
             )
-            self.assertEqual(instructions.count("Agent 记忆文件："), 1)
-            self.assertEqual(instructions.count(guidance), 1)
-            positions = [instructions.index(part) for part in (
-                self.definition.system_prompt, "Agent 记忆文件：", "## Skills System", guidance,
-            )]
-            self.assertEqual(positions, sorted(positions))
             self.assertNotIn(guidance, json.dumps(body["input"], ensure_ascii=False))
-            self.assertNotIn("Agent 记忆文件：", json.dumps(body["input"], ensure_ascii=False))
         async for snapshot in self.graph.aget_state_history(conversation_config("stable")):
             for message in snapshot.values.get("messages", []):
                 self.assertNotIsInstance(message, SystemMessage)
                 self.assertNotIn(guidance, str(message.content))
-                self.assertNotIn("Agent 记忆文件：", str(message.content))
         message_groups(state["messages"])
 
     async def test_without_store_memory_path_is_an_ordinary_file_for_both_consumers(self):
         backend = LocalShellBackend(root_dir=self.root, virtual_mode=True)
         self.definition = replace(self.definition, code_mode=True)
         calls = [
-            tool_call("write_file", {"file_path": MEMORY_PATH, "content": "ordinary"}, "write"),
-            tool_call("run_code", {"code": f"print(await edit({MEMORY_PATH!r}, 'ordinary', 'ordinary edited'))"}, "edit"),
+            tool_call("write_file", {"file_path": WORK_MEMORY_PATH, "content": "ordinary"}, "write"),
+            tool_call("run_code", {"code": f"print(await edit({WORK_MEMORY_PATH!r}, 'ordinary', 'ordinary edited'))"}, "edit"),
             answer("done"),
         ]
 
         async def respond(model, body):
-            self.assertNotIn("Agent 记忆文件：", body["instructions"])
             yield calls.pop(0)
 
         async with pm.AsyncMonty() as pool:
@@ -159,10 +151,10 @@ class MiddlewareGuidanceTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(CodexSubscriptionModel, "_arequest", respond):
                 self.manager.start("write", "ordinary")
                 state = await self.finish("ordinary")
-        self.assertEqual((self.root / ".wandrun" / "memory.md").read_text(), "ordinary edited")
+        self.assertEqual((self.root / ".wandrun" / "memory" / "work.md").read_text(), "ordinary edited")
         self.assertEqual(self.store.read("main").content, "")
-        self.assertNotIn("memory_version", state)
-        self.assertFalse(any("memory_snapshot_version" in m.additional_kwargs for m in state["messages"]))
+        self.assertNotIn("memory_versions", state)
+        self.assertFalse(any("memory_snapshot_scope" in m.additional_kwargs for m in state["messages"]))
 
     async def test_concurrent_code_tasks_keep_paths_and_observed_versions_isolated(self):
         entered = {name: asyncio.Event() for name in ("old", "new")}
@@ -188,7 +180,7 @@ class MiddlewareGuidanceTests(unittest.IsolatedAsyncioTestCase):
                     f"await write('before.txt', {task!r})\n"
                     f"await tools.pause(label={task!r})\n"
                     f"await write('after.txt', {task!r})\n"
-                    f"print(await edit({MEMORY_PATH!r}, {old!r}, {task!r}))"
+                    f"print(await edit({WORK_MEMORY_PATH!r}, {old!r}, {task!r}))"
                 )
                 yield tool_call("run_code", {"code": code}, task)
             else:

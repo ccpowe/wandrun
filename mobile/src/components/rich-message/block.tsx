@@ -54,7 +54,7 @@ function RenderableBlock({ spec, submission, onSubmit, draft: owner, imageFiles,
     elements: Object.fromEntries(Object.entries(spec.elements).map(([id, node]) =>
       node.type === 'Grid'
         ? [id, { ...node, props: { ...node.props, __minimumWidth: gridMinimumWidth(spec.elements, id) } }]
-        : ['Image', 'MediaCard', 'Gallery', 'Mermaid'].includes(node.type)
+        : ['Image', 'MediaCard', 'Gallery', 'Mermaid', 'LinkCard'].includes(node.type)
           ? [id, { ...node, props: { ...node.props, __mediaId: id } }] : [id, node])),
   }), [spec]);
 

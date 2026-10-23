@@ -38,7 +38,7 @@ const DraftMarkdownRun = memo(function DraftMarkdownRun({ prefixTokens, tailToke
   const projectedParts = useMemo(() => joinTextParts(stableProjection, tailProjection),
     [stableProjection, tailProjection]);
   if (!projectedParts.length) return null;
-  return <AgentMemoryMarkdown content=" " projectedParts={projectedParts} readOnly />;
+  return <AgentMemoryMarkdown content=" " projectedParts={projectedParts} readOnly scrollCodeBlocks />;
 });
 
 type DraftRun = { kind: 'markdown'; parts: DraftPart[]; index: number } |
@@ -100,7 +100,7 @@ export function DraftMessageContent({ text, interrupted = false }: { text: strin
         {run.kind === 'mermaid' ? t('流程图生成中') : interrupted ? t('界面未完成') : t('界面生成中')}
       </Text>)}
     {document.parsed.tail.length
-      ? <AgentMemoryMarkdown content=" " projectedParts={groupSelectableMarkdown(document.parsed.tail)} readOnly />
+      ? <AgentMemoryMarkdown content=" " projectedParts={groupSelectableMarkdown(document.parsed.tail)} readOnly scrollCodeBlocks />
       : null}
   </View>;
 }

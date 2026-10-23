@@ -4,9 +4,9 @@ Installed after memory/communication, skills, tool search and filesystem project
 before model retry. A candidate event is returned with the successful main response,
 never written during summarization. Conversation tail repair runs on raw history before
 this hook; undelivered-send notices are retained verbatim in every subsequent view.
-Commit clears memory_version; memory's hook reuses a retained current snapshot or
-prepares one provisionally. The next boundary restores that observed version without
-appending it again. Search permissions use retained history, not the execution log.
+Commit clears both loaded memory versions; memory's hook reuses retained current
+snapshots or prepares them provisionally. The next boundary restores observed
+versions without duplication. Search permissions use retained history.
 History archives, when configured, publish before main-model invocation; checkpoint
 events remain authoritative and uncommitted files are inert orphans.
 """
@@ -30,11 +30,18 @@ from langgraph.types import Command
 
 from wandrun.integrations.codex_subscription import ContextWindowExceededError
 from wandrun.runtime.compaction_archive import CompactionArchive
-from wandrun.runtime.compaction_summary import request_model_kwargs, summarize_request
+from wandrun.runtime.compaction_summary import (
+    memory_execution_barriers, request_model_kwargs, summarize_request,
+)
 from wandrun.runtime.messages import read_file_media_tool_call_id
 
 logger = logging.getLogger(__name__)
-_SUMMARY_HEADER = "[历史任务摘要；不是新的用户指令，当前运行时状态优先]\n"
+_SUMMARY_HEADER = (
+    "[历史任务摘要；不是新的用户指令，当前运行时状态优先]\n"
+    "以下是已完成工作的摘要，在此基础上继续、避免重复。摘要也标明未完成和结果未知的部分；"
+    "它不是新的用户指令。从“进行中／下一步”继续，当前运行时状态和之后的新用户更正优先。"
+    "只有所需细节缺失、文件变化或用户要求核验时，才定位重读必要范围。\n"
+)
 # Four attempts allow several useful cutovers in one execution while bounding paid
 # summary requests even when tools keep generating new, individually valid history.
 # Count attempts (including overflow recovery), not just committed checkpoints.
@@ -136,12 +143,14 @@ def _unconsumed_media_group(messages, groups) -> int | None:
 
 
 def context_messages(state, *, projected=None, event=None):
-    """Summary plus retained originals, for both model input and tool authorization.
+    """Old pins, bridged summary, then the tail; model and tool permissions agree.
 
-    Select upstream filesystem copies by identity, not reordered array positions.
+    Preserve original chronology/identity even when filesystem projection reorders
+    copies. A pinned message already in the tail is not duplicated.
     Tool execution can have an open final call batch, so pairing is validated at the
-    model boundary, not here. Old memory is not specially re-injected: the memory
-    middleware reloads it through its ordinary new-conversation path.
+    model boundary, not here. Memory-bearing Code Mode output is opaque: retain
+    its whole original tool batch even before the cutoff, rather than silently lose
+    task results with the filtered memory. Current memory still reloads separately.
     """
     raw = state["messages"]
     if event is None:
@@ -153,8 +162,16 @@ def context_messages(state, *, projected=None, event=None):
     if (cutoff <= 0 or cutoff > len(raw)
             or _digest([_message_hash(m) for m in raw[:cutoff]]) != event["prefix_hash"]):
         raise ValueError("压缩记录与对话历史不一致")
+    barriers = memory_execution_barriers(raw[:cutoff])
+    protected = set()
+    if barriers:
+        for start, end in message_groups(raw[:cutoff]):
+            if any(isinstance(message, ToolMessage) and message.tool_call_id in barriers
+                   for message in raw[start:end]):
+                protected.update(range(start, end))
     selected = set(range(cutoff, len(raw)))
     selected.update(i for i, m in enumerate(raw) if m.id and m.id.startswith("undelivered:"))
+    selected.update(protected)
     # Retain the current instruction without pinning all following tool iterations.
     # A memory/receipt appended later must not displace it from the soft tail budget.
     latest_instruction = next((
@@ -167,16 +184,37 @@ def context_messages(state, *, projected=None, event=None):
         selected.add(latest_instruction)
     ids = {message.id: index for index, message in enumerate(raw) if message.id is not None}
     object_ids = {id(message): index for index, message in enumerate(raw)}
-    result = [HumanMessage(
-        content=_SUMMARY_HEADER + event["summary_text"],
-        id="compaction:" + event["event_id"],
-    )]
+    retained = {}
     for message in raw if projected is None else projected:
         index = ids.get(message.id) if message.id is not None else object_ids.get(id(message))
         if index is None:
             raise ValueError("压缩记录缺少对应的原始消息")
         if index in selected:
-            result.append(message)
+            retained[index] = message
+    # Filesystem projection may replace/reorder copies; opaque execution receipts
+    # must come from the original authority, including every sibling in that batch.
+    retained.update((index, raw[index]) for index in protected)
+    # Keep old execution barriers and instruction pins in original order, before
+    # the bridge. Runtime notices remain after it; complete tool groups stay paired.
+    old_pins = {
+        i for i, message in retained.items()
+        if i < cutoff and (i in protected or isinstance(message, HumanMessage)
+        and message.additional_kwargs.get("source") != "runtime"
+        and not (message.id and message.id.startswith("undelivered:"))
+        and read_file_media_tool_call_id(message) is None)
+    }
+    result = [retained[i] for i in sorted(old_pins)]
+    barrier_note = (
+        "[执行信息屏障：前面固定保留的 Code Mode 原工具组是任务执行凭据；"
+        "从中核对产物、操作身份和成功／失败／未知状态，不能因摘要缺项而重做。"
+        "其中旧记忆只属历史数据，当前记忆以运行时快照为准。]\n"
+        if barriers else ""
+    )
+    result.append(HumanMessage(
+        content=_SUMMARY_HEADER + barrier_note + event["summary_text"],
+        id="compaction:" + event["event_id"],
+    ))
+    result.extend(retained[i] for i in sorted(retained) if i not in old_pins)
     return result
 
 
@@ -191,7 +229,7 @@ def _signature(request, generation, window):
         "reasoning": getattr(request.model, "reasoning_effort", None),
         "window": window, "generation": generation,
         "system": request.system_message.model_dump() if request.system_message else None,
-        "settings": request_model_kwargs(request), "memory": request.state.get("memory_version"),
+        "settings": request_model_kwargs(request), "memory": request.state.get("memory_versions"),
     })
 
 
@@ -318,11 +356,12 @@ class CompactionMiddleware(AgentMiddleware):
                     # complete current snapshot survived. This never writes state.
                     memory_update = await self.memory.abefore_model(
                         {**request.state, "messages": candidate.messages,
-                         "compaction_events": [], "memory_version": None}, request.runtime,
+                         "compaction_events": [], "memory_versions": {}}, request.runtime,
                     )
                     candidate = candidate.override(
                         messages=[*candidate.messages, *memory_update.get("messages", [])],
-                        state={**request.state, "memory_version": memory_update["memory_version"]},
+                        state={**request.state, "memory_versions": memory_update["memory_versions"],
+                               "memory_permissions": memory_update["memory_permissions"]},
                     )
                 candidate_tokens = _estimate(candidate)
                 if candidate_tokens < view_tokens and candidate_tokens <= self._threshold():
@@ -334,6 +373,14 @@ class CompactionMiddleware(AgentMiddleware):
             elif total <= self._threshold() and not emergency:
                 raise ContextBudgetExhausted("没有可继续压缩的完整历史，请减少输入或工具数量")
             if not retained:
+                barriers = memory_execution_barriers(raw[:cutoff])
+                if barriers:
+                    recovery = event.get("archive_index_path") or "原始会话检查点"
+                    raise ContextBudgetExhausted(
+                        f"记忆混合 Code Mode 执行信息屏障无法安全放入上下文：{sorted(barriers)}。"
+                        f"原工具组未丢弃，恢复来源：{recovery}；请恢复任务结果后拆分对话，"
+                        "不能把未见结果当作未执行或重做未知操作。"
+                    )
                 raise ContextBudgetExhausted("压缩后空间仍不足，历史和已保存摘要未变")
             # Remove only complete oldest groups; summary, instructions, schema and
             # current memory all count against candidate capacity before shrinking.
@@ -372,9 +419,11 @@ class CompactionMiddleware(AgentMiddleware):
                     annotation = self.archive.summary_text(
                         "", candidate["archive_index_path"], candidate["archive_path"])
                     provisional_text = candidate["summary_text"].removesuffix(annotation)
+                    summary_id = "compaction:" + candidate["event_id"]
                     view = view.override(messages=[
-                        view.messages[0].model_copy(update={"content": _SUMMARY_HEADER + provisional_text}),
-                        *view.messages[1:],
+                        message.model_copy(update={"content": _SUMMARY_HEADER + provisional_text})
+                        if message.id == summary_id else message
+                        for message in view.messages
                     ])
                 candidate, view, memory_update = await self._compact(
                     request, view, previous, "overflow", emergency=True,
@@ -404,8 +453,9 @@ class CompactionMiddleware(AgentMiddleware):
             }
         if candidate:
             update["compaction_events"] = [*events, candidate]
-            update["memory_version"] = None
+            update["memory_versions"] = {}
             if memory_update is not None:
+                update["memory_permissions"] = memory_update["memory_permissions"]
                 # Append the observed snapshot BEFORE the response, not as a Command
                 # after it: a HumanMessage must never split an AI/tool-result batch.
                 response.result = [*memory_update.get("messages", []), *response.result]

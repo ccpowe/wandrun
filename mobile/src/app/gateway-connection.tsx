@@ -125,7 +125,7 @@ export default function GatewayConnection() {
           <Text className="text-lg font-semibold">{action === "rename" ? t("修改本地备注名") : t("断开{name}？", { name: selected ? displayName(selected) : t("这台电脑") })}</Text>
           {action === "rename"
             ? <Input testID="connection-local-name" value={name} onChangeText={setName} placeholder={selected?.computerName ?? t("电脑")} autoFocus />
-            : <Text className="text-sm leading-5 text-muted-foreground">{t("将请求这台电脑撤销本设备令牌，成功后从列表移除。要再次连接，需要在电脑上生成新配对码。")}</Text>}
+            : <Text className="text-sm leading-5 text-muted-foreground">{t("将请求电脑撤销本设备令牌，成功后移出列表。再次连接需在电脑上生成新配对码。")}</Text>}
           <View className="flex-row justify-end gap-3 pt-2">
             <Button testID="connection-cancel" variant="ghost" disabled={working} onPress={() => setAction(null)}><Text>{t("取消")}</Text></Button>
             <Button testID={action === "rename" ? "connection-rename-confirm" : "connection-disconnect-confirm"} variant="outline" disabled={working} onPress={() => void confirm()}><Text>{working ? t("请稍候…") : action === "rename" ? t("保存备注名") : t("断开电脑")}</Text></Button>

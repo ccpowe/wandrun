@@ -27,7 +27,7 @@ import { eventTimelines } from "./timelines.ts";
 import { networkDiagnostic } from "./network-diagnostics.ts";
 
 
-export type ConversationView = Conversation & {
+export type ConversationView = Omit<Conversation, "last_agent_seq"> & {
   /** 临时的“正在做什么”，状态离开 working 时清掉。 */
   activity: string | null;
   lastTextSeq: number;
@@ -121,9 +121,10 @@ export class ChatSession {
   readonly connectorDefinitionSeq = new Map<string, number>();
   memoryConnectionRevision = 0;
   private memoryResourceSeq = new Map<string, number>();
-  /** 单个 Agent 的资源版本；其他 Agent 改记忆不重拉本页。 */
-  memoryRevisionFor(id: string): number {
-    return this.memoryResourceSeq.get(id) ?? 0;
+  private profileMemorySeq = 0;
+  /** Profile invalidates every Agent's shared section; work only the named Agent. */
+  memoryRevisionFor(scope: "profile" | "work", id?: string): number {
+    return scope === "profile" ? this.profileMemorySeq : this.memoryResourceSeq.get(id ?? "") ?? 0;
   }
 
 
@@ -302,6 +303,7 @@ export class ChatSession {
     this.refreshConnectors();
     this.skillRevision++;
     this.memoryResourceSeq.clear();
+    this.profileMemorySeq = 0;
     this.scheduleSeq.clear();
     this.deletedScheduleIds.clear();
     this.scheduleRevision++;
@@ -425,6 +427,7 @@ export class ChatSession {
       this.deletedConnectorIds.clear();
       this.connectorDefinitionSeq.clear();
       this.memoryResourceSeq.clear();
+      this.profileMemorySeq = 0;
       this.connection = "stopped";
       this.notice = null;
       this.snapshotSeq = 0;
@@ -446,10 +449,9 @@ export class ChatSession {
     this.lastStatusSeq.clear();
     this.lastTitleSeq.clear();
     this.conversations = new Map(
-      conversations.filter((c) => !this.deleted.has(c.id)).map((c) => [
+      conversations.filter((c) => !this.deleted.has(c.id)).map(({ last_agent_seq, ...c }) => [
         c.id,
-        // 列表只说“有未读”，不给最后一条 Agent 消息的 seq；按 as_of_seq 估计，宁可多亮一会儿红点。
-        { ...c, activity: null, lastTextSeq: 0, lastActivityAt: null, lastAgentSeq: c.unread ? asOf : 0 },
+        { ...c, activity: null, lastTextSeq: 0, lastActivityAt: null, lastAgentSeq: last_agent_seq },
       ]),
     );
     for (const [id, conversation] of this.createdBeforeSnapshot) {
@@ -756,10 +758,12 @@ export class ChatSession {
       this.browserRevision++;
     }
     if (event.type === "takeover.ended") void this.refreshBrowserTasks();
-    if (event.type === "resource.changed" && event.data.kind === "memory" && typeof event.data.id === "string") {
-      const previous = this.memoryResourceSeq.get(event.data.id) ?? 0;
-      if (event.seq > previous) {
-        this.memoryResourceSeq.set(event.data.id, event.seq);
+    if (event.type === "resource.changed" && event.data.kind === "memory") {
+      if (event.data.scope === "profile") {
+        this.profileMemorySeq = Math.max(this.profileMemorySeq, event.seq);
+      } else if (event.data.scope === "work" && typeof event.data.id === "string") {
+        const previous = this.memoryResourceSeq.get(event.data.id) ?? 0;
+        if (event.seq > previous) this.memoryResourceSeq.set(event.data.id, event.seq);
       }
     }
     if (event.type === "resource.changed" && event.data.kind === "schedule" && typeof event.data.id === "string") {

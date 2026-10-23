@@ -11,7 +11,7 @@ Agents work on your machine with real files, shell and Chrome; you talk to them,
 
 English · [简体中文](README.zh-CN.md)
 
-<img src="docs/media/highlights.png" alt="Wandrun highlights: rich replies, agent teams, browser takeover, agent setup, ChatGPT subscription" />
+<img src="docs/media/highlights.png" alt="Wandrun highlights: rich interactive replies, parallel agent teams, browser takeover, agents you design, your ChatGPT subscription, shared profile and per-agent working memory" />
 
 </div>
 
@@ -29,7 +29,8 @@ and only asks you when it really needs a human — a login, a captcha, a decisio
 
 ## Highlights
 
-- **Rich, interactive replies** — agents answer with charts, tables, forms and cards mixed with text; your form submission becomes the next message.
+- **Updated chat interface** — a conversation drawer, revised message layout and a simpler composer.
+- **Rich, interactive replies** — charts, tables, forms, link lists and expandable file trees mixed with text; agents are guided to use components when they fit. Form submissions become the next message. Link icons are fetched by the gateway from Google s2 with only the hostname, not the page path or query.
 - **A team that works in parallel** — an agent can hand pieces of a task to other agents, keep working, and pull the results together. You see each member's progress live.
 - **A browser you can take over** — agents drive a real Chrome on your machine. Watch the page from your phone and take over for logins or captchas, then hand it back.
 - **Agents you design** — give each agent its own prompt, model, reasoning effort, skills, MCP connectors and team members, all from the app.
@@ -41,12 +42,14 @@ and only asks you when it really needs a human — a login, a captcha, a decisio
 
 - **Files both ways** — send photos, videos and documents with resumable uploads; agent output arrives as cards you can preview, download and share.
 - **Schedules** — one-off, daily, weekly or cron; each run opens a new conversation, and agents can schedule work for you.
-- **Memory** — each agent keeps a small, editable Markdown memory across conversations.
-- **Long conversations** — automatic context compaction; the original history stays on disk and can be looked up.
+- **Shared profile, separate working memory** — edit your shared profile in Settings → About you, and each agent's working memory on its profile page; both support a short Markdown index and on-demand details.
+- **Long conversations** — automatic context compaction now checks summary structure and length and carries completed work and next steps forward; original history stays on disk. Validation does not guarantee summary accuracy or prevent all repeated work.
 - **MCP & skills** — any MCP server (stdio or HTTP), searchable tool sets, Notion and GitHub OAuth from the phone, skills from `SKILL.md`.
 - **Code Mode** — agents can call many tools from one short script in a sandboxed interpreter.
 - **Image generation** — agents create images with your subscription and send them as attachments.
 - **Search, themes, languages** — search across agents, conversations, messages and files; light and dark themes; English and Chinese UI.
+- **Optional LangSmith tracing** — off by default; see [setup and privacy](docs/deploy.md#optional-langsmith-tracing) before enabling uploads of conversation, model and tool data.
+- **Evaluation** — a [Harbor adapter](src/wandrun/evaluation/harbor_agent.py) with opt-in LangSmith trace parenting, plus [gateway replay](src/wandrun/evaluation/memory_eval.py) and [memory evaluators](src/wandrun/evaluation/profile_evaluators.py) for dataset experiments. These are evaluation building blocks, not an app feature.
 
 ## How it works
 

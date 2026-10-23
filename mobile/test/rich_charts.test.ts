@@ -3,11 +3,11 @@ import { readFileSync } from 'node:fs';
 import { registerHooks } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
-import { act, createElement } from 'react';
+import React, { act, createContext, createElement, type Context } from 'react';
 import { createRoot } from 'test-renderer';
 import ts from 'typescript';
 import { chartValueAxis } from '../src/components/rich-message/chart-values.ts';
-import { richGeometry } from '../src/components/rich-message/tokens.ts';
+import { richGeometry, richSpace } from '../src/components/rich-message/tokens.ts';
 
 const stylesheet = readFileSync(new URL('../global.css', import.meta.url), 'utf8');
 const themes = (['light', 'dark'] as const).map((theme) => {
@@ -22,22 +22,35 @@ declare global {
   var __richChartVariables: (names: string[]) => (string | undefined)[];
   var IS_REACT_ACT_ENVIRONMENT: boolean;
   var __richChartFontScale: number;
+  var __richChartReact: typeof React;
+  var __richChartDrawerContext: Context<object | undefined>;
 }
+globalThis.__richChartReact = React;
+globalThis.__richChartDrawerContext = createContext<object | undefined>(undefined);
 globalThis.__richChartVariables = (names) => names.map((name) => currentTheme[name]);
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 globalThis.__richChartFontScale = 1;
 
 // Keep the actual chart component and value projection; substitute only platform hosts/hooks.
 const hosts: Record<string, string> = {
-  'react-native': `export const View = 'View'; export const Pressable = 'Pressable'; export const useWindowDimensions = () => ({fontScale: globalThis.__richChartFontScale});`,
+  'react-native': `export const View = 'View'; export const Pressable = 'Pressable'; export const ScrollView = 'ScrollView'; export const useWindowDimensions = () => ({fontScale: globalThis.__richChartFontScale});`,
   'react-native-svg': `export default 'Svg'; export const Circle = 'Circle'; export const Line = 'Line'; export const Rect = 'Rect';`,
   'react-native-gifted-charts': `export const LineChart = 'LineChart'; export const BarChart = 'BarChart'; export const PieChart = 'PieChart';`,
   'uniwind': `export const useCSSVariable = globalThis.__richChartVariables;`,
   './math.tsx': `export const RichText = 'Text';`,
+  'react-native-drawer-layout': `export const DrawerGestureContext = globalThis.__richChartDrawerContext;`,
+  'react-native-gesture-handler': `const React = globalThis.__richChartReact;
+    export const Gesture = { Native: () => ({
+      shouldCancelWhenOutside() { return this; }, disallowInterruption() { return this; }, blocksExternalGesture() { return this; }
+    }) };
+    export const GestureDetector = ({gesture, children}) => React.createElement('GestureDetector', {gesture}, children);`,
 };
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier in hosts) return { url: `data:text/javascript,${encodeURIComponent(hosts[specifier])}`, shortCircuit: true };
+    if (specifier === '@/components/chat/drawer-horizontal-gesture.tsx') {
+      return nextResolve(new URL('../src/components/chat/drawer-horizontal-gesture.tsx', import.meta.url).href, context);
+    }
     return nextResolve(specifier, context);
   },
   load(url, context, nextLoad) {
@@ -51,8 +64,104 @@ registerHooks({
   },
 });
 
+
 // Import after hook registration: static imports would load native-only chart dependencies before substitutes.
 const { RichLineChart, RichBarChart, RichPieChart } = await import('../src/components/rich-message/charts.tsx');
+
+test('chat bars scroll on the native outer surface without compressing marks or losing bar selection', async () => {
+  const root = createRoot({ textComponentTypes: ['Text'] });
+  const drawerPan = { id: 'drawer' };
+  try {
+    for (const count of [2, 12]) {
+      const labels = Array.from({ length: count }, (_, index) => `Bar ${index}`);
+      await act(async () => { root.render(createElement(globalThis.__richChartDrawerContext.Provider, { value: drawerPan },
+        createElement(RichBarChart, { props: { labels, values: labels.map((_, index) => index + 1) } }))); });
+      await act(async () => { root.container.queryAll(node => node.props.testID === 'rich-bar-chart')[0]
+        .props.onLayout({ nativeEvent: { layout: { width: 320 } } }); });
+      const scroll = root.container.queryAll(node => node.props.testID === 'rich-bar-scroll')[0];
+      const detector = root.container.queryAll(node => node.type === 'GestureDetector')[0];
+      const bar = root.container.queryAll(node => node.type === 'BarChart')[0];
+      assert.equal(detector.children[0], scroll, 'Native attaches to the real external ScrollView');
+      assert.equal(scroll.props.horizontal, true);
+      assert.equal(scroll.props.scrollEnabled, count === 12);
+      assert.equal(bar.props.disableScroll, true, 'Gifted must not have a competing internal scroll');
+      assert.ok(bar.props.barWidth >= richSpace.lg);
+      assert.ok(bar.props.spacing >= richSpace.md);
+      const content = scroll.children[0];
+      assert.ok(typeof content !== 'string');
+      assert.equal(content.props.style.width, bar.props.width + bar.props.yAxisLabelWidth + 1);
+      if (count === 12) assert.ok(bar.props.width + bar.props.yAxisLabelWidth + 1 > 320);
+      await act(async () => { bar.props.data[count - 1].onPress(); });
+      assert.equal(root.container.queryAll(node => node.props.testID === 'rich-chart-selected-value')[0].props.children,
+        `Bar ${count - 1}：${count}`);
+    }
+  } finally { await act(async () => { root.unmount(); }); }
+});
+
+test('bar overdraw stays inside the clipping scroll viewport without doubling top space', async () => {
+  const root = createRoot({ textComponentTypes: ['Text'] });
+  const positive = [12, 18, 25, 36, 28, 45, 31, 52, 43, 60, 65, 72];
+  try {
+    for (const fontScale of [1, 2]) {
+      globalThis.__richChartFontScale = fontScale;
+      for (const values of [positive, positive.map(value => -value), [-40, -10, 0, 20, 72]]) {
+        for (const drawer of [undefined, { id: 'drawer' }]) {
+          await act(async () => { root.render(createElement(globalThis.__richChartDrawerContext.Provider, { value: drawer },
+            createElement(RichBarChart, { props: { labels: values.map((_, i) => `Bar ${i}`), values } }))); });
+          await act(async () => { root.container.queryAll(node => node.props.testID === 'rich-bar-chart')[0]
+            .props.onLayout({ nativeEvent: { layout: { width: 320 } } }); });
+          const bar = root.container.queryAll(node => node.type === 'BarChart')[0];
+          const plot = root.container.queryAll(node => node.props.testID === 'rich-bar-plot')[0];
+          const outerTop = plot.props.style?.paddingTop ?? 0;
+          let insideTop = outerTop;
+          if (drawer) {
+            const scroll = root.container.queryAll(node => node.props.testID === 'rich-bar-scroll')[0];
+            insideTop = scroll.props.contentContainerStyle?.paddingTop ?? 0;
+            let ancestor = bar.parent;
+            for (; ancestor && ancestor !== scroll; ancestor = ancestor.parent) {
+              insideTop += ancestor.props.style?.paddingTop ?? 0;
+            }
+            assert.equal(ancestor, scroll, 'the chart must remain inside the scrolling touch surface');
+          }
+          // Gifted moves the first rules/labels wrapper up by half a section. Only space
+          // inside the clipping viewport protects that overdraw; this models layout, not font rasterization.
+          const firstRuleTop = insideTop - bar.props.stepHeight / 2;
+          assert.ok(firstRuleTop >= -1e-8,
+            `first rule is clipped at fontScale=${fontScale}, values=${values}, drawer=${!!drawer}: y=${firstRuleTop}`);
+          const totalTop = drawer ? outerTop + insideTop : outerTop;
+          assert.ok(Math.abs(totalTop - bar.props.stepHeight / 2) < 1e-8,
+            'relocate the existing reserve instead of adding it to both sides of the viewport');
+          assert.ok(Math.abs(bar.props.height + bar.props.negativeStepHeight * bar.props.noOfSectionsBelowXAxis
+            - richGeometry.chartHeight) < 1e-8, 'positive and below-zero sections retain one plot height');
+        }
+      }
+    }
+  } finally {
+    globalThis.__richChartFontScale = 1;
+    await act(async () => { root.unmount(); });
+  }
+});
+
+test('charts outside the drawer retain Gifted scrolling and line charts do not gain a gesture owner', async () => {
+  const root = createRoot({ textComponentTypes: ['Text'] });
+  try {
+    await act(async () => { root.render(createElement(RichBarChart, { props: {
+      labels: Array.from({ length: 12 }, (_, i) => String(i)), values: Array.from({ length: 12 }, (_, i) => i + 1),
+    } })); });
+    await act(async () => { root.container.queryAll(node => node.props.testID === 'rich-bar-chart')[0]
+      .props.onLayout({ nativeEvent: { layout: { width: 320 } } }); });
+    assert.equal(root.container.queryAll(node => node.props.testID === 'rich-bar-scroll').length, 0);
+    assert.equal(root.container.queryAll(node => node.type === 'BarChart')[0].props.disableScroll, undefined);
+    await act(async () => { root.render(createElement(globalThis.__richChartDrawerContext.Provider, { value: { id: 'drawer' } },
+      createElement(RichLineChart, { props: {
+        xLabels: ['a', 'b'], series: [{ name: 'Series', values: [1, 2] }],
+      } }))); });
+    await act(async () => { root.container.queryAll(node => node.props.testID === 'rich-line-chart')[0]
+      .props.onLayout({ nativeEvent: { layout: { width: 320 } } }); });
+    assert.equal(root.container.queryAll(node => node.type === 'LineChart')[0].props.disableScroll, true);
+    assert.equal(root.container.queryAll(node => node.type === 'GestureDetector').length, 0);
+  } finally { await act(async () => { root.unmount(); }); }
+});
 
 function contrast(a: string, b: string) {
   const luminance = (hex: string) => {

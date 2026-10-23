@@ -1,6 +1,7 @@
 import { Children, createContext, useContext, useId, useState } from 'react';
 import { Linking, Pressable, ScrollView, View, Platform, useWindowDimensions } from 'react-native';
 import type { MediaLocation, ImageItem } from './media.tsx';
+import { DrawerHorizontalGesture } from '@/components/chat/drawer-horizontal-gesture.tsx';
 import { MediaCard, MediaGallery, MediaPicture } from './media.tsx';
 import { MermaidPicture } from './mermaid.tsx';
 import SliderControl from '@react-native-community/slider';
@@ -10,7 +11,7 @@ import { defineRegistry, useStateStore } from '@json-render/react-native';
 import { schema } from '@json-render/react-native/schema';
 import * as SelectPrimitive from '@rn-primitives/select';
 import { useCSSVariable } from 'uniwind';
-import { CalendarDays, Check, ChevronDown, ChevronUp, ExternalLink, Info, CircleCheck, TriangleAlert, CircleAlert, X } from 'lucide-react-native';
+import { CalendarDays, Check, ChevronDown, ChevronUp, Info, CircleCheck, TriangleAlert, CircleAlert, X } from 'lucide-react-native';
 import type { GatewayApi } from '@/gateway/api.ts';
 import { useTranslation } from '../../lib/i18n.ts';
 import { sourceSite } from './source-site.ts';
@@ -33,6 +34,8 @@ import { Textarea } from '@/components/ui/textarea.tsx';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs.tsx';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group.tsx';
 import { richIcons } from './icons.tsx';
+import { FileTreeDisplay } from './file-tree.tsx';
+import { LinkCardDisplay, groupLinks } from './link-card.tsx';
 import { RichMath, RichText } from './math.tsx';
 import { useRichColors, type RichTone } from './semantic-colors.ts';
 import { RichBarChart, RichLineChart, RichPieChart } from './charts.tsx';
@@ -82,7 +85,8 @@ export const richCatalog = defineCatalog(schema, {
     Accordion: { props: componentSchemas.Accordion, slots: container, description: '本地展开的详情' },
     Grid: { props: componentSchemas.Grid, slots: container, description: '响应式等宽网格' },
     Source: { props: componentSchemas.Source, slots: leaf, description: '可展开横滑的网页来源卡片' },
-    LinkCard: { props: componentSchemas.LinkCard, slots: leaf, description: '网页链接卡片' },
+    LinkCard: { props: componentSchemas.LinkCard, slots: leaf, description: '网页链接列表项' },
+    FileTree: { props: componentSchemas.FileTree, slots: leaf, description: '目录结构' },
     Icon: { props: componentSchemas.Icon, slots: leaf, description: '受控图标' },
     List: { props: componentSchemas.List, slots: leaf, description: '有序或无序列表' },
     Callout: { props: componentSchemas.Callout, slots: leaf, description: '语义提示' },
@@ -107,7 +111,7 @@ function CardDisplay({ props, children }: { props: z.infer<typeof componentSchem
     style={{ gap: richSpace.lg, borderRadius: nested ? richRadius.medium : richRadius.large,
       paddingTop: richSpace.lg, paddingRight: richSpace.lg, paddingBottom: richSpace.lg, paddingLeft: richSpace.lg }}>
     {props.title ? <RichText style={richType.title}>{props.title}</RichText> : null}
-    <InsideRichCard.Provider value={true}>{children}</InsideRichCard.Provider>
+    <InsideRichCard.Provider value={true}>{groupLinks(children)}</InsideRichCard.Provider>
   </CardUI>;
 }
 
@@ -121,12 +125,12 @@ function RichTable({ columns, rows }: { columns: string[]; rows: TableCell[][] }
   const width = Math.max(80, available / columns.length);
   const cell = { width, paddingRight: richSpace.xs } as const;
   return <View onLayout={(event) => setAvailable(event.nativeEvent.layout.width)}>
-    {available > 0 ? <ScrollView horizontal showsHorizontalScrollIndicator={false}><View>
+    {available > 0 ? <DrawerHorizontalGesture><ScrollView horizontal showsHorizontalScrollIndicator={false}><View>
       <View className="flex-row">{columns.map((column, i) => <View key={i} style={cell}><Subtle>{column}</Subtle></View>)}</View>
       {rows.map((row, i) => <View key={i} className="border-border flex-row items-start border-t" style={{ paddingVertical: richSpace.sm }}>{row.map((value, j) => <View key={j} style={cell}>
         {typeof value === 'string' ? <Body>{value}</Body> : <View className="self-start"><StatusBadge {...value.badge} /></View>}
       </View>)}</View>)}
-    </View></ScrollView> : null}
+    </View></ScrollView></DrawerHorizontalGesture> : null}
   </View>;
 }
 function StatusBadge({ text, tone = 'neutral' }: { text: string; tone?: RichTone }) {
@@ -368,7 +372,7 @@ function TabsDisplay({ props, children }: { props: z.infer<typeof componentSchem
     </TabsTrigger>)}
   </TabsList>;
   return <Tabs value={active} onValueChange={setActive} style={{ gap: richSpace.md }}>
-    {scrollable ? <ScrollView horizontal showsHorizontalScrollIndicator={false}>{tabList}</ScrollView> : tabList}
+    {scrollable ? <DrawerHorizontalGesture><ScrollView horizontal showsHorizontalScrollIndicator={false}>{tabList}</ScrollView></DrawerHorizontalGesture> : tabList}
     {/* Primitive web Content drops forceMount; stable panels preserve nested local state on both platforms. */}
     {panels.map((panel, index) => <View key={index} role="tabpanel"
       nativeID={`${id}-panel-${index}`} aria-labelledby={`${id}-tab-${index}`}
@@ -392,7 +396,7 @@ function AccordionDisplay({ props, children }: { props: z.infer<typeof component
       </AccordionTrigger>
       <AccordionContent forceMount className="pb-0" style={{ display: open ? 'flex' : 'none' }}
         accessibilityElementsHidden={!open} importantForAccessibility={open ? 'auto' : 'no-hide-descendants'}>
-        <View style={{ paddingBottom: richSpace.lg }}>{children}</View>
+        <View style={{ paddingBottom: richSpace.lg }}>{groupLinks(children)}</View>
       </AccordionContent>
     </AccordionItem>
   </Accordion>;
@@ -415,7 +419,7 @@ function GridDisplay({ props, children }: { props: z.infer<typeof componentSchem
   // Reserve a pixel before flex growth: a measured fractional width can round down in Yoga.
   // A single wrapping parent keeps each cell's React ancestry unchanged when columns change.
   const basis = Math.max(0, Math.floor(width) - 1);
-  const cells = Children.toArray(children);
+  const cells = Children.toArray(groupLinks(children));
   return <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: richSpace.sm }}
     onLayout={(event) => setAvailable(event.nativeEvent.layout.width)}>
     {available > 0 && cells.map((cell, index) =>
@@ -469,7 +473,7 @@ function SourceDisplay({ props }: { props: z.infer<typeof componentSchemas.Sourc
       <UIText style={richType.subtle} className="text-muted-foreground">{t('来源 · {count}', { count: sources.length })}</UIText>
       <Icon as={expanded ? ChevronUp : ChevronDown} className="text-muted-foreground size-4" />
     </Pressable> : null}
-    {!multiple || expanded ? <ScrollView horizontal directionalLockEnabled showsHorizontalScrollIndicator={false}
+    {!multiple || expanded ? <DrawerHorizontalGesture><ScrollView horizontal directionalLockEnabled showsHorizontalScrollIndicator={false}
       testID="rich-source-rail" contentContainerStyle={{ gap: richSpace.sm }}
       style={{ flexGrow: 0, ...(Platform.OS === 'web' ? { touchAction: 'pan-x' as const, overscrollBehaviorX: 'contain' as const } : {}) }}>
       {sources.map((source, index) => <Pressable key={`${source.url}-${index}`} testID={`rich-source-${index}`}
@@ -491,25 +495,10 @@ function SourceDisplay({ props }: { props: z.infer<typeof componentSchemas.Sourc
           <UIText numberOfLines={1} className="text-muted-foreground" style={{ ...richType.caption, flexShrink: 1 }}>{source.host.replace(/^www\./, '')}</UIText>
         </View>
       </Pressable>)}
-    </ScrollView> : null}
+    </ScrollView></DrawerHorizontalGesture> : null}
   </View>;
 }
 
-function LinkCardDisplay({ props }: { props: z.infer<typeof componentSchemas.LinkCard> }) {
-  const host = new URL(props.url).hostname;
-  return <Pressable accessibilityRole="link" accessibilityLabel={`${props.title}，${host}`}
-    onPress={() => void Linking.openURL(props.url)} className="border-border bg-card border"
-    style={{ borderRadius: richRadius.medium, padding: richSpace.md }}>
-    <View pointerEvents="none" style={{ gap: richSpace.sm }}>
-      <View className="flex-row items-center justify-between" style={{ gap: richSpace.sm }}>
-        <RichText className="text-foreground flex-1" style={richType.title}>{props.title}</RichText>
-        <Icon as={ExternalLink} className="text-muted-foreground size-4" />
-      </View>
-      <Subtle>{host}</Subtle>
-      {props.description ? <Body>{props.description}</Body> : null}
-    </View>
-  </Pressable>;
-}
 
 function ListDisplay({ props }: { props: z.infer<typeof componentSchemas.List> }) {
   return <View style={{ gap: richSpace.sm }}>{props.items.map((item, index) => <View key={index} className="flex-row items-start" style={{ gap: richSpace.sm }}>
@@ -564,7 +553,7 @@ function MermaidNode({ props, elementId }: { props: z.infer<typeof componentSche
 export const { registry: richRegistry } = defineRegistry(richCatalog, {
   components: {
     Stack: ({ props, children }) => <View className={`${props.direction === 'horizontal' ? `flex-row flex-wrap items-center ${props.justify === 'between' ? 'justify-between' : ''}` : 'flex-col'}`}
-      style={{ gap: props.gap === 'sm' ? richSpace.sm : richSpace.md }}>{children}</View>,
+      style={{ gap: props.gap === 'sm' ? richSpace.sm : richSpace.md }}>{groupLinks(children)}</View>,
     Card: CardDisplay,
     Divider: () => <Separator style={{ marginVertical: richSpace.xs }} />,
     Heading: ({ props }) => <RichText style={richType.heading}>{props.text}</RichText>,
@@ -614,7 +603,12 @@ export const { registry: richRegistry } = defineRegistry(richCatalog, {
     Accordion: AccordionDisplay,
     Grid: GridDisplay,
     Source: SourceDisplay,
-    LinkCard: LinkCardDisplay,
+    LinkCard: ({ props }) => {
+      const owner = useContext(RichImageContext);
+      return <LinkCardDisplay props={props} api={owner.api}
+        location={locationFor(owner, (props as typeof props & { __mediaId: string }).__mediaId, 0, true)} />;
+    },
+    FileTree: FileTreeDisplay,
     Icon: ({ props }) => <View accessibilityLabel={props.label} accessible={!!props.label} className="self-start">
       <Icon as={richIcons[props.name as keyof typeof richIcons]} className="text-foreground"
         size={props.size === 'sm' ? 16 : props.size === 'lg' ? 24 : 20} />

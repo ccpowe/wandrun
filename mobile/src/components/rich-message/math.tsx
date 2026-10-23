@@ -28,7 +28,7 @@ function safeColor(value: unknown, fallback: string): string {
   return typeof value === 'string' && /^(#[0-9a-f]{3,8}|(?:rgb|hsl)a?\([\d\s,.%]+\))$/i.test(value) ? value : fallback;
 }
 
-type MathContentProps = { html: string; source: string; className?: string; style?: TextProps['style']; accessibilityLabel?: string; testID?: string; pointerEvents?: TextProps['pointerEvents'] };
+type MathContentProps = { html: string; source: string; className?: string; style?: TextProps['style']; accessibilityLabel?: string; testID?: string; pointerEvents?: TextProps['pointerEvents']; onManagedLink?: (href: string) => boolean };
 
 /** All formula entry points share visibility and a global four-frame budget.
  * Inactive blocks retain source and their measured height; no page is prepared.
@@ -69,7 +69,7 @@ export function MathContent(props: MathContentProps) {
 }
 
 /** One isolated offline renderer, mounted only while its outer owner has a permit. */
-function ActiveMathContent({ html, source, className, style, accessibilityLabel, pointerEvents, onFailure }: MathContentProps & { onFailure: () => void }) {
+function ActiveMathContent({ html, source, className, style, accessibilityLabel, pointerEvents, onManagedLink, onFailure }: MathContentProps & { onFailure: () => void }) {
   const { t } = useTranslation();
   const computerId = useSession()?.api.config.computerId ?? 'offline';
   const [foreground, mutedValue, borderValue] = useCSSVariable(['--color-foreground', '--color-muted', '--color-border']);
@@ -137,8 +137,9 @@ function ActiveMathContent({ html, source, className, style, accessibilityLabel,
         setReady(true);
       } else if (payload.kind === 'error') {
         setFailed(true);
-      } else if (payload.kind === 'link' && typeof payload.href === 'string' && safeWebLink(payload.href)) {
-        void Linking.openURL(payload.href);
+      } else if (payload.kind === 'link' && typeof payload.href === 'string') {
+        if (onManagedLink?.(payload.href)) return;
+        if (safeWebLink(payload.href)) void Linking.openURL(payload.href);
       }
     } catch { /* Untrusted bridge data has no effects. */ }
   }

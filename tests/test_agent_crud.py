@@ -546,8 +546,9 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         url = "/agents/main/memory"
         empty = (await self.client.get(url)).json()
         self.assertEqual(empty, {
-            "agent_id": "main", "content": "", "version": self.runtime.memory.read("main").version,
-            "updated_at": None, "updated_by": None, "limit": 1000,
+            "scope": "work", "agent_id": "main", "content": "",
+            "version": self.runtime.memory.read("main").version,
+            "details": {}, "updated_at": None, "updated_by": None, "limit": 1000,
         })
         invalid = [
             {}, {"content": None, "version": empty["version"]},
@@ -568,7 +569,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.get(url)).json(), saved)
         events = self.store.after(0)
         self.assertEqual([(e.type, e.data) for e in events], [
-            ("resource.changed", {"kind": "memory", "id": "main", "op": "updated"}),
+            ("resource.changed", {"kind": "memory", "scope": "work", "id": "main", "op": "updated"}),
         ])
         noop = await self.client.put(url, json={"content": saved["content"], "version": saved["version"]})
         self.assertEqual(noop.json(), saved)
@@ -582,17 +583,14 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((stale.status_code, stale.json()["error"]["code"]), (409, "memory_conflict"))
         self.assertEqual(stale.json()["error"]["details"]["current"], saved)
         self.assertEqual(self.store.last_seq(), events[-1].seq)
-        (self.runtime.memory.root / "main.md").write_text("外部更改", encoding="utf-8")
+        with patch.object(self.runtime.memory, "on_change", None):
+            direct = self.runtime.memory.save("main", "外部更改", saved["version"])
         external = (await self.client.get(url)).json()
         self.assertEqual((external["content"], external["updated_by"]), ("外部更改", "external"))
         conflicted = await self.client.put(url, json={"content": "不覆盖", "version": saved["version"]})
         self.assertEqual(conflicted.json()["error"]["details"]["current"], external)
         self.assertEqual(self.store.last_seq(), events[-1].seq)
-        (self.runtime.memory.root / "main.md").unlink()
-        missing_file = (await self.client.get(url)).json()
-        self.assertEqual((missing_file["content"], missing_file["updated_at"], missing_file["updated_by"]),
-                         ("", None, None))
-        self.assertEqual(self.store.last_seq(), events[-1].seq)
+        self.assertEqual(direct.version, external["version"])
         self.assertEqual((await self.client.get("/agents/missing/memory")).status_code, 404)
 
     async def test_agent_memory_callback_records_root_event_but_user_edits_do_not(self):
@@ -607,8 +605,10 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(event.type, event.data) for event in self.store.after(cursor)],
             [
-                ("resource.changed", {"kind": "memory", "id": "child", "op": "updated"}),
-                ("memory.updated", {"agent_id": "child", "version": first.version, "summary": "已记住"}),
+                ("resource.changed", {"kind": "memory", "scope": "work", "id": "child", "op": "updated"}),
+                ("memory.updated", {
+                    "scope": "work", "agent_id": "child", "version": first.version, "summary": "已记住",
+                }),
             ],
         )
         self.assertEqual(self.store.history(root)[-1].conversation_id, root)
@@ -620,7 +620,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(
             [(event.type, event.data) for event in self.store.after(cursor)],
-            [("resource.changed", {"kind": "memory", "id": "child", "op": "updated"})],
+            [("resource.changed", {"kind": "memory", "scope": "work", "id": "child", "op": "updated"})],
         )
         self.assertEqual((await self.client.get("/agents/child/memory")).json()["updated_by"], "user")
         clear = await self.client.put("/agents/child/memory", json={
@@ -628,18 +628,201 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual((clear.status_code, clear.json()["updated_by"], clear.json()["content"]),
                          (200, "user", ""))
-        (memory.root / "child.md").unlink()
-        self.assertIsNone((await self.client.get("/agents/child/memory")).json()["updated_by"])
+        self.assertEqual((await self.client.get("/agents/child/memory")).json()["updated_by"], "user")
+
+    async def test_profile_api_is_shared_and_reports_actual_root_writer(self):
+        profile_url = "/memory/profile"
+        empty = (await self.client.get(profile_url)).json()
+        self.assertEqual(empty, {
+            "scope": "profile", "content": "", "version": self.runtime.memory.read(None).version,
+            "details": {}, "updated_at": None, "updated_by": None, "limit": 1000,
+        })
+        work = (await self.client.get("/agents/child/memory")).json()
+        changed = await self.client.put(profile_url, json={
+            "content": "跨 Agent 偏好", "version": empty["version"],
+        })
+        self.assertEqual(changed.status_code, 200, changed.text)
+        profile = changed.json()
+        self.assertEqual(profile["updated_by"], "user")
+        self.assertNotIn("agent_id", profile)
+        self.assertEqual((await self.client.get(profile_url)).json(), profile)
+        self.assertEqual((await self.client.get("/agents/child/memory")).json(), work)
+        self.assertEqual([(e.type, e.data) for e in self.store.after(0)], [
+            ("resource.changed", {"kind": "memory", "scope": "profile", "op": "updated"}),
+        ])
+        stale = await self.client.put(profile_url, json={
+            "content": "旧覆盖", "version": empty["version"],
+        })
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.json()["error"]["details"]["current"], profile)
+        root = self.gateway.create_conversation("入口", "main")["id"]
+        self.gateway.send_message(root, "profile-root", "开始")
+        await self.runtime.workers.wait(root)
+        cursor = self.store.last_seq()
+        written = self.runtime.memory.save(None, "入口更新", profile["version"], task_id=root)
+        self.assertEqual([(e.type, e.data) for e in self.store.after(cursor)], [
+            ("resource.changed", {"kind": "memory", "scope": "profile", "op": "updated"}),
+            ("memory.updated", {
+                "scope": "profile", "agent_id": "main", "version": written.version,
+                "summary": "已记住",
+            }),
+        ])
+        self.assertEqual((await self.client.get(profile_url)).json()["updated_by"], "agent")
+
+    async def test_profile_a_b_a_rejects_old_cas_baseline(self):
+        url = "/memory/profile"
+        empty = (await self.client.get(url)).json()
+        first = (await self.client.put(url, json={
+            "content": "A", "version": empty["version"],
+        })).json()
+        second = (await self.client.put(url, json={
+            "content": "B", "version": first["version"],
+        })).json()
+        back = (await self.client.put(url, json={
+            "content": "A", "version": second["version"],
+        })).json()
+        self.assertNotEqual(back["version"], first["version"])
+        stale = await self.client.put(url, json={
+            "content": "旧编辑", "version": first["version"],
+        })
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.json()["error"]["details"]["current"], back)
+
+    async def test_detail_api_combines_index_publication_and_cas_in_both_scopes(self):
+        for identity, index_url, detail_url, scope in (
+            (None, "/memory/profile", "/memory/profile/details/tone", "profile"),
+            ("main", "/agents/main/memory", "/agents/main/memory/details/tone", "work"),
+        ):
+            with self.subTest(scope=scope):
+                empty = (await self.client.get(index_url)).json()
+                logical = f"/.wandrun/memory/{scope}/details/tone.md"
+                initial = f"偏好：[语气]({logical})"
+                cursor = self.store.last_seq()
+                no_index = await self.client.put(detail_url, json={
+                    "content": "保持简洁", "version": empty["version"],
+                })
+                self.assertEqual(no_index.status_code, 400)
+                self.assertEqual(self.store.last_seq(), cursor)
+                created = await self.client.put(detail_url, json={
+                    "content": "保持简洁", "version": empty["version"], "index_content": initial,
+                })
+                self.assertEqual(created.status_code, 200, created.text)
+                document = created.json()
+                self.assertEqual(document["scope"], scope)
+                self.assertEqual(len(self.store.after(cursor)), 1)
+                reference = document["details"]["tone"]
+                self.assertIn(reference["path"], document["content"])
+                self.assertNotIn(logical, document["content"])
+                detail = (await self.client.get(detail_url)).json()
+                self.assertEqual(detail, {
+                    "scope": scope, "slug": "tone", "content": "保持简洁",
+                    "sha256": reference["sha256"], "path": reference["path"],
+                    "version": document["version"], "limit": 65536,
+                    **({"agent_id": identity} if identity is not None else {}),
+                })
+                same = await self.client.put(detail_url, json={
+                    "content": "保持简洁", "version": document["version"],
+                })
+                self.assertEqual(same.json(), document)
+                self.assertEqual(len(self.store.after(cursor)), 1)
+                stale = await self.client.put(detail_url, json={
+                    "content": "旧编辑", "version": empty["version"],
+                })
+                self.assertEqual(stale.status_code, 409)
+                self.assertEqual(stale.json()["error"]["details"]["current"], document)
+                stale_delete = await self.client.request("DELETE", detail_url, json={
+                    "content": "", "version": empty["version"],
+                })
+                self.assertEqual(stale_delete.status_code, 409)
+                self.assertEqual(stale_delete.json()["error"]["details"]["current"], document)
+                changed = await self.client.put(detail_url, json={
+                    "content": "LF\r\n与 🤖", "version": document["version"],
+                })
+                self.assertEqual(changed.status_code, 200, changed.text)
+                newer = changed.json()
+                self.assertNotEqual(newer["version"], document["version"])
+                self.assertNotEqual(newer["details"]["tone"], reference)
+                self.assertEqual((await self.client.get(detail_url)).json()["content"], "LF\n与 🤖")
+                with self.assertRaisesRegex(ValueError, "失效"):
+                    self.runtime.memory.read_detail(identity, "tone", path=reference["path"])
+                still_referenced = await self.client.request("DELETE", detail_url, json={
+                    "content": newer["content"], "version": newer["version"],
+                })
+                self.assertEqual(still_referenced.status_code, 400)
+                deleted = await self.client.request("DELETE", detail_url, json={
+                    "content": "", "version": newer["version"],
+                })
+                self.assertEqual(deleted.status_code, 200, deleted.text)
+                self.assertEqual(deleted.json()["details"], {})
+                self.assertEqual((await self.client.get(detail_url)).status_code, 400)
+                before_noop = self.store.last_seq()
+                repeated = await self.client.request("DELETE", detail_url, json={
+                    "content": "", "version": deleted.json()["version"],
+                })
+                self.assertEqual(repeated.json(), deleted.json())
+                self.assertEqual(self.store.last_seq(), before_noop)
+
+    async def test_detail_api_rejects_invalid_input_and_preserves_document(self):
+        index = (await self.client.get("/memory/profile")).json()
+        url = "/memory/profile/details/tone"
+        for body in ({}, {"content": 1, "version": index["version"]}, {
+            "content": "x", "version": index["version"], "index_content": None,
+        }, {"content": "x", "version": "wrong", "index_content": "x"}):
+            self.assertEqual((await self.client.put(url, json=body)).status_code, 400)
+        oversized = await self.client.put(url, json={
+            "content": "中" * 21846, "version": index["version"],
+            "index_content": "/.wandrun/memory/profile/details/tone.md",
+        })
+        self.assertEqual(oversized.status_code, 400)
+        bad_slug = await self.client.put("/memory/profile/details/bad.slug", json={
+            "content": "x", "version": index["version"],
+            "index_content": "/.wandrun/memory/profile/details/bad.slug.md",
+        })
+        self.assertEqual(bad_slug.status_code, 400)
+        cross_scope = await self.client.put("/memory/profile", json={
+            "content": "/.wandrun/memory/work/details/tone/" + "0" * 64 + ".md",
+            "version": index["version"],
+        })
+        self.assertEqual(cross_scope.status_code, 400)
+        self.assertEqual((await self.client.get("/memory/profile")).json(), index)
+
+    async def test_detail_publication_failure_does_not_report_unpublished_success(self):
+        empty = (await self.client.get("/memory/profile")).json()
+        cursor = self.store.last_seq()
+        with patch.object(self.store, "record_memory_change", side_effect=OSError("event disk failed")):
+            failed = await self.client.put("/memory/profile/details/tone", json={
+                "content": "已发布", "version": empty["version"],
+                "index_content": "/.wandrun/memory/profile/details/tone.md",
+            })
+        self.assertEqual((failed.status_code, failed.json()["error"]["code"]), (503, "unavailable"))
+        published = self.runtime.memory.read(None)
+        self.assertIn("tone", published.details)
+        self.assertEqual(self.runtime.memory.read_detail(None, "tone").content, "已发布")
+        self.assertEqual(self.store.last_seq(), cursor)
+        self.assertIsInstance(self.gateway.failure, GatewayFailure)
+
+    async def test_detail_cleanup_failure_reports_partial_publication(self):
+        memory = self.runtime.memory
+        empty = (await self.client.get("/agents/main/memory")).json()
+        with patch.object(memory, "_cleanup", side_effect=OSError("unlink failed")):
+            failed = await self.client.put("/agents/main/memory/details/tone", json={
+                "content": "正文", "version": empty["version"],
+                "index_content": "/.wandrun/memory/work/details/tone.md",
+            })
+        self.assertEqual((failed.status_code, failed.json()["error"]["code"]), (503, "unavailable"))
+        self.assertIn("tone", memory.read("main").details)
+        self.assertEqual(len(self.store.after(0)), 1)
 
     async def test_invalid_external_memory_read_fails_closed(self):
         memory = self.runtime.memory
-        memory.root.mkdir(parents=True, exist_ok=True)
-        (memory.root / "main.md").write_bytes(b"\xff")
+        memory.save("main", "good", memory.read("main").version)
+        manifest = memory.root / "agents" / "main" / "current.json"
+        manifest.write_bytes(b"\xff")
         response = await self.client.get("/agents/main/memory")
         self.assertEqual((response.status_code, response.json()["error"]["code"]), (503, "unavailable"))
         self.assertIsInstance(self.gateway.failure.__cause__, MemoryReadError)
-        self.assertEqual((memory.root / "main.md").read_bytes(), b"\xff")
-        self.assertEqual(self.store.last_seq(), 0)
+        self.assertEqual(manifest.read_bytes(), b"\xff")
+        self.assertEqual(self.store.last_seq(), 1)
 
     async def test_memory_storage_and_post_save_metadata_failures_stop_gateway(self):
         with patch.object(self.runtime.memory, "read", side_effect=OSError("read failed")):
@@ -810,13 +993,24 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_memory_unlink_failure_keeps_delete_intent_and_retries_after_restart(self):
         memory = self.runtime.memory
-        saved = memory.save("main", "待清理", memory.read("main").version)
-        file = memory.root / "main.md"
+        work = await self.client.put("/agents/main/memory/details/note", json={
+            "content": "待清理", "version": memory.read("main").version,
+            "index_content": "/.wandrun/memory/work/details/note.md",
+        })
+        self.assertEqual(work.status_code, 200, work.text)
+        saved = memory.read("main")
+        profile_response = await self.client.put("/memory/profile/details/note", json={
+            "content": "保留画像", "version": memory.read(None).version,
+            "index_content": "/.wandrun/memory/profile/details/note.md",
+        })
+        self.assertEqual(profile_response.status_code, 200, profile_response.text)
+        profile = memory.read(None)
+        file = memory.root / "agents" / "main" / "current.json"
         with patch.object(memory, "delete", side_effect=OSError("unlink failed")):
             with self.assertRaises(GatewayFailure):
                 await self.gateway.delete_agent("main")
         self.assertTrue(self.store.agent_deleting("main"))
-        self.assertEqual(file.read_text(encoding="utf-8"), "待清理")
+        self.assertIn("note", file.read_text(encoding="utf-8"))
         with self.assertRaises(MemoryRetired):
             memory.save("main", "新任务", saved.version)
         await self.stack.aclose()
@@ -827,6 +1021,9 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         await self.gateway.resume_deletions()
         self.assertFalse(file.exists())
         self.assertIsNone(self.store.agent("main"))
+        self.assertEqual(self.runtime.memory.read(None).content, profile.content)
+        self.assertEqual(self.runtime.memory.read_detail(None, "note").content, "保留画像")
+        self.assertEqual(self.store.memory_author(None, profile.version), "user")
         self.assertIsNone(self.store.memory_author("main", saved.version))
         deleted = [
             event for event in self.store.after(0)
@@ -867,7 +1064,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
             await self.gateway.drain_deletions()
         self.assertIsNone(self.store.agent("main"))
         self.assertEqual(self.store.agent("child")["name"], "独立更新")
-        self.assertFalse((memory.root / "main.md").exists())
+        self.assertFalse((memory.root / "agents" / "main" / "current.json").exists())
 
     async def test_deleted_empty_catalog_is_not_reimported(self):
         # 桌面角色仍有独立保护；这里用单 Agent catalog 验证合法删空后的首次导入边界。

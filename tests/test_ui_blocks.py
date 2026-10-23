@@ -37,7 +37,8 @@ PROPS = {
     "Accordion": {"title": "细节"},
     "Grid": {"columns": 2},
     "Source": {"items": [{"url": "https://example.com/a"}, {"url": "https://www.iana.org/domains/reserved"}]},
-    "LinkCard": {"url": "https://example.com/a", "title": "原文"},
+    "LinkCard": {"url": "https://example.com/a", "title": "原文", "tags": ["网页"]},
+    "FileTree": {"nodes": [{"path": "src/components/App.tsx", "note": "入口"}, {"path": "src/utils/"}]},
     "Icon": {"name": "circle-check"},
     "List": {"items": [{"text": "检查", "icon": "circle-check"}]},
     "Callout": {"tone": "warning", "text": "注意"},
@@ -92,7 +93,6 @@ class CatalogTests(unittest.TestCase):
 
     def test_all_contract_components_are_valid_and_authoritative(self):
         self.assertEqual(set(CATALOG["components"]), set(PROPS))
-        self.assertEqual(len(PROPS), 38)
         for kind in PROPS:
             with self.subTest(kind=kind):
                 block = parse(spec_for(kind)) if kind != "Submit" else None
@@ -158,6 +158,7 @@ class CatalogTests(unittest.TestCase):
             ("Image", "alt", "x" * 201, "props.alt"),
             ("MediaCard", "title", "x" * 81, "props.title"),
             ("Gallery", "items", [], "props.items"),
+            ("FileTree", "nodes", [], "props.nodes"),
             ("Mermaid", "source", "", "props.source"),
         ]
         for kind, field, value, path in changes:
@@ -193,6 +194,8 @@ class CatalogTests(unittest.TestCase):
             ("Image", ("alt",), 200),
             ("MediaCard", ("description",), 500),
             ("Gallery", ("items", 0, "caption"), 200),
+            ("FileTree", ("nodes", 0, "note"), 60),
+            ("LinkCard", ("tags", 0), 12),
             ("Mermaid", ("source",), 10000),
         ):
             spec = spec_for(kind)
@@ -393,10 +396,83 @@ class CatalogTests(unittest.TestCase):
         spec["elements"]["item"]["props"]["options"][1]["value"] = "a"
         self.assertIn("props.options", parse(spec).error)
 
+    def test_file_tree_path_structure_and_implicit_folders(self):
+        spec = spec_for("FileTree")
+        props = spec["elements"]["item"]["props"]
+        props["nodes"] = [
+            {"path": "🪴" * 64 + "/a", "note": "🪴" * 60},
+            {"path": "src/child", "collapsed": False},
+            {"path": "src/", "kind": "folder", "collapsed": True},
+            {"path": "/".join(["d"] * 8), "kind": "file"},
+        ]
+        self.assertIsNone(parse(spec).error)
+        for invalid in (
+            "/absolute", "dir//file", "dir/./file", "dir/../file",
+            "dir\\file", "dir/\nfile", "dir/\x7ffile",
+            "🪴" * 65, "/".join(["d"] * 9), "",
+        ):
+            with self.subTest(path=invalid):
+                changed = deepcopy(spec)
+                changed["elements"]["item"]["props"]["nodes"][0]["path"] = invalid
+                self.assertIn("props.nodes[0].path", parse(changed).error)
+        for nodes, location in (
+            ([{"path": "a"}, {"path": "a/"}], "nodes[1].path"),
+            ([{"path": "a/"}, {"path": "a"}], "nodes[1].path"),
+            ([{"path": "a/", "kind": "file"}], "nodes[0].path"),
+            ([{"path": "a", "kind": "file"}, {"path": "a/b"}], "nodes[1].path"),
+            ([{"path": "a/b"}, {"path": "a", "kind": "file"}], "nodes[0].path"),
+            ([{"path": "a", "kind": "file"}, {"path": "a/b/c"}], "nodes[1].path"),
+        ):
+            with self.subTest(nodes=nodes):
+                changed = spec_for("FileTree")
+                changed["elements"]["item"]["props"]["nodes"] = nodes
+                self.assertIn(location, parse(changed).error)
+        for nodes in ([{"path": "child", "kind": "file"}],
+                      [{"path": "parent/child"}, {"path": "parent", "note": "late"}],
+                      [{"path": "parent/child"}, {"path": "parent", "kind": "folder"}]):
+            with self.subTest(nodes=nodes):
+                changed = spec_for("FileTree")
+                changed["elements"]["item"]["props"]["nodes"] = nodes
+                self.assertIsNone(parse(changed).error)
+
+    def test_file_tree_and_link_card_bounds(self):
+        tree = spec_for("FileTree")
+        props = tree["elements"]["item"]["props"]
+        props.update(title="🪴" * 40, nodes=[
+            {"path": "/".join(["🪴" * 64] * 3 + ["🪴" * 5]), "note": "🪴" * 60},
+            *({"path": f"file{index}"} for index in range(79)),
+        ])
+        self.assertIsNone(parse(tree).error)
+        for field, value in (("title", "🪴" * 41), ("nodes", [{"path": "a" * 201}]),
+                             ("nodes", [{"path": "a" * 64 + "/" + "b" * 64 + "/" + "c" * 64 + "/xxxxxx"}]),
+                             ("nodes", [{"path": "a"}] * 81),
+                             ("nodes", [{"path": "a", "kind": "directory"}]),
+                             ("nodes", [{"path": "a", "collapsed": 0}]),
+                             ("nodes", [{"path": "a", "note": "🪴" * 61}]),
+                             ("nodes", [{"path": "a", "extra": True}])):
+            with self.subTest(field=field, value=str(value)[:30]):
+                changed = deepcopy(tree)
+                changed["elements"]["item"]["props"][field] = value
+                self.assertIsNotNone(parse(changed).error)
+        missing = deepcopy(tree)
+        del missing["elements"]["item"]["props"]["nodes"]
+        self.assertIn("props.nodes", parse(missing).error)
+        link = spec_for("LinkCard")
+        link_props = link["elements"]["item"]["props"]
+        link_props.update(tags=["🪴" * 12] * 3, image="https://example.org/" + "x" * (2048 - len("https://example.org/")))
+        self.assertIsNone(parse(link).error)
+        for field, value in (("tags", ["🪴" * 13]), ("tags", ["tag"] * 4),
+                             ("image", link_props["image"] + "x"), ("image", "http://user@host.example/img"),
+                             ("image", "file:///tmp/image")):
+            with self.subTest(field=field, value=str(value)[:30]):
+                changed = deepcopy(link)
+                changed["elements"]["item"]["props"][field] = value
+                self.assertIn(f"props.{field}", parse(changed).error)
+
     def test_source_links_and_icons_are_safe_and_catalog_bound(self):
         vectors = json.loads((Path(__file__).parent / "fixtures/ui_urls.json").read_text(encoding="utf-8"))
         for kind, field in (
-            ("Source", ("items", 0, "url")), ("LinkCard", ("url",)),
+            ("Source", ("items", 0, "url")), ("LinkCard", ("url",)), ("LinkCard", ("image",)),
             ("Image", ("url",)), ("MediaCard", ("url",)), ("Gallery", ("items", 0, "url")),
         ):
             spec = spec_for(kind)

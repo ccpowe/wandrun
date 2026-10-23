@@ -56,10 +56,10 @@ test("横幅只渲染一次错误标题，并保留断线说明", async () => {
   const texts = () => root.container.queryAll((node) => node.type === "Text").map((node) => node.props.children);
   try {
     await act(async () => root.render(createElement(ConnectionBanner, { session })));
-    assert.deepEqual(texts(), ["连不上网关", "显示的是断开前的内容，暂时不能发消息"]);
+    assert.deepEqual(texts().filter((text) => text === "连不上网关" || text === "令牌不对"), ["连不上网关"]);
     session.notice = "令牌不对";
     await act(async () => root.render(createElement(ConnectionBanner, { session })));
-    assert.deepEqual(texts(), ["令牌不对", "显示的是断开前的内容，暂时不能发消息"]);
+    assert.deepEqual(texts().filter((text) => text === "连不上网关" || text === "令牌不对"), ["令牌不对"]);
     session.connection = "open";
     await act(async () => root.render(createElement(ConnectionBanner, { session })));
     assert.deepEqual(texts(), []);

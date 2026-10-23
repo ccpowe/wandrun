@@ -979,7 +979,7 @@ test("当前字段水位独立：快照前的重放不回滚，乱序命令响�
   session.agents.close();
   session["reset"]([{
     id: "c", agent_id: "helper", title: "C", created_at: 1, updated_at: 20,
-    status: "idle", read_seq: 20, unread: false, last_text: "快照消息",
+    status: "idle", read_seq: 20, last_agent_seq: 19, unread: false, last_text: "快照消息",
     source: "user", schedule_origin: null,
   }], 20);
   const apply = (seq: number, type: string, data: object) =>
@@ -1019,7 +1019,7 @@ test("改名事件按 seq 覆盖快照，不受乱序命令响应或旧事件回
   session.agents.close();
   session["reset"]([{
     id: "c", agent_id: "helper", title: "快照标题", created_at: 1, updated_at: 20,
-    status: "idle", read_seq: 0, unread: false, last_text: null,
+    status: "idle", read_seq: 0, last_agent_seq: 0, unread: false, last_text: null,
     source: "user", schedule_origin: null,
   }], 20);
   const renaming = session.renameConversation("c", "我提交的标题");
@@ -1050,7 +1050,7 @@ test("删除墓碑清除本地状态：迟到的历史、在途发送与旧快�
   session.agents.close();
   const row = (id: string) => ({
     id, agent_id: "helper", title: id, created_at: 1, updated_at: 1,
-    status: "idle" as const, read_seq: 0, unread: false, last_text: null,
+    status: "idle" as const, read_seq: 0, last_agent_seq: 0, unread: false, last_text: null,
     source: "user" as const, schedule_origin: null,
   });
   session["reset"]([row("gone"), row("survivor")], 5);
@@ -1082,7 +1082,7 @@ test("初始列表迟到：命令事件优先于旧快照，删除与改名不�
   session.agents.close();
   const row = (id: string) => ({
     id, agent_id: "helper", title: "旧标题", created_at: 1, updated_at: 1,
-    status: "idle" as const, read_seq: 0, unread: false, last_text: null,
+    status: "idle" as const, read_seq: 0, last_agent_seq: 0, unread: false, last_text: null,
     source: "user" as const, schedule_origin: null,
   });
   session["apply"]({ seq: 11, type: "conversation.updated", conversation_id: "kept", at: 11, data: { title: "新标题" } });
@@ -1098,7 +1098,7 @@ test("换库后旧首页行不能把用户送回旧库对话", async () => {
   session.agents.close();
   const row = (id: string) => ({
     id, agent_id: "helper", title: id, created_at: 1, updated_at: 1,
-    status: "idle" as const, read_seq: 0, unread: false, last_text: null,
+    status: "idle" as const, read_seq: 0, last_agent_seq: 0, unread: false, last_text: null,
     source: "user" as const, schedule_origin: null,
   });
   session["reset"]([row("old")], 40);
@@ -1122,7 +1122,7 @@ test("改名与删除请求失败保留旧状态，向用户报告失败", async
   sessions.add(session);
   session["reset"]([{
     id: "c", agent_id: "helper", title: "保留", created_at: 1, updated_at: 1,
-    status: "idle", read_seq: 0, unread: false, last_text: null,
+    status: "idle", read_seq: 0, last_agent_seq: 0, unread: false, last_text: null,
     source: "user", schedule_origin: null,
   }], 1);
   assert.equal(await session.renameConversation("c", "失败"), false);
@@ -1130,6 +1130,73 @@ test("改名与删除请求失败保留旧状态，向用户报告失败", async
   assert.equal(await session.deleteConversation("c"), false);
   assert.equal(session.conversations.has("c"), true);
   assert.equal(session.notice, "连不上网关");
+});
+
+test("未读位置：较新回执只确认旧回复，迟到本机确认也不能吃掉后续回复", async () => {
+  const confirmation = Promise.withResolvers<Response>();
+  const session = new ChatSession({ baseUrl: "http://unused", token: "dev" }, async () => confirmation.promise);
+  sessions.add(session);
+  session.agents.close();
+  session["reset"]([{
+    id: "c", agent_id: "helper", title: "C", created_at: 1, updated_at: 5,
+    status: "idle", read_seq: 0, last_agent_seq: 5, unread: true, last_text: "回复",
+    source: "user", schedule_origin: null,
+  }], 10);
+  session.connection = "open";
+  const apply = (seq: number, type: string, data: object) =>
+    session["apply"]({ seq, type, data, conversation_id: "c", at: seq });
+  apply(11, "conversation.read", { seq: 3 });
+  assert.equal(session.conversations.get("c")!.unread, true, "回执比快照新不等于已经读到最后回复");
+  session["insert"]({ seq: 5, type: "message.agent", data: { text: "回复" }, conversation_id: "c", at: 5 });
+  const reading = session["markRead"]("c");
+  apply(12, "message.agent", { text: "确认在途时的新回复" });
+  confirmation.resolve(new Response(null, { status: 204 }));
+  await reading;
+  assert.equal(session.conversations.get("c")!.read_seq, 11);
+  assert.equal(session.conversations.get("c")!.unread, true);
+  apply(13, "conversation.read", { seq: 12 });
+  assert.equal(session.conversations.get("c")!.unread, false);
+  apply(11, "conversation.read", { seq: 3 });
+  assert.equal(session.conversations.get("c")!.unread, false);
+});
+
+test("冷启动未读：其他对话推进全局水位后，本机和另一设备的已读都能清除旧回复红点", async (t) => {
+  for (const reader of ["phone", "tablet"] as const) {
+    await t.test(reader, async () => {
+      const gateway = new StubGateway();
+      await gateway.start();
+      const api = new GatewayApi({ baseUrl: gateway.url, token: "dev" });
+      const a = await api.createConversation("assistant", "A");
+      await api.sendMessage(a.id, "cold-a", "A");
+      await until(async () => (await api.listConversations()).conversations
+        .some((c) => c.id === a.id && c.status === "idle" && c.last_text === "收到：A"));
+      const aLatest = (await serverHistory(gateway, a.id)).at(-1)!.seq;
+      const b = await api.createConversation("assistant", "B");
+      await api.sendMessage(b.id, "cold-b", "B");
+      await until(async () => (await api.listConversations()).conversations
+        .some((c) => c.id === b.id && c.status === "idle" && c.last_text === "收到：B"));
+      const snapshot = await api.listConversations();
+      assert.ok(snapshot.as_of_seq > aLatest);
+      const phone = await started(gateway);
+      assert.equal(phone.conversations.get(a.id)!.unread, true);
+      const tablet = reader === "tablet" ? await started(gateway) : phone;
+      const leave = tablet.view(a.id);
+      await until(async () => !(await api.listConversations()).conversations.find((c) => c.id === a.id)!.unread);
+      const readEvent = (await serverHistory(gateway, a.id)).findLast((event) => event.type === "conversation.read")!;
+      await until(() => phone.lastSeq >= readEvent.seq);
+      leave();
+      assert.equal(phone.conversations.get(a.id)!.unread, false,
+        `${reader}: read_seq=${phone.conversations.get(a.id)!.read_seq}, lastAgentSeq=${phone.conversations.get(a.id)!.lastAgentSeq}, snapshot=${snapshot.as_of_seq}`);
+      // A truly later reply must restore unread even after the snapshot baseline was acknowledged.
+      await api.sendMessage(a.id, "cold-a-later", "later");
+      await until(() => phone.timeline(a.id).events.some((event) =>
+        event.type === "message.agent" && event.data.text === "收到：later"));
+      assert.equal(phone.conversations.get(a.id)!.unread, true);
+      await phone.close();
+      if (tablet !== phone) await tablet.close();
+      await gateway.kill();
+    });
+  }
 });
 
 test("未读：另一台设备看过之后，红点经 conversation.read 同步消失", async () => {
@@ -1287,7 +1354,7 @@ for (const type of ["message.user", "message.agent"]) {
     sessions.add(session);
     session["reset"](["empty", "nonempty"].map((id, index) => ({
       id, agent_id: "helper", title: id, created_at: index, updated_at: index,
-      status: "idle" as const, read_seq: 0, unread: false, last_text: null,
+      status: "idle" as const, read_seq: 0, last_agent_seq: 0, unread: false, last_text: null,
       source: "user" as const, schedule_origin: null,
     })), 0);
     session["insert"]({ seq: 1, type: "conversation.status", conversation_id: "empty", at: 1, data: { status: "idle" } });
@@ -1342,24 +1409,28 @@ test("Agent 记忆 API 的版本冲突、长度、删除与资源事件；成员
   await gateway.start();
   const api = new GatewayApi({ baseUrl: gateway.url, token: "dev" });
   const session = await started(gateway);
-  const empty = await api.getAgentMemory("helper");
+  const empty = await api.getMemory("work", "helper");
+  const profile = await api.getMemory("profile");
   assert.equal(empty.content, "");
+  assert.equal(empty.scope, "work");
+  assert.equal(profile.scope, "profile");
+  assert.equal(profile.agent_id, undefined);
   assert.equal(empty.updated_at, null);
   assert.equal(empty.updated_by, null);
   assert.equal(empty.limit, 1000);
 
-  const saved = await api.updateAgentMemory("helper", "# 成员\r\n😀", empty.version);
+  const saved = await api.updateMemory("work", "helper", "# 成员\r\n😀", empty.version);
   assert.equal(saved.content, "# 成员\n😀");
   assert.equal(saved.updated_by, "user");
-  await until(() => session.memoryRevisionFor("helper") > 0);
-  assert.equal(session.memoryRevisionFor("assistant"), 0);
-  const revision = session.memoryRevisionFor("helper");
-  await api.updateAgentMemory("helper", "# 成员\n😀", saved.version);
-  assert.equal(session.memoryRevisionFor("helper"), revision);
-  await assert.rejects(api.updateAgentMemory("helper", "x".repeat(1001), saved.version),
+  await until(() => session.memoryRevisionFor("work", "helper") > 0);
+  assert.equal(session.memoryRevisionFor("work", "assistant"), 0);
+  const revision = session.memoryRevisionFor("work", "helper");
+  await api.updateMemory("work", "helper", "# 成员\n😀", saved.version);
+  assert.equal(session.memoryRevisionFor("work", "helper"), revision);
+  await assert.rejects(api.updateMemory("work", "helper", "x".repeat(1001), saved.version),
     (error: unknown) => error instanceof GatewayError && error.status === 400);
-  assert.equal((await api.getAgentMemory("helper")).content, saved.content);
-  await assert.rejects(api.updateAgentMemory("helper", "竞争写入", empty.version),
+  assert.equal((await api.getMemory("work", "helper")).content, saved.content);
+  await assert.rejects(api.updateMemory("work", "helper", "竞争写入", empty.version),
     (error: unknown) => {
       if (!(error instanceof GatewayError) || error.status !== 409 ||
           !error.details || typeof error.details !== "object" || !("current" in error.details)) return false;
@@ -1372,25 +1443,41 @@ test("Agent 记忆 API 的版本冲突、长度、删除与资源事件；成员
   await until(() => session.timeline(root.id).events.some((event) => event.type === "memory.updated"));
   const event = session.timeline(root.id).events.find((entry) => entry.type === "memory.updated")!;
   assert.equal(event.conversation_id, root.id);
-  assert.deepEqual([event.data.agent_id, event.data.summary], ["helper", "已记住"]);
+  assert.deepEqual([event.data.agent_id, event.data.scope, event.data.summary], ["helper", "work", "已记住"]);
   assert.equal(buildItems(session.timeline(root.id).events, []).some((item) => item.event?.seq === event.seq), true);
-  assert.equal((await api.getAgentMemory("helper")).updated_by, "agent");
+  assert.equal((await api.getMemory("work", "helper")).updated_by, "agent");
   assert.equal((await api.listConversations("helper")).conversations.length, 0);
-  await until(() => session.memoryRevisionFor("helper") > revision);
-  const revisionAfterAgent = session.memoryRevisionFor("helper");
-  writeFileSync(path.join(gateway.database + ".memory", "helper.md"), "# 外部文件改动");
-  const external = await api.getAgentMemory("helper");
-  assert.equal(external.content, "# 外部文件改动");
-  assert.equal(external.updated_by, "external");
-  assert.equal(session.memoryRevisionFor("helper"), revisionAfterAgent, "外部文件修改没有伪造资源事件");
+  await until(() => session.memoryRevisionFor("work", "helper") > revision);
+  const shared = await api.updateMemory("profile", undefined, "Shared profile", profile.version);
+  await until(() => session.memoryRevisionFor("profile", "assistant") > 0);
+  assert.equal(session.memoryRevisionFor("profile", "helper"), session.memoryRevisionFor("profile", "assistant"));
+  assert.equal((await api.getMemory("work", "helper")).content.includes("Shared profile"), false);
+  assert.equal(shared.content, "Shared profile");
+  const created = await api.updateMemoryDetail("profile", undefined, "topic", "First 😀", shared.version,
+    "Shared profile\n- [topic](/.wandrun/memory/profile/details/topic.md)\n");
+  assert.equal(created.scope, "profile");
+  assert.ok(created.details.topic.path.startsWith("/.wandrun/memory/profile/details/topic/"));
+  const detail = await api.getMemoryDetail("profile", undefined, "topic");
+  assert.equal(detail.content, "First 😀");
+  assert.equal(detail.version, created.version);
+  assert.equal(detail.path, created.details.topic.path);
+  await assert.rejects(api.updateMemoryDetail("profile", undefined, "topic", "Outdated", shared.version),
+    (error: unknown) => error instanceof GatewayError && error.status === 409);
+  const changed = await api.updateMemoryDetail("profile", undefined, "topic", "New detail", created.version);
+  assert.notEqual(changed.version, created.version);
+  const removed = await api.deleteMemoryDetail("profile", undefined, "topic", "Shared profile\n", changed.version);
+  assert.deepEqual(removed.details, {});
+  await assert.rejects(api.getMemoryDetail("profile", undefined, "topic"),
+    (error: unknown) => error instanceof GatewayError && error.status === 400);
 
 
   await api.updateAgent("assistant", { workers: [] });
   await api.deleteAgent("helper");
-  await assert.rejects(api.getAgentMemory("helper"), (error: unknown) =>
+  await assert.rejects(api.getMemory("work", "helper"), (error: unknown) =>
     error instanceof GatewayError && error.status === 404);
-  await assert.rejects(api.updateAgentMemory("helper", "复活", saved.version), (error: unknown) =>
+  await assert.rejects(api.updateMemory("work", "helper", "复活", saved.version), (error: unknown) =>
     error instanceof GatewayError && error.status === 404);
+  assert.equal((await api.getMemory("profile")).content, "Shared profile\n");
 });
 
 test("two real gateway instances isolate identical agent IDs, event sequences, files and device revocation", async () => {
@@ -1430,15 +1517,15 @@ test("two real gateway instances isolate identical agent IDs, event sequences, f
   assert.equal((await secondApi.listConversations()).conversations.some(({ id }) => id === firstConversation.id), false);
   assert.equal((await firstApi.getFile(firstFile.id)).available, true);
   await assert.rejects(secondApi.getFile(firstFile.id), (error: unknown) => error instanceof GatewayError && error.status === 404);
-  const firstMemory = await firstApi.getAgentMemory("assistant");
-  await firstApi.updateAgentMemory("assistant", "first computer", firstMemory.version);
-  assert.equal((await firstApi.getAgentMemory("assistant")).content, "first computer");
-  assert.equal((await secondApi.getAgentMemory("assistant")).content, "");
+  const firstMemory = await firstApi.getMemory("work", "assistant");
+  await firstApi.updateMemory("work", "assistant", "first computer", firstMemory.version);
+  assert.equal((await firstApi.getMemory("work", "assistant")).content, "first computer");
+  assert.equal((await secondApi.getMemory("work", "assistant")).content, "");
   await firstApi.revokeCurrent();
   await assert.rejects(firstApi.listConversations(), (error: unknown) => error instanceof GatewayError && error.status === 401);
   assert.equal((await secondApi.getFile(secondFile.id)).available, true);
   assert.equal((await secondApi.listConversations()).conversations[0].id, secondConversation.id);
-  assert.equal((await secondApi.getAgentMemory("assistant")).content, "");
+  assert.equal((await secondApi.getMemory("work", "assistant")).content, "");
   firstApi.close();
   secondApi.close();
 });

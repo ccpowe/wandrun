@@ -11,6 +11,9 @@ import { KeyboardStickyView } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { ChatHeader } from "@/components/chat/chat-header.tsx";
+import { CHAT_FLOATING_SURFACE, CHAT_LAYOUT, chatBottomLayout } from "@/components/chat/chat-surface.ts";
+import { ChatFade } from "@/components/chat/chat-fade.tsx";
+import { ChatNotices } from "@/components/chat/chat-notices.tsx";
 import { ChatTimelineList } from "@/components/chat/chat-timeline-list.tsx";
 import { ConversationDrawer } from "@/components/chat/conversation-drawer.tsx";
 import { Composer } from "@/components/chat/composer.tsx";
@@ -20,8 +23,10 @@ import { TypingDots } from "@/components/chat/typing-dots.tsx";
 import { ProgressRow } from "@/components/chat/progress-row.tsx";
 import { Icon } from "@/components/ui/icon.tsx";
 import { Text } from "@/components/ui/text.tsx";
+import { WandrunAvatar } from "@/components/wandrun-avatar.tsx";
 import { GatewayError } from "@/gateway/api.ts";
 import { buildItems, isMessageTarget, showFailedHint, type Item } from "@/lib/chat-timeline.ts";
+import { buildChatNotices } from "@/lib/chat-notices.ts";
 import { agentDisplayName } from "@/lib/agent-display-name.ts";
 import { useConnectionLabel } from "@/lib/connection-banner.tsx";
 import { missingConversationAction, switchConversation } from "@/lib/conversation-navigation.ts";
@@ -36,7 +41,7 @@ import { userErrorMessage } from "@/lib/user-error.ts";
 
 const VIEWABILITY_CONFIG = { itemVisiblePercentThreshold: 25 };
 const FOLLOW_AT_END = { animated: false };
-const LIST_CONTENT = { paddingHorizontal: 16, paddingVertical: 12 };
+const LIST_CONTENT = { paddingHorizontal: CHAT_LAYOUT.contentInsetHorizontal, paddingBottom: CHAT_LAYOUT.listBottomGap };
 const ROW_GAP = 12;
 const MESSAGE_SPACING = { paddingTop: ROW_GAP };
 const FOOTER_CONTENT = { gap: ROW_GAP };
@@ -93,6 +98,8 @@ function ChatScreen({ id, messageSeq }: { id: string; messageSeq?: number }) {
   const mode = atEnd ? "FOLLOW" : "READ";
   const composer = useRef<View>(null);
   const [composerMeasured, setComposerMeasured] = useState(false);
+  const [composerHeight, setComposerHeight] = useState(0);
+  const [topOverlayHeight, setTopOverlayHeight] = useState(0);
   const { contentInsetEndAdjustment, onComposerLayout } = useKeyboardChatComposerInset(list, composer);
   const [visibleCards, setVisibleCards] = useState<Set<string>>(new Set());
   const onViewableItemsChanged = useCallback(({ viewableItems }: { viewableItems: ViewToken<Item>[] }) => {
@@ -102,6 +109,7 @@ function ChatScreen({ id, messageSeq }: { id: string; messageSeq?: number }) {
   const viewabilityConfig = VIEWABILITY_CONFIG;
   const attemptedOldest = useRef<{ messageSeq: number | undefined; value: number | null | undefined } | null>(null);
   const insets = useSafeAreaInsets();
+  const bottomLayout = chatBottomLayout(composerHeight, insets.bottom);
 
   useEffect(() => focused ? session?.view(id) : undefined, [session, id, focused, session?.connection]);
   const conversation = session?.chat(id);
@@ -232,62 +240,28 @@ function ChatScreen({ id, messageSeq }: { id: string; messageSeq?: number }) {
     }
   };
 
+  const notices = buildChatNotices({
+    offline: offlineLabel,
+    history: historyError ? t("历史消息加载失败：{error}", { error: t(historyError) }) : undefined,
+    stop: stopError ? t("停止未确认，工作可能仍在继续：{error}", { error: t(stopError) }) : undefined,
+    collaboration: [
+      task?.status === "unavailable" ? t("这个协作已无法继续") : taskError ? t(taskError) : null,
+      (task?.status === "failed" || task?.status === "unavailable") && task.error ? t(task.error) : null,
+    ].filter(Boolean).join("\n"),
+    target: targetFailed ? t("目标消息加载失败：{error}", { error: t(targetError ?? "") }) : undefined,
+  });
+  // Match the session's definition of a reusable blank: pending/failed local sends count as content.
+  const emptyConversation = !!conversation && "last_text" in conversation && conversation.last_text === null &&
+    !items.some((item) => item.pending || item.event?.type === "message.user" || item.event?.type === "message.agent");
+  const browser = items.reduce<Item["browser"]>((active, item) =>
+    item.browser && item.browser.state !== "released" ? item.browser : active, undefined);
+  const browserUrl = (browser?.pages.find((page) => page.id === browser.current) ?? browser?.pages[0])?.url;
+
   return (
-    // 单一 inset 路径：列表处理键盘，浮动 composer 的实际高度由官方 hook 上报。
+    <ConversationDrawer {...drawer.drawerProps} onOpen={drawer.show} swipeEnabled={!!conversation}>
+    {/* Keep the existing keyboard-controller inset path; safe area is removed by StickyView only while open. */}
     <View className="flex-1 bg-background" style={{ paddingBottom: insets.bottom }}>
       <Stack.Screen options={{ headerShown: false }} />
-      <ChatHeader
-        agent={agent}
-        title={conversation?.title ?? ""}
-        source={conversation && "source" in conversation ? conversation.source : undefined}
-        collaboration={task ? {
-          creatorName: agentDisplayName(session.agents, task.creator_agent_id),
-          rootId: task.root_id, rootTitle: session.conversations.get(task.root_id)?.title ?? task.root_title,
-        } : undefined}
-        paddingTop={insets.top}
-        onOpenConversations={conversation ? drawer.show : undefined}
-      />
-      {task?.status === "unavailable" || taskError || (task?.status === "failed" && task.error) ? <View className="gap-2 px-4 py-2">
-        {(task?.status === "unavailable" || taskError) && <Text accessibilityRole="alert" className="text-sm text-destructive">
-          {task?.status === "unavailable" ? t("这个协作已无法继续") : t(taskError ?? "")}
-        </Text>}
-        {(task?.status === "failed" || task?.status === "unavailable") && task.error &&
-          <Text accessibilityRole="alert" className="text-sm text-destructive">{t(task.error)}</Text>}
-        {!conversation && <Pressable accessibilityRole="button" accessibilityLabel={t("重试加载协作")} onPress={() => void session.loadOlder(id)}>
-          <Text className="text-sm">{t("重试")}</Text>
-        </Pressable>}
-      </View> : null}
-      {offlineLabel && (
-        <View className="bg-muted px-4 py-1.5">
-          <Text className="text-[13px] text-muted-foreground">{offlineLabel}</Text>
-        </View>
-      )}
-      {historyError && (
-        <View testID="chat-history-error" className="gap-2 bg-muted px-4 py-2">
-          <Text accessibilityRole="alert" className="text-sm text-foreground">{t("历史消息加载失败：{error}", { error: t(historyError) })}</Text>
-          <Pressable testID="chat-history-retry" accessibilityRole="button" accessibilityLabel={t("重试加载历史消息")}
-            onPress={() => void session.loadOlder(id)}>
-            <Text className="text-sm text-primary">{t("重试加载历史消息")}</Text>
-          </Pressable>
-        </View>
-      )}
-      {stopError && (
-        <View testID="chat-stop-error" className="gap-2 bg-muted px-4 py-2">
-          <Text accessibilityRole="alert" className="text-sm text-foreground">{t("停止未确认，工作可能仍在继续：{error}", { error: t(stopError) })}</Text>
-          <Pressable testID="chat-stop-retry" accessibilityRole="button" accessibilityLabel={t("重试停止")}
-            onPress={() => void session.stop(id)}>
-            <Text className="text-sm text-primary">{t("重试停止")}</Text>
-          </Pressable>
-        </View>
-      )}
-      {targetFailed && (
-        <View className="gap-2 bg-muted px-4 py-2">
-          <Text accessibilityRole="alert" className="text-sm text-foreground">{t("目标消息加载失败：{error}", { error: t(targetError ?? "") })}</Text>
-          <Pressable accessibilityRole="button" accessibilityLabel={t("重试加载目标消息")} onPress={() => void session.loadOlder(id)}>
-            <Text className="text-sm text-primary">{t("重试加载目标消息")}</Text>
-          </Pressable>
-        </View>
-      )}
       <View className="flex-1">
         {/* Initial placement measures the target as it mounts; do not position against paginating estimates. */}
         {composerMeasured && (!targetActive || targetFailed || (timelineLoaded && targetIndex >= 0)) && <ChatTimelineList
@@ -306,7 +280,7 @@ function ChatScreen({ id, messageSeq }: { id: string; messageSeq?: number }) {
           maintainScrollAtEnd={targetReading ? false : FOLLOW_AT_END}
           maintainVisibleContentPosition
           contentInsetEndAdjustment={contentInsetEndAdjustment}
-          keyboardOffset={insets.bottom}
+          keyboardOffset={bottomLayout.keyboardOffset}
           keyboardLiftBehavior="whenAtEnd"
           onReady={() => {
             setListGeneration((generation) => generation + 1);
@@ -336,6 +310,14 @@ function ChatScreen({ id, messageSeq }: { id: string; messageSeq?: number }) {
           }}
           onStartReached={() => { if (!targetActive) void session.loadOlder(id); }}
           onStartReachedThreshold={0.3}
+          ListHeaderComponent={task ? <Pressable testID="chat-root-conversation" accessibilityRole="button"
+            accessibilityLabel={t("返回根对话 {title}", { title: task.root_title })}
+            onPress={() => router.push({ pathname: "/c/[id]", params: { id: task.root_id } })}
+            className="mb-3 self-center rounded-full bg-card px-3 py-2">
+            <Text numberOfLines={1} className="text-xs text-muted-foreground">
+              {t("返回根对话 {title}", { title: session.conversations.get(task.root_id)?.title || task.root_title || t("新对话") })} ›
+            </Text>
+          </Pressable> : null}
           ListFooterComponent={working || showFailedHint(conversation, items) ? (
             <View style={[FOOTER_CONTENT, items.length > 0 && FOOTER_AFTER_ITEMS]}>
               {working && (
@@ -351,28 +333,41 @@ function ChatScreen({ id, messageSeq }: { id: string; messageSeq?: number }) {
               )}
             </View>
           ) : null}
-          contentContainerStyle={LIST_CONTENT}
+          contentContainerStyle={[LIST_CONTENT, { paddingTop: insets.top + 62 }]}
           keyboardShouldPersistTaps="handled"
         />}
+        {emptyConversation && timelineLoaded && !working && agent && <View pointerEvents="none"
+          testID="chat-empty" className="absolute inset-0 items-center justify-center gap-2 px-8"
+          style={{ paddingTop: insets.top + 62, paddingBottom: composerHeight + 24 }}>
+          <WandrunAvatar index={agent.avatar} alt={agent.name} size={88} className="mb-2 border border-border bg-white" />
+          <Text className="w-full text-center text-xl font-semibold" numberOfLines={2}>{agent.name}</Text>
+          {!!agent.description && <Text className="text-center text-sm text-muted-foreground">{agent.description}</Text>}
+        </View>}
         {timeline.loading && (
-          <View pointerEvents="none" className="absolute inset-x-0 top-0 items-center">
+          <View pointerEvents="none" className="absolute inset-x-0 items-center" style={{ top: insets.top + 62 }}>
             <Text className="rounded-full bg-background px-3 py-1 text-xs text-muted-foreground">{t("加载中…")}</Text>
           </View>
         )}
-        <KeyboardStickyView pointerEvents="box-none" style={{ position: "absolute", bottom: 0, left: 0, right: 0 }}
-          offset={{ closed: 0, opened: insets.bottom }}>
+        {/* The jump hit area is outside the composer-only measurement used for the list inset. */}
+        <KeyboardStickyView pointerEvents="box-none"
+          style={{ position: "absolute", bottom: 0, left: 0, right: 0, paddingTop: bottomLayout.stickyPaddingTop }}
+          offset={{ closed: 0, opened: bottomLayout.keyboardOffset }}>
+          <ChatFade edge="bottom" height={bottomLayout.fadeHeight} solidHeight={bottomLayout.fadeSolidHeight} />
           {mode === "READ" && (
             <Pressable testID="chat-return-to-bottom" accessibilityRole="button" accessibilityLabel={t("回到最新消息")}
-              className="mb-3 mr-4 size-11 self-end items-center justify-center rounded-full border border-border bg-card shadow-sm"
+              hitSlop={2} style={[CHAT_FLOATING_SURFACE, { position: "absolute", bottom: bottomLayout.returnButtonBottom,
+                width: CHAT_LAYOUT.returnButtonSize, height: CHAT_LAYOUT.returnButtonSize }]}
+              className="self-center items-center justify-center rounded-full border border-border bg-card"
               onPress={returnToBottom}>
-              <Icon as={ArrowDown} className="size-5 text-foreground" />
+              <Icon as={ArrowDown} className="size-5 text-foreground" strokeWidth={1.75} />
             </Pressable>
           )}
           <View ref={composer} onLayout={(event) => {
             onComposerLayout(event);
+            setComposerHeight(event.nativeEvent.layout.height);
             // Bootstrap with the real composer inset, not a zero-height first frame.
             setComposerMeasured(true);
-          }} className="bg-background">
+          }} style={{ paddingBottom: CHAT_LAYOUT.composerBottomGap }}>
             <Composer
               textOnly={!!task}
               disabledReason={task?.status === "unavailable" ? t("这个协作已无法继续") : !conversation ? t("正在加载会话…") : undefined}
@@ -396,7 +391,32 @@ function ChatScreen({ id, messageSeq }: { id: string; messageSeq?: number }) {
           </View>
         </KeyboardStickyView>
       </View>
-      <ConversationDrawer {...drawer.drawerProps} />
+      <ChatFade edge="top" height={Math.max(insets.top + 82, notices.length ? topOverlayHeight + 24 : 0)} solidHeight={insets.top} />
+      <View pointerEvents="box-none" className="absolute inset-x-0 top-0"
+        onLayout={(event) => setTopOverlayHeight(event.nativeEvent.layout.height)}>
+        <ChatHeader
+          agent={agent}
+          title={conversation?.title ?? ""}
+          source={conversation && "source" in conversation ? conversation.source : undefined}
+          collaboration={task ? {
+            creatorName: agentDisplayName(session.agents, task.creator_agent_id),
+            rootId: task.root_id, rootTitle: session.conversations.get(task.root_id)?.title ?? task.root_title,
+          } : undefined}
+          paddingTop={insets.top}
+          working={working}
+          browserUrl={browserUrl}
+          onOpenConversations={conversation ? drawer.show : undefined}
+          newConversationDisabled={!conversation || emptyConversation}
+          onNewConversation={drawer.newConversation}
+        />
+        {notices.length > 0 && <View className="mt-2">
+          <ChatNotices notices={notices} canRetryCollaboration={!conversation} onRetry={(kind) => {
+            if (kind === "stop") void session.stop(id);
+            else void session.loadOlder(id);
+          }} />
+        </View>}
+      </View>
     </View>
+    </ConversationDrawer>
   );
 }

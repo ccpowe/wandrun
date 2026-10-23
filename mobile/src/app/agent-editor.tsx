@@ -296,7 +296,7 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
         <Icon as={panel === "main" && !memberOnly ? X : ChevronLeft} className="size-[22px]" />
       </Button>} right={draft && !loading ? <Button testID={panel === "main" || memberOnly ? "editor-save" : "editor-done"} variant="outline" size="sm" className="h-8 border-foreground bg-background" disabled={saving || deleting} onPress={() => void done()}><Text>{saving ? t("请稍候…") : actionLabel}</Text></Button> : null} />
       <ConnectionBanner session={session} />
-      {createUnknown ? <Text className="mx-6 my-2 text-sm text-destructive">{t("创建结果尚未确认。请点“创建”用同一次命令重试；确认结果前不能修改字段。")}</Text> : null}
+      {createUnknown ? <Text className="mx-6 my-2 text-sm text-destructive">{t("创建未确认。点“创建”重试同一次操作；确认前不能修改字段。")}</Text> : null}
       {saveError ? <Text testID="editor-error" className="mx-6 my-2 text-sm text-destructive">{t(saveError)}</Text> : null}
       {loading ? <Text className="mt-12 text-center text-sm text-muted-foreground">{t("正在加载 Agent…")}</Text> : loadError || !draft ? (
         <View className="mx-6 mt-10 items-center gap-3"><Text className="text-sm text-destructive">{t(loadError || "无法加载 Agent")}</Text><Button variant="outline" onPress={() => { setLoading(true); setLoadError(""); setRetryLoad((value) => value + 1); }}><Text>{t("重试")}</Text></Button></View>
@@ -305,7 +305,7 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
           <View className="flex-1 gap-2 px-4 pt-2" style={{ paddingBottom: insets.bottom + 12 }}>
             <Textarea testID="editor-prompt-input" accessibilityLabel={t("提示词")} editable={!draftLocked} value={draft.system_prompt} onChangeText={(system_prompt) => change({ system_prompt })}
               className="flex-1 border-0 bg-muted px-3.5 py-3 font-mono text-[13px] leading-[21px]" />
-            <Text className="mx-3 text-xs leading-[17px] text-muted-foreground">{t("提示词决定职责和做事方式，修改从下一轮生效。")}</Text>
+            <Text className="mx-3 text-xs leading-[17px] text-muted-foreground">{t("修改从下一轮生效。")}</Text>
           </View>
         </KeyboardAvoidingView>
       ) : panel === "main" ? (
@@ -331,7 +331,7 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
             </View>
             <Pressable testID="editor-prompt" accessibilityRole="button" accessibilityLabel={t("提示词")} disabled={draftLocked} onPress={() => setPanel("prompt")} className="gap-1 px-4 py-3 active:bg-muted">
               <View className="flex-row items-center"><Text className="flex-1 text-[15px]">{t("提示词")}</Text><Icon as={ChevronRight} className="size-[18px] text-muted-foreground" /></View>
-              <Text numberOfLines={2} className="text-sm leading-5 text-muted-foreground">{draft.system_prompt || t("填写职责和做事方式")}</Text>
+              <Text numberOfLines={2} className="text-sm leading-5 text-muted-foreground">{draft.system_prompt || t("填写提示词")}</Text>
             </Pressable>
           </ListGroup>
           {nameError ? <Text className="mx-8 mt-1 text-sm text-destructive">{t(nameError)}</Text> : null}
@@ -348,7 +348,7 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
             <View className="min-h-[72px] flex-row items-center gap-3 px-4 py-2.5">
               <View className="min-w-0 flex-1">
                 <Text className="text-[15px]">{t("代码模式")}</Text>
-                <Text className="text-xs leading-[18px] text-muted-foreground">{t("用脚本批量调用工具、处理文件，只把结果交给模型。")}</Text>
+                <Text className="text-xs leading-[18px] text-muted-foreground">{t("脚本批量调用工具、处理文件，仅向模型返回结果。")}</Text>
               </View>
               <Switch testID="editor-code-mode" accessibilityLabel={t("代码模式")} checked={draft.code_mode}
                 disabled={draftLocked} onCheckedChange={(code_mode) => change({ code_mode })} />
@@ -360,7 +360,7 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
               value={capabilityCatalog.capabilities ? t("{count} 项已启用", { count: capabilityCatalog.capabilities.filter((item) => item.status === "enabled").length }) : capabilityCatalog.error ? t("无法加载") : t("加载中")}
               onPress={() => router.push({ pathname: "/agent-capabilities", params: { id } })} /> : null}
           </ListGroup>
-          {id ? <Text className="mx-8 mt-3 text-xs leading-[17px] text-muted-foreground">{t("修改会影响直接对话及所在团队，进行中的工作从下一轮生效。")}</Text> : null}
+          {id ? <Text className="mx-8 mt-3 text-xs leading-[17px] text-muted-foreground">{t("影响直接对话及所在团队，进行中的工作从下一轮生效。")}</Text> : null}
           {id ? <Button testID="editor-delete" variant="ghost" className="mt-3 self-center bg-transparent" disabled={saving || deleting} onPress={() => void requestDeletion()}><Text className="font-normal text-destructive">{t("删除 Agent")}</Text></Button> : null}
         </KeyboardAwareScrollView>
       ) : panel === "model" ? (
@@ -378,7 +378,7 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
             </View>
           </>}
           {panel === "connectors" && <>
-            <Text className="mx-6 mb-3 mt-2 text-sm leading-5 text-muted-foreground">{t("直接携带：从首次请求起加载全部工具；按需搜索：找到后才加载。")}</Text>
+            <Text className="mx-6 mb-3 mt-2 text-sm leading-5 text-muted-foreground">{t("直接携带从首次请求加载全部工具；按需搜索找到后才加载。")}</Text>
             <ListGroup>{connectorCatalog.connectors.map((connector) => {
               const direct = draft.mcp_servers.includes(connector.id);
               const searched = draft.searchable_mcp_servers.includes(connector.id);
@@ -410,7 +410,7 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
             {connectorCatalog.error ? <View className="mx-6 mt-3 gap-2"><Text className="text-sm text-destructive">{t(connectorCatalog.error)}</Text><Button variant="outline" onPress={connectorCatalog.refresh}><Text>{t("重试")}</Text></Button></View> : null}
           </>}
           {panel === "skills" && <>
-            <Text className="mx-6 mb-3 mt-2 text-sm text-muted-foreground">{t("选择 Agent 可用的技能；无法加载的技能不能新选，已选的可取消。")}</Text>
+            <Text className="mx-6 mb-3 mt-2 text-sm text-muted-foreground">{t("无法加载的技能不能新选，已选的可取消。")}</Text>
             <ListGroup>{availableSkills.map(({ skill, removableOnly }) => <SelectionRow key={skill.name} testID={`editor-skill-${skill.name}`} label={skill.name}
               subtitle={removableOnly ? t("无法加载：{error} · 仅可取消勾选", { error: t(skill.error || "当前技能不可用") }) : skill.description}
               selected={draft.skills.includes(skill.name)} disabled={draftLocked}
@@ -419,7 +419,7 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
             {skillCatalog.error ? <View className="mx-6 mt-3 gap-2"><Text className="text-sm text-destructive">{t(skillCatalog.error)}</Text><Button variant="outline" size="sm" onPress={refreshSkills}><Text>{t("重试")}</Text></Button></View> : null}
           </>}
           {panel === "members" && <>
-            <Text className="mx-6 mb-3 mt-2 text-sm leading-5 text-muted-foreground">{t("成员可接收{name}委派的工作，按各自设置运行。", { name: draft.name || t("它") })}</Text>
+            <Text className="mx-6 mb-3 mt-2 text-sm leading-5 text-muted-foreground">{t("成员按各自设置运行。")}</Text>
             <View className="mx-4 mb-2 flex-row items-center gap-2 rounded-[12px] border border-input px-3">
               <Icon as={Search} className="size-[18px] text-muted-foreground" />
               <Input testID="editor-member-search" value={memberQuery} editable={!draftLocked} onChangeText={setMemberQuery} placeholder={t("搜索 Agent")} accessibilityLabel={t("搜索 Agent")} className="flex-1 border-0 bg-transparent px-0" />
@@ -456,7 +456,7 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
             <Button testID="editor-delete-blocked-ack" variant="outline" className="border-foreground bg-card" onPress={() => setDeleteDialog(null)}><Text>{t("知道了")}</Text></Button>
           </> : <>
             <AlertDialogHeader><AlertDialogTitle>{t("删除{name}？", { name: detail?.name ?? "" })}</AlertDialogTitle>
-              <AlertDialogDescription>{t("它的对话、定时和记忆会一并删除，无法恢复；团队成员和对话中的文件保留。")}</AlertDialogDescription>
+              <AlertDialogDescription>{t("它的对话、定时和工作记忆会一并删除，无法恢复；共享用户画像、团队成员和对话中的文件保留。")}</AlertDialogDescription>
             </AlertDialogHeader>
             {deleteError ? <Text testID="editor-delete-error" className="text-sm text-destructive">{t(deleteError)}</Text> : null}
             <AlertDialogFooter className="flex-col-reverse gap-2">

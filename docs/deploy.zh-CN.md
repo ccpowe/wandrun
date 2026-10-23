@@ -74,6 +74,9 @@ CODEX_HOME=~/.local/share/wandrun/codex-home \
 设备登录不可用时，去掉 `--device-auth` 改用浏览器登录。重新登录前**一定先停止网关**，登录完再启动。
 未登录时网关也能启动，App 的模型页会显示登录命令。
 
+模型目录缓存 300 秒，重新打开页面不一定会重新拉取。验收 Codex 或连接器 OAuth 时允许令牌轮换：
+确认刷新和后续认证请求成功，不要以 token 字节保持不变作为通过条件。
+
 ## 4. 工作区
 
 创建一个空工作区。网关首次启动时会写入默认的 `.wandrun/agents.toml`、`mcps.toml`、
@@ -190,6 +193,11 @@ WantedBy=default.target
 ```
 
 `PartOf` 让网关随 Chrome 一起重启，不会继续持有失效的浏览器连接。
+
+Wandrun 不再自动读取 `.env`。需要的变量放在 unit 的 `Environment=` 中，或在 `[Service]` 下显式添加
+`EnvironmentFile=%h/.config/wandrun/gateway.env`（先创建文件，权限设为 `0600`）。
+systemd 环境文件使用 `NAME=value`，不写 shell 的 `export`。修改后重新加载 unit 并重启网关。
+
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now wandrun-xvfb wandrun-chrome wandrun-gateway
@@ -253,16 +261,68 @@ npx eas-cli build --platform android --profile preview  # 生成可安装的 APK
 
 本地开发可用 `npx expo run:android`，在连接的设备上构建并安装调试版。
 
+## 可选 LangSmith 追踪
+
+追踪**默认关闭**。确需开启时，按上文给网关 unit 显式添加环境文件，内容如下：
+
+```ini
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=<你的 LangSmith API key>
+LANGSMITH_PROJECT=wandrun
+```
+
+重启网关生效；删除 `LANGSMITH_TRACING` 或设为 `false` 后重启即可关闭。
+`LANGSMITH_ENDPOINT`、`LANGSMITH_WORKSPACE_ID` 是可选的路由配置。
+开启会把对话内容（含注入的记忆）、模型输入输出和工具输入结果发送到配置的 LangSmith 服务。
+已知凭据会脱敏，trace 附件会移除，但不保证移除未知秘密或个人内容；启用前核对数据范围与服务保留策略，
+并留意 LangSmith 额度。Harbor 转发还须显式设置适配器的 `langsmith_tracing=True`，
+见[适配器源码](../src/wandrun/evaluation/harbor_agent.py)。
+
 ## 升级
 
-1. 阅读发布说明。持久化格式尚不稳定，某些版本需要全新的状态目录。
-2. 停止服务：`systemctl --user stop wandrun-chrome wandrun-xvfb`（网关随 Chrome 一起停止）。
-3. 备份 `~/wandrun-workspace` 和 `~/wandrun-chrome`。
-4. 切换到新 tag，执行 `uv sync --locked --no-dev`。
-5. 如果发布说明要求，把 `~/wandrun-workspace/.wandrun/state` 移走。Agent 和连接器会从 TOML 重新导入，手机需要重新配对。
-6. 启动服务，按上面的方法等到 401。
+1. 阅读发布说明，停止服务：`systemctl --user stop wandrun-chrome wandrun-xvfb`（网关随 Chrome 一起停止）。
+2. 停服备份 `~/wandrun-workspace` 和 `~/wandrun-chrome`，包括 SQLite 附属文件；凭据备份保密，回滚限制见下文。
+3. 切换到新 tag，执行 `uv sync --locked --no-dev`。
+4. 按下面两条路径处理状态，然后启动服务，按上面的方法等到 401。
 
-不要恢复旧的 `auth.json` 副本：刷新令牌可能已经轮换过。
+### 从 v0.1.x 升级（网关结构 22 → 23）
+
+新旧格式不兼容，项目不含迁移代码。优先选择**全新 state**：停服后把
+`~/wandrun-workspace/.wandrun/state` 移到备份位置。对话、定时和设备配对重新开始；
+Agent 和连接器从 TOML 重新导入，不会恢复旧数据库中经 App 做的编辑；旧记忆不导入。
+
+也可保留网关数据库：安装 `sqlite3` 命令行工具，仅对**已停服、已备份的结构版本 22 数据库**
+执行以下一次性 SQL。它丢弃记忆修改者元数据，重建 `memory_metadata` 并设版本 23，不是通用状态迁移。
+旧记忆不转换为画像或工作记忆，需要的内容在 App 重新录入；升级后新建对话，不继续旧执行检查点。
+
+```bash
+sqlite3 "$HOME/wandrun-workspace/.wandrun/state/gateway.sqlite" <<'SQL'
+.bail on
+PRAGMA foreign_keys = ON;
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE upgrade_guard (version INTEGER CHECK (version = 22));
+INSERT INTO upgrade_guard SELECT user_version FROM pragma_user_version;
+DROP TABLE memory_metadata;
+CREATE TABLE memory_metadata (
+    scope TEXT NOT NULL CHECK (scope IN ('profile', 'work')),
+    agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,
+    version TEXT NOT NULL,
+    updated_by TEXT NOT NULL CHECK (updated_by IN ('user', 'agent')),
+    CHECK ((scope = 'profile' AND agent_id IS NULL) OR (scope = 'work' AND agent_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX memory_metadata_profile ON memory_metadata(scope) WHERE scope = 'profile';
+CREATE UNIQUE INDEX memory_metadata_work ON memory_metadata(agent_id) WHERE scope = 'work';
+PRAGMA user_version = 23;
+COMMIT;
+PRAGMA user_version;
+PRAGMA integrity_check;
+SQL
+```
+
+预期输出 `23` 和 `ok`。出错时保持停服并核对备份，不绕过版本守卫；这段 SQL 不处理其他结构版本。
+
+**回滚与 OAuth：** 验收可能使令牌轮换。不要把备份中的旧 Codex `auth.json` 或连接器 refresh token
+覆盖回当前凭据。回滚代码／状态不等于回滚凭据；无法一致保留当前凭据时，重新登录或授权，不重放旧 refresh token。
 
 ## 常见问题
 

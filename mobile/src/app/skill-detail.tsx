@@ -125,7 +125,7 @@ function SkillDetailScreen({ name, session }: { name: string; session: ChatSessi
       {loading && !detail ? <Text className="mt-12 text-center text-sm text-muted-foreground">{t("正在加载技能…")}</Text> : null}
       {loadError ? <View className="mx-6 mt-5 items-center gap-2"><Text className="text-center text-sm text-destructive">{t(loadError)}</Text><Button variant="outline" onPress={() => { setLoading(true); setRetry((value) => value + 1); }}><Text>{t("重试")}</Text></Button></View> : null}
       {detail ? <>
-        <Text className="mx-[22px] mb-3 text-[15px] leading-[22px]">{detail.description || t("暂无说明")}</Text>
+        {detail.description ? <Text className="mx-[22px] mb-3 text-[15px] leading-[22px]">{detail.description}</Text> : null}
         {detail.status === "error" ? <Text testID="skill-detail-error" className="mx-4 mb-3 rounded-[14px] border border-destructive px-3 py-2.5 text-[13px] leading-[18px] text-destructive">{t("无法加载：{error}", { error: t(detail.error || "未知原因") })}</Text> : null}
         <ListGroup>
           <View className="min-h-[52px] flex-row items-center gap-3 px-4 py-3"><Text className="text-[15px]">{t("位置")}</Text><Text selectable className="min-w-0 flex-1 text-right font-mono text-[13px] text-muted-foreground">{detail.path}</Text></View>

@@ -1,73 +1,33 @@
 import { router, useIsFocused } from "expo-router";
-import { useEffect, useState } from "react";
-import { View } from "react-native";
+import { ChevronRight, UserRound } from "lucide-react-native";
+import { Pressable, View } from "react-native";
 
-import { AgentMemoryMarkdown } from "@/components/agent-memory-markdown.tsx";
-import { EmptyState } from "@/components/empty-state.tsx";
-import { Button } from "@/components/ui/button.tsx";
+import { MemorySection } from "@/components/memory-section.tsx";
+import { Icon } from "@/components/ui/icon.tsx";
 import { Text } from "@/components/ui/text.tsx";
-import { GatewayError, type AgentMemory } from "@/gateway/api.ts";
 import type { ChatSession } from "@/gateway/session.ts";
 import { memoryModified } from "@/lib/agent-memory.ts";
 import { useTranslation } from "@/lib/i18n.ts";
+import { memoryEntryCount } from "@/lib/memory-index.ts";
+import { useMemory } from "@/lib/use-memory.ts";
 
 export function AgentMemoryTab({ id, session }: { id: string; session: ChatSession }) {
-  const { t } = useTranslation();
-  const [memory, setMemory] = useState<AgentMemory | null>(null);
-  const [error, setError] = useState("");
-  const [retry, setRetry] = useState(0);
   const focused = useIsFocused();
-  const revision = session.memoryRevisionFor(id);
-  const connectionRevision = session.memoryConnectionRevision;
-
-  // External file edits and unchanged saves emit no SSE event; refetch on return.
-  useEffect(() => {
-    if (!focused) return;
-    let active = true;
-    void session.api.getAgentMemory(id).then(
-      (snapshot) => {
-        if (!active || session.agents.deletedIds.has(id) ||
-          session.memoryRevisionFor(id) !== revision || session.memoryConnectionRevision !== connectionRevision) return;
-        setMemory(snapshot);
-        setError("");
-      },
-      (reason: unknown) => {
-        if (!active || session.memoryRevisionFor(id) !== revision || session.memoryConnectionRevision !== connectionRevision) return;
-        if (reason instanceof GatewayError && reason.status === 404) {
-          router.dismissTo("/");
-          return;
-        }
-        setError(reason instanceof Error ? reason.message : String(reason));
-      },
-    );
-    return () => { active = false; };
-  }, [session, id, revision, connectionRevision, retry, focused]);
-
-  return (
-    <View className="min-h-[320px] flex-1">
-      <View className="mx-8 mt-3 flex-row items-center justify-between">
-        <Text testID="profile-memory-modified" className="flex-1 text-xs text-muted-foreground">{memory ? memoryModified(memory) : t("跨对话记忆")}</Text>
-        <Button testID="profile-memory-edit" variant="outline" size="sm" className="h-8 border-foreground"
-          disabled={!memory} onPress={() => router.push({ pathname: "/memory-editor", params: { id } })}>
-          <Text className="text-sm">{t("编辑")}</Text>
-        </Button>
+  const { t } = useTranslation();
+  const { memory, error } = useMemory(session, "profile", "profile", focused);
+  const modified = memory ? memoryModified(memory) : null;
+  const summary = !memory ? error ? t("暂不可用") : t("加载中…") : !memory.content ? t("还没有内容") :
+    modified ? t("{count} 条 · {modified}", { count: memoryEntryCount(memory.content), modified }) : t("{count} 条", { count: memoryEntryCount(memory.content) });
+  return <View className="min-h-[520px] flex-1 pb-8">
+    <MemorySection scope="work" id={id} session={session} focused={focused} />
+    <Pressable testID="profile-about-you" accessibilityRole="button" onPress={() => router.push("/settings-about-you")}
+      className="mx-4 mt-[18px] min-h-14 flex-row items-center gap-3 rounded-2xl border border-border bg-card px-3.5 py-3 active:bg-accent">
+      <View className="size-9 items-center justify-center rounded-full bg-muted"><Icon as={UserRound} className="size-5" /></View>
+      <View className="min-w-0 flex-1 gap-px">
+        <Text className="text-base font-medium">{t("关于你")}</Text>
+        <Text testID="profile-about-you-summary" numberOfLines={1} className="text-xs text-muted-foreground">{summary}</Text>
       </View>
-      {error ? <View className="mx-8 mt-2 gap-2">
-        <Text testID="profile-memory-error" className="text-sm text-destructive">{t("无法加载记忆：{error}", { error: t(error) })}</Text>
-        <Button testID="profile-memory-retry" variant="outline" size="sm" className="self-start" onPress={() => setRetry((value) => value + 1)}><Text>{t("重试")}</Text></Button>
-      </View> : null}
-      {!memory && !error ? <Text className="mt-12 text-center text-sm text-muted-foreground">{t("正在加载记忆…")}</Text> : null}
-      {memory ? <>
-        {memory.content ? (
-          <View testID="profile-memory-content" className="mx-[22px] mt-3">
-            <AgentMemoryMarkdown content={memory.content} />
-          </View>
-        ) : (
-          <View testID="profile-empty-memory" className="min-h-[240px] flex-1">
-            <EmptyState title={t("它还没有记忆")} description={t("记忆是供未来对话使用的少量稳定背景。")} />
-          </View>
-        )}
-      </> : null}
-    </View>
-  );
+      <Icon as={ChevronRight} className="size-5 text-muted-foreground" />
+    </Pressable>
+  </View>;
 }

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import tempfile
 from pathlib import Path
 
 from harbor.agents.installed.base import (
@@ -23,7 +24,11 @@ from wandrun.config import load_config
 
 
 class WandrunAgent(BaseInstalledAgent):
-    """在 Harbor 任务容器中安装并以 headless 模式运行 Wandrun。"""
+    """Run Wandrun in a task container; tracing credentials require trusted private tasks.
+
+    langsmith_tracing opts into forwarding credentials and the plugin's per-trial
+    parent. A private uploaded file keeps secrets out of shell and Docker argv.
+    """
 
     ERROR_PATTERNS = [
         ErrorPattern(r'"status"\s*:\s*"auth_failed"', AgentAuthenticationError),
@@ -44,6 +49,7 @@ class WandrunAgent(BaseInstalledAgent):
         model_max_retries: int = 2,
         cleanup_grace_seconds: float = 10,
         max_model_requests: int = 120,
+        langsmith_tracing: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -76,6 +82,7 @@ class WandrunAgent(BaseInstalledAgent):
         self.model_max_retries = model_max_retries
         self.cleanup_grace_seconds = cleanup_grace_seconds
         self.max_model_requests = max_model_requests
+        self.langsmith_tracing = langsmith_tracing
 
     @staticmethod
     def name() -> str:
@@ -141,6 +148,39 @@ class WandrunAgent(BaseInstalledAgent):
         await self.exec_as_root(environment, command=f"chmod 600 {target}")
         return "/installed-agent/wandrun-codex"
 
+    async def _upload_tracing_env(self, environment: BaseEnvironment) -> str:
+        """Upload only opted-in LangSmith settings; trial routing overrides host defaults."""
+        from harbor_langsmith import parent_env
+
+        values = {}
+        for name in (
+            "LANGSMITH_API_KEY", "LANGSMITH_ENDPOINT", "LANGSMITH_PROJECT",
+            "LANGSMITH_WORKSPACE_ID",
+        ):
+            value = self._get_env(name)
+            if value:
+                values[name] = value
+        if not values.get("LANGSMITH_API_KEY"):
+            raise AgentAuthenticationError("LangSmith tracing 需要 LANGSMITH_API_KEY")
+        values["LANGSMITH_TRACING"] = "true"
+        values.update({
+            name: value for name, value in parent_env(self.context_id).items()
+            if name in {
+                "HARBOR_LANGSMITH_PARENT", "HARBOR_LANGSMITH_BAGGAGE",
+                "LANGSMITH_PROJECT", "LANGSMITH_WORKSPACE_ID",
+            }
+        })
+        target = "/installed-agent/wandrun-state/langsmith.env"
+        with tempfile.TemporaryDirectory(prefix="wandrun-harbor-tracing-") as directory:
+            source = Path(directory) / "langsmith.env"
+            source.touch(mode=0o600)
+            source.write_text("".join(
+                f"{name}={shlex.quote(value)}\n" for name, value in values.items()
+            ), encoding="utf-8")
+            await self._upload_agent_owned_file(environment, source, target)
+        await self.exec_as_root(environment, command=f"chmod 600 {target}")
+        return target
+
     @with_prompt_template
     async def run(
         self,
@@ -196,6 +236,9 @@ class WandrunAgent(BaseInstalledAgent):
         if self.reasoning_effort is not None:
             parts.extend(("--reasoning-effort", shlex.quote(self.reasoning_effort)))
         command = " ".join(parts)
+        if self.langsmith_tracing:
+            tracing_env = await self._upload_tracing_env(environment)
+            command = f"set -a && . {tracing_env} && set +a && {command}"
         await self.exec_as_agent(
             environment,
             command=command,

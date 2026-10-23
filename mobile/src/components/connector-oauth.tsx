@@ -17,7 +17,7 @@ type OAuthAction = "start" | "callback" | "cancel" | "revoke";
 function oauthFailure(reason: unknown, action: OAuthAction): string {
   if (reason instanceof GatewayError) {
     switch (reason.code) {
-      case "unsupported_oauth": return "此服务暂不支持安全的 DCR + PKCE S256 OAuth 接入，请检查服务地址或改用其他认证方式。";
+      case "unsupported_oauth": return "此服务不支持安全 OAuth（DCR + PKCE S256）。请检查地址或改用其他认证方式。";
       case "oauth_unavailable": return action === "callback" ? "授权兑换或连接准备暂不可用，请重新发起授权。" : "OAuth 服务暂不可用，请稍后重试。";
       case "invalid_callback": return "完整回调网址与本次授权不匹配或已过期，请核对网址，必要时重新发起授权。";
       case "oauth_denied": return "未同意服务方授权，请重新发起。";
@@ -207,7 +207,7 @@ export function ConnectorOAuth({ session, connector, onChange, onMissing, autoSt
       if (!await Clipboard.setStringAsync(device ? flow.user_code : flow.authorization_url)) throw new Error("clipboard unavailable");
       if (!mounted.current || observed !== generation.current || startRef.current !== flow || !focusedRef.current) return;
       AccessibilityInfo.announceForAccessibility(t(device ? "已复制验证码" : "已复制授权链接"));
-      setNotice(device ? "已复制验证码，请在 GitHub 授权页面输入。" : "已复制本次授权链接，可在手机浏览器中打开。");
+      setNotice(device ? "已复制验证码" : "已复制授权链接");
     } catch {
       if (mounted.current && observed === generation.current && startRef.current === flow && focusedRef.current) {
         setLocalError(device ? "无法复制验证码，请检查剪贴板权限。" : "无法复制授权链接，请检查剪贴板权限。", flow);
@@ -251,8 +251,8 @@ export function ConnectorOAuth({ session, connector, onChange, onMissing, autoSt
         : t("授权：{status}", { status: t(authorized ? "已授权" : connector.auth.status === "reauthorization_required" ? "需要重新授权" : "未授权") })}</Text>
       {waiting ? <View className="gap-3">
         <Text className="text-sm leading-5 text-muted-foreground">{t(device
-          ? start ? "复制验证码，在 GitHub 页面输入并确认授权，完成后返回此页。" : "本次验证码只在发起设备显示。请重新发起授权，获取新的验证码。"
-          : "正在等待浏览器授权。返回此页会刷新状态；如果本次授权链接不在此页，请重新发起。")}</Text>
+          ? start ? "在 GitHub 页面输入验证码并授权，完成后返回此页。" : "验证码仅在发起设备显示，请重新发起授权获取新码。"
+          : "等待浏览器授权。返回此页刷新状态；若本次授权链接未显示，请重新发起。")}</Text>
         {start?.flow === "device_code" ? <View className="items-center gap-2 rounded-sm bg-muted px-4 py-5">
           <Text testID="oauth-user-code" selectable accessibilityLabel={t("GitHub 验证码：{code}", { code: start.user_code })} className="text-center font-mono text-[28px] font-semibold leading-9 tracking-[3px]">{start.user_code}</Text>
           <Text testID="oauth-expiry" className="text-center text-xs leading-[18px] text-muted-foreground">{t("验证码有效至 {time}", { time: new Date(start.expires_at * 1000).toLocaleTimeString(locale) })}</Text>

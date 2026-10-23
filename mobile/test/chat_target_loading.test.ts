@@ -10,7 +10,7 @@ import type { GatewayEvent } from "../src/gateway/api.ts";
 import { ChatSession } from "../src/gateway/session.ts";
 import { collaborationEvents } from "./fixtures/collaboration-timeline.ts";
 
-// Real Chat, MessageRow, AgentMessageContent, useUiDraft, session and timeline.
+// Real Chat, ChatHeader, ChatNotices, MessageRow, AgentMessageContent, useUiDraft, session and timeline.
 // Native hosts, rich visual rendering and unrelated resources are substituted; no native scroll claims.
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const react = JSON.stringify(import.meta.resolve("react"));
@@ -20,7 +20,7 @@ const hosts: Record<string, string> = {
   "react-native": "export const View='View', Pressable='Pressable', ScrollView='ScrollView', useWindowDimensions=()=>({width:400,height:800}), Alert={alert:(...args)=>globalThis.__targetAlerts.push(args)};",
   "react-native-keyboard-controller": "export const KeyboardStickyView='KeyboardStickyView';",
   "react-native-safe-area-context": "export const useSafeAreaInsets=()=>({top:0,bottom:0});",
-  "lucide-react-native": "export const ArrowDown='ArrowDown', WifiOff='WifiOff', Brain='Brain', Check='Check', ChevronRight='ChevronRight', CircleAlert='CircleAlert', Clock='Clock', Hand='Hand', RefreshCw='RefreshCw', Square='Square';",
+  "lucide-react-native": "export const SquarePen='SquarePen', TextAlignStart='TextAlignStart', ArrowDown='ArrowDown', WifiOff='WifiOff', Brain='Brain', Check='Check', ChevronRight='ChevronRight', CircleAlert='CircleAlert', Clock='Clock', Hand='Hand', RefreshCw='RefreshCw', Square='Square';",
   "@legendapp/list/keyboard": `import {createElement, useRef, useImperativeHandle, useLayoutEffect} from ${react};
     export const useKeyboardChatComposerInset=()=>({contentInsetEndAdjustment:70,onComposerLayout:()=>{}});
     export function KeyboardAwareLegendList(props) {
@@ -45,8 +45,8 @@ const hosts: Record<string, string> = {
     return {release:()=>{}};
   };`,
   "@/lib/pick-upload.ts": "export const pickUploads=()=>[];",
-  "@/lib/use-conversation-drawer.ts": "export const useConversationDrawer=()=>({drawerProps:{}});",
-  "@/components/chat/chat-header.tsx": "export const ChatHeader='ChatHeader';",
+  "@/lib/use-conversation-drawer.ts": "export const useConversationDrawer=()=>({drawerProps:{},newConversation:()=>{}});",
+  "@/components/chat/chat-fade.tsx": "export const ChatFade='ChatFade';",
   "@/components/chat/conversation-drawer.tsx": "export const ConversationDrawer='ConversationDrawer';",
   "@/components/chat/composer.tsx": "export const Composer='Composer';",
   "@/components/chat/browser-card.tsx": "export const BrowserCard='BrowserCard';",
@@ -109,7 +109,7 @@ function fixture(preloaded: boolean, messageSeq: string | null = "42", initially
   session.agents.close();
   session["reset"]([{
     id: "c", agent_id: "agent", title: "Chat", created_at: 1, updated_at: 200,
-    status: "idle", read_seq: 200, unread: false, last_text: "Latest", source: "user", schedule_origin: null,
+    status: "idle", read_seq: 200, last_agent_seq: 199, unread: false, last_text: "Latest", source: "user", schedule_origin: null,
   }], 200);
   session.connection = "open";
   if (preloaded) Object.assign(session.timeline("c"), { events: page(100), oldest: 100, loaded: true });
@@ -132,6 +132,31 @@ function fixture(preloaded: boolean, messageSeq: string | null = "42", initially
     async close() { await act(async () => root.unmount()); await session.close(); },
   };
 }
+
+test("new conversation is inert only while the current conversation has no durable or pending messages", async () => {
+  const f = fixture(false, null);
+  const button = () => f.root.container.queryAll((node) => node.type === "Pressable" && node.props.testID === "chat-new-conversation")[0];
+  try {
+    f.session.conversations.get("c")!.last_text = null;
+    await f.mount();
+    await f.respond(0, []);
+    assert.equal(button().props.disabled, true);
+    assert.equal(button().props.onPress, undefined);
+    await act(async () => {
+      f.session.pending.set("failed-send", {
+        clientId: "failed-send", conversationId: "c", text: "Not delivered yet", attachments: [],
+        status: "failed", retryable: true, error: "Disconnected",
+      });
+      f.session["changed"]();
+    });
+    assert.equal(button().props.disabled, false, "failed sends must not be treated as a reusable blank");
+    await act(async () => {
+      f.session.pending.clear();
+      f.session["apply"](message(42));
+    });
+    assert.equal(button().props.disabled, false, "a durable message also makes the conversation non-empty");
+  } finally { await f.close(); }
+});
 
 test("ordinary first-page failure stays actionable while connected and recovers without losing messages", async () => {
   const f = fixture(false, null);

@@ -1,5 +1,5 @@
 import { router, Stack, useFocusEffect, useIsFocused } from "expo-router";
-import { Bell, Bot, Cable, ChevronLeft, ChevronRight, CircleHelp, Cpu, Grid2X2, Monitor, Moon, Sparkles } from "lucide-react-native";
+import { Bell, Bot, Cable, ChevronLeft, ChevronRight, CircleHelp, Cpu, Grid2X2, Monitor, Moon, Sparkles, UserRound } from "lucide-react-native";
 import { useCallback, useState } from "react";
 import { Pressable, ScrollView, View } from "react-native";
 
@@ -17,6 +17,8 @@ import { useTranslation } from "@/lib/i18n.ts";
 import { useBuiltinSkillCatalog, useSkillCatalog } from "@/lib/skill-catalog.ts";
 import { useGateway, useSession } from "@/lib/session-context.tsx";
 import { useComputerStatus } from "@/lib/use-computer-status.ts";
+import { memoryEntryCount } from "@/lib/memory-index.ts";
+import { useMemory } from "@/lib/use-memory.ts";
 
 export default function Settings() {
   const { t } = useTranslation();
@@ -26,6 +28,7 @@ export default function Settings() {
   const focused = useIsFocused();
   const computer = useComputerStatus(session, focused);
   const [subscription, setSubscription] = useState(() => api ? lastSubscriptionUsage(api) : null);
+  const profile = useMemory(session, "profile", "profile", focused);
 
   useFocusEffect(useCallback(() => {
     if (!api) return;
@@ -61,6 +64,9 @@ export default function Settings() {
           {session ? <SkillSettingsRow session={session} /> : <SettingsRow testID="settings-skills" icon={Sparkles} title={t("技能")} disabled disabledReason={t("连接网关后可用")} />}
           {session ? <ConnectorSettingsRow session={session} /> : <SettingsRow testID="settings-connectors" icon={Cable} title={t("连接器")} disabled disabledReason={t("连接网关后可用")} />}
           <SettingsRow testID="settings-apps" icon={Grid2X2} title={t("应用")} disabled={!session} disabledReason={t("连接网关后可用")} onPress={() => router.push("/settings-apps")} />
+          <SettingsRow testID="settings-about-you" icon={UserRound} title={t("关于你")}
+            detail={profile.memory ? t("{count} 条", { count: memoryEntryCount(profile.memory.content) }) : profile.error ? t("暂不可用") : t("加载中…")}
+            disabled={!session} disabledReason={t("连接网关后可用")} onPress={() => router.push("/settings-about-you")} />
         </ListGroup>
         <ListGroup label={t("App")}>
           <SettingsRow icon={Bell} title={t("通知")} disabled />
@@ -81,7 +87,7 @@ function SkillSettingsRow({ session }: { session: ChatSession }) {
   useFocusEffect(useCallback(() => { refresh(); refreshBuiltins(); }, [refresh, refreshBuiltins]));
   const failed = catalog.skills.some((skill) => skill.status === "error");
   return <SettingsRow testID="settings-skills" icon={Sparkles} title={t("技能")}
-    detail={catalog.loaded && builtins.loaded ? failed ? t("{count} · 有无法加载", { count: catalog.skills.length + builtins.skills.length }) : String(catalog.skills.length + builtins.skills.length) : catalog.error || builtins.error ? t("暂不可用") : t("加载中…")}
+    detail={catalog.loaded && builtins.loaded ? failed ? t("{count} · 部分失败", { count: catalog.skills.length + builtins.skills.length }) : String(catalog.skills.length + builtins.skills.length) : catalog.error || builtins.error ? t("暂不可用") : t("加载中…")}
     danger={catalog.loaded && failed} onPress={() => router.push("/settings-skills")} />;
 }
 
@@ -96,12 +102,12 @@ function ConnectorSettingsRow({ session }: { session: ChatSession }) {
 }
 
 function SettingsRow({ testID, icon, title, detail, danger, disabled, disabledReason, onPress }: { testID?: string; icon: LucideIcon; title: string; detail?: string; danger?: boolean; disabled?: boolean; disabledReason?: string; onPress?: () => void }) {
-  const { t } = useTranslation();
+  const value = disabled ? disabledReason : detail;
   return <Pressable testID={testID} disabled={disabled} accessibilityState={{ disabled }} onPress={onPress} className={`min-h-[60px] flex-row items-center gap-3 px-4 ${disabled ? "opacity-50" : "active:bg-accent"}`}>
     <Icon as={icon} className="size-[22px]" />
-    <Text className="min-w-0 flex-1 text-[15px]">{title}</Text>
+    <Text numberOfLines={1} className="shrink-0 text-[15px]">{title}</Text>
     {danger && !disabled ? <View className="size-2 rounded-full bg-destructive" /> : null}
-    <Text className={`text-[13px] ${danger ? "text-destructive" : "text-muted-foreground"}`} numberOfLines={1}>{disabled ? disabledReason ?? t("即将支持") : detail}</Text>
+    {value ? <Text className={`min-w-0 flex-1 text-right text-[13px] ${danger && !disabled ? "text-destructive" : "text-muted-foreground"}`} numberOfLines={1} ellipsizeMode="tail">{value}</Text> : <View className="flex-1" />}
     {!disabled && <Icon as={ChevronRight} className="size-4 text-muted-foreground" />}
   </Pressable>;
 }

@@ -1,23 +1,80 @@
-import type { AgentMemory } from "../gateway/api.ts";
-import { getLocale, t } from "./i18n.ts";
+import { GatewayError, type AgentMemory, type MemoryScope } from "../gateway/api.ts";
+import { getLanguage, getLocale, t } from "./i18n.ts";
 
-/** 服务端按 LF 计 Unicode 码点，不裁剪正文或做 Unicode 归一化。 */
+/** The host normalizes LF and counts index Unicode code points without truncation. */
 export function normalizeMemory(content: string): string {
   return content.replace(/\r\n?/g, "\n");
 }
 
 export function memoryLength(content: string): number {
-  return Array.from(normalizeMemory(content)).length;
+  const normalized = normalizeMemory(content);
+  let count = 0;
+  for (let i = 0; i < normalized.length; i++, count++) {
+    const unit = normalized.charCodeAt(i);
+    if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < normalized.length &&
+      normalized.charCodeAt(i + 1) >= 0xdc00 && normalized.charCodeAt(i + 1) <= 0xdfff) i++;
+  }
+  return count;
 }
 
-/** 409 错误详情可能来自不可用/旧版网关；只信经结构校验的当前快照。 */
-export function conflictMemory(details: unknown, id: string): AgentMemory | null {
+export function detailBytes(content: string): number {
+  const normalized = normalizeMemory(content);
+  let bytes = 0;
+  for (let i = 0; i < normalized.length; i++) {
+    const unit = normalized.charCodeAt(i);
+    if (unit <= 0x7f) bytes++;
+    else if (unit <= 0x7ff) bytes += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < normalized.length &&
+      normalized.charCodeAt(i + 1) >= 0xdc00 && normalized.charCodeAt(i + 1) <= 0xdfff) {
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+/** Known gateway reasons are translated; unknown input errors use the safe local fallback. */
+export function memoryError(reason: unknown): string {
+  const raw = reason instanceof Error ? reason.message : String(reason);
+  const translated = t(raw);
+  return reason instanceof GatewayError && reason.status === 400 && getLanguage() === "en" && translated === raw
+    ? t("提交内容有误，请检查后重试") : translated;
+}
+
+/** Only active, scope-matching references may become internal navigation. */
+export function managedMemorySlug(url: string, memory: AgentMemory): string | null {
+  const match = /^\/.wandrun\/memory\/(profile|work)\/details\/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})\/([a-f0-9]{64})\.md$/.exec(url);
+  if (!match || match[1] !== memory.scope) return null;
+  const ref = memory.details[match[2]];
+  return ref?.path === url && ref.sha256 === match[3] ? match[2] : null;
+}
+
+export function newDetailIndex(content: string, scope: MemoryScope, slug: string): string {
+  const link = `- [${slug}](/.wandrun/memory/${scope}/details/${slug}.md)`;
+  return content ? `${content}${content.endsWith("\n") ? "" : "\n"}${link}\n` : `${link}\n`;
+}
+
+/** Suggest removal of simple inline links; the deletion screen reviews the entire index
+ * because titled, reference-style and other host-accepted Markdown needs user editing. */
+export function withoutDetailLink(content: string, path: string): string {
+  const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const link = new RegExp(`\\[([^\\]]+)\\]\\(${escaped}\\)`, "g");
+  return content.split("\n").flatMap((line) => {
+    if (new RegExp(`^\\s*(?:[-*+]\\s+)?\\[[^\\]]+\\]\\(${escaped}\\)\\s*$`).test(line)) return [];
+    return [line.replace(link, "$1")];
+  }).join("\n");
+}
+
+/** Ignore malformed or differently scoped 409 payloads; they must not replace a draft baseline. */
+export function conflictMemory(details: unknown, scope: MemoryScope, id?: string): AgentMemory | null {
   if (!details || typeof details !== "object" || !("current" in details)) return null;
   const current = details.current;
   if (!current || typeof current !== "object" ||
-      !("agent_id" in current) || current.agent_id !== id ||
+      !("scope" in current) || current.scope !== scope ||
+      (scope === "work" && (!("agent_id" in current) || current.agent_id !== id)) ||
       !("content" in current) || typeof current.content !== "string" ||
       !("version" in current) || typeof current.version !== "string" ||
+      !("details" in current) || !current.details || typeof current.details !== "object" ||
       !("limit" in current) || typeof current.limit !== "number" ||
       !("updated_at" in current) || (current.updated_at !== null && typeof current.updated_at !== "number") ||
       !("updated_by" in current) || (current.updated_by !== null &&
@@ -28,7 +85,7 @@ export function conflictMemory(details: unknown, id: string): AgentMemory | null
 export type MemoryDraft = {
   base: AgentMemory;
   content: string;
-  /** 后台更新或 409 的当前版本；不能替换正在编辑的内容/期望版本。 */
+  /** Observation, never the CAS baseline until explicit reload. */
   remote: AgentMemory | null;
 };
 
@@ -41,7 +98,7 @@ export function observeMemory(state: MemoryDraft | null, incoming: AgentMemory):
   return { ...state, remote: incoming.version === state.base.version ? null : incoming };
 }
 
-/** 用户显式确认拿最新版本作为保存基线；始终保留草稿，哪怕最新正文不同。 */
+/** Explicitly adopt the latest version while keeping local text for review. */
 export function reloadMemoryBase(state: MemoryDraft, incoming: AgentMemory): MemoryDraft {
   return { base: incoming, content: state.content, remote: null };
 }
@@ -55,7 +112,8 @@ export function memoryAuthor(author: AgentMemory["updated_by"]): string {
   }
 }
 
-export function memoryModified(memory: AgentMemory): string {
-  if (memory.updated_at === null) return t("尚未修改");
-  return t("{date} · {author}修改", { date: new Date(memory.updated_at * 1000).toLocaleString(getLocale()), author: memoryAuthor(memory.updated_by) });
+export function memoryModified(memory: AgentMemory, agentName?: string): string | null {
+  if (memory.updated_at === null) return null;
+  return t("{date} · {author}修改", { date: new Date(memory.updated_at * 1000).toLocaleString(getLocale()),
+    author: memory.updated_by === "agent" && agentName ? agentName : memoryAuthor(memory.updated_by) });
 }

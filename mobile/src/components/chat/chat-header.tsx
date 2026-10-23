@@ -1,68 +1,82 @@
 import { router } from "expo-router";
-import { ChevronLeft, Menu } from "lucide-react-native";
+import { SquarePen, TextAlignStart } from "lucide-react-native";
 import { Pressable, View } from "react-native";
 
-import { Button } from "@/components/ui/button.tsx";
+import { CHAT_FLOATING_SURFACE } from "@/components/chat/chat-surface.ts";
 import { Icon } from "@/components/ui/icon.tsx";
 import { Text } from "@/components/ui/text.tsx";
 import { WandrunAvatar } from "@/components/wandrun-avatar.tsx";
 import type { AgentSummary } from "@/gateway/api.ts";
+import { chatSubtitle } from "@/lib/chat-header.ts";
 import { useTranslation } from "@/lib/i18n.ts";
+import { TypingDots } from "./typing-dots.tsx";
+
 
 type Props = {
   agent: AgentSummary | undefined;
   title: string;
   source?: "user" | "schedule";
   paddingTop: number;
-  /** 打开该 Agent 的对话列表抽屉；对话信息还没加载时不传，按钮置灰。 */
+  /** The drawer stays unavailable until the conversation has loaded. */
   onOpenConversations?: () => void;
   collaboration?: { creatorName: string; rootId: string; rootTitle: string };
+  working: boolean;
+  browserUrl?: string;
+  newConversationDisabled: boolean;
+  onNewConversation?: () => void;
 };
 
-/** 顶栏共用资料入口；成员副标题额外提供返回根对话的路径。 */
-export function ChatHeader({ agent, title, source, paddingTop, onOpenConversations, collaboration }: Props) {
+/** Three floating controls; the complete center capsule always opens the Agent profile. */
+export function ChatHeader({ agent, title, source, paddingTop, onOpenConversations, collaboration, working, browserUrl, newConversationDisabled, onNewConversation }: Props) {
   const { t } = useTranslation();
+  const subtitle = chatSubtitle({ title, source, collaboration, browserUrl }, t);
+  const newDisabled = newConversationDisabled || !onNewConversation;
   return (
-    <View className="min-h-[60px] flex-row items-center gap-2 border-b border-border px-4 pb-2" style={{ paddingTop }}>
-      <Button variant="ghost" size="icon" className="bg-transparent" onPress={() => router.back()} aria-label={t("返回")}>
-        <Icon as={ChevronLeft} className="size-[22px]" />
-      </Button>
-      <View className="min-w-0 flex-1 items-center">
-        {agent && (
-          <Pressable
-            className="max-w-full flex-row items-center gap-2"
-            onPress={() => router.push({ pathname: "/agents/[id]", params: { id: agent.id } })}
-            accessibilityRole="button"
-            accessibilityLabel={t("查看{agent}资料", { agent: agent.name })}
-            testID="chat-agent-profile"
-          >
-            <WandrunAvatar index={agent.avatar} alt={agent.name} size={28} className="border border-border" />
-            <Text className="shrink text-lg font-semibold" numberOfLines={1} testID="chat-agent-name">
-              {agent.name}
-            </Text>
-          </Pressable>
-        )}
-        {collaboration ? <Pressable testID="chat-root-conversation" accessibilityRole="button"
-          accessibilityLabel={t("返回根对话 {title}", { title: collaboration.rootTitle })}
-          onPress={() => router.push({ pathname: "/c/[id]", params: { id: collaboration.rootId } })}
-          className="max-w-full py-1">
-          <Text className="text-xs text-muted-foreground" numberOfLines={1}>
-            {t("{creator} 发起 · {title}", { creator: collaboration.creatorName, title: collaboration.rootTitle || t("新对话") })} ›
-          </Text>
-        </Pressable> : <Text className="mt-0.5 text-xs text-muted-foreground" numberOfLines={1} testID="chat-conversation-title">
-          {source === "schedule" ? t("定时 · {title}", { title: title || t("新对话") }) : title || t("新对话")}
-        </Text>}
-      </View>
-      <Button
-        variant="ghost"
-        size="icon"
-        className="bg-transparent"
+    <View className="flex-row items-center gap-2 px-3" style={{ paddingTop: paddingTop + 4 }}>
+      <Pressable
+        className="size-11 items-center justify-center rounded-full border border-border bg-card disabled:opacity-50"
+        style={CHAT_FLOATING_SURFACE}
         onPress={onOpenConversations}
         disabled={!onOpenConversations}
-        aria-label={t("对话列表")}
+        accessibilityRole="button"
+        accessibilityLabel={t("对话列表")}
       >
-        <Icon as={Menu} className="size-[22px]" />
-      </Button>
+        <Icon as={TextAlignStart} className="size-[22px]" />
+      </Pressable>
+      <View className="min-w-0 flex-1 items-center">
+        {agent && <Pressable
+          className="h-11 max-w-full flex-row items-center gap-2 rounded-full border border-border bg-card pl-1.5 pr-4"
+          style={CHAT_FLOATING_SURFACE}
+          onPress={() => router.push({ pathname: "/agents/[id]", params: { id: agent.id } })}
+          accessibilityRole="button"
+          accessibilityLabel={t("查看{agent}资料", { agent: agent.name })}
+          testID="chat-agent-profile"
+        >
+          <WandrunAvatar index={agent.avatar} alt={agent.name} size={28} className="size-8 border border-border" />
+          <View className="min-w-0 shrink items-start">
+            <Text className="max-w-full text-[15px] leading-[19px] font-semibold" numberOfLines={1} testID="chat-agent-name">
+              {agent.name}
+            </Text>
+            <View className="max-w-[160px] min-w-0 flex-row items-center gap-1">
+              {working && <TypingDots compact />}
+              <Text className="min-w-0 shrink text-[12px] leading-[15px] text-muted-foreground" numberOfLines={1} testID="chat-conversation-title">
+                {subtitle}
+              </Text>
+            </View>
+          </View>
+        </Pressable>}
+      </View>
+      <Pressable
+        className="size-11 items-center justify-center rounded-full border border-border bg-card"
+        style={[CHAT_FLOATING_SURFACE, newDisabled && { opacity: 0.55 }]}
+        onPress={newDisabled ? undefined : onNewConversation}
+        disabled={newDisabled}
+        accessibilityRole="button"
+        accessibilityLabel={t("新对话")}
+        testID="chat-new-conversation"
+      >
+        <Icon as={SquarePen} className={newDisabled ? "size-[22px] text-muted-foreground" : "size-[22px]"} />
+      </Pressable>
     </View>
   );
 }

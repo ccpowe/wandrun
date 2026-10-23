@@ -33,7 +33,7 @@ export function profileMembers(detail: Pick<AgentDetail, "workers">, agents: rea
 /** 网关没有全局 Agent 执行状态：只描述其作为入口的直接对话，不推断被委派工作的状态。 */
 export function profileStatus(id: string, conversations: Iterable<Pick<Conversation, "agent_id" | "status">>): string {
   for (const conversation of conversations) {
-    if (conversation.agent_id === id && conversation.status === "working") return t("对话进行中");
+    if (conversation.agent_id === id && conversation.status === "working") return t("对话中");
   }
-  return t("暂无进行中的对话");
+  return t("无进行中对话");
 }

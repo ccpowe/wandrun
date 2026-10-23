@@ -22,6 +22,7 @@ for (const { name, url, valid } of urlCases) {
     for (const [type, props] of [
       ['Source', { items: [{ url }] }],
       ['LinkCard', { url, title: 'Reference' }],
+      ['LinkCard', { url: 'https://example.com/article', title: 'Reference', image: url }],
       ['Image', { url, alt: '照片' }],
       ['MediaCard', { url, alt: '照片', title: '参考' }],
       ['Gallery', { items: [{ url, alt: '照片' }] }],
@@ -78,7 +79,7 @@ function sample(schema: Schema, path: Path = [], index = 0): unknown {
     .map(([name, property]) => [name, sample(property, [...path, name], index)]));
   if (schema.type === 'array') return Array.from({ length: schema.minItems ?? 0 }, (_, i) => sample(schema.items!, [...path, i], i));
   if (schema.type === 'string') {
-    if (path.at(-1) === 'url') return 'https://example.com/source';
+    if (path.at(-1) === 'url' || path.at(-1) === 'image') return 'https://example.com/source';
     if (path.at(-1) === 'icon' || path.length === 1 && path[0] === 'name') return 'circle-check';
     return path.at(-1) === 'stateKey' ? 'field' : path.at(-1) === 'value' && path.includes('options') ? `option${index}` : 'x';
   }
@@ -157,12 +158,12 @@ test('every catalog component prop schema matches defensive App parsing at each 
         put(42, false, 'string type');
         if (schema.maxLength !== undefined) {
           const prefix = 'https://example.org/';
-          const value = path.at(-1) === 'url' ? prefix + 'x'.repeat(schema.maxLength - prefix.length) : '🧪'.repeat(schema.maxLength);
+          const value = path.at(-1) === 'url' || path.at(-1) === 'image' ? prefix + 'x'.repeat(schema.maxLength - prefix.length) : '🧪'.repeat(schema.maxLength);
           put(value, true, 'unicode at max codepoints');
           put(`${value}🧪`, false, 'unicode over max codepoints');
         }
         if (schema.minLength !== undefined) {
-          if (path.at(-1) !== 'url') put('x'.repeat(schema.minLength), true, 'minimum length');
+          if (path.at(-1) !== 'url' && path.at(-1) !== 'image') put('x'.repeat(schema.minLength), true, 'minimum length');
           if (schema.minLength > 0) put('', false, 'empty value');
         }
         if (schema.pattern && path.at(-1) === 'stateKey') {

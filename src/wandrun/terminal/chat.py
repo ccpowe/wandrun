@@ -120,7 +120,7 @@ async def chat(
                 continue
 
             try:
-                launched = submit(user_input, target_id)
+                launched = submit(user_input, target_id, direct_user=True)
             except ValueError as error:
                 print(f"[rejected] {error}")
                 continue

@@ -16,16 +16,14 @@ import { useSession } from "@/lib/session-context.tsx";
 
 // Original brand assets: notion.com/front-static/logo-ios.png and brand.github.com/GitHub_Logos.zip.
 // White plates preserve the original black marks in both application themes.
-const APP_BRANDS: Record<string, { logo: ImageSourcePropType; category: string; description: string } | undefined> = {
+const APP_BRANDS: Record<string, { logo: ImageSourcePropType; description: string } | undefined> = {
   notion: {
     logo: require("../../assets/apps/notion.png"),
-    category: "文档与知识库",
-    description: "让 Agent 查找页面、读取文档，协助整理你的 Notion 工作区。",
+    description: "查找页面、读取文档，整理 Notion 工作区。",
   },
   github: {
     logo: require("../../assets/apps/github.png"),
-    category: "代码与协作",
-    description: "让 Agent 查找仓库、跟进 Issue 与 Pull Request，协助处理 GitHub 工作。",
+    description: "查找仓库，处理 Issue 与 Pull Request。",
   },
 };
 
@@ -72,7 +70,7 @@ function AppList({ session }: { session: ChatSession }) {
         const status = t(authorized ? "已授权" : pending ? "等待授权" : reauthorize ? "需要重新授权" : app.connector ? "未授权" : "尚未连接");
         const subtitle = authorized
           ? app.connector!.used_by.length ? t("{count} 个 Agent 使用", { count: app.connector!.used_by.length }) : t("尚未分配给 Agent")
-          : pending ? t("请在浏览器中继续") : reauthorize ? t("重新连接以恢复使用") : t("通过 {app} 安全授权", { app: app.name });
+          : pending ? t("请在浏览器中继续") : reauthorize ? t("重新连接以恢复使用") : null;
         const action = t(authorized ? "管理应用" : pending ? "继续授权" : reauthorize ? "重新授权" : app.connector ? "去授权" : "连接应用");
         return <Pressable key={app.id} testID={`app-${app.id}`} accessibilityRole="button" accessibilityLabel={`${app.name}，${status}，${action}`}
           onPress={() => router.push({ pathname: "/apps/[id]", params: { id: app.id } })} className="gap-4 rounded-lg border border-border bg-card p-5 active:bg-muted">
@@ -80,9 +78,8 @@ function AppList({ session }: { session: ChatSession }) {
             {brand ? <View className="size-[58px] items-center justify-center rounded-[15px] border border-black/10 bg-white">
               <Image source={brand.logo} style={{ width: 48, height: 48 }} resizeMode="contain" accessible={false} />
             </View> : null}
-            <View className="min-w-0 flex-1 gap-1">
+            <View className="min-w-0 flex-1">
               <Text className="text-[19px] font-semibold" numberOfLines={1}>{app.name}</Text>
-              {brand ? <Text className="text-xs leading-[18px] text-muted-foreground">{t(brand.category)}</Text> : null}
             </View>
             <Icon as={ChevronRight} className="size-[18px] text-muted-foreground" />
           </View>
@@ -93,7 +90,7 @@ function AppList({ session }: { session: ChatSession }) {
                 <View className={`size-1.5 rounded-full ${reauthorize ? "bg-destructive" : authorized ? "bg-foreground" : "bg-muted-foreground"}`} />
                 <Text className={`min-w-0 flex-1 text-xs font-medium leading-[18px] ${reauthorize ? "text-destructive" : "text-foreground"}`}>{status}</Text>
               </View>
-              <Text className="text-xs leading-[18px] text-muted-foreground">{subtitle}</Text>
+              {subtitle ? <Text className="text-xs leading-[18px] text-muted-foreground">{subtitle}</Text> : null}
             </View>
             <View pointerEvents="none" className={`h-9 items-center justify-center rounded-full border px-4 ${authorized || pending ? "border-border" : "border-primary bg-primary"}`}>
               <Text className={`text-xs font-semibold ${authorized || pending ? "text-foreground" : "text-primary-foreground"}`}>{action}</Text>

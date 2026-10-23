@@ -3,20 +3,21 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { DrawerFlow, drawerTransition } from "../src/lib/drawer-flow.ts";
+import { DrawerFlow } from "../src/lib/drawer-flow.ts";
 
 function setup(blank: () => Promise<string> = async () => "blank", hasConversation: (id: string) => boolean = () => true) {
   const log: string[] = [];
+  const navigations: string[] = [];
   const failures: unknown[] = [];
   const flow = new DrawerFlow({
     currentId: "cur",
     blankConversation: blank,
     hasConversation,
-    navigate: (id) => log.push(`go:${id}`),
+    navigate: (id) => { log.push(`go:${id}`); navigations.push(id); },
     setOpen: (open) => log.push(open ? "open" : "close"),
     failed: (error) => failures.push(error),
   });
-  return { flow, log, failures };
+  return { flow, log, navigations, failures };
 }
 
 function deferred() {
@@ -86,6 +87,52 @@ test("新对话成功：关闭动画结束后导航到新对话", async () => {
   assert.deepEqual(log, ["open", "close", "go:fresh"]);
 });
 
+test("已关闭时顶部新对话直接导航，关闭完成回调不可重复导航", async () => {
+  let calls = 0;
+  const { flow, navigations } = setup(async () => (++calls, "fresh"));
+  await Promise.all([flow.newConversation(), flow.newConversation()]);
+  assert.equal(calls, 1);
+  assert.deepEqual(navigations, ["fresh"]);
+  flow.onClosed();
+  assert.deepEqual(navigations, ["fresh"]);
+});
+
+test("已关闭时复用当前空对话，不导航；创建失败后可重试", async () => {
+  let calls = 0;
+  const { flow, navigations, failures } = setup(async () => {
+    if (++calls === 1) throw new Error("offline");
+    return "cur";
+  });
+  await flow.newConversation();
+  await flow.newConversation();
+  assert.equal(calls, 2);
+  assert.equal(failures.length, 1);
+  assert.deepEqual(navigations, []);
+});
+
+test("顶部创建期间的连点由同一个 busy 拦截，重新打开使旧请求失效", async () => {
+  const old = deferred();
+  const { flow, log } = setup(() => old.promise);
+  const first = flow.newConversation();
+  const duplicate = flow.newConversation();
+  flow.show();
+  old.resolve("old");
+  await Promise.all([first, duplicate]);
+  assert.deepEqual(log, ["open"]);
+  flow.onClosed();
+  assert.deepEqual(log, ["open"]);
+});
+
+test("顶部新对话在抽屉正关闭时仍等待本轮关闭完成", async () => {
+  const { flow, navigations } = setup(async () => "fresh");
+  flow.show();
+  flow.requestClose();
+  await flow.newConversation();
+  assert.deepEqual(navigations, []);
+  flow.onClosed();
+  assert.deepEqual(navigations, ["fresh"]);
+});
+
 for (const mode of ["select", "new"] as const) {
   test(`${mode}：动画中删除目标则留在原对话，仍存在的目标可正常切换`, async () => {
     const conversations = new Set(["cur", "removed"]);
@@ -147,16 +194,17 @@ test("创建失败：提示错误，抽屉保持打开且可以再操作", async
 });
 
 test("点遮罩关闭后不导航；对话切换动作不会泄漏到下一次打开", () => {
-  const { flow, log } = setup();
+  const { flow, navigations } = setup();
   flow.show();
   flow.select("a");
   flow.requestClose();
   flow.onClosed();
-  assert.deepEqual(log, ["open", "close", "close"]);
+  assert.deepEqual(navigations, []);
   flow.show();
   flow.select("b");
   flow.onClosed();
-  assert.deepEqual(log.slice(-3), ["open", "close", "go:b"]);
+  flow.onClosed();
+  assert.deepEqual(navigations, ["b"]);
 });
 
 test("过期失败不清除新操作的 busy，也不提示错误", async () => {
@@ -236,24 +284,15 @@ test("Flow 销毁清除待导航动作，旧界面的关闭通知和交互均无
   assert.deepEqual(log, ["open", "close"]);
 });
 
-test("覆盖层打开及退出期间持续可见，当前动画完成后才释放底层", () => {
-  const initial = { open: false, visible: false, generation: 0 };
-  const opened = drawerTransition(initial, { type: "target", open: true });
-  assert.equal(opened.visible, true);
-  const closing = drawerTransition(opened, { type: "target", open: false });
-  assert.equal(closing.open, false);
-  assert.equal(closing.visible, true);
-  const closed = drawerTransition(closing, { type: "closed", generation: closing.generation });
-  assert.equal(closed.visible, false);
-});
-
-test("重开后旧关闭通知不能释放覆盖层，再次关闭须等本次动画完成", () => {
-  const opened = drawerTransition({ open: false, visible: false, generation: 0 }, { type: "target", open: true });
-  const firstClose = drawerTransition(opened, { type: "target", open: false });
-  const reopened = drawerTransition(firstClose, { type: "target", open: true });
-  const stale = { type: "closed", generation: firstClose.generation } as const;
-  assert.deepEqual(drawerTransition(reopened, stale), reopened);
-  const secondClose = drawerTransition(reopened, { type: "target", open: false });
-  assert.deepEqual(drawerTransition(secondClose, stale), secondClose);
-  assert.equal(drawerTransition(secondClose, { type: "closed", generation: secondClose.generation }).visible, false);
+test("重开取消旧关闭，旧关闭通知不导航；新一轮关闭只消费自己的目标", () => {
+  const { flow, log } = setup();
+  flow.show();
+  flow.select("old");
+  flow.show();
+  flow.onClosed();
+  assert.deepEqual(log, ["open", "close", "open"]);
+  flow.select("new");
+  flow.onClosed();
+  flow.onClosed();
+  assert.deepEqual(log, ["open", "close", "open", "close", "go:new"]);
 });

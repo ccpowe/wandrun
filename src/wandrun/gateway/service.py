@@ -51,7 +51,8 @@ from wandrun.gateway.subscription import SubscriptionData, SubscriptionUnavailab
 from wandrun.runtime.capabilities import EntryCapabilityDefinition
 from wandrun.integrations.mcp import MCPConnectionError
 from wandrun.runtime.memory import (
-    MEMORY_LIMIT, InvalidMemory, MemoryChange, MemoryConflict, MemoryRetired, MemorySnapshot, MemoryStore,
+    MEMORY_LIMIT, MEMORY_DETAIL_LIMIT, InvalidMemory, MemoryChange, MemoryConflict,
+    MemoryDetailSnapshot, MemoryRetired, MemorySnapshot, MemoryStore,
 )
 from wandrun.runtime.preview import PreviewPersistenceError
 from wandrun.runtime.session import Runtime
@@ -413,9 +414,11 @@ class Gateway:
 
     def _on_memory_changed(self, change: MemoryChange) -> None:
         root = self.manager.root_of(change.task_id) if change.task_id is not None else None
+        writer = self.manager.agent_name(change.task_id) if change.task_id is not None else None
         self.store.record_memory_change(
             change.agent_id, change.snapshot.version,
             "agent" if change.task_id is not None else "user", root,
+            writer_agent_id=writer,
         )
         self._wake()
 
@@ -1048,25 +1051,42 @@ class Gateway:
             raise AgentConflict("Agent 正在删除", {"agent_id": identity})
         return agent
 
-    def _memory_store(self, identity: str) -> MemoryStore:
-        """删除中的 Agent 对记忆 API 等同于不存在；文件失败不得冒充空记忆。"""
+    def _memory_store(self, identity: str | None) -> MemoryStore:
+        """画像不归某个 Agent；删除中的 Agent 只封锁自己的工作记忆。"""
         self._require_serving()
-        if self._persist(self.store.agent, identity) is None or self._persist(self.store.agent_deleting, identity):
+        if identity is not None and (
+            self._persist(self.store.agent, identity) is None
+            or self._persist(self.store.agent_deleting, identity)
+        ):
             raise UnknownAgent(identity)
         if self.runtime is None or self.runtime.memory is None:
             raise RuntimeError("运行时记忆尚未就绪")
         return self.runtime.memory
 
-    def _memory_response(self, identity: str, snapshot: MemorySnapshot) -> dict:
+    def _memory_response(self, identity: str | None, snapshot: MemorySnapshot) -> dict:
         author = self._persist(self.store.memory_author, identity, snapshot.version)
-        return {
-            "agent_id": identity, "content": snapshot.content, "version": snapshot.version,
-            "updated_at": snapshot.updated_at,
+        response = {
+            "scope": snapshot.scope, "content": snapshot.content, "version": snapshot.version,
+            "details": snapshot.details, "updated_at": snapshot.updated_at,
             "updated_by": (author or "external") if snapshot.updated_at is not None else None,
             "limit": MEMORY_LIMIT,
         }
+        if identity is not None:
+            response["agent_id"] = identity
+        return response
 
-    def get_memory(self, identity: str) -> dict:
+    @staticmethod
+    def _memory_detail_response(snapshot: MemoryDetailSnapshot) -> dict:
+        response = {
+            "scope": snapshot.scope, "slug": snapshot.slug, "content": snapshot.content,
+            "sha256": snapshot.sha256, "path": snapshot.path,
+            "version": snapshot.version, "limit": MEMORY_DETAIL_LIMIT,
+        }
+        if snapshot.agent_id is not None:
+            response["agent_id"] = snapshot.agent_id
+        return response
+
+    def get_memory(self, identity: str | None) -> dict:
         memory = self._memory_store(identity)
         try:
             return self._memory_response(identity, memory.read(identity))
@@ -1075,11 +1095,54 @@ class Gateway:
         except Exception as error:
             raise self._fail(error) from error
 
-    def put_memory(self, identity: str, content: str, expected_version: str) -> dict:
-        """受管 CAS；冲突和输入错误不停止网关，IO/提交后元数据错误则停服。"""
+    def put_memory(self, identity: str | None, content: str, expected_version: str) -> dict:
+        """受管 CAS；输入和冲突受控拒绝，持久化失败停止网关。"""
         memory = self._memory_store(identity)
         try:
             return self._memory_response(identity, memory.save(identity, content, expected_version))
+        except (MemoryConflict, InvalidMemory, MemoryRetired):
+            raise
+        except GatewayFailure:
+            raise
+        except Exception as error:
+            raise self._fail(error) from error
+
+    def get_memory_detail(self, identity: str | None, slug: str) -> dict:
+        memory = self._memory_store(identity)
+        try:
+            return self._memory_detail_response(memory.read_detail(identity, slug))
+        except (InvalidMemory, MemoryRetired):
+            raise
+        except GatewayFailure:
+            raise
+        except Exception as error:
+            raise self._fail(error) from error
+
+    def put_memory_detail(
+        self, identity: str | None, slug: str, content: str, expected_version: str,
+        *, index_content: str | None = None,
+    ) -> dict:
+        """详情与索引一次发布；不把单独准备成功报告为保存成功。"""
+        memory = self._memory_store(identity)
+        try:
+            snapshot = memory.put_detail(
+                identity, slug, content, expected_version, index_content=index_content,
+            )
+            return self._memory_response(identity, snapshot)
+        except (MemoryConflict, InvalidMemory, MemoryRetired):
+            raise
+        except GatewayFailure:
+            raise
+        except Exception as error:
+            raise self._fail(error) from error
+
+    def delete_memory_detail(
+        self, identity: str | None, slug: str, content: str, expected_version: str,
+    ) -> dict:
+        memory = self._memory_store(identity)
+        try:
+            snapshot = memory.delete_detail(identity, slug, content, expected_version)
+            return self._memory_response(identity, snapshot)
         except (MemoryConflict, InvalidMemory, MemoryRetired):
             raise
         except GatewayFailure:
@@ -1843,7 +1906,10 @@ class Gateway:
                 raise ClientIdConflict("client_id 已用于其他会话或其他命令")
             return existing, False
         self._check_pending_client_id(client_id)
-        self.manager.interrupt(prompt if prompt is not None else text, task_id, agent_name=task["agent_id"])
+        self.manager.interrupt(
+            prompt if prompt is not None else text, task_id,
+            agent_name=task["agent_id"], direct_user=True,
+        )
         self.manager.add_feedback(task["creator_task_id"], {
             "task_id": task_id, "agent": task["agent_id"], "cause": "user_interjection",
             "message": f"用户直接对 {task['agent_id']} 说：{text}",
@@ -1921,6 +1987,7 @@ class Gateway:
             raise MediaError(404, "media_not_found", "消息媒体不存在")
         text = source.data["text"]
         value = None
+        favicon_url = None
         if block == "markdown" and element == "image":
             urls = markdown_image_urls(text)
             if 0 <= index < len(urls):
@@ -1938,11 +2005,18 @@ class Gateway:
                     props = node["props"]
                     if node["type"] in ("Image", "MediaCard") and index == 0:
                         value = props.get("url")
+                    elif node["type"] == "LinkCard" and index == 0:
+                        value = props.get("image")
+                        if value is None:
+                            favicon_url = props["url"]
                     elif node["type"] == "Gallery" and 0 <= index < len(props["items"]):
                         value = props["items"][index].get("url")
-        if value is None:
+        if value is None and favicon_url is None:
             raise MediaError(404, "media_not_found", "消息媒体不存在或无效")
-        result = await self.image_proxy.get(value)
+        if favicon_url is not None:
+            result = await self.image_proxy.get_favicon(favicon_url)
+        else:
+            result = await self.image_proxy.get(value)
         self._require(conversation_id)
         return result
 
@@ -1988,7 +2062,7 @@ class Gateway:
         attachments: list[dict], *, ui_submission: dict | None = None,
     ) -> tuple[Event, bool]:
         # 与普通消息共享同一打断和持久化顺序；提交不能在二者间 await。
-        self.manager.interrupt(prompt, conversation_id, agent_name=agent_id)
+        self.manager.interrupt(prompt, conversation_id, agent_name=agent_id, direct_user=True)
         event, created = self._persist(
             self.store.append_user_message, conversation_id, text, client_id, attachments,
             ui_submission=ui_submission,

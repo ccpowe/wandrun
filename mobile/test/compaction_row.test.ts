@@ -24,6 +24,7 @@ declare global {
 globalThis.__compactionRowReact = React;
 globalThis.__compactionMarkdownIt = MarkdownIt;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+Object.assign(globalThis, { __DEV__: false });
 
 // This suite runs the real SessionProvider on its web branch, including persistence.
 const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -43,9 +44,17 @@ after(() => {
 });
 
 // Mount the real chat row and Markdown wrapper. Only native host components and
-// platform packages unavailable to Node are substituted; no Gateway/session logic is mocked.
+// platform packages unavailable to Node are substituted; event routing and message lookup remain real.
 const platform: Record<string, string> = {
-  "react-native": `export const View='View', Text='Text', Pressable='Pressable', ScrollView='ScrollView', Image='Image', TextInput='TextInput', ActivityIndicator='ActivityIndicator', FlatList='FlatList';
+  "@/components/chat/drawer-horizontal-gesture.tsx": "export const DrawerHorizontalGesture=({children})=>children;",
+  "react-native-drawer-layout": "export const DrawerGestureContext=globalThis.__compactionRowReact.createContext(undefined);",
+  "react-native": `export const View='View', Text='Text', Pressable='Pressable', ScrollView='ScrollView', Image='Image', TextInput='TextInput', ActivityIndicator='ActivityIndicator';
+    export const Animated={};
+    export function FlatList({ref,...props}) {
+      const React=globalThis.__compactionRowReact;
+      React.useImperativeHandle(ref,()=>({scrollToIndex(){}}),[]);
+      return React.createElement('FlatList',props);
+    }
     export const Platform={OS:'web',select:({web})=>web};
     export const StyleSheet={create:(styles)=>styles,flatten:(style)=>style,absoluteFill:{}};
     export const Alert={alert:()=>{}}; export const Linking={openURL:async()=>{}};
@@ -54,14 +63,16 @@ const platform: Record<string, string> = {
     export const AccessibilityInfo={setAccessibilityFocus(){}},findNodeHandle=()=>null;
     export const Dimensions={get:()=>({width:390,height:800})};
     export const useWindowDimensions=()=>({width:390,height:800});`,
-  "expo-router": `export const router={push(){}}; export const useIsFocused=()=>true;`,
+  "expo-router": `export const router={push(route){globalThis.__attachmentRoutes.push(route)}}; export const Stack={Screen:'StackScreen'}; export const useLocalSearchParams=()=>globalThis.__attachmentParams; export const useIsFocused=()=>true;`,
   "expo-secure-store": `export async function getItemAsync(){return null} export async function setItemAsync(){} export async function deleteItemAsync(){}`,
   "expo-network": `export const NetworkStateType={NONE:'NONE'}; export const addNetworkStateListener=()=>({remove(){}});`,
   "expo": `export const requireOptionalNativeModule=()=>null;`,
   "expo-file-system": `export class Directory {} export class File {} export const FileMode={ReadOnly:0}; export const Paths={document:'/mock-documents'};`,
-  "expo-image": `export const Image='ExpoImage';`,
+  "expo-image": `export const Image=props=>globalThis.__compactionRowReact.createElement('ExpoImage',props);`,
   "expo-clipboard": `export const setStringAsync=async()=>true;`,
   "react-native-safe-area-context": `export const useSafeAreaInsets=()=>({top:0,right:0,bottom:0,left:0});`,
+  "react-native-gesture-handler": `const gesture=()=>({onStart(){return this},onUpdate(){return this},onEnd(){return this},maxPointers(){return this},activeOffsetY(){return this},failOffsetX(){return this},enabled(){return this}}); export const Gesture={Pinch:gesture,Pan:gesture,Simultaneous:()=>({})}; export const GestureDetector='GestureDetector';`,
+  "react-native-worklets": `export const scheduleOnRN=(fn,value)=>fn(value);`,
   "react-native-keyboard-controller": `export const useKeyboardState=(select)=>select({isVisible:false,height:0});`,
   "react-native-webview": `export default 'WebView';`,
   "react-native-svg": `export default 'Svg'; export const Circle='Circle', Line='Line', Rect='Rect';`,
@@ -73,7 +84,7 @@ const platform: Record<string, string> = {
     export const FadeIn=animation,FadeOut=animation,FadeOutUp=animation,LinearTransition=animation;
     export const ReduceMotion={System:0},Extrapolation={CLAMP:0};
     export const Easing={linear:(value)=>value},cancelAnimation=()=>{};
-    export const useSharedValue=(value)=>({value}),withRepeat=(value)=>value;
+    export const useSharedValue=(value)=>({value,get(){return this.value},set(next){this.value=next}}),useAnimatedReaction=()=>{},withRepeat=(value)=>value;
     export const LayoutAnimationConfig='LayoutAnimationConfig';
     export const useAnimatedStyle=(fn)=>fn(),useDerivedValue=(fn)=>({value:fn()});
     export const withTiming=(value)=>value,withSpring=(value)=>value,interpolate=()=>0;
@@ -94,7 +105,7 @@ const platform: Record<string, string> = {
 };
 const icons = ["Copy", "ExternalLink", "Brain", "ChevronRight", "CircleAlert", "Clock", "Hand", "RefreshCw", "Square",
   "Monitor", "Clapperboard", "File", "FileText", "Image", "CalendarDays", "Check", "X", "ChevronDown", "ChevronUp",
-  "ArrowLeft", "Minus", "Plus", "Code2", "Expand", "Play", "RotateCcw"];
+  "ArrowLeft", "ArrowUpRight", "Folder", "FolderOpen", "FolderTree", "FileCode2", "Minus", "Plus", "Code2", "Expand", "Play", "RotateCcw"];
 const richIconNames: string[] = JSON.parse(readFileSync(new URL("../../src/wandrun/gateway/ui_icons.json", import.meta.url), "utf8"));
 const iconExports = new Set([...icons, ...richIconNames.map(name => name.split("-").map(part => part[0].toUpperCase() + part.slice(1)).join(""))]);
 platform["lucide-react-native"] = [...iconExports].map((name) => `export const ${name}='Icon${name}';`).join("\n");
@@ -106,6 +117,9 @@ const primitive = `export const Root='PrimitiveRoot', Trigger='PrimitiveTrigger'
   export const Slot='Slot';`;
 registerHooks({
   resolve(specifier, context, nextResolve) {
+    if (specifier === "@/lib/session-context.tsx" && context.parentURL?.endsWith("/app/media-viewer.tsx")) {
+      return { url: "data:text/javascript,export const useSession=()=>globalThis.__attachmentSession", shortCircuit: true };
+    }
     // Match Metro's Web resolution for both offline rich-content resource owners.
     if (specifier === "./math-page" || specifier === "./mermaid-page") return nextResolve(`${specifier}.web.ts`, context);
     // Preserve RNR Dialog/Portal/Slot/Hook behavior; only other unmounted primitives use host placeholders.
@@ -137,15 +151,67 @@ registerHooks({
 });
 
 // Hooks must register before loading Native-compatible business components and the real RNR portal.
+const attachmentRoutes: Array<{ pathname: string; params: Record<string, string> }> = [];
+Object.assign(globalThis, { __attachmentRoutes: attachmentRoutes });
 const { PortalHost } = await import("@rn-primitives/portal");
 const { MessageRow } = await import("../src/components/chat/message-row.tsx");
 const { SessionProvider } = await import("../src/lib/session-context.tsx");
 const { ProgressRow } = await import("../src/components/chat/progress-row.tsx");
 // The Node renderer's TSX/React Native resolution hooks must register before this component loads.
 const { DraftMessageContent } = await import("../src/components/chat/draft-message-content.tsx");
+const { default: MediaViewer } = await import("../src/app/media-viewer.tsx");
 const session = {} as ChatSession; // These event branches never call the session.
 const event = (seq: number, type: string, data: Record<string, unknown>): GatewayEvent =>
   ({ seq, type, conversation_id: "root", at: seq, data });
+
+test("成员及深层任务附件点击按所在时间线定位完整图片组", async () => {
+  const chat = new ChatSession({ baseUrl: "http://attachments", token: "test" }, async () => new Response("{}"));
+  chat.agents.close();
+  // Native thumbnail I/O is outside this navigation/lookup smoke path.
+  chat.api.loadFileThumbnail = async (id) => ({ uri: `data:image/png,${id}`, dispose() {} });
+  Object.assign(globalThis, { __attachmentSession: chat });
+  const root = createRoot({ textComponentTypes: ["Text"] });
+  const pictures = ["one", "two"].map(id => ({ id, name: `${id}.png`, media_type: "image/png", size: 10 }));
+  const cases = [
+    { timelines: ["child"], entry: event(7, "message.agent", { agent: "worker", text: "", attachments: pictures, task_id: "child", timeline_ids: ["child"] }) },
+    { timelines: ["grandchild", "child"], entry: event(8, "message.task", {
+      task_id: "child", sender_task_id: "grandchild", recipient_task_id: "child",
+      sender_agent_id: "worker", recipient_agent_id: "planner", text: "", attachments: pictures,
+      timeline_ids: ["grandchild", "child"],
+    }) },
+  ];
+  try {
+    for (const { timelines, entry } of cases) {
+      chat["apply"](entry);
+      assert.equal(chat.timeline("root").events.some(candidate => candidate.seq === entry.seq), false);
+      // Member-to-member delivery uses the recipient as primary, but each visible
+      // timeline must open its own copy of the same message's attachment gallery.
+      for (const timeline of timelines) {
+        await act(async () => root.render(React.createElement(MessageRow, {
+          item: { key: `e${entry.seq}`, event: entry }, session: chat, timelineId: timeline,
+        })));
+        const image = root.container.queryAll(node => node.props.testID === "attachment-image-two")[0];
+        assert.ok(image, "real row renders its second attachment");
+        await act(async () => image.queryAll(node =>
+          node.type === "Pressable" && node.props.accessibilityLabel === "查看图片 two.png")[0].props.onPress());
+        const route = attachmentRoutes.at(-1)!;
+        assert.equal(route.pathname, "/media-viewer");
+        assert.deepEqual(route.params, { id: timeline, seq: String(entry.seq), file_id: "two", index: "1" });
+        Object.assign(globalThis, { __attachmentParams: route.params });
+        await act(async () => root.render(React.createElement(MediaViewer)));
+        const gallery = root.container.queryAll(node => node.type === "FlatList")[0];
+        assert.deepEqual(gallery.props.data.map((file: { id: string }) => file.id), ["one", "two"]);
+        assert.equal(gallery.props.initialScrollIndex, 1);
+      }
+    }
+  } finally {
+    await act(async () => root.unmount());
+    await chat.close();
+    attachmentRoutes.length = 0;
+    Reflect.deleteProperty(globalThis, "__attachmentSession");
+    Reflect.deleteProperty(globalThis, "__attachmentParams");
+  }
+});
 
 function summary(seq: number, text: string): GatewayEvent {
   return event(seq, "context.compacted", {
@@ -272,7 +338,7 @@ test("只有其他 Agent 的草稿和回复显示发送者，使用目录显示�
   const chat = new ChatSession({ baseUrl: "http://sender-test", token: "test" });
   chat.agents.close();
   chat["reset"]([{ id: "root", agent_id: "parent-id", title: "Root", status: "idle", unread: false,
-    read_seq: 0, created_at: 1, updated_at: 1, last_text: null, source: "user", schedule_origin: null }], 1);
+    read_seq: 0, last_agent_seq: 0, created_at: 1, updated_at: 1, last_text: null, source: "user", schedule_origin: null }], 1);
   chat["apply"](event(2, "task.created", { task_id: "child", creator_task_id: "root",
     creator_agent_id: "parent-id", agent_id: "member-id", title: "Child", status: "running",
     timeline_ids: ["root", "child"] }));

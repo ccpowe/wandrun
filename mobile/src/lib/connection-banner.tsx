@@ -50,7 +50,7 @@ export function ConnectionBanner({ session }: { session: ChatSession }) {
       <Icon as={WifiOff} className="size-5 text-muted-foreground" />
       <View className="min-w-0 flex-1 gap-0.5">
         <Text className="text-sm font-semibold">{label}</Text>
-        <Text className="text-xs text-muted-foreground">{t("显示的是断开前的内容，暂时不能发消息")}</Text>
+        <Text className="text-xs text-muted-foreground">{t("内容可能不是最新的")}</Text>
       </View>
     </View>
   );

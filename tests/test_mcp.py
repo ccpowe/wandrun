@@ -1336,6 +1336,116 @@ class MCPCallFailureTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MCPHTTPTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from sse_starlette.sse import AppStatus
+
+        # Each test owns a new Uvicorn server, but SSE's shutdown flag is process-wide.
+        # A previous server's watcher can set it during shutdown; restore it after cleanup.
+        self.enterContext(patch.object(AppStatus, "should_exit", False))
+
+    async def test_http_session_404_recovers_on_next_use_without_replaying_call(self):
+        import socket
+        import uvicorn
+        from fastmcp import FastMCP
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse, Response
+
+        peer = FastMCP("session-expiry")
+        executions, requests = [], []
+        expired = set()
+        business_error = False
+        json_error = True
+
+        @peer.tool
+        async def lookup() -> str:
+            executions.append(True)
+            return "ok"
+
+        underlying = peer.http_app(stateless_http=False)
+
+        async def app(scope, receive, send):
+            if scope["type"] != "http" or scope["method"] != "POST":
+                return await underlying(scope, receive, send)
+            request = Request(scope, receive)
+            body = await request.body()
+            message = json.loads(body)
+            session = request.headers.get("mcp-session-id")
+            method = message.get("method")
+            requests.append((method, session))
+            if method == "server/discover":
+                # Exercise the supported legacy stateful session, not modern stateless HTTP.
+                return await JSONResponse({
+                    "jsonrpc": "2.0", "id": message["id"],
+                    "error": {"code": -32601, "message": "Method not found"},
+                })(scope, receive, send)
+            if session in expired or (business_error and method == "tools/call"):
+                error = {"jsonrpc": "2.0", "id": message.get("id"),
+                         "error": {"code": -32600, "message": "controlled rejection"}}
+                status = 404 if session in expired else 200
+                response = JSONResponse(error, status_code=status) if json_error else Response(status_code=status)
+                return await response(scope, receive, send)
+            replayed = False
+
+            async def replay():
+                nonlocal replayed
+                if not replayed:
+                    replayed = True
+                    return {"type": "http.request", "body": body, "more_body": False}
+                return await receive()
+
+            return await underlying(scope, replay, send)
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        sock.setblocking(False)
+        server = uvicorn.Server(uvicorn.Config(app, access_log=False, log_level="critical"))
+        serving = asyncio.create_task(server.serve(sockets=[sock]))
+        try:
+            async with asyncio.timeout(5):
+                while not server.started:
+                    await asyncio.sleep(0.01)
+            connection = {"url": f"http://127.0.0.1:{sock.getsockname()[1]}/mcp"}
+            async with MCPConnectionPool(open_timeout=3) as pool:
+                tools = await pool.open("docs", connection)
+                call = {"type": "tool_call", "id": "use", "name": "lookup", "args": {}}
+                self.assertEqual((await tools[0].ainvoke(call)).status, "success")
+                owner = pool._services["docs"]
+                business_error = True
+                self.assertEqual((await tools[0].ainvoke(call)).status, "error")
+                business_error = False
+                self.assertEqual((await tools[0].ainvoke(call)).status, "success")
+                self.assertIs(pool._services["docs"], owner)
+                self.assertEqual(sum(method == "ping" for method, _ in requests), 0)
+                for json_error in (True, False):
+                    with self.subTest(json_error=json_error):
+                        session = next(session for method, session in reversed(requests)
+                                       if method == "tools/call")
+                        self.assertIsNotNone(session)
+                        expired.add(session)
+                        before = len(executions)
+                        tool_requests_before = sum(method == "tools/call" for method, _ in requests)
+                        failed = await tools[0].ainvoke(call)
+                        self.assertEqual(
+                            sum(method == "tools/call" for method, _ in requests) - tool_requests_before,
+                            1,
+                        )
+                        self.assertEqual(failed.status, "error")
+                        self.assertIn("结果未知", str(failed.content))
+                        self.assertEqual(len(executions), before)
+                        self.assertIs(await pool.open("docs", connection), tools)
+                        recovered = await tools[0].ainvoke(call)
+                        self.assertEqual(recovered.status, "success", recovered.content)
+                        self.assertEqual(len(executions), before + 1)
+                        self.assertTrue(owner.released)
+                        owner = pool._services["docs"]
+                self.assertEqual(sum(method == "initialize" for method, _ in requests), 3)
+                self.assertEqual(sum(method == "ping" for method, _ in requests), 2)
+        finally:
+            server.should_exit = True
+            await asyncio.wait_for(serving, 5)
+            sock.close()
+
     async def test_sse_endpoint_follows_same_origin_307(self):
         import socket
         import uvicorn

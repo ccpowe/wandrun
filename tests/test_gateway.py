@@ -118,6 +118,27 @@ class GatewayStoreTests(unittest.TestCase):
         self.store.append(conversation["id"], "message.agent", {"text": "又一条"})
         self.assertTrue(self.store.conversation(conversation["id"])["unread"])
 
+    def test_last_agent_seq_tracks_only_this_root_timeline_and_survives_reads(self):
+        first, _ = self.store.create_conversation("一", "main")
+        second, _ = self.store.create_conversation("二", "main")
+        self.assertEqual(first["last_agent_seq"], 0)
+        reply, _ = self.store.append(first["id"], "message.agent", {"text": "根回复"})
+        self.store.append(second["id"], "message.agent", {"text": "另一对话"})
+        self.store.append(first["id"], "message.agent", {
+            "text": "成员回复", "timeline_ids": ["child"], "task_id": "child",
+        })
+        self.store.append(first["id"], "message.user", {"text": "继续"})
+        listed = next(row for row in self.store.conversations() if row["id"] == first["id"])
+        self.assertEqual((listed["last_agent_seq"], listed["unread"]), (reply.seq, True))
+        self.store.mark_read(first["id"], reply.seq)
+        detail = self.store.conversation(first["id"])
+        self.assertEqual((detail["last_agent_seq"], detail["unread"]), (reply.seq, False))
+        later, _ = self.store.append(first["id"], "message.agent", {"text": "真正新回复"})
+        self.assertEqual(
+            (self.store.conversation(first["id"])["last_agent_seq"],
+             self.store.conversation(first["id"])["unread"]), (later.seq, True),
+        )
+
     def test_status_column_and_event_change_together(self):
         conversation, _ = self.store.create_conversation("新对话", "main")
         self.assertEqual(conversation["status"], "idle")

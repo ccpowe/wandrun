@@ -1,5 +1,5 @@
 import { router, Stack, useLocalSearchParams } from "expo-router";
-import { Bot, FileText, MessageSquare, MessagesSquare, Search as SearchIcon } from "lucide-react-native";
+import { Bot, FileText, MessageSquare, MessagesSquare } from "lucide-react-native";
 import { useEffect, useState } from "react";
 import { ActivityIndicator, Keyboard, Pressable, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -81,7 +81,6 @@ export default function SearchScreen() {
       </View>
       {agent_id && <Text className="px-5 pb-2 text-xs text-muted-foreground">{t("仅搜索 {name} 的内容", { name: scopeName ?? t("当前 Agent") })}</Text>}
       <ScrollView keyboardShouldPersistTaps="handled" contentContainerClassName="px-4 pb-10">
-        {!query.trim() ? <View className="items-center gap-2 pt-20"><Icon as={SearchIcon} className="size-9 text-muted-foreground" /><Text className="text-muted-foreground">{t("输入关键词搜索")}</Text></View> : null}
         {GROUPS.map(({ kind, title, icon }) => {
           const group = visibleResults.filter((result) => result.kind === kind);
           if (!group.length) return null;

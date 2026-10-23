@@ -8,10 +8,21 @@ import { AgentMessageContent } from "@/components/chat/agent-message-content.tsx
 import { Button } from "@/components/ui/button.tsx";
 import { Text } from "@/components/ui/text.tsx";
 import { richScenarios } from "@/dev/rich-scenarios.ts";
-import { GatewayError } from "@/gateway/api.ts";
+import { GatewayApi, GatewayError } from "@/gateway/api.ts";
+import type { ChatSession } from "@/gateway/session.ts";
 
 type Submission = { values: Record<string, unknown>; createdAt: string };
 type Outcome = "success" | "pending" | "400" | "404" | "409";
+// A development-only persisted-coordinate owner exercises the actual authenticated-media
+// error path in the link-list scenario without contacting a gateway or the source URL.
+const failedLinkMedia = new GatewayApi(
+  { baseUrl: "https://preview.invalid", token: "preview", computerId: "preview" },
+  async () => Response.json({ error: { code: "media_not_found", message: "Image unavailable" } }, { status: 404 }),
+);
+const failedLinkOwner = {
+  session: { api: failedLinkMedia, subscribe: () => () => {}, uiDraftFor: () => undefined, saveUiDraft: () => {} } as unknown as ChatSession,
+  conversationId: "rich-link-preview", messageSeq: 1,
+};
 
 export default function RichPreviewRoute() {
   if (!__DEV__) return <Redirect href="/" />;
@@ -73,6 +84,7 @@ function RichPreview() {
           ui={scenario.invalid ? [{ block: 0, valid: false }] : scenario.files
             ? scenario.text.split("```wandrun-ui\n").slice(1).map((_, block) => ({ block, valid: true, files: scenario.files }))
             : undefined}
+          draftOwner={selected === "link-list-v3" ? failedLinkOwner : undefined}
           attachments={scenario.attachments}
           submissions={submission ? new Map([[0, submission]]) : undefined}
           onSubmit={async (_block, values) => {

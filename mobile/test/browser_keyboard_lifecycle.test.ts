@@ -143,6 +143,45 @@ async function showPage(root: Root, next = snapshot) {
   return client;
 }
 
+test("viewer keeps a confirmed static picture across an agent-to-requested control change, but removes a changed picture identity", async () => {
+  const root = createRoot();
+  const canvas = () => root.container.queryAll(node => node.type === "FrameCanvas")[0];
+  try {
+    await act(async () => root.render(createElement(BrowserScreen, { id: "lease", control: false })));
+    await act(async () => root.container.queryAll(node => node.type === "FrameViewport")[0].props.onLayout({ nativeEvent: { layout: { width: 720, height: 900 } } }));
+    const client = clients.at(-1)!;
+    await act(async () => client.events.state("open"));
+    await act(async () => client.events.pages({ ...snapshot, state: "agent" }));
+    await act(async () => client.events.frame({ frame: { seq: 1, page: "page", epoch: 1, vp: 1, css: [800, 600] }, jpeg: new Uint8Array() }));
+    await act(async () => canvas().props.onDisplayed(canvas().props.candidate));
+    const confirmed = canvas().props.candidate;
+    await act(async () => client.events.pages({ ...snapshot, state: "requested" }));
+    // Compare only a boolean: renderer host nodes retain the entire React tree,
+    // so formatting a failed node equality assertion can exhaust memory.
+    assert.equal(canvas()?.props.candidate === confirmed, true, "a control-only transition must not unmount a displayed static frame");
+    assert.equal(client.closed, false, "the open stream must remain in place");
+    await act(async () => client.events.pages({ ...snapshot, state: "requested", vp: 2 }));
+    assert.equal(canvas(), undefined, "a viewport identity change must remove the stale frame");
+  } finally { await act(async () => root.unmount()); }
+});
+
+test("viewer retains a candidate awaiting UI confirmation across a control-only transition", async () => {
+  const root = createRoot();
+  const canvas = () => root.container.queryAll(node => node.type === "FrameCanvas")[0];
+  try {
+    await act(async () => root.render(createElement(BrowserScreen, { id: "lease", control: false })));
+    await act(async () => root.container.queryAll(node => node.type === "FrameViewport")[0].props.onLayout({ nativeEvent: { layout: { width: 720, height: 900 } } }));
+    const client = clients.at(-1)!;
+    await act(async () => { client.events.state("open"); client.events.pages({ ...snapshot, state: "agent" }); });
+    await act(async () => client.events.frame({ frame: { seq: 2, page: "page", epoch: 1, vp: 1, css: [800, 600] }, jpeg: new Uint8Array() }));
+    const pending = canvas().props.candidate;
+    await act(async () => client.events.pages({ ...snapshot, state: "requested" }));
+    assert.equal(canvas()?.props.candidate === pending, true, "candidate must survive until its UI confirmation can release stream credit");
+    await act(async () => canvas().props.onDisplayed(pending));
+    assert.ok(canvas(), "a subsequently confirmed frame remains visible");
+  } finally { await act(async () => root.unmount()); }
+});
+
 test("rejected keyboard text remains pending until an explicit successful submit", async () => {
   const root = createRoot();
   try {

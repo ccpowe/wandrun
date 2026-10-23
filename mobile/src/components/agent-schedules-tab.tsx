@@ -73,7 +73,7 @@ export function AgentSchedulesTab({ id, name, session }: { id: string; name: str
       <Button variant="outline" className="self-start" onPress={() => setRetry((n) => n + 1)}><Text>{t("重试")}</Text></Button></View> : null}
     {updateError ? <Text testID="profile-schedules-update-error" className="mx-8 mt-2 text-sm text-destructive">{t("无法更新定时：{error}", { error: t(updateError) })}</Text> : null}
     {schedules === null && !error ? <Text className="mt-12 text-center text-sm text-muted-foreground">{t("正在加载定时…")}</Text> : null}
-    {schedules?.length === 0 ? <EmptyState title={t("还没有定时")} description={t("你或 Agent 可以创建定时，到点后会开一个新对话。")} /> : null}
+    {schedules?.length === 0 ? <EmptyState title={t("还没有定时")} description={t("到点后会开启新对话。")} /> : null}
     {!!schedules?.length && <ListGroup>{schedules.map((schedule) => <ListRow compact key={schedule.id} testID={`profile-schedule-${schedule.id}`}
       leading={<View className="size-9 items-center justify-center rounded-[10px] bg-muted"><Icon as={Clock} className="size-[18px]" /></View>}
       title={schedule.name} subtitle={<RowSubtitle compact text={`${scheduleRuleLabel(schedule.rule)} · ${scheduleNext(schedule)}`} />}

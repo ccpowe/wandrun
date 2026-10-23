@@ -15,7 +15,7 @@ import type { ContextCompactedData, ContextCompactionFailedData, FileRecord } fr
 import type { ChatSession } from "@/gateway/session.ts";
 import { WandrunAvatar } from "@/components/wandrun-avatar.tsx";
 import { TypingDots } from "./typing-dots.tsx";
-import { AttachmentPreview } from "@/components/chat/attachment-preview.tsx";
+import { AttachmentPreview, type AttachmentOwner } from "@/components/chat/attachment-preview.tsx";
 import { ProgressRow } from "./progress-row.tsx";
 import { useTranslation } from "@/lib/i18n.ts";
 import { messagePreview } from "@/lib/message-preview.ts";
@@ -24,7 +24,7 @@ type CardFile = Pick<FileRecord, "id" | "name" | "size" | "media_type"> & Partia
 
 /** My text bubble and the same attachment preview used by Agent messages. */
 function MineBubble({ text, attachments = [], session, owner }: {
-  text: string; attachments?: CardFile[]; session: ChatSession; owner?: { conversationId?: string; messageSeq?: number };
+  text: string; attachments?: CardFile[]; session: ChatSession; owner?: AttachmentOwner;
 }) {
   return (
     <View className={attachments.length ? "w-[240px] max-w-[78%] self-end" : "max-w-[78%] self-end"}>
@@ -57,7 +57,7 @@ function CompactedRow({ data, seq, agentName }: { data: ContextCompactedData; se
         <Text className="text-xs text-muted-foreground">{t("模型生成的工作摘要，非原文；聊天记录仍保留。")}</Text>
         <ScrollView style={{ maxHeight: height * 0.65 }} testID={`context-summary-body-${seq}`}>
           <View onStartShouldSetResponder={() => true}>
-            <AgentMemoryMarkdown content={data.summary_text} />
+            <AgentMemoryMarkdown content={data.summary_text} scrollCodeBlocks />
           </View>
         </ScrollView>
       </DialogContent>
@@ -132,7 +132,7 @@ export function MessageRow({ item, session, visible = false, timelineId, onUiSub
       const creatorName = task && agentDisplayName(session.agents, task.creator_agent_id);
       return <View className="gap-3">
         <MineBubble text={event.data.text} attachments={event.data.attachments} session={session}
-          owner={{ conversationId: event.conversation_id, messageSeq: event.seq }} />
+          owner={{ timelineId: ownerId, messageSeq: event.seq }} />
         {task && <Text testID={`interjection-${event.seq}`} className="self-center text-[13px] text-muted-foreground">
           {t("已打断这一轮 · 已告知 {agent}", { agent: creatorName ?? "" })}
         </Text>}
@@ -156,7 +156,7 @@ export function MessageRow({ item, session, visible = false, timelineId, onUiSub
           </View>
         </Pressable>
         {attachments.length ? <AttachmentPreview files={attachments} session={session}
-          owner={{ conversationId: event.data.task_id, messageSeq: event.data.message_seq }} /> : null}
+          owner={{ timelineId: event.data.task_id, messageSeq: event.data.message_seq }} /> : null}
       </View>;
     }
     case "message.task": {
@@ -170,9 +170,9 @@ export function MessageRow({ item, session, visible = false, timelineId, onUiSub
           <Text className="text-xs text-muted-foreground">{incoming ? name : t("交给 {agent}", { agent: name })}</Text>
         </View>
         <View className={incoming ? "rounded-[20px] rounded-tl-[4px] border border-border px-3.5 py-2.5" : undefined}>
-          <AgentMemoryMarkdown content={event.data.text} selectable />
+          <AgentMemoryMarkdown content={event.data.text} selectable scrollCodeBlocks />
           <AttachmentPreview files={event.data.attachments ?? []} session={session}
-            owner={{ conversationId: event.conversation_id, messageSeq: event.seq }} />
+            owner={{ timelineId: ownerId, messageSeq: event.seq }} />
         </View>
       </View>;
     }
@@ -197,7 +197,7 @@ export function MessageRow({ item, session, visible = false, timelineId, onUiSub
           {event.data.status === "interrupted"
             ? <Text className="mt-1 text-xs text-muted-foreground">{t("已中断 · 内容未完成")}</Text>
             : Array.isArray(event.data.attachments) && <AttachmentPreview files={event.data.attachments} session={session}
-              owner={{ conversationId: event.conversation_id, messageSeq: event.seq }} />}
+              owner={{ timelineId: ownerId, messageSeq: event.seq }} />}
         </View>
       );
     case "context.compacted":
@@ -229,11 +229,11 @@ export function MessageRow({ item, session, visible = false, timelineId, onUiSub
     case "memory.updated":
       return (
         <Pressable testID={`memory-updated-${event.seq}`} accessibilityRole="button"
-          accessibilityLabel={t("查看{agent}的记忆", { agent: agentDisplayName(session.agents, event.data.agent_id, event.data.agent_name) })}
-          onPress={() => router.push({ pathname: "/agents/[id]", params: { id: event.data.agent_id, tab: "memory" } })}
+          accessibilityLabel={event.data.scope === "profile" ? t("查看关于你") : t("查看{agent}的工作记忆", { agent: agentDisplayName(session.agents, event.data.agent_id, event.data.agent_name) })}
+          onPress={() => event.data.scope === "profile" ? router.push("/settings-about-you") : router.push({ pathname: "/agents/[id]", params: { id: event.data.agent_id, tab: "memory" } })}
           className="flex-row items-center gap-1.5 self-center rounded-full border border-border bg-card px-3 py-1.5">
           <Icon as={Brain} className="size-3.5 text-muted-foreground" />
-          <Text className="text-[13px] text-muted-foreground">{t(event.data.summary || "已记住")} · {t("查看记忆")}</Text>
+          <Text className="text-[13px] text-muted-foreground">{t(event.data.summary || "已记住")} · {event.data.scope === "profile" ? t("查看关于你") : t("查看工作记忆")}</Text>
         </Pressable>
       );
     case "turn.stopped":

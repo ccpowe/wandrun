@@ -273,6 +273,50 @@ test("actual canvas submission ACKs after the next UI callback, rejects stale/un
   }
 });
 
+test("a candidate awaiting UI confirmation survives control state changes and later frames receive credit", async () => {
+  const scheduler = globalThis.__browserCanvasScheduler = new Scheduler();
+  const original = { socket: globalThis.WebSocket, raf: globalThis.requestAnimationFrame, cancel: globalThis.cancelAnimationFrame };
+  globalThis.WebSocket = Socket as unknown as typeof WebSocket;
+  globalThis.requestAnimationFrame = (callback) => { const id = scheduler.nextHandle++; scheduler.raf.set(id, callback); return id; };
+  globalThis.cancelAnimationFrame = (id) => { if (id != null) scheduler.raf.delete(id); };
+  const candidates: FrameCandidate[] = [];
+  const api = new GatewayApi({ baseUrl: "http://test", token: "dev", computerId: "canvas-state-test" });
+  const stream = new BrowserStream(api, "lease", false, {
+    state: () => {}, pages: () => {}, reply: () => {}, ended: () => {}, error: (message) => assert.fail(message),
+    frame: ({ frame }) => candidates.push({ frame, image: { seq: frame.seq } as unknown as SkImage, source: stream, connectionId: "socket" }),
+  });
+  const root = createRoot();
+  try {
+    const socket = Socket.latest;
+    socket.open(); socket.emit({ ...pages(3), state: "agent" });
+    socket.emit(packet(baseFrame)); scheduler.tick();
+    await act(async () => root.render(renderFrame(candidates[0], (candidate) => { candidate.source.displayedFrame(candidate.frame); })));
+    scheduler.flushUI(); scheduler.tick();
+    assert.deepEqual(socket.sent, [], "UI confirmation has not reached RN yet");
+    socket.emit({ ...pages(3), state: "requested" });
+    scheduler.flushRN();
+    assert.deepEqual(socket.sent, [{ t: "ack", seq: 1, displayed: true }], "control change cannot strand the ACK slot");
+    socket.emit(packet({ ...baseFrame, seq: 2 })); scheduler.tick();
+    await act(async () => root.render(renderFrame(candidates[1], (candidate) => { candidate.source.displayedFrame(candidate.frame); })));
+    scheduler.flushUI(); scheduler.tick(); scheduler.flushRN();
+    assert.deepEqual(socket.sent, [{ t: "ack", seq: 1, displayed: true }, { t: "ack", seq: 2, displayed: true }]);
+    socket.emit(packet({ ...baseFrame, seq: 3 })); scheduler.tick();
+    await act(async () => root.render(renderFrame(candidates[2], (candidate) => { candidate.source.displayedFrame(candidate.frame); })));
+    scheduler.flushUI(); scheduler.tick();
+    socket.emit({ ...pages(4), state: "requested" });
+    scheduler.flushRN();
+    assert.deepEqual(socket.sent, [
+      { t: "ack", seq: 1, displayed: true }, { t: "ack", seq: 2, displayed: true }, { t: "ack", seq: 3, displayed: false },
+    ], "a genuine picture identity change settles an invalid candidate as discarded");
+  } finally {
+    await act(async () => root.unmount());
+    stream.close();
+    globalThis.WebSocket = original.socket;
+    globalThis.requestAnimationFrame = original.raf;
+    globalThis.cancelAnimationFrame = original.cancel;
+  }
+});
+
 test("four real region gestures retain native identity while each receives its latest committed handler", async () => {
   const scheduler = globalThis.__browserCanvasScheduler = new Scheduler();
   const history: string[] = [];

@@ -22,6 +22,8 @@ from wandrun.runtime.compaction_summary import SUMMARY_INSTRUCTION
 from wandrun.integrations.shell_backend import ManagedShellBackend
 from wandrun.runtime.workers import WorkerManager
 
+from compaction_fixtures import SUMMARY_TEXT
+
 
 def output(*messages, next="done"):
     return AgentOutput(messages=list(messages), next=next)
@@ -86,7 +88,7 @@ class HeadlessLifecycleTests(unittest.IsolatedAsyncioTestCase):
             if body["input"][-1].get("content") == SUMMARY_INSTRUCTION:
                 if fail_summary:
                     raise ValueError("summary rejected")
-                yield answer_text("PRIVATE_SUMMARY_ONLY")
+                yield answer_text(SUMMARY_TEXT)
             elif len(requests) == 1:
                 yield {
                     "type": "response.completed",
@@ -137,7 +139,7 @@ class HeadlessLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["messages"][0]["message"], "finished")
             self.assertEqual(len(result["messages"]), 1)
             self.assertEqual(stdout.getvalue(), "")
-            self.assertNotIn("PRIVATE_SUMMARY_ONLY", json.dumps(saved, ensure_ascii=False))
+            self.assertNotIn("result=67", json.dumps(saved, ensure_ascii=False))
             requests.clear()
             fail_summary = True
             with (
@@ -161,7 +163,7 @@ class HeadlessLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 (workspace / "failed-output" / "result.json").read_text(encoding="utf-8")
             )
             self.assertEqual(failed_saved["compaction_count"], 0)
-            self.assertNotIn("PRIVATE_SUMMARY_ONLY", json.dumps(failed_saved, ensure_ascii=False))
+            self.assertNotIn("result=67", json.dumps(failed_saved, ensure_ascii=False))
 
     async def test_task_outcome_and_cleanup_breach_preserve_result_and_metrics(self):
         class Model(FakeMessagesListChatModel):

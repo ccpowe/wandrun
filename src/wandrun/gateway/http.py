@@ -244,7 +244,7 @@ def create_app(
                 return _error(503, error.code, str(error))
             except MemoryConflict as error:
                 try:
-                    current = gateway._memory_response(request.path_params["id"], error.current)
+                    current = gateway._memory_response(request.path_params.get("id"), error.current)
                 except GatewayFailure:
                     return _error(503, "unavailable", "网关状态更新失败，网关正在退出")
                 return _error(409, "memory_conflict", str(error), {"current": current})
@@ -307,7 +307,8 @@ def create_app(
                 )) or (gateway.manager is not None and gateway.manager.snapshot()["closed"]) or (
                     gateway.runtime is None and request.url.path.startswith("/agents")
                 ) or (
-                    request.url.path.endswith("/memory") and getattr(gateway.runtime, "memory", None) is None
+                    ("/memory" in request.url.path)
+                    and getattr(gateway.runtime, "memory", None) is None
                 ) or (
                     request.url.path.startswith("/browser-tasks/")
                     and getattr(gateway.runtime, "browser", None) is None
@@ -556,7 +557,7 @@ def create_app(
         return JSONResponse({"event": event.to_dict()})
 
     async def agent_memory(request):
-        identity = request.path_params["id"]
+        identity = request.path_params.get("id")
         if request.method in ("GET", "HEAD"):
             return JSONResponse(gateway.get_memory(identity))
         if request.method != "PUT":
@@ -568,6 +569,32 @@ def create_app(
         ):
             raise HttpError(400, "invalid_request", "记忆需要 content 字符串和 SHA-256 version")
         return JSONResponse(gateway.put_memory(identity, body["content"], body["version"]))
+
+    async def memory_detail(request):
+        identity = request.path_params.get("id")
+        slug = request.path_params["slug"]
+        if request.method in ("GET", "HEAD"):
+            return JSONResponse(gateway.get_memory_detail(identity, slug))
+        body = await _json(request)
+        required = {"content", "version"}
+        allowed = required | ({"index_content"} if request.method == "PUT" else set())
+        if not required.issubset(body) or not body.keys() <= allowed or (
+            not isinstance(body["content"], str)
+            or not isinstance(body["version"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", body["version"]) is None
+            or ("index_content" in body and not isinstance(body["index_content"], str))
+        ):
+            raise HttpError(400, "invalid_request", "详情需要 content 字符串和文档 SHA-256 version")
+        if request.method == "PUT":
+            return JSONResponse(gateway.put_memory_detail(
+                identity, slug, body["content"], body["version"],
+                index_content=body.get("index_content"),
+            ))
+        if request.method == "DELETE":
+            return JSONResponse(gateway.delete_memory_detail(
+                identity, slug, body["content"], body["version"],
+            ))
+        raise HTTPException(405)
 
     async def apps(request):
         return JSONResponse({"apps": gateway.list_apps()})
@@ -1007,6 +1034,9 @@ def create_app(
         Route("/schedules/{id}", handled(manage_schedule), methods=["GET", "PATCH", "DELETE"]),
         Route("/schedules/{id}/runs", handled(schedule_runs), methods=["GET"]),
         Route("/agents/{id}/memory", handled(agent_memory), methods=["GET", "PUT"]),
+        Route("/memory/profile", handled(agent_memory), methods=["GET", "PUT"]),
+        Route("/memory/profile/details/{slug}", handled(memory_detail), methods=["GET", "PUT", "DELETE"]),
+        Route("/agents/{id}/memory/details/{slug}", handled(memory_detail), methods=["GET", "PUT", "DELETE"]),
         Route("/models", handled(models), methods=["GET"]),
         Route("/settings", handled(settings), methods=["GET", "PUT"]),
         Route("/usage/subscription", handled(subscription_usage), methods=["GET"]),

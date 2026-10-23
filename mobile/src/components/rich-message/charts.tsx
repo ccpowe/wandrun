@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import { Pressable, View, useWindowDimensions } from 'react-native';
+import { useContext, useState } from 'react';
+import { Pressable, ScrollView, View, useWindowDimensions } from 'react-native';
+import { DrawerGestureContext } from 'react-native-drawer-layout';
 import { BarChart, LineChart, PieChart } from 'react-native-gifted-charts';
 import Svg, { Circle, Line, Rect } from 'react-native-svg';
 import { useCSSVariable } from 'uniwind';
@@ -8,6 +9,7 @@ import { RichText as Text } from './math.tsx';
 import { componentSchemas } from './spec.ts';
 import { chartValueAxis } from './chart-values.ts';
 import { barLayout, chartViewportProps, chartYAxisLabelWidth, lineLayout, LINE_POINT_RADIUS } from './chart-viewport.ts';
+import { DrawerHorizontalGesture } from '@/components/chat/drawer-horizontal-gesture.tsx';
 import { richGeometry, richRadius, richSpace, richType } from './tokens.ts';
 import type { z } from 'zod';
 
@@ -154,6 +156,7 @@ export function RichLineChart({ props }: { props: LineProps }) {
 
 export function RichBarChart({ props }: { props: BarProps }) {
   const colors = useChartColors();
+  const drawerPan = useContext(DrawerGestureContext);
   const [containerWidth, setContainerWidth] = useState<number>();
   const [selected, setSelected] = useState<string | null>(null);
   const axis = chartValueAxis(props.values);
@@ -166,22 +169,38 @@ export function RichBarChart({ props }: { props: BarProps }) {
   // Keep the native below-zero sections within the same plot height.
   const sectionHeight = richGeometry.chartHeight / (axis.above + axis.below);
   const viewport = chartViewportProps(containerWidth ?? 0, 'bar', yAxisLabelWidth);
+  // Gifted's ScrollView is private: it offers no renderer/scroll-view prop to bind a Native
+  // handler. In chat, scroll the whole chart (including its axis) instead, with Gifted's
+  // internal scrolling disabled. Outside the drawer keep the existing chart unchanged.
+  const plotWidth = drawerPan
+    ? Math.max(viewport.width, 2 * richSpace.md + props.values.length * (richSpace.lg + richSpace.md))
+    : viewport.width;
+  const chartWidth = viewport.yAxisLabelWidth + 1 + plotWidth;
+  const chart = <BarChart data={data}
+    height={axis.above * sectionHeight} initialSpacing={richSpace.md} endSpacing={richSpace.md}
+    {...viewport} width={plotWidth} {...barLayout(plotWidth, props.values.length)}
+    maxValue={axis.above * 25} noOfSections={axis.above} stepValue={25}
+    stepHeight={sectionHeight} negativeStepHeight={sectionHeight}
+    noOfSectionsBelowXAxis={axis.below} mostNegativeValue={-axis.below * 25}
+    yAxisLabelTexts={axis.labels}
+    frontColor={colors.series[0]} barBorderRadius={richGeometry.chartBarRadius}
+    yAxisTextStyle={{ color: colors.text, ...richType.subtle }}
+    xAxisLabelTextStyle={{ color: colors.text, ...richType.subtle }} xAxisTextNumberOfLines={1}
+    xAxisColor={colors.border} yAxisColor={colors.border} rulesColor={colors.border}
+    backgroundColor={colors.background} isAnimated={false} {...(drawerPan ? { disableScroll: true } : {})} />;
   return <View style={{ gap: richSpace.sm }} testID="rich-bar-chart"
     onLayout={(event) => setContainerWidth(event.nativeEvent.layout.width)}>
     <ChartDetails kind="bar" title={props.title} unit={props.unit} selected={selected} points={data}>
-    {/* The same half-section overdraw applies to the bar chart's first rule. */}
-    {containerWidth !== undefined && <View testID="rich-bar-plot" style={{ paddingTop: sectionHeight / 2 }}><BarChart data={data}
-      height={axis.above * sectionHeight} initialSpacing={richSpace.md} endSpacing={richSpace.md}
-      {...viewport} {...barLayout(viewport.width, props.values.length)}
-      maxValue={axis.above * 25} noOfSections={axis.above} stepValue={25}
-      stepHeight={sectionHeight} negativeStepHeight={sectionHeight}
-      noOfSectionsBelowXAxis={axis.below} mostNegativeValue={-axis.below * 25}
-      yAxisLabelTexts={axis.labels}
-      frontColor={colors.series[0]} barBorderRadius={richGeometry.chartBarRadius}
-      yAxisTextStyle={{ color: colors.text, ...richType.subtle }}
-      xAxisLabelTextStyle={{ color: colors.text, ...richType.subtle }} xAxisTextNumberOfLines={1}
-      xAxisColor={colors.border} yAxisColor={colors.border} rulesColor={colors.border}
-      backgroundColor={colors.background} isAnimated={false} /></View>}
+    {/* Gifted overdraws half a section upward; reserve that space inside the clipping scroll content. */}
+    {containerWidth !== undefined && <View testID="rich-bar-plot" style={drawerPan ? undefined : { paddingTop: sectionHeight / 2 }}>
+      {drawerPan
+        ? <DrawerHorizontalGesture><ScrollView horizontal scrollEnabled={chartWidth > containerWidth}
+          showsHorizontalScrollIndicator={false} style={{ flexGrow: 0 }} testID="rich-bar-scroll"
+          contentContainerStyle={{ paddingTop: sectionHeight / 2 }}>
+          <View style={{ width: chartWidth }}>{chart}</View>
+        </ScrollView></DrawerHorizontalGesture>
+        : chart}
+    </View>}
     </ChartDetails>
   </View>;
 }

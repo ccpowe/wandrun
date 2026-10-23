@@ -23,7 +23,8 @@ export function stopActiveAudio(): void {
   activePlayer = null;
 }
 
-/** The useAudioPlayer hook owns native disposal; this only forgets the global owner. */
+/** Pause and forget only this owner; a departing page cannot stop a newer player's audio.
+ * Native disposal still belongs to useAudioPlayer. */
 export function releaseAudioPlayer(player: AudioPlaybackHandle): void {
-  if (activePlayer === player) activePlayer = null;
+  if (activePlayer === player) stopActiveAudio();
 }

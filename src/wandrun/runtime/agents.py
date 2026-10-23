@@ -49,7 +49,7 @@ from wandrun.runtime.compaction_archive import CompactionArchive
 from wandrun.runtime.tool_search import ToolNamespace, ToolSearchMiddleware
 from wandrun.runtime.memory import MemoryStore
 from wandrun.runtime.memory_runtime import MemoryMiddleware
-from wandrun.runtime.workers import CommunicationMiddleware
+from wandrun.runtime.workers import CommunicationMiddleware, current_execution_generation
 from wandrun.runtime.browser import BrowserLeases
 from wandrun.runtime.browser_tools import BrowserTakeoverMiddleware
 from wandrun.runtime.capabilities import (
@@ -349,7 +349,8 @@ class ConversationState(CompactionState):
     agent_name: str
     skills_selection: NotRequired[Annotated[list[str], PrivateStateAttr]]
     skills_fingerprints: NotRequired[Annotated[list[str], PrivateStateAttr]]
-    memory_version: NotRequired[Annotated[str | None, PrivateStateAttr]]
+    memory_versions: NotRequired[Annotated[dict[str, str], PrivateStateAttr]]
+    memory_permissions: NotRequired[Annotated[dict[str, str], PrivateStateAttr]]
 
 
 @wrap_model_call
@@ -410,6 +411,8 @@ def build_agents(
     """
     if model_max_retries < 0:
         raise ValueError("model_max_retries 不能小于 0")
+    if memory is not None:
+        manager.bind_memory(memory)
     agents = {}
     for name in (graph_names if graph_names is not None else definitions):
         definition = definitions[name]
@@ -422,7 +425,7 @@ def build_agents(
         )
         role_browser = capabilities.browser
         backend = environment.backend
-        memory_middleware = MemoryMiddleware(memory, name) if capabilities.enabled("memory") else None
+        memory_middleware = MemoryMiddleware(memory, name, manager) if capabilities.enabled("memory") else None
         if memory_middleware is not None:
             backend = memory_middleware.wrap_backend(backend)
         if capabilities.enabled("task_path"):
@@ -580,7 +583,9 @@ async def run_conversation(agent, prompts, task_id, agent_name, *, on_update=Non
         async for chunk in agent.astream(
             inputs,
             config=config,
-            context={"task_id": task_id, "compaction_attempts": 0},
+            # Capture Worker identity at launch, never retrieve a later same-id lease.
+            context={"task_id": task_id, "compaction_attempts": 0,
+                     "execution_generation": current_execution_generation.get()},
             stream_mode="updates",
             version="v2",
             durability="sync",

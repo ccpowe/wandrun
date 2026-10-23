@@ -1,14 +1,16 @@
 """Offline request projection and summary generation contracts."""
 
+import asyncio
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from langchain.agents.middleware.types import ModelRequest
 from langchain.agents.structured_output import ProviderStrategy
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
+from langgraph.errors import GraphInterrupt
 
 from wandrun.integrations.codex_subscription import (
     CodexSubscriptionModel,
@@ -18,13 +20,15 @@ from wandrun.integrations.codex_subscription import (
     is_retryable_model_error,
 )
 from wandrun.runtime.compaction_summary import (
-    SUMMARY_INSTRUCTION,
     SummaryGenerationError,
     request_model_kwargs,
     summarize_request,
+    _validate_summary,
 )
 from wandrun.runtime.messages import AgentOutput
 from wandrun.runtime.preview import PreviewExecution, current_preview
+
+from compaction_fixtures import SUMMARY_TEXT
 
 
 @tool
@@ -52,7 +56,7 @@ def prepared(model):
     )
 
 
-def summary_events(text="summary"):
+def summary_events(text=SUMMARY_TEXT):
     text = json.dumps({
         "messages": [{"to": "human", "task_id": None, "message": text, "attachments": []}],
         "next": "done",
@@ -135,7 +139,7 @@ class SummaryTests(unittest.IsolatedAsyncioTestCase):
         before = list(published)
 
         async def response(_model, body):
-            completed = summary_events("private summary")
+            completed = summary_events()
             output = completed["response"]["output"][0]
             yield {"type": "response.output_item.added", "output_index": 0,
                    "item": {**output, "content": []}}
@@ -147,10 +151,10 @@ class SummaryTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.object(CodexSubscriptionModel, "_arequest", response):
                 result = await summarize_request(request)
-                self.assertEqual(result.content, "private summary")
+                self.assertEqual(result.content, SUMMARY_TEXT)
                 self.assertEqual(published, before)
                 await model.ainvoke(request.messages, **request_model_kwargs(request))
-                self.assertEqual(published[-1]["text"], "private summary")
+                self.assertEqual(published[-1]["text"], SUMMARY_TEXT)
         finally:
             scope.close()
             current_preview.reset(token)
@@ -167,7 +171,7 @@ class SummaryTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(CodexSubscriptionModel, "_arequest", response):
             result = await summarize_request(request)
-        self.assertEqual(result.content, "summary")
+        self.assertEqual(result.content, SUMMARY_TEXT)
         normal = model.project_request([request.system_message, *request.messages],
                                        **request_model_kwargs(request))
         summary = bodies[0]
@@ -175,7 +179,6 @@ class SummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["tools"], normal["tools"])
         self.assertEqual(summary["prompt_cache_key"], normal["prompt_cache_key"])
         self.assertEqual(summary["input"][:-1], normal["input"])
-        self.assertEqual(summary["input"][-1]["content"], SUMMARY_INSTRUCTION)
         self.assertEqual({**summary, "input": summary["input"][:-1]}, normal)
         self.assertEqual(request.messages[-1].content, "tool result")
         self.assertEqual(result.usage_metadata["input_token_details"]["cache_read"], 64)
@@ -276,3 +279,133 @@ class SummaryTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(CodexSubscriptionModel, "_arequest", response):
                     with self.assertRaises(SummaryGenerationError):
                         await summarize_request(prepared(CodexSubscriptionModel()))
+
+    def test_section_validation_accepts_markdown_lists_and_nested_content(self):
+        plain = SUMMARY_TEXT.replace("## ", "")
+        nested = SUMMARY_TEXT.replace(
+            "失败尝试与结果未知项：无。",
+            "失败尝试与结果未知项：无。\n\n### 示例（不是顶层章节）\n"
+            "```markdown\n## 1. 目标\n伪标题\n```\n\n1. 子步骤甲\n2. 子步骤乙",
+        )
+        spaced = SUMMARY_TEXT.replace("## ", "  ##\t").replace("1. 目标", "1.\t目标  ")
+        empty_facts = SUMMARY_TEXT.replace(
+            "已读 /reports/a.txt 第 1～80 行，覆盖全文；result=67，信息已足够回答。", "无",
+        )
+        for text in (SUMMARY_TEXT, plain, nested, spaced, empty_facts):
+            with self.subTest(text=text):
+                _validate_summary(text, CodexSubscriptionModel())
+
+    def test_section_validation_rejects_missing_duplicate_reordered_empty_and_extra_sections(self):
+        parts = SUMMARY_TEXT.split("\n\n")
+        variants = [
+            "",
+            "result=67",
+            "\n\n".join(parts[:2] + parts[3:]),
+            "\n\n".join(parts[:3] + [parts[2]] + parts[4:]),
+            "\n\n".join(parts[:2] + [parts[3], parts[2]] + parts[4:]),
+            SUMMARY_TEXT.replace("## 5. 产物与路径\n无", "## 5. 产物与路径\n"),
+            "```markdown\n" + SUMMARY_TEXT + "\n```",
+            "已完成，请看下面。\n\n" + SUMMARY_TEXT,
+            SUMMARY_TEXT + "\n## 最终回复\nresult=67",
+            SUMMARY_TEXT.replace("## 3. 已确认事实", "## 3. 最终答案"),
+            SUMMARY_TEXT.replace("## 3. 已确认事实", "### 3. 已确认事实"),
+            SUMMARY_TEXT.replace("## 3. 已确认事实", "> ## 3. 已确认事实"),
+            SUMMARY_TEXT.replace("## 4. 决策", "# 4. 决策"),
+            SUMMARY_TEXT.replace("## ", "") + "\n\n这是另附的业务回复。",
+            SUMMARY_TEXT.replace("## ", "").replace("3. 已确认事实", "2. 已确认事实"),
+            SUMMARY_TEXT.replace("## 3. 已确认事实", "```markdown\n## 3. 已确认事实")
+                        .replace("## 4. 决策", "```\n\n## 4. 决策"),
+        ]
+        for text in variants:
+            with self.subTest(text=text), self.assertRaises(SummaryGenerationError):
+                _validate_summary(text, CodexSubscriptionModel())
+
+    def test_summary_length_boundary_counts_only_plain_text(self):
+        model = CodexSubscriptionModel()
+        empty = model.estimate_request_tokens([HumanMessage(content="")])
+        def size(text):
+            return model.estimate_request_tokens([HumanMessage(content=text)]) - empty
+        text = SUMMARY_TEXT + "a" * 20000
+        while size(text) < 8000:
+            text += "a"
+        self.assertEqual(size(text), 8000)
+        _validate_summary(text, model)
+        while size(text) == 8000:
+            text += "a"
+        with self.assertRaisesRegex(SummaryGenerationError, "8000"):
+            _validate_summary(text, model)
+
+    async def test_invalid_summary_retries_same_prefix_without_replaying_bad_body(self):
+        model = CodexSubscriptionModel(request_budget=ModelRequestBudget(2))
+        req = prepared(model)
+        bodies = []
+        bad = "UNUSABLE_BUSINESS_REPLY result=67"
+
+        async def respond(_model, body):
+            bodies.append(body)
+            yield summary_events(bad if len(bodies) == 1 else SUMMARY_TEXT)
+
+        with patch.object(CodexSubscriptionModel, "_arequest", respond):
+            answer = await summarize_request(req)
+        self.assertEqual(answer.text, SUMMARY_TEXT)
+        normal = model.project_request([req.system_message, *req.messages], **request_model_kwargs(req))
+        self.assertEqual(len(bodies), 2)
+        for body in bodies:
+            self.assertEqual({**body, "input": body["input"][:-1]}, normal)
+            self.assertNotIn(bad, json.dumps(body, ensure_ascii=False))
+        self.assertNotEqual(bodies[0]["input"][-1], bodies[1]["input"][-1])
+        self.assertEqual(len(model.request_summaries), 2)
+        self.assertEqual(answer.usage_metadata["input_token_details"]["cache_read"], 64)
+
+    async def test_format_and_transport_retries_share_one_extra_transport_attempt(self):
+        for outcomes in (
+            ["transport", "bad", "good"],
+            ["bad", "transport", "good"],
+            ["transport", "bad", "transport"],
+            ["bad", "bad"],
+        ):
+            with self.subTest(outcomes=outcomes):
+                model = CodexSubscriptionModel(request_budget=ModelRequestBudget(3))
+                bodies = []
+                async def respond(_model, body):
+                    index = len(bodies)
+                    bodies.append(body)
+                    if outcomes[index] == "transport":
+                        raise httpx.ConnectTimeout("temporary")
+                    yield summary_events("result=67" if outcomes[index] == "bad" else SUMMARY_TEXT)
+
+                with patch.object(CodexSubscriptionModel, "_arequest", respond):
+                    if outcomes[-1] == "good":
+                        self.assertEqual((await summarize_request(prepared(model))).text, SUMMARY_TEXT)
+                    else:
+                        expected = httpx.ConnectTimeout if outcomes[-1] == "transport" else SummaryGenerationError
+                        with self.assertRaises(expected):
+                            await summarize_request(prepared(model))
+                self.assertEqual(len(bodies), len(outcomes))
+
+    async def test_format_retry_stops_at_shared_budget(self):
+        model = CodexSubscriptionModel(request_budget=ModelRequestBudget(1))
+        bodies = []
+        async def respond(_model, body):
+            bodies.append(body)
+            yield summary_events("result=67")
+        with patch.object(CodexSubscriptionModel, "_arequest", respond):
+            with self.assertRaisesRegex(RuntimeError, "请求上限"):
+                await summarize_request(prepared(model))
+        self.assertEqual(len(bodies), 1)
+
+    async def test_cancel_and_graph_interrupt_do_not_retry_and_restore_preview(self):
+        for error in (asyncio.CancelledError(), GraphInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                scope = PreviewExecution("root", lambda *_: None)
+                token = current_preview.set(scope)
+                model = AsyncMock()
+                model.ainvoke.side_effect = error
+                try:
+                    with self.assertRaises(type(error)):
+                        await summarize_request(prepared(model))
+                    self.assertIs(current_preview.get(), scope)
+                    self.assertEqual(model.ainvoke.await_count, 1)
+                finally:
+                    scope.close()
+                    current_preview.reset(token)

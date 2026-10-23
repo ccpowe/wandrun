@@ -69,7 +69,7 @@ test("short inactive period is untouched; long background resets before recovery
   t.mock.method(globalThis, "fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = new URL(String(input)).pathname;
     if (path === "/conversations") return Response.json({ conversations: [{
-      id: "c", agent_id: "main", title, created_at: 1, updated_at: 1, status: "idle", read_seq: 0,
+      id: "c", agent_id: "main", title, created_at: 1, updated_at: 1, status: "idle", read_seq: 0, last_agent_seq: 0,
       unread: false, last_text: null, source: "user", schedule_origin: null,
     }], as_of_seq: seq });
     if (path === "/agents") return Response.json({ agents: [], as_of_seq: seq });

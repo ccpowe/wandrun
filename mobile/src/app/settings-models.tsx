@@ -139,7 +139,7 @@ function ModelsScreen({ session }: { session: ChatSession }) {
               }</Text>}
             </View>
           </View>
-          <Text className="mx-8 mt-2.5 text-xs leading-[18px] text-muted-foreground">{t("各 Agent 的模型和推理强度在 Agent 编辑 › 模型中设置。")}</Text>
+          <Text className="mx-8 mt-2.5 text-xs leading-[18px] text-muted-foreground">{t("单个 Agent 的模型和推理强度请在其编辑页设置。")}</Text>
         </ScrollView>
       )}
     </View>

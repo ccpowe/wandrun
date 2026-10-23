@@ -3,22 +3,28 @@ import { existsSync, readFileSync } from 'node:fs';
 import { registerHooks } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
-import React, { act, createElement } from 'react';
+import React, { act, createContext, createElement } from 'react';
 import { createRoot, type Root, type TestInstance } from 'test-renderer';
 import Yoga, { type Node as YogaNode } from 'yoga-layout';
 import MarkdownIt from 'markdown-it';
 import ts from 'typescript';
 import type { ChatSession } from '../src/gateway/session.ts';
-import { GatewayApi } from '../src/gateway/api.ts';
+import { GatewayApi, type AgentMemory } from '../src/gateway/api.ts';
 import { parseMessageMarkdown } from '../src/lib/agent-message-markdown.ts';
 import { groupSelectableMarkdown } from '../src/lib/selectable-markdown.ts';
-Object.assign(globalThis, { __markdownTestReact: React });
+const markdownDrawerContext = createContext<object | undefined>(undefined);
+Object.assign(globalThis, { __markdownTestReact: React, __markdownDrawerContext: markdownDrawerContext });
 
 // Keep the real Markdown parser, menu/Portal state and placement, and media effects.
 // Native host measurement places the message tail at y=1200, outside the viewport.
 const hosts: Record<string, string> = {
+  'react-native-drawer-layout': 'export const DrawerGestureContext=globalThis.__markdownDrawerContext;',
+  'react-native-gesture-handler': `const React=globalThis.__markdownTestReact;
+    export const Gesture={Native:()=>({shouldCancelWhenOutside(){return this},disallowInterruption(){return this},blocksExternalGesture(){return this}})};
+    export const GestureDetector=({gesture,children})=>React.createElement('GestureDetector',{gesture},children);`,
   'react-native': `export const Text='Text', View='View', ScrollView='ScrollView',
     ActivityIndicator='ActivityIndicator', FlatList='FlatList', TouchableWithoutFeedback='TouchableWithoutFeedback';
+    export const Animated={};
     export function Pressable({ref,...props}) {
       const React=globalThis.__markdownTestReact;
       React.useImperativeHandle(ref,()=>({measure:callback=>{
@@ -48,7 +54,8 @@ const hosts: Record<string, string> = {
   'expo-file-system': `export const Directory=class {}, File=class {}; export const Paths={};`,
   'expo-image': `export const Image='ExpoImage';`,
   'expo-router': `export const router={push:()=>{}};`,
-  'uniwind': `export const useUniwind=()=>({theme:'light'}); export const useCSSVariable=()=>['#111','#eee','#ddd'];`,
+  'uniwind': `export const useUniwind=()=>({theme:globalThis.__markdownDark?'dark':'light'});
+    export const useCSSVariable=()=>globalThis.__markdownDark?['#eee','#222','#444']:['#111','#eee','#ddd'];`,
   'react-native-fit-image': `export default 'FitImage';`,
   '@/components/ui/text.tsx': `export const Text='Text', TextClassContext=globalThis.__markdownTestReact.createContext(undefined);`,
   '@/components/rich-message/block.tsx': `export const RichBlock=()=>null;`,
@@ -153,6 +160,42 @@ function imageLayout(image: TestInstance, availableWidth: number) {
   } finally {
     root.freeRecursive();
   }
+}
+
+/** Use the rendered native styles; fixed text measurement isolates horizontal list hierarchy from fonts. */
+function markdownLayoutPositions(host: TestInstance) {
+  const nodes = new Map<TestInstance, YogaNode>();
+  function build(cell: TestInstance): YogaNode {
+    const node = Yoga.Node.create();
+    nodes.set(cell, node);
+    const style = Object.assign({}, ...[cell.props.style].flat(Infinity).filter(Boolean));
+    if (style.flexDirection === 'row') node.setFlexDirection(Yoga.FLEX_DIRECTION_ROW);
+    if (style.flexWrap === 'wrap') node.setFlexWrap(Yoga.WRAP_WRAP);
+    if (style.flex !== undefined) node.setFlex(style.flex);
+    if (style.flexShrink !== undefined) node.setFlexShrink(style.flexShrink);
+    if (style.width !== undefined) node.setWidth(style.width);
+    if (style.height !== undefined) node.setHeight(style.height);
+    if (style.minWidth !== undefined) node.setMinWidth(style.minWidth);
+    for (const [edge, suffix] of [[Yoga.EDGE_LEFT, 'Left'], [Yoga.EDGE_RIGHT, 'Right']] as const) {
+      const margin = style[`margin${suffix}`] ?? style.marginHorizontal ?? style.margin;
+      const padding = style[`padding${suffix}`] ?? style.paddingHorizontal ?? style.padding;
+      if (margin !== undefined) node.setMargin(edge, margin);
+      if (padding !== undefined) node.setPadding(edge, padding);
+    }
+    if (cell.type === 'Text') node.setMeasureFunc(() => ({ width: 64, height: 22 }));
+    else for (const child of cell.children) if (typeof child !== 'string') node.insertChild(build(child), node.getChildCount());
+    return node;
+  }
+  const layout = build(host);
+  try {
+    layout.setWidth(390);
+    layout.calculateLayout(undefined, undefined, Yoga.DIRECTION_LTR);
+    return new Map([...nodes].map(([cell, node]) => {
+      let left = 0;
+      for (let ancestor: YogaNode | null = node; ancestor; ancestor = ancestor.getParent()) left += ancestor.getComputedLeft();
+      return [cell, left];
+    }));
+  } finally { layout.freeRecursive(); }
 }
 
 for (const text of [
@@ -359,6 +402,149 @@ test('non-chat Markdown retains its existing link behavior without a link menu',
     Object.assign(globalThis, { __openedLinks: undefined });
   }
 });
+
+test('real Markdown renderer routes active links in math lists internally and keeps external/local policy', async () => {
+  const path = `/.wandrun/memory/profile/details/topic/${'a'.repeat(64)}.md`;
+  const stale = `/.wandrun/memory/profile/details/topic/${'b'.repeat(64)}.md`;
+  const memory: AgentMemory = { scope: 'profile', content: '', version: 'v1', limit: 1000,
+    updated_at: null, updated_by: null, details: { topic: { path, sha256: 'a'.repeat(64) } } };
+  const opened: string[] = [];
+  const root = createRoot();
+  try {
+    await act(async () => { root.render(createElement(AgentMemoryMarkdown, {
+      content: `- [topic](${path} "title") $x$ [web](https://example.org)\n- [stale](${stale}) [local](/etc/passwd)`,
+      managedMemory: { memory, onOpen: (slug: string) => opened.push(slug) },
+    })); });
+    const math = root.container.queryAll(node => node.type === 'MathContent')[0];
+    assert.ok(math, 'the math-containing list uses the actual math branch');
+    assert.match(math.props.html, new RegExp(`href="${path}"`));
+    assert.match(math.props.html, /href="https:\/\/example\.org"/);
+    assert.ok(!math.props.html.includes(`href="${stale}"`));
+    assert.ok(!math.props.html.includes('href="/etc/passwd"'));
+    await act(async () => {
+      assert.equal(math.props.onManagedLink(path), true);
+      assert.equal(math.props.onManagedLink(stale), false);
+      assert.equal(math.props.onManagedLink('/etc/passwd'), false);
+      assert.equal(math.props.onManagedLink('https://example.org'), false);
+    });
+    assert.deepEqual(opened, ['topic']);
+  } finally { await act(async () => { root.unmount(); }); }
+});
+
+test('memory index rows own only a single active canonical destination, including nested and reference links', async () => {
+  const path = `/.wandrun/memory/profile/details/topic/${'a'.repeat(64)}.md`;
+  const stale = `/.wandrun/memory/profile/details/topic/${'b'.repeat(64)}.md`;
+  const work = `/.wandrun/memory/work/details/topic/${'a'.repeat(64)}.md`;
+  const memory: AgentMemory = { scope: 'profile', content: '', version: 'v1', limit: 1000,
+    updated_at: null, updated_by: null, details: { topic: { path, sha256: 'a'.repeat(64) } } };
+  const opened: string[] = [];
+  const external: string[] = [];
+  Object.assign(globalThis, { __openedLinks: external });
+  const root = createRoot();
+  try {
+    await act(async () => { root.render(createElement(AgentMemoryMarkdown, {
+      content: `## Group\n- Plain **formatted** [topic][detail] tail\n  - Nested [topic](${path})\n- [topic](${path}) and [web](https://example.org)\n- [stale](${stale})\n- [wrong scope](${work})\n\n[detail]: ${path}`,
+      managedMemory: { memory, onOpen: (slug: string) => opened.push(slug) }, memoryIndex: true,
+    })); });
+    const rows = root.container.queryAll(node => node.props.testID === 'memory-index-detail-topic');
+    assert.equal(rows.length, 2, 'only the parent and its independently navigable nested row claim the whole row');
+    assert.ok(rows.every(row => row.type === 'Pressable' && row.props.accessibilityRole === 'button'));
+    await act(async () => { rows[0].props.onPress(); rows[1].props.onPress(); });
+    assert.deepEqual(opened, ['topic', 'topic']);
+    const links = root.container.queryAll(node => node.type === 'Text' && typeof node.props.onPress === 'function');
+    assert.equal(links.length, 2, 'mixed-target row keeps both destinations; stale and wrong-scope links stay inert');
+    await act(async () => { links[0].props.onPress(); links[1].props.onPress(); });
+    assert.deepEqual(opened, ['topic', 'topic', 'topic']);
+    assert.deepEqual(external, ['https://example.org']);
+    await act(async () => { root.render(createElement(AgentMemoryMarkdown, {
+      content: `## Group\n- prose [topic](${path})`,
+      managedMemory: { memory, onOpen: (slug: string) => opened.push(slug) },
+    })); });
+    assert.equal(root.container.queryAll(node => node.type === 'Pressable' && node.props.testID?.startsWith('memory-index-detail-')).length, 0);
+    const ordinaryLink = root.container.queryAll(node => node.type === 'Text' && typeof node.props.onPress === 'function');
+    assert.equal(ordinaryLink.length, 1, 'ordinary memory Markdown keeps link-level navigation');
+    await act(async () => { ordinaryLink[0].props.onPress(); });
+    assert.deepEqual(opened, ['topic', 'topic', 'topic', 'topic']);
+    const workMemory: AgentMemory = { ...memory, scope: 'work',
+      details: { topic: { path: work, sha256: 'a'.repeat(64) } } };
+    await act(async () => { root.render(createElement(AgentMemoryMarkdown, {
+      content: `- [profile](${path})\n- [work](${work})`,
+      managedMemory: { memory: workMemory, onOpen: (slug: string) => opened.push(slug) }, memoryIndex: true,
+    })); });
+    const workRows = root.container.queryAll(node => node.props.testID === 'memory-index-detail-topic');
+    assert.equal(workRows.length, 1, 'only the currently active scope can claim a row');
+    await act(async () => { workRows[0].props.onPress(); });
+    assert.deepEqual(opened, ['topic', 'topic', 'topic', 'topic', 'topic']);
+  } finally {
+    await act(async () => { root.unmount(); });
+    Object.assign(globalThis, { __openedLinks: undefined });
+  }
+});
+
+test('memory index nested rows preserve visible hierarchy and separate parent and child detail targets', async () => {
+  const reference = (slug: string) => ({ path: `/.wandrun/memory/work/details/${slug}/${'a'.repeat(64)}.md`, sha256: 'a'.repeat(64) });
+  const memory: AgentMemory = { scope: 'work', agent_id: 'helper', content: '', version: 'v1', limit: 1000,
+    updated_at: null, updated_by: null, details: { parent: reference('parent'), child: reference('child') } };
+  const opened: string[] = [];
+  const root = createRoot();
+  try {
+    for (const content of [
+      '- Parent\n  - Child\n    - Grandchild\n- Sibling',
+      `- [Parent](${memory.details.parent.path})\n  - [Child](${memory.details.child.path})\n    - Grandchild\n- Sibling`,
+    ]) {
+      await act(async () => root.render(createElement(AgentMemoryMarkdown, {
+        content, memoryIndex: true, managedMemory: { memory, onOpen: (slug: string) => opened.push(slug) },
+      })));
+      const positions = markdownLayoutPositions(root.container);
+      const left = (label: string) => {
+        let cell = root.container.queryAll(node => node.type === 'Text' && node.props.children === label)[0];
+        assert.ok(cell, label);
+        while (!positions.has(cell)) cell = cell.parent!;
+        return positions.get(cell)!;
+      };
+      assert.equal(left('Parent'), left('Sibling'), 'siblings retain the same level');
+      assert.ok(left('Child') > left('Parent'), 'a child is visibly indented from its parent');
+      assert.ok(left('Grandchild') > left('Child'), 'each deeper list adds indentation');
+    }
+    const parent = root.container.queryAll(node => node.props.testID === 'memory-index-detail-parent')[0];
+    const child = root.container.queryAll(node => node.props.testID === 'memory-index-detail-child')[0];
+    assert.equal(parent.queryAll(node => node === child).length, 0, 'the parent press target excludes the nested child');
+    await act(async () => { child.props.onPress(); parent.props.onPress(); });
+    assert.deepEqual(opened, ['child', 'parent']);
+  } finally { await act(async () => root.unmount()); }
+});
+
+for (const content of ['3. Numbered', '- Parent\n\n  - Child\n\n  Continuation']) {
+  test(`memory index fallback marker inherits body color and typography: ${content.split('\n')[0]}`, async () => {
+    const memory: AgentMemory = { scope: 'profile', content, version: 'v1', limit: 1000,
+      updated_at: null, updated_by: null, details: {} };
+    const root = createRoot();
+    try {
+      for (const dark of [false, true]) for (const compact of [false, true]) {
+        Object.assign(globalThis, { __markdownDark: dark });
+        let ordinaryStyle: Record<string, unknown> = {};
+        for (const memoryIndex of [false, true]) {
+          await act(async () => root.render(createElement(AgentMemoryMarkdown, {
+            content, compact, memoryIndex, managedMemory: { memory, onOpen: () => {} },
+          })));
+          const marker = root.container.queryAll(node => node.type === 'Text' &&
+            (node.props.children === '•' || Array.isArray(node.props.children) && node.props.children.join('') === '3.'))[0];
+          assert.ok(marker);
+          const markerStyle = Object.assign({}, ...[marker.props.style].flat(Infinity).filter(Boolean));
+          if (!memoryIndex) {
+            ordinaryStyle = markerStyle;
+            assert.equal(markerStyle.color, dark ? '#eee' : '#111');
+          } else for (const field of ['color', 'fontSize', 'lineHeight']) {
+            assert.equal(markerStyle[field], ordinaryStyle[field], `${field} must be inherited in ${dark ? 'dark' : 'light'} mode, compact=${compact}`);
+          }
+        }
+      }
+    } finally {
+      await act(async () => root.unmount());
+      Object.assign(globalThis, { __markdownDark: undefined });
+    }
+  });
+}
 
 test('readOnly overrides selectable links and media, including a transition from an open link menu', async () => {
   let requests = 0;
@@ -788,4 +974,52 @@ test('stable code and table hosts survive tail updates with and without definiti
       await act(async () => { root.unmount(); });
     }
   }
+});
+
+test('chat code fences and indented blocks preserve columns on the drawer-isolated horizontal surface', async () => {
+  const code = 'root/\n├── src/          // aligned comment\n└── tests/        // aligned comment\n' +
+    Array.from({ length: 80 }, (_, i) => `row_${i}    ${'long_column_'.repeat(12)}    // keep this column`).join('\n');
+  const root = createRoot();
+  const withDrawer = (child: React.ReactNode) =>
+    createElement(markdownDrawerContext.Provider, { value: { id: 'drawer' } }, child);
+  try {
+    for (const block of ['```text\n' + code + '\n```', code.split('\n').map(line => '    ' + line).join('\n')]) {
+      await act(async () => { root.render(withDrawer(createElement(AgentMessageContent, {
+        text: 'Before `inline`.\n\n' + block + '\n\nAfter.', onSubmit: async () => {},
+      }))); });
+      const scroll = root.container.queryAll(node => node.props.testID === 'markdown-code-scroll')[0];
+      assert.ok(scroll);
+      assert.equal(scroll.type, 'ScrollView');
+      assert.equal(scroll.props.horizontal, true);
+      assert.equal(scroll.parent?.type, 'GestureDetector');
+      assert.equal(scroll.parent?.children[0], scroll, 'priority is attached to the scrolling host');
+      const text = scroll.queryAll(node => node.props.testID === 'markdown-code-text')[0];
+      assert.equal(text.props.children, code);
+      assert.equal(text.props.selectable, true, 'wrapping must not move selection onto the ScrollView');
+      const style = Object.assign({}, ...[text.props.style].flat(Infinity).filter(Boolean));
+      assert.equal(style.flexShrink, 0);
+      assert.equal(style.maxHeight, undefined);
+      assert.equal(text.props.numberOfLines, undefined);
+      assert.equal(scroll.props.style.maxHeight, undefined);
+      const inline = root.container.queryAll(node => node.type === 'Text' && node.props.children === 'inline')[0];
+      assert.ok(inline);
+      assert.equal(scroll.queryAll(node => node === inline).length, 0);
+    }
+    await act(async () => { root.render(withDrawer(createElement(DraftMessageContent, { text: '```text\n' + code }))); });
+    assert.equal(root.container.queryAll(node => node.props.testID === 'markdown-code-text')[0].props.children, code,
+      'an unfinished streaming code fence uses the same unwrapped surface');
+  } finally { await act(async () => { root.unmount(); }); }
+});
+
+test('horizontal code is opt-in and can change without stale memoized rules', async () => {
+  const root = createRoot();
+  const content = 'A `short` value.\n\n```text\none    two\nthree  four\n```';
+  try {
+    await act(async () => { root.render(createElement(AgentMemoryMarkdown, { content, selectable: true })); });
+    assert.equal(root.container.queryAll(node => node.props.testID === 'markdown-code-scroll').length, 0);
+    await act(async () => { root.render(createElement(AgentMemoryMarkdown, { content, selectable: true, scrollCodeBlocks: true })); });
+    assert.equal(root.container.queryAll(node => node.props.testID === 'markdown-code-scroll').length, 1);
+    await act(async () => { root.render(createElement(AgentMemoryMarkdown, { content, selectable: true, scrollCodeBlocks: false })); });
+    assert.equal(root.container.queryAll(node => node.props.testID === 'markdown-code-scroll').length, 0);
+  } finally { await act(async () => { root.unmount(); }); }
 });

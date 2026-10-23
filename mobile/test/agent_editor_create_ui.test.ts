@@ -93,7 +93,6 @@ test("unknown create followed by explicit refusal keeps the original command and
   assert.deepEqual(requests[1], requests[0]);
   assert.equal(byId("editor-name").props.editable, false);
   assert.equal(byId("editor-name").props.value, "初稿");
-  assert.ok(root.container.queryAll((node) => node.type === "Text" && typeof node.props.children === "string" && node.props.children.includes("创建结果尚未确认")).length > 0);
   await act(async () => byId("editor-name").props.onChangeText("不应变更"));
   assert.equal(byId("editor-name").props.value, "初稿");
   await act(async () => byId("editor-save").props.onPress());

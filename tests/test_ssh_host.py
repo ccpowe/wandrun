@@ -186,41 +186,57 @@ class HostWithLocalSessionTests(unittest.IsolatedAsyncioTestCase):
 
         from wandrun.runtime.code_mode import CodeModeCatalog, code_mode_tool
         from wandrun.runtime.memory import MemoryStore
-        from wandrun.runtime.memory_runtime import MEMORY_PATH, ManagedMemoryBackend, MemoryMiddleware
+        from wandrun.runtime.memory_runtime import WORK_MEMORY_PATH, MemoryMiddleware
+        from wandrun.runtime.workers import WorkerManager
 
         with tempfile.TemporaryDirectory() as host:
             store = MemoryStore(Path(host) / "memory")
             initial = store.save("ssh-agent", "旧背景\n保留", store.read("ssh-agent").version)
-            backend = ManagedMemoryBackend(self.backend, store, "ssh-agent")
-            request = SimpleNamespace(
-                runtime=SimpleNamespace(context={"task_id": "ssh-task"}),
-                state={"memory_version": initial.version},
-            )
+            async def run(_prompts, task_id):
+                middleware = MemoryMiddleware(store, "ssh-agent", manager)
+                backend = middleware.wrap_backend(self.backend)
+                request = SimpleNamespace(
+                    runtime=SimpleNamespace(context={
+                        "task_id": task_id, "execution_generation": manager.execution_generation(task_id),
+                    }),
+                    state={"messages": [], "memory_versions": {
+                        "work": initial.version, "profile": store.read(None).version,
+                    }},
+                )
 
-            async def ordinary(_request):
-                return await backend.aedit(MEMORY_PATH, "旧背景", "SSH 更新")
+                async def ordinary(_request):
+                    return await backend.aedit(WORK_MEMORY_PATH, "旧背景", "SSH 更新")
 
-            middleware = MemoryMiddleware(store, "ssh-agent")
-            self.assertIsNone((await middleware.awrap_tool_call(request, ordinary)).error)
-            request.state["memory_version"] = store.read("ssh-agent").version
-            async with pm.AsyncMonty() as pool:
-                tool = code_mode_tool(pool, backend, CodeModeCatalog([], []))
+                self.assertIsNone((await middleware.awrap_tool_call(request, ordinary)).error)
+                request.state["memory_versions"]["work"] = store.read("ssh-agent").version
+                async with pm.AsyncMonty() as pool:
+                    tool = code_mode_tool(pool, backend, CodeModeCatalog([], []))
 
-                async def code(_request):
-                    return await tool.ainvoke({
-                        "type": "tool_call", "id": "ssh-memory", "name": "run_code",
-                        "args": {"code": (
-                            f"await edit('{MEMORY_PATH}', 'SSH 更新', 'Code Mode 更新')\n"
-                            f"result = await read('{MEMORY_PATH}')\n"
-                            "print(result['file_data']['content'])\n"
-                        )},
-                    })
+                    async def code(_request):
+                        return await tool.ainvoke({
+                            "type": "tool_call", "id": "ssh-memory", "name": "run_code",
+                            "args": {"code": (
+                                f"await edit('{WORK_MEMORY_PATH}', 'SSH 更新', 'Code Mode 更新')\n"
+                                f"result = await read('{WORK_MEMORY_PATH}')\n"
+                                "print(result['file_data']['content'])\n"
+                            )},
+                        })
 
-                result = await middleware.awrap_tool_call(request, code)
-            self.assertEqual(result.status, "success", result.content)
-            self.assertIn("Code Mode 更新", result.content)
+                    result = await middleware.awrap_tool_call(request, code)
+                self.assertEqual(result.status, "success", result.content)
+                self.assertIn("Code Mode 更新", result.content)
+                return "done"
+
+            manager = WorkerManager(run, agent_workers={"ssh-agent": ()}, default_agent="ssh-agent")
+            manager.bind_memory(store)
+            try:
+                manager.start("update work memory", "ssh-task")
+                result = await manager.wait("ssh-task")
+                self.assertEqual(result["status"], "completed", result)
+            finally:
+                await manager.close()
             self.assertEqual(store.read("ssh-agent").content, "Code Mode 更新\n保留")
-            self.assertFalse((Path(self.directory.name) / ".wandrun" / "memory.md").exists())
+            self.assertFalse((Path(self.directory.name) / ".wandrun" / "memory" / "work.md").exists())
 
     async def test_execute_timeout_and_cancel(self):
         result = await self.backend.aexecute("echo out; echo err >&2; exit 3")

@@ -19,7 +19,8 @@ const LazyAccordionTrigger = lazy(async () => ({ default: (await import("@/compo
 
 
 type CardFile = Pick<FileRecord, "id" | "name" | "size" | "media_type"> & Partial<Pick<FileRecord, "remote_environment">>;
-export type AttachmentOwner = { conversationId?: string; messageSeq?: number };
+/** Attachment lookup uses the message's visible timeline, not its root resource conversation. */
+export type AttachmentOwner = { timelineId?: string; messageSeq?: number };
 
 type FileNotice = { api: ChatSession["api"]; id: string; text: string } | null;
 
@@ -67,8 +68,8 @@ function FileCard({ file, api, mine = false }: { file: CardFile; api: ChatSessio
 function openImage(owner: AttachmentOwner | undefined, images: readonly CardFile[], index: number): void {
   const file = images[index];
   if (!file) return;
-  const params = owner?.conversationId && owner.messageSeq !== undefined
-    ? { id: owner.conversationId, seq: String(owner.messageSeq), file_id: file.id, index: String(index) }
+  const params = owner?.timelineId && owner.messageSeq !== undefined
+    ? { id: owner.timelineId, seq: String(owner.messageSeq), file_id: file.id, index: String(index) }
     : { file_id: file.id, file_ids: JSON.stringify(images.map((entry) => entry.id)), index: String(index) };
   router.push({ pathname: "/media-viewer", params });
 }

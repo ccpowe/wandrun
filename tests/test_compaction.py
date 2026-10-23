@@ -26,10 +26,13 @@ from wandrun.runtime.compaction_archive import CompactionArchive
 from wandrun.runtime.conversations import conversation_config, prepare_conversation_input
 from wandrun.runtime.agents import ConversationState
 from wandrun.runtime.memory import MemoryStore
-from wandrun.runtime.memory_runtime import MEMORY_PATH, ManagedMemoryBackend, MemoryMiddleware
+from wandrun.runtime.memory_runtime import WORK_MEMORY_PATH, ManagedMemoryBackend, MemoryMiddleware
+from wandrun.runtime.compaction_summary import _summary_history
+from wandrun.runtime.compaction_summary import SummaryGenerationError
 from wandrun.runtime.tool_search import ToolNamespace, ToolSearchMiddleware, loaded_tool_names
 from langchain.tools import tool
 
+from compaction_fixtures import SUMMARY_TEXT
 
 def reply(text="done", *, usage=True):
     return AIMessage(content=text, additional_kwargs={"codex_output_items": [{
@@ -71,6 +74,31 @@ def archived_messages(path):
 
 
 class CompactionTests(unittest.IsolatedAsyncioTestCase):
+    def test_summary_keeps_unrelated_code_mode_and_scrubs_managed_access(self):
+        ordinary = AIMessage(content="", tool_calls=[{
+            "name": "run_code", "id": "ordinary", "args": {"code": "print('task facts')"},
+        }])
+        ordinary_result = ToolMessage(content="task facts", tool_call_id="ordinary")
+        memory = AIMessage(content="", tool_calls=[{
+            "name": "run_code", "id": "memory", "args": {"code": "print(old_secret)"},
+        }])
+        memory_result = ToolMessage(content="old secret", tool_call_id="memory",
+                                    additional_kwargs={"managed_memory_access": True})
+        aliased = AIMessage(content="", tool_calls=[{
+            "name": "write_file", "id": "alias",
+            "args": {"file_path": "//.wandrun/memory/work.md", "content": "old preference"},
+        }])
+        alias_result = ToolMessage(content="old preference", tool_call_id="alias")
+        history = list(_summary_history([
+            ordinary, ordinary_result, memory, memory_result, aliased, alias_result,
+        ]))
+        self.assertEqual(history[0].tool_calls[0]["args"]["code"], "print('task facts')")
+        self.assertEqual(history[1].content, "task facts")
+        self.assertEqual(history[2].tool_calls[0]["args"], {})
+        self.assertNotIn("old secret", history[3].content)
+        self.assertEqual(history[4].tool_calls[0]["args"], {})
+        self.assertNotIn("old preference", history[5].content)
+
     async def test_two_compactions_keep_raw_and_old_summary_in_next_summary(self):
         middleware = CompactionMiddleware(context_window=10_000, keep_tokens=100)
         req = request()
@@ -78,7 +106,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         seen = []
         async def summary(r, **kwargs):
             seen.append(r)
-            return reply("1. 目标\n2. 用户约束与偏好原话：never overwrite\n3. 已确认事实\n4. 决策与否决及理由\n5. 产物与路径\n6. 进行中 / 下一步\n7. 关键标识")
+            return reply(SUMMARY_TEXT)
         async def main(r):
             self.assertIn("never overwrite", r.messages[0].content)
             self.assertEqual(r.messages[-1].content, "latest instruction")
@@ -431,7 +459,8 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 return ChatResult(generations=[ChatGeneration(message=reply())])
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(Path(directory) / "memory")
-            current = store.save("agent", "只使用中文答复", store.read("agent").version)
+            profile = store.save(None, "共享画像", store.read(None).version)
+            work = store.save("agent", "本 Agent 反馈", store.read("agent").version)
             path = str(Path(directory) / "state.sqlite")
             config = conversation_config("memory-compaction")
             async with AsyncSqliteSaver.from_conn_string(path) as saver:
@@ -442,23 +471,13 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("task summary"))):
                     await graph.ainvoke({"messages": history()}, config, context={"task_id": "memory-compaction"})
                 saved = (await graph.aget_state(config)).values
-                self.assertIsNone(saved["memory_version"])
+                self.assertEqual(saved.get("memory_versions"), {})
                 self.assertEqual(saved["compaction_events"][0]["summary_text"], "task summary")
-                self.assertIn("只使用中文答复", observations[0][-1].content)
-                view = [m for m in observations[0] if not isinstance(m, SystemMessage)]
-                self.assertTrue(view[0].id.startswith("compaction:"))
-                # The snapshot precedes the response in raw history, even if it calls tools.
-                self.assertEqual(saved["messages"][-2].additional_kwargs["memory_snapshot_version"], current.version)
-                self.assertEqual(sum(
-                    m.additional_kwargs.get("memory_snapshot_version") == current.version
-                    for m in observations[0]
-                ), 1)
-                self.assertEqual(sum(
-                    m.additional_kwargs.get("memory_snapshot_version") == current.version
-                    for m in saved["messages"]
-                ), 1)
-            # Reopen SQLite with the same store version: recover the cleared marker,
-            # not another copy of the snapshot already seen by the successful model.
+                snapshots = [m for m in saved["messages"] if m.additional_kwargs.get("memory_snapshot_scope")]
+                self.assertEqual({m.additional_kwargs["memory_snapshot_scope"] for m in snapshots},
+                                 {"profile", "work"})
+                self.assertEqual({m.additional_kwargs["memory_snapshot_version"] for m in snapshots},
+                                 {profile.version, work.version})
             async with AsyncSqliteSaver.from_conn_string(path) as saver:
                 memory = MemoryMiddleware(store, "agent")
                 graph = create_agent(Model(), state_schema=ConversationState, middleware=[
@@ -467,13 +486,15 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 await graph.ainvoke({"messages": [HumanMessage(content="继续")]}, config,
                                     context={"task_id": "memory-compaction"})
                 unchanged = (await graph.aget_state(config)).values
-                self.assertEqual(unchanged["memory_version"], current.version)
-                for messages in (observations[-1], unchanged["messages"]):
-                    self.assertEqual(sum(
-                        m.additional_kwargs.get("memory_snapshot_version") == current.version
-                        for m in messages
-                    ), 1)
-            store.save("agent", "", current.version)
+                self.assertEqual(unchanged["memory_versions"],
+                                 {"profile": profile.version, "work": work.version})
+                # The model sees only the post-cut snapshots; immutable checkpoint
+                # history also retains the two original snapshots before the cut.
+                self.assertEqual(sum(bool(m.additional_kwargs.get("memory_snapshot_scope"))
+                                     for m in observations[-1]), 2)
+                self.assertEqual(sum(bool(m.additional_kwargs.get("memory_snapshot_scope"))
+                                     for m in unchanged["messages"]), 4)
+            new_work = store.save("agent", "", work.version)
             async with AsyncSqliteSaver.from_conn_string(path) as saver:
                 memory = MemoryMiddleware(store, "agent")
                 graph = create_agent(Model(), state_schema=ConversationState, middleware=[
@@ -484,13 +505,13 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                                         context={"task_id": "memory-compaction"})
                 summarize.assert_not_awaited()
                 resumed = (await graph.aget_state(config)).values
-                self.assertEqual(resumed["memory_version"], store.read("agent").version)
+                self.assertEqual(resumed["memory_versions"],
+                                 {"profile": profile.version, "work": new_work.version})
                 self.assertEqual(resumed["compaction_events"], saved["compaction_events"])
-                self.assertIn("当前记忆为空", observations[-1][-1].content)
-                for messages in (observations[-1], resumed["messages"]):
-                    versions = [m.additional_kwargs["memory_snapshot_version"] for m in messages
-                                if "memory_snapshot_version" in m.additional_kwargs]
-                    self.assertEqual(versions, [current.version, store.read("agent").version])
+                work_rows = [m for m in observations[-1]
+                             if m.additional_kwargs.get("memory_snapshot_scope") == "work"]
+                self.assertEqual(len(work_rows), 2)
+                self.assertIn("当前记忆为空", work_rows[-1].content)
 
     async def test_cut_snapshot_is_reloaded_once_and_next_boundary_reuses_it(self):
         observations = []
@@ -516,14 +537,17 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                                         context={"task_id": "cut-memory"})
                 saved = (await graph.aget_state(config)).values
                 self.assertEqual(len(saved["compaction_events"]), 1)
-                self.assertEqual(saved["memory_version"], current.version)
-                # The immutable old history has its original snapshot plus the one
-                # reload; each actual post-compaction request has only the reload.
+                self.assertEqual(saved["memory_versions"], {
+                    "profile": store.read(None).version, "work": current.version,
+                })
+                # Immutable history has each original and each reload; active
+                # requests after compaction retain one snapshot per scope.
                 self.assertEqual(sum("memory_snapshot_version" in m.additional_kwargs
-                                     for m in saved["messages"]), 2)
+                                     for m in saved["messages"]), 4)
                 for messages in observations[1:]:
-                    self.assertEqual([m.additional_kwargs["memory_snapshot_version"] for m in messages
-                                      if "memory_snapshot_version" in m.additional_kwargs], [current.version])
+                    scopes = [m.additional_kwargs["memory_snapshot_scope"] for m in messages
+                              if "memory_snapshot_scope" in m.additional_kwargs]
+                    self.assertEqual(scopes, ["profile", "work"])
 
     async def test_cut_search_must_reload_before_execution(self):
         @tool
@@ -654,20 +678,20 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(events[0]["event_id"], events[1]["event_id"])
 
     async def test_actual_usage_triggers_and_changed_response_invalidates_baseline(self):
-        middleware = CompactionMiddleware(context_window=1000, keep_tokens=50)
-        req = request([HumanMessage(content="old instruction", id="first")])
+        middleware = CompactionMiddleware(context_window=10000, keep_tokens=50)
+        req = request([HumanMessage(content="old instruction " * 1000, id="first")])
         answer = reply("short answer")
         answer.id = "answer"
-        answer.usage_metadata = {"input_tokens": 800, "output_tokens": 100, "total_tokens": 900}
+        answer.usage_metadata = {"input_tokens": 8000, "output_tokens": 1000, "total_tokens": 9000}
         initial = await middleware.awrap_model_call(req, AsyncMock(return_value=ModelResponse(result=[answer])))
         following = request([*req.messages, answer, HumanMessage(content="next", id="next")],
                             **initial.command.update)
-        self.assertGreaterEqual(middleware._usage(following, 0)[0], 900)
+        self.assertGreaterEqual(middleware._usage(following, 0)[0], 9000)
         changed = following.override(messages=[
             *req.messages, reply("replacement without the original reasoning"), following.messages[-1],
         ])
-        self.assertLess(middleware._usage(changed, 0)[0], 750)
-        with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("short summary"))):
+        self.assertLess(middleware._usage(changed, 0)[0], 7500)
+        with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply(SUMMARY_TEXT))):
             compacted = await middleware.awrap_model_call(
                 following, AsyncMock(return_value=ModelResponse(result=[reply()])),
             )
@@ -693,11 +717,19 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(concurrent_edit=concurrent_edit), tempfile.TemporaryDirectory() as directory:
                 store = MemoryStore(Path(directory) / "memory")
                 saved = store.save("agent", "旧背景", store.read("agent").version)
-                backend = ManagedMemoryBackend(FilesystemBackend(root_dir=directory), store, "agent")
+                class Authorizer:
+                    def authorize_memory(self, task_id, agent_id, generation, *, profile):
+                        if task_id != "memory-write" or agent_id != "agent" or generation != 1 or profile:
+                            raise ValueError("无写入权限")
+                    def memory_permission(self, task_id, agent_id, generation):
+                        return False
+                authorizer = Authorizer()
+                backend = ManagedMemoryBackend(FilesystemBackend(root_dir=directory), store,
+                                               "agent", manager=authorizer)
                 @tool
                 async def save_memory(content: str) -> str:
                     """Replace the memory document using the observed version."""
-                    result = await backend.awrite(MEMORY_PATH, content)
+                    result = await backend.awrite(WORK_MEMORY_PATH, content)
                     return result.error or "保存成功"
                 calls = []
                 class Model(CodexSubscriptionModel):
@@ -715,12 +747,13 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                         else:
                             result = reply()
                         return ChatResult(generations=[ChatGeneration(message=result)])
-                memory = MemoryMiddleware(store, "agent")
+                memory = MemoryMiddleware(store, "agent", authorizer)
                 graph = create_agent(Model(), tools=[save_memory], state_schema=ConversationState, middleware=[
                     memory, CompactionMiddleware(context_window=10_000, keep_tokens=100, memory=memory),
                 ])
                 with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
-                    state = await graph.ainvoke({"messages": history()}, context={"task_id": "memory-write"})
+                    state = await graph.ainvoke({"messages": history()},
+                                                context={"task_id": "memory-write", "execution_generation": 1})
                 self.assertEqual(store.read("agent").content, "外部新背景" if concurrent_edit else "模型新背景")
                 result = next(m for m in state["messages"] if isinstance(m, ToolMessage))
                 self.assertIn("已更新" if concurrent_edit else "保存成功", result.content)
@@ -764,3 +797,106 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 resumed = (await graph.aget_state(config)).values
                 self.assertEqual([e["summary_text"] for e in resumed["compaction_events"]], ["retry summary"])
                 self.assertEqual([m.id for m in resumed["messages"]].count("old"), 1)
+
+    async def test_old_instruction_precedes_summary_and_runtime_anchors_keep_their_order(self):
+        before = HumanMessage(content="尚未收到先前发送", id="undelivered:before",
+                              additional_kwargs={"source": "runtime"})
+        instruction = HumanMessage(content="Read report once", id="instruction")
+        receipt = HumanMessage(content="另一发送尚未收到", id="undelivered:after",
+                               additional_kwargs={"source": "runtime"})
+        raw = [before, instruction, receipt, reply("diagnostic " * 5000)]
+        raw[-1].id = "large-result"
+        req = request(raw)
+        projected = list(reversed([m.model_copy() for m in raw]))
+        with patch("wandrun.runtime.compaction.summarize_request",
+                   AsyncMock(return_value=reply(SUMMARY_TEXT))):
+            event, candidate, _ = await CompactionMiddleware(
+                context_window=10000, keep_tokens=1,
+            )._compact(req.override(messages=projected), req, None, "threshold")
+        view = candidate.messages
+        self.assertEqual(event["cutoff_index"], len(raw))
+        self.assertEqual(view[0].id, instruction.id)
+        summary = view[1]
+        self.assertEqual([m.id for m in view[2:]], [before.id, receipt.id])
+        self.assertEqual(summary.id, "compaction:" + event["event_id"])
+        # A duplicate filesystem copy cannot duplicate a pinned message.
+        deduped = context_messages(req.state, event=event, projected=[*projected, projected[2]])
+        self.assertEqual([m.id for m in deduped], [m.id for m in view])
+        correction = HumanMessage(content="更正：核对第 90 行", id="correction")
+        continued = context_messages({"messages": [*raw, correction]}, event=event)
+        self.assertEqual(continued[-1], correction)
+        self.assertLess(next(i for i, m in enumerate(continued) if m.id == summary.id),
+                        len(continued) - 1)
+        self.assertEqual([m.id for m in continued].count(correction.id), 1)
+        self.assertEqual(raw[1], instruction)
+
+    async def test_invalid_provider_summaries_leave_committed_state_and_permissions_unchanged(self):
+        import copy
+        from test_compaction_summary import summary_events
+
+        notices = []
+        middleware = CompactionMiddleware(
+            context_window=10000, keep_tokens=100,
+            on_compaction=lambda task, event: notices.append(event),
+        )
+        initial = request()
+        with patch("wandrun.runtime.compaction.summarize_request",
+                   AsyncMock(return_value=reply(SUMMARY_TEXT))):
+            committed = await middleware.awrap_model_call(
+                initial, AsyncMock(return_value=ModelResponse(result=[reply()])),
+            )
+        raw = [*initial.messages, HumanMessage(content="new detail " * 5000, id="more"),
+               HumanMessage(content="finish", id="finish")]
+        req = request(raw, **{
+            **committed.command.update,
+            "memory_versions": {"profile": "observed-profile", "work": "observed-work"},
+            "memory_permissions": {"profile": False},
+        })
+        saved = copy.deepcopy(req.state)
+        bodies = []
+        async def respond(_model, body):
+            bodies.append(body)
+            yield summary_events("business result=67")
+        main = AsyncMock()
+        with patch.object(CodexSubscriptionModel, "_arequest", respond):
+            with self.assertRaisesRegex(SummaryGenerationError, "两份摘要"):
+                await middleware.awrap_model_call(req, main)
+        self.assertEqual(req.state, saved)
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(req.runtime.context["compaction_attempts"], 1)
+        self.assertEqual([event["status"] for event in notices], ["failed"])
+        main.assert_not_awaited()
+
+    async def test_overflow_removes_orphan_annotation_by_summary_id_not_pin_position(self):
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            root = Path(directory)
+            archive = CompactionArchive(str(root / "artifacts"),
+                                        FilesystemBackend(root_dir=root, virtual_mode=False))
+            raw = [
+                HumanMessage(content="Read once", id="instruction"),
+                reply("old diagnostic " * 4000),
+                reply("new diagnostic " * 2000),
+            ]
+            raw[1].id, raw[2].id = "old-result", "new-result"
+            summaries, main_views = [], []
+            async def summarize(view, **kwargs):
+                summaries.append(view.messages)
+                return reply(SUMMARY_TEXT)
+            async def main(view):
+                main_views.append(view.messages)
+                if len(main_views) == 1:
+                    raise ContextWindowExceededError("overflow")
+                return ModelResponse(result=[reply()])
+            with patch("wandrun.runtime.compaction.summarize_request", summarize):
+                result = await CompactionMiddleware(
+                    context_window=40000, keep_tokens=100, archive=archive,
+                ).awrap_model_call(request(raw), main)
+            self.assertEqual([m.id for m in main_views[0]][:2],
+                             ["instruction", next(m.id for m in main_views[0] if m.id.startswith("compaction:"))])
+            first_summary = next(m for m in main_views[0] if m.id.startswith("compaction:"))
+            replacement_input = next(m for m in summaries[1] if m.id == first_summary.id)
+            self.assertIn("原文留档索引", first_summary.text)
+            self.assertNotIn("原文留档索引", replacement_input.text)
+            self.assertEqual(summaries[1][0], raw[0])
+            self.assertEqual(len(result.command.update["compaction_events"]), 1)
+            self.assertEqual(result.command.update["compaction_events"][0]["cutoff_index"], len(raw))

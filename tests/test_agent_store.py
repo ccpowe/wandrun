@@ -180,24 +180,28 @@ class AgentPersistenceTests(unittest.TestCase):
             self.assertEqual(store.agent("root")["description"], "说明")
             self.assertEqual(store.last_seq(), 0)
 
-    def test_memory_authorship_persists_only_for_matching_version_and_cascades_on_delete(self):
-        memory_dir = self.path.parent / "memory"
-        memory = MemoryStore(memory_dir)
+    def test_memory_authorship_persists_per_scope_and_work_cascades_on_delete(self):
+        memory = MemoryStore(self.path.parent / "memory")
         with closing(GatewayStore(self.path)) as store:
             store.import_agents(AgentCatalog("root", {"root": definition()}))
-            first = memory.save("root", "记住", memory.read("root").version)
-            store.record_memory_change("root", first.version, "user", None)
-            self.assertEqual(store.memory_author("root", first.version), "user")
+            work = memory.save("root", "工作", memory.read("root").version)
+            profile = memory.save(None, "画像", memory.read(None).version)
+            store.record_memory_change("root", work.version, "user", None)
+            store.record_memory_change(None, profile.version, "agent", None, writer_agent_id="root")
+            self.assertEqual(store.memory_author("root", work.version), "user")
+            self.assertEqual(store.memory_author(None, profile.version), "agent")
         with closing(GatewayStore(self.path)) as store:
-            self.assertEqual(store.memory_author("root", memory.read("root").version), "user")
-            (memory_dir / "root.md").write_text("外部内容", encoding="utf-8")
-            self.assertIsNone(store.memory_author("root", memory.read("root").version))
+            self.assertEqual(store.memory_author(None, profile.version), "agent")
+            changed = memory.save("root", "新的工作", work.version)
+            self.assertIsNone(store.memory_author("root", changed.version))
             store.begin_delete_agent("root")
             memory.delete("root")
             store.finish_delete_agent("root")
             self.assertEqual(store._connection.execute(
-                "SELECT COUNT(*) FROM memory_metadata"
+                "SELECT COUNT(*) FROM memory_metadata WHERE scope = 'work'"
             ).fetchone()[0], 0)
+            self.assertEqual(store.memory_author(None, profile.version), "agent")
+            self.assertEqual(memory.read(None).content, "画像")
 
     def test_memory_metadata_and_both_events_roll_back_together(self):
         with closing(GatewayStore(self.path)) as store:
@@ -213,10 +217,23 @@ class AgentPersistenceTests(unittest.TestCase):
 
             with patch.object(store, "_insert", side_effect=fail_second_event):
                 with self.assertRaises(sqlite3.OperationalError):
-                    store.record_memory_change("root", "v", "agent", root["id"])
-            self.assertIsNone(store.memory_author("root", "v"))
+                    store.record_memory_change(None, "v", "agent", root["id"], writer_agent_id="root")
+            self.assertIsNone(store.memory_author(None, "v"))
             self.assertEqual(store.last_seq(), before)
             self.assertEqual([e.type for e in store.history(root["id"])], ["conversation.created"])
+
+    def test_profile_event_keeps_actual_writer_and_never_invents_resource_id(self):
+        with closing(GatewayStore(self.path)) as store:
+            store.import_agents(AgentCatalog("root", {"root": definition()}))
+            root, _ = store.create_conversation("记忆", "root")
+            cursor = store.last_seq()
+            store.record_memory_change(None, "v", "agent", root["id"], writer_agent_id="root")
+            self.assertEqual([(e.type, e.data) for e in store.after(cursor)], [
+                ("resource.changed", {"kind": "memory", "scope": "profile", "op": "updated"}),
+                ("memory.updated", {
+                    "scope": "profile", "agent_id": "root", "version": "v", "summary": "已记住",
+                }),
+            ])
 
     def test_delete_intent_survives_restart_and_finishes_only_without_references(self):
         with closing(GatewayStore(self.path)) as store:

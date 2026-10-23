@@ -12,6 +12,8 @@ export type Conversation = {
   created_at: number;
   updated_at: number;
   read_seq: number;
+  /** 本根时间线最后一条 Agent 回复的位置；没有回复时为 0，不是全局快照水位。 */
+  last_agent_seq: number;
   status: ConversationStatus;
   unread: boolean;
   last_text: string | null;
@@ -273,15 +275,28 @@ export type AgentDetail = AgentCore & {
   environment: string;
   member_of: string[];
 };
-/** 一份 Agent 记忆的权威快照。version 属于内容而非修改时间；缺失文件也有空内容版本。 */
+/** Both index resources use the entire document version as their CAS baseline. */
+export type MemoryScope = "profile" | "work";
 export type AgentMemory = {
-  agent_id: string;
+  scope: MemoryScope;
+  agent_id?: string;
   content: string;
   version: string;
+  details: Record<string, { path: string; sha256: string }>;
   updated_at: number | null;
   updated_by: "user" | "agent" | "external" | null;
   limit: number;
 };
+export type MemoryDetail = {
+  scope: MemoryScope; agent_id?: string; slug: string;
+  content: string; sha256: string; path: string; version: string; limit: number;
+};
+
+function memoryEndpoint(scope: MemoryScope, id?: string): string {
+  if (scope === "profile") return "/memory/profile";
+  if (!id) throw new Error("Work memory requires an agent id");
+  return `/agents/${encodeURIComponent(id)}/memory`;
+}
 
 
 /** Registered original file metadata. Source links become null when the source is deleted. */
@@ -762,13 +777,22 @@ export class GatewayApi {
   getAgent(id: string): Promise<AgentDetail> {
     return this.request("GET", `/agents/${encodeURIComponent(id)}`);
   }
-  getAgentMemory(id: string): Promise<AgentMemory> {
-    return this.request("GET", `/agents/${encodeURIComponent(id)}/memory`);
+  getMemory(scope: MemoryScope, id?: string): Promise<AgentMemory> {
+    return this.request("GET", memoryEndpoint(scope, id));
   }
-
-  /** 全文提交与所见内容版本绑定；409 的 details.current 是网关最新快照。 */
-  updateAgentMemory(id: string, content: string, version: string): Promise<AgentMemory> {
-    return this.request("PUT", `/agents/${encodeURIComponent(id)}/memory`, { content, version });
+  /** A save always uses the document version, including changes to individual details. */
+  updateMemory(scope: MemoryScope, id: string | undefined, content: string, version: string): Promise<AgentMemory> {
+    return this.request("PUT", memoryEndpoint(scope, id), { content, version });
+  }
+  getMemoryDetail(scope: MemoryScope, id: string | undefined, slug: string): Promise<MemoryDetail> {
+    return this.request("GET", `${memoryEndpoint(scope, id)}/details/${encodeURIComponent(slug)}`);
+  }
+  updateMemoryDetail(scope: MemoryScope, id: string | undefined, slug: string, content: string, version: string, indexContent?: string): Promise<AgentMemory> {
+    return this.request("PUT", `${memoryEndpoint(scope, id)}/details/${encodeURIComponent(slug)}`,
+      { content, version, ...(indexContent === undefined ? {} : { index_content: indexContent }) });
+  }
+  deleteMemoryDetail(scope: MemoryScope, id: string | undefined, slug: string, content: string, version: string): Promise<AgentMemory> {
+    return this.request("DELETE", `${memoryEndpoint(scope, id)}/details/${encodeURIComponent(slug)}`, { content, version });
   }
 
 

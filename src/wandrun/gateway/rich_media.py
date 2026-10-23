@@ -31,6 +31,7 @@ MAX_PIXELS = 20_000_000
 MAX_SIDE = 8192
 CACHE_BYTES = 512 * 1024 * 1024
 CACHE_AGE = 30 * 24 * 60 * 60
+FAILURE_AGE = 10 * 60
 USER_AGENT = "Wandrun/0.1 (+https://github.com/ccpowe/wandrun)"
 _KEY = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _HOST = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\Z")
@@ -52,6 +53,19 @@ class MediaError(Exception):
         self.code = code
         self.message = message
 
+# Persist only classified favicon failures, never upstream text or URLs.
+_FAVICON_ERRORS = {
+    (400, "invalid_media_url"): "图片地址无效",
+    (400, "unsafe_media_address"): "图片地址不可访问",
+    (502, "media_unavailable"): "图片源站不可用",
+    (503, "media_unavailable"): "图片处理暂不可用",
+    (502, "media_redirect"): "图片重定向无效",
+    (415, "unsupported_media"): "不支持的图片格式",
+    (413, "media_too_large"): "图片超过大小限制",
+    (504, "media_timeout"): "图片获取超时",
+    (404, "favicon_not_found"): "网站没有可用图标",
+}
+
 
 @dataclass(frozen=True)
 class MediaData:
@@ -62,11 +76,10 @@ class MediaData:
 
 
 class MediaCache:
-    """Atomic, process-local LRU cache for proxied images.
+    """Atomic, process-local LRU shared by explicit images and host favicons.
 
-    Fetch age is independent of recent access: a popular image must still be
-    refetched after 30 days. Synchronous reads/writes complete before returning
-    bytes; a caller never keeps an open cache file across an await.
+    Success expires after 30 days, classified favicon failures after 10 minutes.
+    Access changes eviction order, not fetch age; files close before any await.
     """
 
     def __init__(self, root: Path):
@@ -90,8 +103,9 @@ class MediaCache:
                     header = file.readline(_HEADER_LIMIT + 1)
                 meta = json.loads(header)
                 fetched = meta["fetched"]
+                age = FAILURE_AGE if "error" in meta else CACHE_AGE
                 if (len(header) > _HEADER_LIMIT or not isinstance(fetched, (int, float))
-                        or fetched > now + 60 or now - fetched >= CACHE_AGE
+                        or fetched > now + 60 or now - fetched >= age
                         or stat.st_size > CACHE_BYTES):
                     entry.unlink(missing_ok=True)
                     continue
@@ -121,8 +135,16 @@ class MediaCache:
                 if len(header) > _HEADER_LIMIT:
                     raise ValueError("invalid cache header")
                 meta = json.loads(header)
-                if time.time() - meta["fetched"] >= CACHE_AGE or meta["fetched"] > time.time() + 60:
+                age = FAILURE_AGE if "error" in meta else CACHE_AGE
+                if time.time() - meta["fetched"] >= age or meta["fetched"] > time.time() + 60:
                     raise ValueError("expired cache entry")
+                if "error" in meta:
+                    status, code = meta["status"], meta["error"]
+                    if (not key.startswith("favicon-v1-") or file.read(1)
+                            or (status, code) not in _FAVICON_ERRORS):
+                        raise ValueError("invalid cached failure")
+                    os.utime(path, None)
+                    raise MediaError(status, code, _FAVICON_ERRORS[status, code])
                 size = meta["size"]
                 if type(size) is not int or not 0 < size <= CACHE_BYTES:
                     raise ValueError("invalid cache size")
@@ -147,11 +169,24 @@ class MediaCache:
             raise ValueError("invalid media data")
         if len(value.data) > CACHE_BYTES - _HEADER_LIMIT or not value.data:
             raise MediaError(413, "media_too_large", "媒体超过缓存上限")
-        header = json.dumps({
+        header = {
             "fetched": time.time(), "size": len(value.data), "mime": value.mime,
             "width": value.width, "height": value.height,
             "sha256": hashlib.sha256(value.data).hexdigest(),
-        }, separators=(",", ":")).encode() + b"\n"
+        }
+        self._publish(key, header, value.data)
+
+    def put_failure(self, key: str, error: MediaError) -> None:
+        """Cache classified favicon failures, not shutdown, busy or cancellation."""
+        if not _KEY.fullmatch(key) or not key.startswith("favicon-v1-"):
+            raise ValueError("invalid favicon cache key")
+        if (error.status, error.code) in _FAVICON_ERRORS:
+            self._publish(key, {"fetched": time.time(), "error": error.code, "status": error.status}, b"")
+
+    def _publish(self, key: str, meta: dict, data: bytes) -> None:
+        header = json.dumps(meta, separators=(",", ":")).encode() + b"\n"
+        if len(header) > _HEADER_LIMIT:
+            raise ValueError("invalid cache header")
         path = self.root / key
         # Temporary names are deliberately not valid cache keys; startup pruning
         # removes abandoned writes. replace() only publishes a complete object.
@@ -160,7 +195,7 @@ class MediaCache:
             with tempfile.NamedTemporaryFile(dir=self.root, prefix=".part-", delete=False) as file:
                 name = file.name
                 file.write(header)
-                file.write(value.data)
+                file.write(data)
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(name, path)
@@ -172,6 +207,44 @@ class MediaCache:
 
 def _image_cache_key(url: str) -> str:
     return "image-v1-" + hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+def _favicon_cache_key(host: str) -> str:
+    return "favicon-v1-" + hashlib.sha256(host.encode("ascii")).hexdigest()
+
+
+def _favicon_host(page_url: str) -> str:
+    """Extract a canonical host without resolving or requesting the source page."""
+    if (not isinstance(page_url, str) or len(page_url) > 4096
+            or re.search(r"[\x00-\x20\x7f\\]", page_url)):
+        raise MediaError(400, "invalid_media_url", "图片地址无效")
+    try:
+        parts = urlsplit(page_url)
+        if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+            raise ValueError("invalid source URL")
+        # Reject encoded hosts and ambiguous authorities. The source port and
+        # credentials are ignored, never forwarded.
+        authority = parts.netloc.rsplit("@", 1)[-1]
+        if ("%" in authority or parts.netloc.count("@") > 1
+                or authority.endswith(":")):
+            raise ValueError("ambiguous authority")
+        host = parts.hostname
+        if not host:
+            raise ValueError("invalid host")
+        _ = parts.port
+        if ":" in host:
+            host = str(ipaddress.IPv6Address(host))
+        else:
+            if host.startswith("."):
+                raise ValueError("invalid host")
+            # Keep distinct IDNA2008 domains distinct; the stdlib codec uses IDNA2003.
+            host = URL.build(scheme="https", host=host.removesuffix(".")).raw_host or ""
+            if (len(host) > 253 or not _HOST.fullmatch(host)
+                    or any(len(label) > 63 or label.startswith("-") or label.endswith("-")
+                           for label in host.split("."))):
+                raise ValueError("invalid host")
+        return host
+    except (ValueError, UnicodeError, OverflowError):
+        raise MediaError(400, "invalid_media_url", "图片地址无效") from None
 
 
 def _wikimedia_thumbnail(raw_url: str) -> str | None:
@@ -260,6 +333,17 @@ def _parse_url(raw: str) -> tuple[URL, str, int]:
         raise MediaError(400, "invalid_media_url", "图片地址无效") from None
 
 
+def _redirect_target(current: URL, location: str) -> str:
+    # urljoin normalizes control characters before _parse_url can see them.
+    if not location or re.search(r"[\x00-\x20\x7f\\]", location):
+        raise MediaError(502, "media_redirect", "图片重定向无效")
+    target = urljoin(str(current), location)
+    parsed, _, _ = _parse_url(target)
+    if current.scheme == "https" and parsed.scheme != "https":
+        raise MediaError(502, "media_redirect", "图片重定向无效")
+    return target
+
+
 async def _resolve_addresses(host: str, port: int) -> list[str]:
     try:
         literal = ipaddress.ip_address(host)
@@ -302,6 +386,8 @@ class _PinnedResolver(AbstractResolver):
         pass
 
 
+
+
 class ImageProxy:
     """Fetches validated message URLs, deduplicating up to 32 concurrent jobs.
 
@@ -318,10 +404,20 @@ class ImageProxy:
         self._closed = False
 
     async def get(self, url: str) -> MediaData:
+        """Acquire an explicitly provided image URL."""
         _parse_url(url)
+        return await self._get(url, _image_cache_key(url), self._load)
+
+    async def get_favicon(self, page_url: str) -> MediaData:
+        """Acquire a host-only Google s2 favicon; never contact the source page."""
+        host = _favicon_host(page_url)
+        url = str(URL("https://www.google.com/s2/favicons").with_query(
+            {"domain": host, "sz": "128"}))
+        return await self._get(url, _favicon_cache_key(host), self._load_favicon)
+
+    async def _get(self, url: str, key: str, loader) -> MediaData:
         if self._closed:
             raise MediaError(503, "media_unavailable", "图片代理已关闭")
-        key = _image_cache_key(url)
         cached = self.cache.get(key)
         if cached is not None:
             return cached
@@ -329,7 +425,7 @@ class ImageProxy:
         if task is None:
             if len(self._jobs) + len(self._retiring) >= 32:
                 raise MediaError(429, "media_busy", "图片请求过多")
-            task = asyncio.create_task(self._load(url, key))
+            task = asyncio.create_task(loader(url, key))
             self._jobs[key] = task
             self._waiters[key] = 0
         self._waiters[key] += 1
@@ -357,24 +453,51 @@ class ImageProxy:
                 async with self._slots:
                     thumbnail = _wikimedia_thumbnail(url)
                     if thumbnail is None:
-                        raw = await self._download(url)
+                        raw = await self._fetch(url)
                     else:
                         try:
-                            raw = await self._download(thumbnail)
+                            raw = await self._fetch(thumbnail)
                         except MediaError as error:
-                            # Unavailable previews (including too-small originals)
-                            # may fall back; policy and size failures must not.
+                            # Unavailable Wikimedia thumbnails (including
+                            # too-small originals) may fall back; policy and
+                            # size failures must not.
                             if error.code != "media_unavailable":
                                 raise
-                            raw = await self._download(url)
+                            raw = await self._fetch(url)
                     media = await _decode(raw)
                     self.cache.put(key, media)
                     return media
         except TimeoutError:
             raise MediaError(504, "media_timeout", "图片获取超时") from None
 
-    async def _download(self, raw_url: str) -> bytes:
+    async def _load_favicon(self, url: str, key: str) -> MediaData:
+        try:
+            try:
+                async with asyncio.timeout(15):
+                    async with self._slots:
+                        raw = await self._fetch(url, favicon=True)
+                        media = await _decode(raw)
+                        self.cache.put(key, media)
+                        return media
+            except TimeoutError:
+                raise MediaError(504, "media_timeout", "图片获取超时") from None
+        except MediaError as error:
+            self.cache.put_failure(key, error)
+            raise
+
+    async def _fetch(self, raw_url: str, *, favicon: bool = False) -> bytes:
         seen = set()
+        sends = 0
+
+        async def budget_middleware(request, handler):
+            nonlocal sends
+            # aiohttp invokes client middleware for each actual send, including
+            # its transparent retry of an idempotent disconnected GET.
+            if sends >= 4:
+                raise MediaError(502, "media_redirect", "图片重定向过多")
+            sends += 1
+            return await handler(request)
+
         for redirect_count in range(4):
             url, host, port = _parse_url(raw_url)
             if str(url) in seen:
@@ -389,23 +512,20 @@ class ImageProxy:
             try:
                 async with aiohttp.ClientSession(
                     connector=connector, timeout=timeout, trust_env=False,
+                    middlewares=(budget_middleware,),
                     cookie_jar=aiohttp.DummyCookieJar(), auto_decompress=False,
-                    headers={"Accept": "image/jpeg,image/png,image/webp", "Accept-Encoding": "identity",
-                             "User-Agent": USER_AGENT},
+                    headers={"Accept": "image/jpeg,image/png,image/webp",
+                             "Accept-Encoding": "identity", "User-Agent": USER_AGENT},
                 ) as session:
                     async with session.get(url, allow_redirects=False) as response:
                         if response.status in (301, 302, 303, 307, 308):
                             if redirect_count == 3:
                                 raise MediaError(502, "media_redirect", "图片重定向过多")
                             location = response.headers.get("Location")
-                            if not location:
-                                raise MediaError(502, "media_redirect", "图片重定向无效")
-                            next_url = urljoin(str(url), location)
-                            parsed, _, _ = _parse_url(next_url)
-                            if url.scheme == "https" and parsed.scheme != "https":
-                                raise MediaError(502, "media_redirect", "图片重定向无效")
-                            raw_url = next_url
+                            raw_url = _redirect_target(url, location or "")
                             continue
+                        if response.status == 404 and favicon:
+                            raise MediaError(404, "favicon_not_found", "网站没有可用图标")
                         if response.status != 200:
                             raise MediaError(502, "media_unavailable", "图片源站不可用")
                         if response.headers.get("Content-Encoding", "identity").lower() != "identity":
@@ -433,9 +553,8 @@ class ImageProxy:
 
 
 async def _decode(raw: bytes) -> MediaData:
-    # A process, not a thread: cancellation/timeout can kill the Pillow decoder
-    # even if native code never returns. The child emits only bounded sanitized
-    # pixels and never returns source metadata or error details.
+    # A separate process limits decoder lifetime and resources, but is not a
+    # security sandbox. Only bounded, re-encoded pixels cross back to the caller.
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "wandrun.gateway.rich_media", "--decode",
@@ -489,8 +608,9 @@ def _decode_worker() -> None:
             return
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(raw)) as probe:
-                if probe.format not in ("JPEG", "PNG", "WEBP") or getattr(probe, "n_frames", 1) != 1:
+            allowed_formats = ("JPEG", "PNG", "WEBP")
+            with Image.open(io.BytesIO(raw), formats=allowed_formats) as probe:
+                if probe.format not in allowed_formats or getattr(probe, "n_frames", 1) != 1:
                     raise ValueError("unsupported format or animation")
                 width, height = probe.size
                 if (not 0 < width <= MAX_SIDE or not 0 < height <= MAX_SIDE
@@ -499,8 +619,8 @@ def _decode_worker() -> None:
                     return
                 fmt = probe.format
                 probe.verify()
-            with Image.open(io.BytesIO(raw)) as image:
-                if image.format != fmt or getattr(image, "n_frames", 1) != 1:
+            with Image.open(io.BytesIO(raw), formats=allowed_formats) as image:
+                if image.format != fmt or image.format not in allowed_formats or getattr(image, "n_frames", 1) != 1:
                     raise ValueError("inconsistent image")
                 image.load()
                 oriented = ImageOps.exif_transpose(image)

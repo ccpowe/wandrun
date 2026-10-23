@@ -103,7 +103,7 @@ function AllAgentsScreen({ session }: { session: ChatSession }) {
           </Text>
         )}
         {hidden.length > 0 && (
-          <Text className="mx-8 mt-2.5 text-xs text-muted-foreground">{t("左滑“不在首页”的 Agent 可放回首页。")}</Text>
+          <Text className="mx-8 mt-2.5 text-xs text-muted-foreground">{t("左滑可放回首页。")}</Text>
         )}
       </ScrollView>
     </View>

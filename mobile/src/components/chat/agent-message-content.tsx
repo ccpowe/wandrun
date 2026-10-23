@@ -29,13 +29,13 @@ export function AgentMessageContent({ text, ui, attachments, submissions, onSubm
   return <View className="gap-2">
     {segments.map((part, index) => part.kind === "markdown"
       ? parsed.chunks.get(index)?.length ? <AgentMemoryMarkdown key={index} content={part.text} tokens={parsed.chunks.get(index)}
-        media={media} selectable /> : null
+        media={media} selectable scrollCodeBlocks /> : null
       : <RichBlock key={index} source={part.source} block={part.block}
         valid={part.closed && ui?.find((status) => status?.block === part.block)?.valid !== false}
         imageFiles={authorizedImageFiles(ui?.find((entry) => entry?.block === part.block), attachments)}
         submission={submissions?.get(part.block)}
         draft={draftOwner && { ...draftOwner, block: part.block }}
         onSubmit={(values, clientId) => onSubmit(part.block, values, clientId)} />)}
-    {parsed.tail.length ? <AgentMemoryMarkdown content=" " tokens={parsed.tail} media={media} selectable /> : null}
+    {parsed.tail.length ? <AgentMemoryMarkdown content=" " tokens={parsed.tail} media={media} selectable scrollCodeBlocks /> : null}
   </View>;
 }

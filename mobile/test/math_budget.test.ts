@@ -12,6 +12,8 @@ import { MAX_ACTIVE_RENDERERS, RenderBudget, intersectsRenderViewport } from '..
 import { parseMessageMarkdown } from '../src/lib/agent-message-markdown.ts';
 import { splitAgentMessage } from '../src/lib/agent-message.ts';
 import { groupMarkdownBlocks, mathBlockHtml, mathNode } from '../src/lib/math-html.ts';
+import type { AgentMemory } from '../src/gateway/api.ts';
+import { managedMemorySlug } from '../src/lib/agent-memory.ts';
 
 // Exercise resource ownership with real files; only Expo's native FS API is
 // replaced. Browser execution/CSP/font loading also need the rendering smoke.
@@ -66,7 +68,7 @@ const native = {
     return createElement('WebView', props);
   },
 };
-declare global { var __mathNative: typeof native; var __mathFilesystem: typeof filesystem; var IS_REACT_ACT_ENVIRONMENT: boolean; }
+declare global { var __mathNative: typeof native; var __mathFilesystem: typeof filesystem; var __mathOpenedLinks: string[]; var IS_REACT_ACT_ENVIRONMENT: boolean; }
 globalThis.__mathNative = native;
 globalThis.__mathFilesystem = filesystem;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -74,7 +76,7 @@ const hosts: Record<string, string> = {
   'expo-router': `export const useIsFocused = globalThis.__mathNative.focused;`,
   'expo-file-system': `export const { File, Directory, Paths } = globalThis.__mathFilesystem;`,
   'expo-file-system/legacy': `export const { writeAsStringAsync } = globalThis.__mathFilesystem;`,
-  'react-native': `export const View = 'View', Pressable = 'Pressable', Text = 'Text'; export const Platform = { OS: 'ios' }; export const Linking = { openURL() {} }; export const StyleSheet = { flatten: values => Object.assign({}, ...values) };`,
+  'react-native': `export const View = 'View', Pressable = 'Pressable', Text = 'Text'; export const Platform = { OS: 'ios' }; export const Linking = { openURL: url => {globalThis.__mathOpenedLinks.push(url)} }; export const StyleSheet = { flatten: values => Object.assign({}, ...values) };`,
   'react-native-webview': `export default globalThis.__mathNative.WebView;`,
   'uniwind': `export const useCSSVariable = () => []; export const useResolveClassNames = () => ({});`,
   '@/components/ui/text.tsx': `export const Text = 'Text';`,
@@ -153,6 +155,37 @@ test('500 formula paragraphs and repeated long-conversation scrolling never exce
   }
   assert.equal(live, 0);
   assert.equal(visibility.size, 0);
+});
+
+test('math WebView bridge opens only active managed links internally and HTTP(S) externally', async () => {
+  const path = `/.wandrun/memory/profile/details/topic/${'a'.repeat(64)}.md`;
+  const stale = `/.wandrun/memory/profile/details/topic/${'b'.repeat(64)}.md`;
+  const memory: AgentMemory = { scope: 'profile', content: '', version: 'v1', limit: 1000,
+    updated_at: null, updated_by: null, details: { topic: { path, sha256: 'a'.repeat(64) } } };
+  const source = `- [topic](${path}) $x$\n- [web](https://example.org) [stale](${stale})`;
+  const parsed = parseMessageMarkdown(splitAgentMessage(source));
+  const html = mathBlockHtml([...parsed.chunks.values()][0], memory);
+  const opened: string[] = [];
+  globalThis.__mathOpenedLinks = [];
+  const root = createRoot({ textComponentTypes: ['Text'] });
+  try {
+    await act(async () => root.render(createElement(MathContent, { html, source,
+      onManagedLink: (href: string) => {
+        const slug = managedMemorySlug(href, memory);
+        if (!slug) return false;
+        opened.push(slug);
+        return true;
+      },
+    })));
+    await act(async () => [...visibility.values()].forEach(notify => notify(true)));
+    const bridge = root.container.queryAll(node => node.type === 'WebView')[0];
+    assert.ok(bridge, 'the visible math branch mounts a budgeted renderer');
+    for (const href of [path, stale, '/etc/passwd', 'https://example.org']) {
+      await act(async () => bridge.props.onMessage({ nativeEvent: { data: JSON.stringify({ kind: 'link', href }) } }));
+    }
+    assert.deepEqual(opened, ['topic']);
+    assert.deepEqual(globalThis.__mathOpenedLinks, ['https://example.org']);
+  } finally { await act(async () => root.unmount()); }
 });
 
 test('cancelled waiters cannot consume later permits; cleanup is idempotent', () => {

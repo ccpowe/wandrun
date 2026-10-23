@@ -1,5 +1,5 @@
 import { useAudioPlayer, useAudioPlayerStatus } from "expo-audio";
-import { router } from "expo-router";
+import { router, useIsFocused } from "expo-router";
 import { Pause, Play } from "lucide-react-native";
 import { useEffect, useLayoutEffect, useState } from "react";
 import { AppState, Pressable, View } from "react-native";
@@ -12,7 +12,7 @@ import type { GatewayApi } from "@/gateway/api.ts";
 import type { AttachmentFile } from "@/lib/attachment-grid.ts";
 import { formatDuration } from "@/lib/attachment-grid.ts";
 import { useTranslation } from "@/lib/i18n.ts";
-import { claimAudioPlayer, releaseAudioPlayer, stopActiveAudio } from "@/lib/audio-playback.ts";
+import { claimAudioPlayer, releaseAudioPlayer } from "@/lib/audio-playback.ts";
 import { useFilePreview, type PreviewOverrides } from "@/components/chat/attachment-media.tsx";
 
 export function AudioCard({ file, api, previewOverrides, compact = false }: {
@@ -22,18 +22,23 @@ export function AudioCard({ file, api, previewOverrides, compact = false }: {
   const preview = useFilePreview(api, file.id, previewOverrides);
   const player = useAudioPlayer(api ? { uri: api.fileContentUrl(file.id), headers: api.headers(), name: file.name } : null, { updateInterval: 250 });
   const status = useAudioPlayerStatus(player);
+  const focused = useIsFocused();
   const [seeking, setSeeking] = useState<number | null>(null);
   useLayoutEffect(() => () => {
     releaseAudioPlayer(player);
   }, [player]);
   useEffect(() => {
+    if (!focused) {
+      releaseAudioPlayer(player);
+      return;
+    }
     const subscription = AppState.addEventListener("change", (state) => {
-      if (state !== "active") stopActiveAudio();
+      if (state !== "active") releaseAudioPlayer(player);
     });
     return () => {
       subscription.remove();
     };
-  }, [player]);
+  }, [focused, player]);
   if (preview.failed && api) return <AttachmentFallbackRow file={file} />;
   const duration = preview.preview?.duration_ms ? preview.preview.duration_ms / 1000 : status.duration;
   const current = seeking ?? status.currentTime;

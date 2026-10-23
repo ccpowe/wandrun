@@ -64,6 +64,33 @@ const mediaCard = z.union([
   z.strictObject({ url: webUrl, ...cardFields }),
 ]);
 
+const fileTreeNode = z.strictObject({
+  path: bounded(200).min(1),
+  kind: z.enum(['folder', 'file']).optional(),
+  note: bounded(60).optional(),
+  collapsed: z.boolean().optional(),
+});
+
+/** Paths identify display nodes, not filesystem access; a trailing slash aliases the same folder. */
+function validFileTree(nodes: z.infer<typeof fileTreeNode>[]): boolean {
+  const paths = new Map<string, 'folder' | 'file' | undefined>();
+  for (const node of nodes) {
+    const path = node.path.replace(/\/$/, '');
+    const segments = path.split('/');
+    if (segments.length > 8 || segments.some((part) => !part || part === '.' || part === '..' ||
+        codepoints(part) > 64) || /[\\\u0000-\u001f\u007f]/.test(node.path) ||
+        paths.has(path) || node.kind === 'file' && node.path.endsWith('/')) return false;
+    paths.set(path, node.kind ?? (node.path.endsWith('/') ? 'folder' : undefined));
+  }
+  for (const path of paths.keys()) {
+    const segments = path.split('/');
+    for (let depth = 1; depth < segments.length; depth++) {
+      if (paths.get(segments.slice(0, depth).join('/')) === 'file') return false;
+    }
+  }
+  return true;
+}
+
 
 /** Defensive renderer validation; rich_catalog_validation.test.ts compares every constraint with the authoritative catalog. */
 export const componentSchemas = {
@@ -95,7 +122,9 @@ export const componentSchemas = {
   Accordion: z.strictObject({ title: chartTitle, defaultOpen: z.boolean().optional() }),
   Grid: z.strictObject({ columns: z.union([z.literal(2), z.literal(3)]) }),
   Source: z.strictObject({ items: z.array(z.strictObject({ url: webUrl, title: short.optional() })).min(1).max(8) }),
-  LinkCard: z.strictObject({ url: webUrl, title: short, description: long.optional() }),
+  LinkCard: z.strictObject({ url: webUrl, title: short, description: long.optional(),
+    image: webUrl.optional(), tags: z.array(bounded(12)).max(3).optional() }),
+  FileTree: z.strictObject({ title: bounded(40).optional(), nodes: z.array(fileTreeNode).min(1).max(80) }),
   Icon: z.strictObject({ name: iconName, label: short.optional(), size: z.enum(['sm', 'md', 'lg']).optional() }),
   List: z.strictObject({ ordered: z.boolean().optional(), items: z.array(z.strictObject({ text: long, icon: iconName.optional() })).min(1).max(12) }),
   Callout: z.strictObject({ tone: z.enum(['info', 'success', 'warning', 'error']), title: short.optional(), text: long }),
@@ -217,6 +246,7 @@ export function parseRichSpec(source: string): RichSpec | null {
         const chart = props.data as z.infer<typeof componentSchemas.BarChart>;
         if (chart.values.length !== chart.labels.length) return null;
       }
+      if (type === 'FileTree' && !validFileTree((props.data as z.infer<typeof componentSchemas.FileTree>).nodes)) return null;
       if (type === 'Tabs' && element.children.length !== (props.data as z.infer<typeof componentSchemas.Tabs>).tabs.length) return null;
       if (type === 'Slider') {
         const slider = props.data as z.infer<typeof componentSchemas.Slider>;

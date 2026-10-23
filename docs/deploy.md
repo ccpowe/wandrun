@@ -78,6 +78,10 @@ If device login is unavailable, drop `--device-auth` to use the browser flow.
 Always **stop the gateway before logging in again**, then start it afterwards.
 The gateway starts without a login too; the app's model page then shows the login command.
 
+The model catalog is cached for 300 seconds; reopening the page need not fetch a new catalog.
+When checking Codex or connector OAuth, token rotation is expected: verify that refresh and a
+subsequent authenticated request work, not that token bytes stay unchanged.
+
 ## 4. Workspace
 
 Create an empty workspace. On first start the gateway writes default
@@ -197,6 +201,11 @@ WantedBy=default.target
 
 `PartOf` restarts the gateway together with Chrome, so it never keeps a stale browser connection.
 
+Wandrun no longer automatically reads `.env`. Put required variables in the unit's
+`Environment=` entries or an explicit `EnvironmentFile=%h/.config/wandrun/gateway.env`
+under `[Service]` (create the file first, mode `0600`). systemd environment files use
+`NAME=value`, not shell `export` commands. Reload the units and restart the gateway after changes.
+
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now wandrun-xvfb wandrun-chrome wandrun-gateway
@@ -265,17 +274,79 @@ npx eas-cli build --platform android --profile preview  # produces an installabl
 
 For local development, `npx expo run:android` builds and installs a debug build on a connected device.
 
+## Optional LangSmith tracing
+
+Tracing is **off by default**. To opt in, add an explicit environment file to the gateway
+unit as above, containing:
+
+```ini
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=<your LangSmith API key>
+LANGSMITH_PROJECT=wandrun
+```
+
+Restart the gateway to apply it. Remove `LANGSMITH_TRACING` or set it to `false` and restart
+to turn it off. `LANGSMITH_ENDPOINT` and `LANGSMITH_WORKSPACE_ID` are optional routing settings.
+Enabling tracing sends conversation content (including injected memory), model inputs/outputs
+and tool inputs/results to your configured LangSmith service. Known credentials are redacted
+and trace attachments are stripped, but unknown secrets and personal content are not guaranteed
+to be removed; review the data and the service's retention policy before opting in. Usage counts
+against your LangSmith quota. Harbor forwarding also requires the adapter's
+`langsmith_tracing=True`; see [the adapter](../src/wandrun/evaluation/harbor_agent.py).
+
 ## Upgrades
 
-1. Read the release notes. The state format is not stable yet; a release may require a fresh state.
-2. Stop the services: `systemctl --user stop wandrun-chrome wandrun-xvfb` (the gateway stops with Chrome).
-3. Back up `~/wandrun-workspace` and `~/wandrun-chrome`.
-4. Check out the new tag and run `uv sync --locked --no-dev`.
-5. If the release requires it, move `~/wandrun-workspace/.wandrun/state` aside. Agents and
-   connectors are then re-imported from the TOML files, and phones must be paired again.
-6. Start the services and wait for the 401 check above.
+1. Read the release notes, then stop services: `systemctl --user stop wandrun-chrome wandrun-xvfb`
+   (the gateway stops with Chrome).
+2. Back up `~/wandrun-workspace` and `~/wandrun-chrome` while stopped, including SQLite sidecars.
+   Keep credentials private; see the token rollback warning below.
+3. Check out the new tag and run `uv sync --locked --no-dev`.
+4. Choose the state path below, then start services and wait for the 401 check above.
 
-Do not restore an old copy of `auth.json`: the refresh token may already have rotated.
+### From v0.1.x (gateway schema 22 → 23)
+
+The formats are incompatible; the project contains no migration code. Prefer **fresh state**:
+move `~/wandrun-workspace/.wandrun/state` to a backup location while stopped. Conversations,
+schedules and device pairings start afresh; agents and connectors are re-imported from TOML,
+not recovered from edits in the old database. Old memory is not imported.
+
+Alternatively, to retain the gateway database, install the `sqlite3` CLI and run this
+**one-time SQL only on a stopped, backed-up schema-22 database**. It drops memory authorship
+metadata, rebuilds `memory_metadata` and sets version 23; it is not a general state migration.
+Old memory is not converted to shared profile or working memory: re-enter what you need in
+the app, and start new conversations rather than resuming old execution checkpoints.
+
+```bash
+sqlite3 "$HOME/wandrun-workspace/.wandrun/state/gateway.sqlite" <<'SQL'
+.bail on
+PRAGMA foreign_keys = ON;
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE upgrade_guard (version INTEGER CHECK (version = 22));
+INSERT INTO upgrade_guard SELECT user_version FROM pragma_user_version;
+DROP TABLE memory_metadata;
+CREATE TABLE memory_metadata (
+    scope TEXT NOT NULL CHECK (scope IN ('profile', 'work')),
+    agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,
+    version TEXT NOT NULL,
+    updated_by TEXT NOT NULL CHECK (updated_by IN ('user', 'agent')),
+    CHECK ((scope = 'profile' AND agent_id IS NULL) OR (scope = 'work' AND agent_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX memory_metadata_profile ON memory_metadata(scope) WHERE scope = 'profile';
+CREATE UNIQUE INDEX memory_metadata_work ON memory_metadata(agent_id) WHERE scope = 'work';
+PRAGMA user_version = 23;
+COMMIT;
+PRAGMA user_version;
+PRAGMA integrity_check;
+SQL
+```
+
+Expect `23` and `ok`. On error, keep services stopped and inspect the backup; do not bypass
+the version guard. This SQL does not update other schema versions.
+
+**Rollback and OAuth:** tokens may rotate during acceptance checks. Never restore an older
+Codex `auth.json` or connector refresh token from a database backup over the current credentials.
+Restoring code/state is not a credential rollback; if current credentials cannot be retained
+consistently, sign in or authorize again rather than replaying an old refresh token.
 
 ## Troubleshooting
 

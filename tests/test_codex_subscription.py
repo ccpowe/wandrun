@@ -259,7 +259,7 @@ class StreamingTests(unittest.TestCase):
         self.stream_patch = patch(
             "wandrun.integrations.codex_subscription.urlopen", return_value=self.wire
         )
-        self.stream_patch.start()
+        self.stream_request = self.stream_patch.start()
         self.addCleanup(self.stream_patch.stop)
 
     def test_incremental_output_before_completed_and_replay(self):
@@ -494,6 +494,57 @@ class StreamingTests(unittest.TestCase):
                     list(stream)
                 self.assertTrue(self.wire.closed)
                 self.stream_patch.stop()
+
+    def test_failed_sse_preserves_safe_error_fields_and_http_retry_semantics(self):
+        for code, status in (
+            ("server_error", 503), ("rate_limit_exceeded", 429),
+            ("usage_limit_reached", 429), ("insufficient_quota", 429),
+            ("invalid_request_error", 400),
+        ):
+            with self.subTest(code=code):
+                payload = {"error": {"code": code, "message": "controlled reason", "private": "secret"},
+                           "output": [{"private": "secret"}]}
+                self.events([{"type": "response.failed", "response": payload}])
+                with self.assertRaises(RuntimeError) as caught:
+                    CodexSubscriptionModel().invoke("hello")
+                error = caught.exception
+                self.assertEqual(
+                    getattr(error, "error_payload", None),
+                    {"error": {"code": code, "message": "controlled reason"}},
+                )
+                self.assertIn(code, str(error))
+                self.assertIn("controlled reason", str(error))
+                self.assertNotIn("secret", str(error))
+                http_error = CodexSubscriptionModel._http_error(status, json.dumps(payload), {})
+                self.assertEqual(self.stream_request.call_count, 1)
+                self.assertEqual(is_retryable_model_error(error), is_retryable_model_error(http_error))
+                self.assertTrue(self.wire.closed)
+                self.stream_patch.stop()
+
+    def test_failed_sse_drops_opaque_reason_and_unknown_error_stays_nonretryable(self):
+        self.events([{"type": "response.failed", "response": {
+            "error": {"code": "unknown_error", "message": "data:image/png;base64," + "x" * 100},
+            "output": [{"content": "private output"}],
+        }}])
+        with self.assertRaises(RuntimeError) as caught:
+            CodexSubscriptionModel().invoke("hello")
+        error = caught.exception
+        self.assertEqual(getattr(error, "error_payload", None), {"error": {"code": "unknown_error"}})
+        self.assertNotIn("base64", str(error))
+        self.assertNotIn("private output", str(error))
+        self.assertFalse(is_retryable_model_error(error))
+
+    def test_failed_sse_redacts_credential_echo_from_reason(self):
+        claims = base64.urlsafe_b64encode(b"{}").decode().rstrip("=")
+        token = f"test.{claims}.test"
+        self.events([{"type": "response.failed", "response": {
+            "error": {"code": "server_error", "message": f"rejected {token}"},
+        }}])
+        with self.assertRaises(CodexSubscriptionStreamError) as caught:
+            CodexSubscriptionModel().invoke("hello")
+        self.assertNotIn(token, str(caught.exception))
+        self.assertNotIn(token, repr(caught.exception.error_payload))
+        self.assertIn("[REDACTED]", str(caught.exception))
 
     def test_consumer_close_releases_sync_connection(self):
         self.events(text_events(self.output, self.response))

@@ -32,7 +32,7 @@ export type RowText =
  */
 export function homeRowText(agent: AgentSummary, activity: string | null, offline = false): RowText {
   const latest = agent.latest_conversation;
-  if (offline && latest?.status === "working") return { kind: "plain", text: "状态未知（断开时正在工作）" };
+  if (offline && latest?.status === "working") return { kind: "plain", text: "断开后状态未知" };
   if (latest?.status === "working") return { kind: "working", text: activity ? `工作中 · ${activity}` : "工作中" };
   if (latest?.status === "failed") return { kind: "failed", text: "上一轮失败" };
   return { kind: "plain", text: messagePreview(latest?.last_text) || agent.description.trim() || t("还没有对话") };

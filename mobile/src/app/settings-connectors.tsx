@@ -37,10 +37,10 @@ function ConnectorList({ session }: { session: ChatSession }) {
     <ConnectionBanner session={session} />
     <ScrollView contentContainerStyle={{ paddingBottom: insets.bottom + 24 }}>
       {catalog.connectors.length > 0 ? <ListGroup>{catalog.connectors.map((connector) => <ConnectorRow key={connector.id} connector={connector} />)}</ListGroup> : null}
-      {catalog.loaded && !catalog.connectors.length ? <Text className="mx-8 mt-12 text-center text-sm text-muted-foreground">{t("还没有连接器。点右上角 ＋ 添加。")}</Text> : null}
+      {catalog.loaded && !catalog.connectors.length ? <Text className="mx-8 mt-12 text-center text-sm text-muted-foreground">{t("还没有连接器。")}</Text> : null}
       {!catalog.loaded && !catalog.error ? <Text className="mx-8 mt-8 text-center text-sm text-muted-foreground">{t("正在加载连接器…")}</Text> : null}
       {catalog.error ? <View className="mx-6 mt-5 items-center gap-2"><Text className="text-center text-sm text-destructive">{t(catalog.error)}</Text><Button variant="outline" onPress={catalog.refresh}><Text>{t("重试")}</Text></Button></View> : null}
-      <Text className="mx-8 mt-4 text-xs leading-[18px] text-muted-foreground">{t("使用或测试时连接，网关退出时关闭；使用方式在 Agent 编辑 › 连接器中选择。")}</Text>
+      <Text className="mx-8 mt-4 text-xs leading-[18px] text-muted-foreground">{t("使用或测试时连接，网关退出时关闭；使用方式见 Agent 编辑 › 连接器。")}</Text>
     </ScrollView>
   </View>;
 }

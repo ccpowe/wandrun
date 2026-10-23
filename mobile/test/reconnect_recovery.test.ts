@@ -7,7 +7,7 @@ import { ChatSession } from "../src/gateway/session.ts";
 
 const root: Conversation = {
   id: "root", agent_id: "writer", title: "Before", created_at: 1, updated_at: 1,
-  read_seq: 0, status: "working", unread: false, last_text: null, source: "user", schedule_origin: null,
+  read_seq: 0, last_agent_seq: 0, status: "working", unread: false, last_text: null, source: "user", schedule_origin: null,
 };
 const agent = (name: string): AgentSummary => ({
   id: "writer", name, avatar: 1, description: "", workers: [], home: true, latest_conversation: null, unread: false,
@@ -70,7 +70,7 @@ for (const method of ["POST", "PATCH", "PUT", "DELETE"] as const) {
       switch (method) {
         case "POST": return api.createConversation("writer");
         case "PATCH": return api.renameConversation("root", "Renamed");
-        case "PUT": return api.updateAgentMemory("writer", "Remember this", "old-version");
+        case "PUT": return api.updateMemory("work", "writer", "Remember this", "old-version");
         case "DELETE": return api.deleteConversation("root");
       }
     };

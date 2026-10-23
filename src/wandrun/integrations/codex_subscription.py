@@ -8,6 +8,7 @@ AgentOutput 通信正文收齐响应后合并返回，避免把多个 JSON 对�
 import json
 import logging
 import math
+import os
 import re
 from contextlib import aclosing, closing
 from pathlib import Path
@@ -102,7 +103,11 @@ class CodexSubscriptionHTTPError(RuntimeError):
 
 
 class CodexSubscriptionStreamError(RuntimeError):
-    """SSE 连接未产生完整响应。"""
+    """SSE 未完成；error_payload 为 None 表示截断，否则仅含受控的服务拒绝字段。"""
+
+    def __init__(self, detail: str, error_payload: dict | None = None):
+        super().__init__(detail)
+        self.error_payload = error_payload
 
 
 class ContextWindowExceededError(RuntimeError):
@@ -146,6 +151,11 @@ def _http_error_payload(detail):
         source = json.loads(detail)
     except ValueError:
         return None
+    return _error_payload(source)
+
+
+def _error_payload(source, secrets=()):
+    """Share the HTTP/SSE field whitelist and redact credentials before size checks."""
     if not isinstance(source, dict):
         return {}
 
@@ -153,6 +163,10 @@ def _http_error_payload(detail):
         result = {}
         for key in fields:
             value = source.get(key)
+            if isinstance(value, str):
+                for secret in secrets:
+                    if isinstance(secret, str) and secret:
+                        value = value.replace(secret, "[REDACTED]")
             if key in {"resets_at", "reset_at"} and isinstance(value, (int, float)) and not isinstance(value, bool):
                 result[key] = value
             elif safe := _safe_detail(value):
@@ -171,8 +185,16 @@ def _http_error_payload(detail):
 
 
 def is_retryable_model_error(error: Exception) -> bool:
-    """只重试明确可恢复的传输错误和临时 HTTP 状态。"""
-    if isinstance(error, (httpx.TransportError, CodexSubscriptionStreamError)):
+    """按现有 HTTP 语义重试传输中断、限流/额度错误及服务临时失败；未知拒绝不重试。"""
+    if isinstance(error, CodexSubscriptionStreamError):
+        if error.error_payload is None:
+            return True
+        payload = error.error_payload
+        fields = payload.get("error") or payload
+        return any(fields.get(key) in {
+            "server_error", "rate_limit_exceeded", "usage_limit_reached", "insufficient_quota",
+        } for key in ("code", "type"))
+    if isinstance(error, httpx.TransportError):
         return True
     if isinstance(error, CodexSubscriptionHTTPError):
         return error.status_code in {408, 409, 429} or error.status_code >= 500
@@ -437,6 +459,10 @@ class CodexSubscriptionModel(BaseChatModel):
 
     @staticmethod
     def _prepare_http_request(body, credential: CredentialSnapshot):
+        if os.environ.get("LANGSMITH_TRACING", "").lower() == "true":
+            from wandrun.runtime.tracing import remember_credentials
+
+            remember_credentials(credential)
         headers = dict(credential.headers)
         if cache_key := body.get("prompt_cache_key"):
             headers["session-id"] = cache_key
@@ -541,6 +567,9 @@ class CodexSubscriptionModel(BaseChatModel):
             or error.get("status_code") == 401
         ):
             self.credentials.rejected(credential)
+        if event.get("type") in {"error", "response.failed", "response.incomplete"}:
+            # Keep usage for metrics; expose only credential-redacted error fields.
+            payload.update(_error_payload(payload, credential.tokens.values()))
 
 
 def prepare_subscription_request(
@@ -824,7 +853,10 @@ class _ResponseStream:
         if kind in {"error", "response.failed", "response.incomplete"}:
             if _context_window_exceeded(event) or _context_window_exceeded(event.get("response")):
                 raise ContextWindowExceededError(f"订阅响应超过上下文窗口：{kind}")
-            raise RuntimeError(f"订阅响应失败：{kind}")
+            payload = _error_payload(event.get("response") or event)
+            raise CodexSubscriptionStreamError(
+                f"订阅响应失败：{kind}；{json.dumps(payload, ensure_ascii=False)}", payload,
+            )
         if kind == "response.output_item.added":
             item = self.items[index] = event["item"]
             if item["type"] == "function_call":

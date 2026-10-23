@@ -1,6 +1,7 @@
 """统一装配并持有一次进程内运行；不解释终端命令、HTTP 或评测终态。"""
 
 import asyncio
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
@@ -249,6 +250,7 @@ async def open_runtime(
     stack = AsyncExitStack()
     manager = None
     browser = None
+    tracing = None
     failure = None
     environments: list[Environment] = []
     try:
@@ -286,6 +288,21 @@ async def open_runtime(
                 environments_config or workspace.environments_config,
                 mcp_servers=mcp_servers, mcp_descriptions=mcp_descriptions,
             )
+        credentials = credentials if credentials is not None else CodexCredentials()
+        traced_oauth_ids = frozenset(config.mcp_servers)
+        if os.environ.get("LANGSMITH_TRACING", "").lower() == "true":
+            from wandrun.integrations.codex_credentials import CredentialError
+            from wandrun.runtime.tracing import RuntimeTracing
+
+            tracing = RuntimeTracing(secret_source=lambda: tuple(
+                secret for identity in traced_oauth_ids
+                for secret in (mcp_oauth.secret_values(identity) if mcp_oauth is not None else ())
+            ))
+            tracing.remember_connectors(config.mcp_servers)
+            try:
+                tracing.remember_credentials(credentials.peek())
+            except CredentialError:
+                pass  # Preserve the normal model invocation's credential error.
         browser_settings = [
             environment.browser for environment in config.environments.values()
             if environment.browser is not None
@@ -333,7 +350,6 @@ async def open_runtime(
             # 在 MCP 之后进入资源栈，因此先于 MCP 关闭；Worker 由 Manager 先行收拢（ADR-0010）。
             code_pool = await stack.enter_async_context(pm.AsyncMonty())
         request_budget = ModelRequestBudget(max_model_requests) if max_model_requests is not None else None
-        credentials = credentials if credentials is not None else CodexCredentials()
         models = create_models(
             config.agents,
             model_name=model_name,
@@ -385,7 +401,7 @@ async def open_runtime(
             finally:
                 _current_task.reset(token)
         manager = WorkerManager(
-            run_worker,
+            tracing.wrap_worker(run_worker, lambda: manager) if tracing is not None else run_worker,
             on_human=on_human,
             on_preview=on_preview,
             validate_human=validate_human,
@@ -399,6 +415,7 @@ async def open_runtime(
             attachment_preflight=files.prepare_attachments,
             notify_human_of_roots=notify_human_of_roots,
         )
+        manager.bind_memory(memory)
         files.manager = manager
         entry_middleware_factories = {
             kind: {
@@ -592,7 +609,10 @@ async def open_runtime(
             )
 
             def commit() -> None:
-                nonlocal config
+                nonlocal config, traced_oauth_ids
+                if tracing is not None:
+                    tracing.remember_connectors(checked_servers)
+                    traced_oauth_ids = traced_oauth_ids | checked_servers.keys()
                 config = candidate
 
             return commit
@@ -631,3 +651,8 @@ async def open_runtime(
                 raise
             # 超限仅说明清理耗时，不能覆盖启动/执行错误或调用者的取消。
             failure.add_note(str(error))
+        finally:
+            # Debug uploads are not execution resources: a slow cloud must not turn
+            # a successful headless task into cleanup_failed.
+            if tracing is not None:
+                await tracing.aclose()

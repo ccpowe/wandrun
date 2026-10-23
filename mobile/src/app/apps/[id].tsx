@@ -109,9 +109,11 @@ function AppDetail({ session, id }: { session: ChatSession; id: string }) {
     <ConnectionBanner session={session} />
     <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: insets.bottom + 28 }}>
       {entry ? <>
-        <Text className="mx-6 mt-4 text-sm leading-5 text-muted-foreground">{t(entry.description)}</Text>
+        <Text className="mx-6 mt-4 text-sm leading-5 text-muted-foreground">{entry.description === "连接 Notion 工作区的 MCP 工具"
+          ? t("Notion 工作区工具") : entry.description === "连接 GitHub 仓库、Issue 与 Pull Request"
+            ? t("GitHub 仓库、Issue 与 Pull Request") : t(entry.description)}</Text>
         {!entry.connector ? <View className="mx-5 mt-5 gap-3 rounded-md border border-border bg-card p-4">
-          <Text className="text-sm leading-5">{t("连接会在网关中取得此应用的连接器，然后开始授权；按服务方要求在浏览器中完成。不会自动授予任何 Agent。")}</Text>
+          <Text className="text-sm leading-5">{t("在浏览器中完成服务方授权；连接后不会自动授予任何 Agent。")}</Text>
           {id === "github" ? <Text testID="app-github-permissions" className="text-xs leading-[18px] text-muted-foreground">{t("GitHub 的 repo 授权范围包含私有仓库的读取和写入，并非只读。令牌仅保存在网关；不会自动授予任何 Agent 使用权限。")}</Text> : null}
           <Button testID="app-connect" variant="outline" disabled={connecting} onPress={() => void connect()}><Text>{t(connecting ? "连接中…" : "连接应用")}</Text></Button>
           {connectError ? <Text testID="app-connect-error" className="text-sm text-destructive">{connectError.template ? t(connectError.template, { error: t(connectError.message) }) : t(connectError.message)}</Text> : null}
@@ -124,9 +126,9 @@ function AppDetail({ session, id }: { session: ChatSession; id: string }) {
             <EditorRow label={t("连接状态")} value={connectorStatus(entry.connector).label} description={t("{count} 个工具", { count: entry.connector.tool_count })} />
           </ListGroup>
           <ListGroup label={t("Agent 使用范围")}>
-            <EditorRow label={t("不是自动授予")} description={t("请到每个 Agent 编辑 › 连接器中，显式选择直接携带或按需搜索。")} />
-            {entry.connector.used_by.map((agent) => <EditorRow key={agent.id} testID={`app-agent-${agent.id}`} label={agent.name} description={t("打开 Agent 编辑")} onPress={() => router.push({ pathname: "/agent-editor", params: { id: agent.id } })} />)}
-            <EditorRow testID="app-select-agent" label={t("选择可使用的 Agent")} description={t("打开全部 Agent；进入需要授权的 Agent 编辑页选择连接器")} onPress={() => router.push("/agents")} />
+            <EditorRow label={t("不是自动授予")} description={t("在每个 Agent 编辑 › 连接器中选择直接携带或按需搜索。")} />
+            {entry.connector.used_by.map((agent) => <EditorRow key={agent.id} testID={`app-agent-${agent.id}`} label={agent.name} onPress={() => router.push({ pathname: "/agent-editor", params: { id: agent.id } })} />)}
+            <EditorRow testID="app-select-agent" label={t("选择可使用的 Agent")} onPress={() => router.push("/agents")} />
           </ListGroup>
         </>}
       </> : null}

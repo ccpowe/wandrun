@@ -20,7 +20,7 @@ test("requested leases merge with unread attention on root and member rows, neve
   const session = new ChatSession({ baseUrl: "http://drawer", token: "test" }, async () => new Response("{}"));
   session.agents.close();
   session["reset"]([{ id: "root", agent_id: "parent", title: "Root", status: "idle", unread: false,
-    read_seq: 0, created_at: 1, updated_at: 1, last_text: null, source: "user", schedule_origin: null }], 1);
+    read_seq: 0, last_agent_seq: 0, created_at: 1, updated_at: 1, last_text: null, source: "user", schedule_origin: null }], 1);
   session["apply"]({ seq: 2, at: 2, type: "task.created", conversation_id: "root", data: {
     task_id: "child", creator_task_id: "root", creator_agent_id: "parent", agent_id: "member", title: "Child", status: "waiting",
     timeline_ids: ["root", "child"],

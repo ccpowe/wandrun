@@ -15,7 +15,7 @@ export function AttachmentDrafts({ items, onRetry, onRemove }: {
   return (
     <ScrollView testID="attachment-drafts" className="max-h-48" contentContainerClassName="gap-2 px-3 pb-2 pt-1" keyboardShouldPersistTaps="handled">
       {items.map((item) => (
-        <View key={item.id} className="flex-row items-center gap-2 rounded-xl bg-muted p-2">
+        <View key={item.id} className={`flex-row items-center gap-2 rounded-xl border bg-muted p-2 ${item.error ? "border-destructive" : "border-transparent"}`}>
           <View className="size-10 items-center justify-center rounded-lg bg-card">
             <FileTypeIcon mediaType={item.mediaType} className="size-5 text-muted-foreground" />
           </View>

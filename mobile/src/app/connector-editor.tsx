@@ -244,7 +244,7 @@ function ConnectorEditor({ session, id, fromApp }: { session: ChatSession; id?: 
     {loading ? <Text className="mt-12 text-center text-sm text-muted-foreground">{t("正在加载连接器…")}</Text> : loadError || !draft ?
       <View className="mx-6 mt-12 items-center gap-3"><Text className="text-sm text-destructive">{t(loadError || "无法加载连接器")}</Text><Button variant="outline" onPress={() => { setLoading(true); setLoadRetry((value) => value + 1); }}><Text>{t("重试")}</Text></Button></View> :
       <KeyboardAwareScrollView keyboardShouldPersistTaps="handled" bottomOffset={12} contentContainerStyle={{ paddingBottom: insets.bottom + 26 }}>
-        {externalChange ? <Text testID="connector-external-change" className="mx-5 my-2 rounded-md border border-destructive px-3 py-2 text-sm leading-5 text-destructive">{t("连接器配置已在别处修改，草稿保留。保存会把本页改动应用到当前配置；也可返回列表重新打开。")}</Text> : null}
+        {externalChange ? <Text testID="connector-external-change" className="mx-5 my-2 rounded-md border border-destructive px-3 py-2 text-sm leading-5 text-destructive">{t("连接器已在别处修改，草稿保留。保存将本页改动应用到当前配置；或返回列表重新打开。")}</Text> : null}
         <Field label={t("名称")}><Input testID="connector-name" accessibilityLabel={t("名称")} editable={!locked} value={draft.name} onChangeText={(name) => change({ name })} placeholder={t("例如 docs")} /></Field>
         <Field label={t("说明")}><Input testID="connector-description" accessibilityLabel={t("说明")} editable={!locked} value={draft.description} onChangeText={(description) => change({ description })} placeholder={t("工具及使用场景")} /></Field>
         <Text className="mx-5 mb-2 mt-4 text-[13px] text-muted-foreground">{t("连接方式")}</Text>
@@ -268,7 +268,7 @@ function ConnectorEditor({ session, id, fromApp }: { session: ChatSession; id?: 
           <Field label={t("地址")}><Input testID="connector-url" accessibilityLabel={t("地址")} editable={!locked && !original?.app_id} value={draft.url} onChangeText={(url) => change({ url })} placeholder="https://example.com/mcp" autoCapitalize="none" keyboardType="url" className="font-mono" /></Field>
         </>}
         {draft.mode === "remote" ? <View className="mx-5 mt-4 gap-2">
-          <Text className="text-[13px] text-muted-foreground">{t(original?.app_id ? "授权方式（应用目录管理，只读）" : "授权方式")}</Text>
+          <Text className="text-[13px] text-muted-foreground">{t(original?.app_id ? "授权方式（应用目录管理）" : "授权方式")}</Text>
           <View className="flex-row gap-2">{(["none", "oauth"] as const).map((auth) =>
             <Button key={auth} testID={`connector-auth-${auth}`} variant="outline" size="sm" accessibilityRole="radio"
               accessibilityState={{ selected: draft.auth_type === auth, disabled: locked || !!original?.app_id }}
@@ -302,9 +302,9 @@ function ConnectorEditor({ session, id, fromApp }: { session: ChatSession; id?: 
         </> : null}
         {id && live?.auth_type === "oauth" ? <ListGroup label={t("OAuth 授权")}><ConnectorOAuth key={id} session={session} connector={live} onChange={acceptLive} onMissing={missingConnector} /></ListGroup> : null}
         <ListGroup label={t("Agent 使用")}>
-          <EditorRow label={t("按需搜索由每个 Agent 决定")} description={t("在 Agent 编辑 › 连接器中选择直接携带或按需搜索。")} />
-          {live?.used_by.length ? live.used_by.map((agent) => <EditorRow key={agent.id} testID={`connector-agent-${agent.id}`} label={agent.name} description={t("打开 Agent 资料")} onPress={() => router.push({ pathname: "/agents/[id]", params: { id: agent.id } })} />)
-            : <EditorRow label={t("没有 Agent 使用")} description={t("可在 Agent 编辑 › 连接器中选择此连接器。")} />}
+          <EditorRow label={t("每个 Agent 可选择直接携带或按需搜索")} description={t("在 Agent 编辑 › 连接器中设置。")} />
+          {live?.used_by.length ? live.used_by.map((agent) => <EditorRow key={agent.id} testID={`connector-agent-${agent.id}`} label={agent.name} onPress={() => router.push({ pathname: "/agents/[id]", params: { id: agent.id } })} />)
+            : <EditorRow label={t("没有 Agent 使用")} />}
         </ListGroup>
         {live?.pending_restart || testResult?.pending_restart ? <Text testID="connector-restart-warning" className="mx-5 mt-4 rounded-md border border-border px-3 py-2 text-[13px] leading-[19px]">{t(RESTART_WARNING)}</Text> : null}
         {status?.failed ? <Text className="mx-5 mt-4 rounded-md border border-destructive px-3 py-2 text-[13px] leading-[19px] text-destructive">{t("上次连接失败：{error}", { error: t(live?.error || "未知原因") })}</Text> : null}

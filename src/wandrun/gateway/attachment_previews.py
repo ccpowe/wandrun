@@ -3,7 +3,7 @@
 The parent process owns authorization and opens the already-validated file
 handle. A short-lived worker receives only that read-only descriptor and
 returns sanitized metadata or JPEG bytes; media libraries never run in the
-HTTP process.
+HTTP process. Image dimensions describe EXIF-corrected display orientation.
 """
 
 from __future__ import annotations
@@ -294,7 +294,7 @@ class AttachmentPreviewService:
 
     @staticmethod
     def _key(identity: str, size: int, mtime_ns: int, variant: str) -> str:
-        raw = f"attachment-preview-v1\0{identity}\0{size}\0{mtime_ns}\0{variant}".encode()
+        raw = f"attachment-preview-v2\0{identity}\0{size}\0{mtime_ns}\0{variant}".encode()
         return hashlib.sha256(raw).hexdigest()
 
     @staticmethod
@@ -510,13 +510,14 @@ def _worker_image(path: str, target: int | None) -> tuple[dict, bytes]:
         width, height = probe.size
         _check_dimensions(width, height)
         probe.verify()
-    if target is None:
-        return {"kind": "image", "width": width, "height": height, "duration_ms": None, "page_count": None}, b""
     with Image.open(path) as image:
+        # PNG EXIF lookup can load pixels, so it must follow the separate verify pass.
+        if image.getexif().get(274) in {5, 6, 7, 8}:
+            width, height = height, width
+        if target is None:
+            return {"kind": "image", "width": width, "height": height, "duration_ms": None, "page_count": None}, b""
         image.load()
         image = ImageOps.exif_transpose(image)
-        width, height = image.size
-        _check_dimensions(width, height)
         output_size = _scaled_size(width, height, target)
         image = image.convert("RGB")
         if image.size != output_size:
@@ -558,7 +559,7 @@ def _worker_video(path: str, target: int | None) -> tuple[dict, bytes]:
         target_seconds = min(1.0, (duration_ms or 0) / 1000)
         if target_seconds > 0:
             container.seek(int(target_seconds / float(stream.time_base)), stream=stream, backward=True)
-        frame = next(container.decode(video=stream.index), None)
+        frame = next(container.decode(stream), None)
         if frame is None:
             raise ValueError("no video frame")
         image = frame.to_image().convert("RGB")

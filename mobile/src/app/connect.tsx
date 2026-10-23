@@ -95,11 +95,11 @@ export default function Connect() {
       if (!pairing.current(signal)) return;
       pairing.retryQr(); // An explicit scanner visit may report a consumed code again.
       setPage(status.granted ? "scan" : "manual");
-      if (!status.granted) setError("相机权限未开启。请手动输入电脑地址和配对码，或在系统设置中允许相机权限后重试扫码。");
+      if (!status.granted) setError("相机权限未开启。请手动输入地址和配对码，或在系统设置中允许相机权限后重试扫码。");
     } catch {
       if (!pairing.current(signal)) return;
       setPage("manual");
-      setError("无法使用相机。请手动输入电脑地址和配对码。");
+      setError("无法使用相机。请手动输入地址和配对码。");
     } finally {
       pairing.finish(signal);
     }
@@ -135,9 +135,9 @@ export default function Connect() {
     }
   };
 
-  const retrySuffix = " 现在可以重试；若配对码已使用，请在电脑上重新生成。";
+  const retrySuffix = " 可重试；若码已使用，请在电脑上重新生成。";
   const pairingError = visibleError.endsWith(retrySuffix)
-    ? t("{error} 现在可以重试；若配对码已使用，请在电脑上重新生成。", { error: t(visibleError.slice(0, -retrySuffix.length)) })
+    ? t("{error} 可重试；若码已使用，请在电脑上重新生成。", { error: t(visibleError.slice(0, -retrySuffix.length)) })
     : t(visibleError);
   return <View className="flex-1 bg-background" style={{ paddingTop: insets.top }}>
     {config && config.authStatus !== "invalid" && page === "landing" ? <View className="absolute left-3 z-10" style={{ top: insets.top }}>
@@ -156,7 +156,7 @@ export default function Connect() {
           <Text className="text-center text-xl font-semibold">{t("连接你的电脑")}</Text>
         </Pressable>
         <Text className="text-center text-sm leading-5 text-muted-foreground">{t("在电脑上运行 wandrun pair，\n用手机扫屏幕上的二维码。")}</Text>
-        {config?.authStatus === "invalid" && mode !== "add" ? <Text testID="pairing-invalid" accessibilityLiveRegion="polite" className="mt-4 rounded-[14px] border border-destructive px-4 py-3 text-center text-sm text-destructive">{repairConnectionId ? t("请在电脑上生成新配对码，重新配对。") : t("这台电脑的认证已失效。请在「查看已保存的电脑」中选择「重新配对这台电脑」。")}</Text> : null}
+        {config?.authStatus === "invalid" && mode !== "add" ? <Text testID="pairing-invalid" accessibilityLiveRegion="polite" className="mt-4 rounded-[14px] border border-destructive px-4 py-3 text-center text-sm text-destructive">{repairConnectionId ? t("请在电脑上生成新配对码，再配对。") : t("这台电脑认证已失效。请在「查看已保存的电脑」选「重新配对这台电脑」。")}</Text> : null}
         {revoked ? <Text testID="pairing-revoked" accessibilityLiveRegion="polite" className="mt-4 rounded-[14px] border border-destructive px-4 py-3 text-center text-sm text-destructive">{t("这台设备的连接已被撤销")}</Text> : null}
       </View>
       <View className="gap-1 px-4" style={{ paddingBottom: insets.bottom + 30 }}>
@@ -202,7 +202,7 @@ export default function Connect() {
         <View className="gap-3 px-4 pt-2">
           <Text className="text-[13px] text-muted-foreground">{t("电脑地址")}</Text>
           <Input testID={page === "development" ? "gateway-address" : "pairing-address"} value={address} onChangeText={setAddress} placeholder="192.168.1.20:8765" autoCapitalize="none" autoCorrect={false} keyboardType="url" />
-          <Text className="mt-2 text-[13px] text-muted-foreground">{page === "development" ? t("开发令牌") : t("配对码（电脑上 wandrun pair 显示）")}</Text>
+          <Text className="mt-2 text-[13px] text-muted-foreground">{page === "development" ? t("开发令牌") : t("电脑上显示的配对码")}</Text>
           <Input testID={page === "development" ? "gateway-token" : "pairing-code"} value={page === "development" ? devToken : code}
             onChangeText={page === "development" ? setDevToken : setCode} secureTextEntry autoCapitalize="none" autoCorrect={false} />
         </View>

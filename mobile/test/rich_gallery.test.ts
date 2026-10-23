@@ -13,8 +13,10 @@ import ts from 'typescript';
 const navigation: unknown[] = [];
 Object.assign(globalThis, { __galleryReact: React, __galleryNavigation: navigation, __galleryPlatform: 'android', __DEV__: true, IS_REACT_ACT_ENVIRONMENT: true });
 const hosts: Record<string, string> = {
+  '@/components/chat/drawer-horizontal-gesture.tsx': 'export const DrawerHorizontalGesture=({children})=>children;',
   'react-native': `const React=globalThis.__galleryReact;
     export const View='View', Pressable='Pressable', ActivityIndicator='ActivityIndicator';
+    export const Animated={};
     export const Platform={get OS(){return globalThis.__galleryPlatform}};
     export function FlatList({data,renderItem,ItemSeparatorComponent,ref,...props}) {
       React.useImperativeHandle(ref,()=>({scrollToIndex:({index})=>{globalThis.__galleryScrolls.push(index)}}));

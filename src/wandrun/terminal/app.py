@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
-from dotenv import load_dotenv
 from langchain.messages import AIMessage, ToolMessage
 
 from wandrun.metrics import RunMetrics
@@ -12,8 +11,6 @@ from wandrun.runtime.session import open_runtime
 from wandrun.runtime.workers import SchedulerFailure
 from wandrun.runtime.workspace import Workspace
 from wandrun.terminal.chat import TerminalOutput, chat
-
-load_dotenv()
 
 
 async def run_agent(

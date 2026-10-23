@@ -64,7 +64,7 @@ function BuiltinDetailScreen({ name, session }: { name: string; session: ChatSes
       {loading && !detail ? <Text className="mt-12 text-center text-sm text-muted-foreground">{t("正在加载内置技能…")}</Text> : null}
       {error ? <View className="mx-6 mt-5 items-center gap-2"><Text className="text-center text-sm text-destructive">{t(error)}</Text><Button variant="outline" onPress={() => { setLoading(true); setRetry((value) => value + 1); }}><Text>{t("重试")}</Text></Button></View> : null}
       {detail ? <>
-        <Text className="mx-[22px] mb-3 text-[15px] leading-[22px]">{detail.description || t("暂无说明")}</Text>
+        {detail.description ? <Text className="mx-[22px] mb-3 text-[15px] leading-[22px]">{detail.description}</Text> : null}
         <ListGroup>
           <View className="min-h-[52px] flex-row items-center justify-between gap-3 px-4 py-3"><Text className="text-[15px]">{t("来源")}</Text><Text className="text-[13px] text-muted-foreground">{t("系统内置")}</Text></View>
           <View className="min-h-[52px] flex-row items-center justify-between gap-3 px-4 py-3"><Text className="text-[15px]">{t("所属能力")}</Text><Text testID="builtin-capability" className="text-[13px] text-muted-foreground">{t(detail.capability.name)}</Text></View>

@@ -5,7 +5,7 @@ import functools
 import json
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
-from contextvars import Context
+from contextvars import Context, ContextVar
 from uuid import uuid4
 
 from langchain.tools import tool
@@ -18,6 +18,10 @@ from wandrun.runtime.files import ResolvedAttachment
 from wandrun.runtime.messages import AgentOutput, runtime_message
 from wandrun.runtime.scheduler_store import SchedulerStore, TaskSnapshot
 from wandrun.runtime.preview import PreviewExecution, PreviewPersistenceError, current_preview
+
+current_execution_generation: ContextVar[int | None] = ContextVar(
+    "worker_execution_generation", default=None,
+)
 
 
 class SchedulerFailure(RuntimeError):
@@ -157,6 +161,15 @@ class WorkerManager:
         self._cancel_hooks: list[Callable[[set[str]], Awaitable[None]]] = []
         # 删除意图由入口持久化并在启动时重放；只封锁该角色，不取消其他根分支。
         self._retired_agents: set[str] = set()
+        # Only an explicitly admitted direct-user root turn can maintain the profile.
+        # Neither task identity nor this transient authorization survives restart.
+        self._interactive_roots: set[str] = set()
+        self._execution_generations: dict[str, int] = {}
+        self._next_execution_generation = 0
+        self._memory_store = None
+        # Revocation is immediate even if removing an orphaned staged file fails.
+        # Keep the cleanup owner for stop/close retry and explicit unconfirmed reporting.
+        self._memory_cleanup_pending: dict[str, Exception] = {}
         # 进行中的分支停止操作 → 范围。操作由 Manager 持有，调用方离开不撤销；完成前范围内不能恢复。
         self._branch_stops: dict[asyncio.Task, set[str]] = {}
         if store is not None:
@@ -193,6 +206,10 @@ class WorkerManager:
 
     def retire_agent(self, agent: str) -> None:
         """删除意图发布后永久封锁角色的新建、显式恢复和通知唤醒；不取消任何任务。"""
+        for task_id, bound_agent in self._task_agents.items():
+            if bound_agent == agent:
+                self._revoke_execution(task_id)
+                self._interactive_roots.discard(task_id)
         self._retired_agents.add(agent)
 
     @contextmanager
@@ -304,14 +321,18 @@ class WorkerManager:
         sender_id: str | None = None,
         agent_name: str | None = None,
         attachments: list[ResolvedAttachment] | None = None,
+        direct_user: bool = False,
     ) -> dict:
-        """接收用户或 Agent 来信；创建者才能恢复已停止的委派。"""
-        return self._start(prompt, task_id, sender_id=sender_id, agent_name=agent_name, attachments=attachments)
+        """Admit input; only a trusted caller may mark direct user input."""
+        return self._start(
+            prompt, task_id, sender_id=sender_id, agent_name=agent_name,
+            attachments=attachments, direct_user=direct_user,
+        )
 
     def _start(
         self, prompt: str, task_id: str | None = None, *, sender_id: str | None = None,
         agent_name: str | None = None, attachments: list[ResolvedAttachment] | None = None,
-        user_resume: bool = False,
+        user_resume: bool = False, direct_user: bool = False,
     ) -> dict:
         """共享接收机制；普通发送只允许创建者恢复，用户 interrupt 也可恢复指定成员。
 
@@ -350,6 +371,8 @@ class WorkerManager:
             raise ValueError("to 与目标任务绑定的 Agent 不匹配")
         if target_agent in self._retired_agents:
             raise ValueError(f"Agent 正在删除或已删除: {target_agent}")
+        if direct_user and sender_id is not None:
+            raise ValueError("直接用户输入不能有协作任务发送方")
         if task_id in self._stopped:
             # 隐式唤醒（通知、非创建者来信）一律拒绝；创建者的新消息是显式恢复。
             if not user_resume and sender_id != self._callers.get(task_id):
@@ -365,6 +388,8 @@ class WorkerManager:
                 raise ValueError("任务分支正在停止，请等待清理完成后再发送")
             self._stopped.remove(task_id)
             self._restart_stopped.discard(task_id)
+        # Root provenance is committed after enqueue, which may first settle a
+        # previous execution of this same task identity.
         created = task_id not in self._task_agents
         self._task_agents.setdefault(task_id, target_agent)
         self._callers.setdefault(task_id, sender_id)
@@ -394,12 +419,20 @@ class WorkerManager:
                 f"- {item.name}: {item.path}" for item in attachments
             )
         result = self._enqueue(message, task_id)
+        if sender_id is None and self._callers.get(task_id) is None:
+            if direct_user:
+                self._interactive_roots.add(task_id)
+            else:
+                self._interactive_roots.discard(task_id)
         if sender_id is not None:
             self._observe_fact(self._on_task_message, sender_id, task_id, prompt, attachments or [])
         return result
 
     @_transitional
-    def interrupt(self, prompt: str, task_id: str, *, agent_name: str | None = None) -> dict:
+    def interrupt(
+        self, prompt: str, task_id: str, *, agent_name: str | None = None,
+        direct_user: bool = False,
+    ) -> dict:
         """human 打断目标当前的执行并插入消息（ADR-0013）；不等待清理，不影响后代。
 
         正常返回表示消息已接收并提交，不表示旧执行已停止或新一轮已启动；之后的结果
@@ -419,6 +452,7 @@ class WorkerManager:
         result = self._start(
             prompt, task_id, agent_name=agent_name,
             user_resume=self._callers.get(task_id) is not None,
+            direct_user=direct_user,
         )
         if running and task_id not in self._interrupting:
             # The command was admitted, but a failed durable freeze must not admit its new input.
@@ -441,6 +475,7 @@ class WorkerManager:
                 "frozen_previews": frozen,
             }))
             self._interrupting[task_id] = task
+            self._revoke_execution(task_id)
             task.cancel()
         # 消息和冻结都已接收才开放回报通道；这一步不消费祖先队列，也不启动执行。
         self._stopped.difference_update(ancestors)
@@ -488,6 +523,64 @@ class WorkerManager:
             task_id = caller
         return task_id
 
+    def bind_memory(self, store) -> None:
+        """Register the one host store that owns staged execution writes."""
+        self._memory_store = store
+
+    def execution_generation(self, task_id: str) -> int | None:
+        """Current live execution lease; a restored or settled task has no lease."""
+        task = self._tasks.get(task_id)
+        if (self._closed or task_id in self._stopped or task_id in self._interrupting
+                or task_id in self._finishing or task is None or task.done()):
+            return None
+        return self._execution_generations.get(task_id)
+
+    def authorize_memory(
+        self, task_id: str, agent_id: str, generation: int | None, *, profile: bool,
+    ) -> None:
+        """Recheck task identity, execution lease and root provenance at commit time."""
+        if (generation is None or self.execution_generation(task_id) != generation
+                or self._task_agents.get(task_id) != agent_id
+                or agent_id in self._retired_agents):
+            raise ValueError("记忆写入的任务或执行代际已失效")
+        if profile and (self.root_of(task_id) != task_id
+                        or task_id not in self._interactive_roots):
+            raise ValueError("只有当前直接与用户交互的入口任务可修改用户画像")
+
+    def memory_permission(self, task_id: str, agent_id: str, generation: int | None) -> bool:
+        """Current profile-write permission, including noninteractive and stopped roots."""
+        try:
+            self.authorize_memory(task_id, agent_id, generation, profile=True)
+        except ValueError:
+            return False
+        return True
+
+    def _revoke_execution(self, task_id: str) -> None:
+        generation = self._execution_generations.pop(task_id, None)
+        if generation is not None and self._memory_store is not None:
+            owner = f"{task_id}:{generation}"
+            try:
+                self._memory_store.discard_prepared(owner)
+            except Exception as error:
+                self._memory_cleanup_pending[owner] = error
+
+    def _retry_prepared_cleanup(self, scope: set[str] | None = None) -> list[str]:
+        if self._memory_store is None:
+            return []
+        for owner in list(self._memory_cleanup_pending):
+            if scope is not None and owner.rsplit(":", 1)[0] not in scope:
+                continue
+            try:
+                self._memory_store.discard_prepared(owner)
+            except Exception as error:
+                self._memory_cleanup_pending[owner] = error
+            else:
+                del self._memory_cleanup_pending[owner]
+        return [
+            f"memory:{owner}" for owner in self._memory_cleanup_pending
+            if scope is None or owner.rsplit(":", 1)[0] in scope
+        ]
+
     def _enqueue(self, message: HumanMessage, task_id: str) -> dict:
         agent = self._task_agents[task_id]
         if agent in self._retired_agents or (
@@ -519,12 +612,15 @@ class WorkerManager:
         # 同步确定首批输入；此后收到的消息进入队列。
         # 队列由 before_model 轮内注入，或在正常结束后自动续轮处理。
         prompts = self.take_messages(task_id)
+        self._revoke_execution(task_id)
+        self._next_execution_generation += 1
+        self._execution_generations[task_id] = self._next_execution_generation
         # create_task 调度后台执行；这里没有 await 子 Agent 的结果。
         # 重启后 _tasks 为空也允许传旧 ID；run 回调负责读取持久化历史。
         # name 便于调试；空 Context 避免继承父图的隐式运行配置。
         preview = PreviewExecution(task_id, self._on_preview) if self._on_preview is not None else None
         task = asyncio.create_task(
-            self._run_until_idle(prompts, task_id, preview),
+            self._run_until_idle(prompts, task_id, preview, self._next_execution_generation),
             name=f"worker:{task_id}",
             context=Context(),
         )
@@ -565,9 +661,11 @@ class WorkerManager:
 
     async def _run_until_idle(
         self, prompts: list[HumanMessage], task_id: str, preview: PreviewExecution | None = None,
+        generation: int | None = None,
     ) -> AgentOutput | str:
         """同一个 Task 连续执行，直到正常结束且没有待处理消息。"""
         token = current_preview.set(preview)
+        generation_token = current_execution_generation.set(generation)
         try:
             while True:
                 # 错误或取消直接向外传播，不消费剩余队列，也不自动重试。
@@ -591,6 +689,7 @@ class WorkerManager:
             if preview is not None:
                 preview.close()
             current_preview.reset(token)
+            current_execution_generation.reset(generation_token)
 
     def finish_model_loop(self, task_id: str) -> None:
         """标记图内不再调用模型/工具；仍须等 run 返回才能确认本轮完成。"""
@@ -786,6 +885,8 @@ class WorkerManager:
         if task not in self._unsettled:
             return
         self._unsettled.discard(task)
+        if self._tasks.get(task_id) is task:
+            self._revoke_execution(task_id)
         scope = self._previews.pop(task, None)
         if scope is not None:
             scope.close()
@@ -811,6 +912,9 @@ class WorkerManager:
                     self._notify_completion(
                         task_id, "failed", error=f"{type(error).__name__}: {error}"
                     )
+                if (self._tasks.get(task_id) is task and self._callers.get(task_id) is None
+                        and self._status(task_id)[0] != "waiting"):
+                    self._interactive_roots.discard(task_id)
         except Exception:
             if self._failure is None or earlier_failure is not None:
                 raise  # 不是本次提交造成的存储失败
@@ -1043,7 +1147,7 @@ class WorkerManager:
         for result in revoked:
             if isinstance(result, BaseException):
                 raise result
-        return [item for report in reports for item in report]
+        return [item for report in reports for item in report] + self._retry_prepared_cleanup(scope)
 
     def _branch_stopped(self, stopping: asyncio.Task) -> None:
         del self._branch_stops[stopping]
@@ -1086,6 +1190,7 @@ class WorkerManager:
                 scope.close()
             self._interrupting[task_id] = task
             task.cancel()
+            self._revoke_execution(task_id)
 
     @_transitional
     def add_feedback(self, task_id: str, data: dict) -> None:
@@ -1108,6 +1213,8 @@ class WorkerManager:
             if status == "waiting" or (status == "running" and identity not in self._tasks):
                 interrupted.append(identity)
         for identity in scope:
+            self._revoke_execution(identity)
+            self._interactive_roots.discard(identity)
             task = self._tasks.get(identity)
             preview = self._previews.get(task)
             if preview is not None:
@@ -1133,6 +1240,10 @@ class WorkerManager:
         await asyncio.gather(
             *self._tasks.values(), *self._branch_stops, return_exceptions=True
         )
+        unconfirmed_memory = self._retry_prepared_cleanup()
+        if unconfirmed_memory:
+            first = self._memory_cleanup_pending[unconfirmed_memory[0].removeprefix("memory:")]
+            raise RuntimeError(f"受管记忆暂存清理未确认: {', '.join(unconfirmed_memory)}") from first
         if self._failure is not None:
             raise self._closed_error()
 

@@ -224,7 +224,7 @@ test('SSE reconnect active set, formal-before-snapshot and interrupted historica
       if (connections.length === 2) notifyReconnected();
     } }));
     if (path === '/conversations') return Response.json({ as_of_seq: 0, conversations: [{
-      id: 'root', agent_id: 'writer', title: 'Chat', created_at: 1, updated_at: 1, read_seq: 0,
+      id: 'root', agent_id: 'writer', title: 'Chat', created_at: 1, updated_at: 1, read_seq: 0, last_agent_seq: 0,
       status: 'working', unread: false, last_text: null, source: 'user', schedule_origin: null,
     }] });
     if (path === '/agents') return Response.json({ agents: [], as_of_seq: 0 });
@@ -279,7 +279,7 @@ test('SSE reconnect snapshot before question replay reanchors new replies and la
       if (connections.length === 2) notifyReconnected();
     } }));
     if (path === '/conversations') return Response.json({ as_of_seq: 0, conversations: [{
-      id: 'root', agent_id: 'writer', title: 'Chat', created_at: 1, updated_at: 1, read_seq: 0,
+      id: 'root', agent_id: 'writer', title: 'Chat', created_at: 1, updated_at: 1, read_seq: 0, last_agent_seq: 0,
       status: 'working', unread: false, last_text: null, source: 'user', schedule_origin: null,
     }] });
     if (path === '/agents') return Response.json({ agents: [], as_of_seq: 0 });

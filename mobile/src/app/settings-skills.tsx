@@ -85,10 +85,10 @@ function SkillsList({ session }: { session: ChatSession }) {
       {!builtins.loaded && !builtins.error ? <Text className="mx-8 mt-5 text-sm text-muted-foreground">{t("正在加载系统内置技能…")}</Text> : null}
       {builtins.error ? <View className="mx-6 mt-5 items-center gap-2"><Text className="text-center text-sm text-destructive">{t(builtins.error)}</Text><Button variant="outline" onPress={refreshBuiltins}><Text>{t("重试")}</Text></Button></View> : null}
       {catalog.skills.length ? <ListGroup label={t("我的技能")}>{catalog.skills.map((skill) => <SkillRow key={skill.name} skill={skill} onOpen={() => { scope.current.blur(); opening.current = null; router.push({ pathname: "/skill-detail", params: { name: skill.name } }); }} />)}</ListGroup> : null}
-      {catalog.loaded && !catalog.skills.length ? <Text className="mx-8 mt-5 text-center text-sm text-muted-foreground">{t("暂无技能，点右上角 ＋ 添加。")}</Text> : null}
+      {catalog.loaded && !catalog.skills.length ? <Text className="mx-8 mt-5 text-center text-sm text-muted-foreground">{t("暂无技能")}</Text> : null}
       {!catalog.loaded && !catalog.error ? <Text className="mx-8 mt-8 text-center text-sm text-muted-foreground">{t("正在加载我的技能…")}</Text> : null}
       {catalog.error ? <View className="mx-6 mt-5 items-center gap-2"><Text className="text-center text-sm text-destructive">{t(catalog.error)}</Text><Button variant="outline" onPress={refresh}><Text>{t("重试")}</Text></Button></View> : null}
-      <Text className="mx-8 mt-4 text-xs leading-[18px] text-muted-foreground">{t("内置技能随系统能力自动加载；我的技能需在 Agent 编辑中选择。")}</Text>
+      <Text className="mx-8 mt-4 text-xs leading-[18px] text-muted-foreground">{t("内置技能自动可用；我的技能需在 Agent 编辑中选择。")}</Text>
     </ScrollView>
   </View>;
 }

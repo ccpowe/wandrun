@@ -46,7 +46,7 @@ GROUPS = {
     "drawer": "对话抽屉、新建/切换/返回、重命名、删除当前及非当前对话",
     "collaboration": "真实委派、主进度/预览跳转、接收/发起胶囊抽屉、成员插话与完成后续聊、根删除及浅深色截图",
     "profile": "聊天顶栏、资料页、成员跳转、空成员及记忆页",
-    "memory": "独立 Agent 记忆：Markdown 编辑、外部变化、冲突保留草稿、显式重新载入、浅深色截图",
+    "memory": "共享画像跨 Agent、独立工作记忆、详情创建/冲突/编辑/删除、草稿保留、根对话事件及浅深色截图",
     "schedules": "定时列表/全屏编辑、外部创建同步、到点对话来源与运行记录、删除",
     "agent": "新建、编辑、代码模式默认开启/关闭保存、外部同步、引用阻止删除、解除引用及删除",
     "settings": "设置首页与关于/连接浅深色、单一入口及连接信息、模型/订阅额度/Agent 用量、默认档位、新建表单默认值、Agent 模型档位编辑及恢复",
@@ -62,6 +62,19 @@ GROUPS = {
     "compaction": "真实多轮模型压缩、系统行、完整摘要、关闭重开一致及浅深色截图",
     "rich": "真实模型富交互 P0/P1/P2、提交只读、图表、公式、媒体、Mermaid 与浅深色预览",
 }
+
+def restore_memory_profile(original, marker):
+    if original is None:
+        return
+    current = api("/memory/profile")
+    expected = original["content"] + ("\n" if original["content"] and not original["content"].endswith("\n") else "") + marker
+    if current["content"] == original["content"]:
+        return
+    assert current["content"] == expected and current["details"] == original["details"], (
+        "Shared profile changed outside this fixture; refusing to overwrite it"
+    )
+    api("/memory/profile", "PUT", {"content": original["content"], "version": current["version"]})
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("groups", nargs="*", help="Groups in execution order; default: all")
 parser.add_argument("--list", action="store_true", help="List groups without touching the phone")
@@ -985,7 +998,7 @@ def capture_dark_profiles(profile):
     wait_id("profile-computer-empty")
     ad("screenshot", str(OUT / "22-profile-computer-empty-dark.png"))
     press_id("profile-tab-memory")
-    wait_id("profile-memory-modified")
+    wait_id("profile-empty-memory")
     ad("screenshot", str(OUT / "24-profile-memory-dark.png"))
     press_id("profile-close")
     press_id("chat-agent-profile")
@@ -1572,61 +1585,59 @@ def replay_steps(group, env, browser_server=None, pairing=None, source=None):
                 assert current["content"] == env["MEMORY_SAVED"] and current["updated_by"] == "user", (
                     "Editor did not save the complete Markdown body"
                 )
-            elif hook == "memory-external-view":
-                current = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")
-                new_content = env["MEMORY_REMOTE"]
-                saved = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory", "PUT", {
-                    "content": new_content, "version": current["version"],
+            elif hook == "memory-profile-shared":
+                current = api("/memory/profile")
+                marker = env["MEMORY_PROFILE_TEXT"]
+                saved = api("/memory/profile", "PUT", {
+                    "content": current["content"] + ("\n" if current["content"] and not current["content"].endswith("\n") else "") + marker,
+                    "version": current["version"],
                 })
-                assert saved["content"] == new_content
-            elif hook == "memory-external-file":
-                identity = env["MEMORY_AGENT_ID"]
-                assert identity in owned_agents, "Only this run's Agent memory may be changed"
-                memory_path = WORKSPACE / ".wandrun" / "state" / "memory" / f"{identity}.md"
-                assert memory_path.read_text(encoding="utf-8") == env["MEMORY_REMOTE"]
-                env["MEMORY_NO_EVENT_CURSOR"] = api("/agents")["as_of_seq"]
-                # Bypass managed PUT deliberately: an external file edit emits no event.
-                memory_path.write_text(env["MEMORY_FILE_BODY"], encoding="utf-8")
-                current = api(agent_path(identity) + "/memory")
-                assert current["content"] == env["MEMORY_FILE_BODY"] and current["updated_by"] == "external"
-                assert api("/agents")["as_of_seq"] == env["MEMORY_NO_EVENT_CURSOR"]
-            elif hook == "memory-unchanged-saved":
+                assert saved["scope"] == "profile" and "agent_id" not in saved
+                assert saved["content"].endswith(marker)
+                assert api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")["content"] == env["MEMORY_SAVED"]
+            elif hook == "memory-detail-created":
+                slug = env["MEMORY_DETAIL_SLUG"]
+                index = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")
+                ref = index["details"][slug]
+                detail = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory/details/" + slug)
+                assert detail["content"] == env["MEMORY_DETAIL_CONTENT"]
+                assert detail["version"] == index["version"] and detail["path"] == ref["path"]
+                assert ref["path"] in index["content"] and index["scope"] == "work"
+            elif hook == "memory-detail-conflict":
+                slug = env["MEMORY_DETAIL_SLUG"]
+                path = agent_path(env["MEMORY_AGENT_ID"]) + "/memory/details/" + slug
                 current = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")
-                assert current["content"] == env["MEMORY_FILE_BODY"] and current["updated_by"] == "external"
-                assert api("/agents")["as_of_seq"] == env["MEMORY_NO_EVENT_CURSOR"], (
-                    "External edit or unchanged save unexpectedly emitted an event"
-                )
-            elif hook == "memory-external-conflict":
-                current = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")
-                identity = env["MEMORY_CONVERSATION_ID"]
-                api(conversation_path(identity) + "/messages", "POST", {
-                    "client_id": "e2e-memory-conflict-" + uuid4().hex,
-                    "text": f"记住：本项目发布说明的固定标签是 release-{run_id}。保留其他记忆。",
+                updated = api(path, "PUT", {
+                    "content": "Remote-" + run_id, "version": current["version"],
                 })
-                wait_api(
-                    lambda: next(row for row in api("/conversations")["conversations"] if row["id"] == identity),
-                    lambda row: row["status"] != "working",
-                    timeout=180,
-                )
-                changed = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")
-                assert changed["version"] != current["version"] and changed["updated_by"] == "agent", (
-                    "Real Agent did not update memory while the phone draft was open"
-                )
-            elif hook == "memory-draft-retained":
+                assert updated["version"] != current["version"]
+            elif hook == "memory-detail-draft-retained":
                 nodes = ad("snapshot", "-i")["nodes"]
                 field = next((node for node in nodes
-                              if node.get("id", node.get("identifier")) == "memory-editor-input"), None)
-                assert field is not None and env["MEMORY_DRAFT"] in json.dumps(
+                              if node.get("id", node.get("identifier")) == "memory-detail-input"), None)
+                assert field is not None and env["MEMORY_DETAIL_DRAFT"] in json.dumps(
                     field, ensure_ascii=False
-                ), "Memory conflict/reload discarded the unsaved draft"
-            elif hook == "memory-conflict-saved":
-                current = wait_api(
-                    lambda: api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory"),
-                    lambda snapshot: snapshot["content"] == env["MEMORY_DRAFT"],
-                )
-                assert current["content"] == env["MEMORY_DRAFT"] and current["updated_by"] == "user", (
-                    "Explicit reload did not permit saving the retained draft"
-                )
+                ), "Remote change/reload discarded the unsaved detail draft"
+            elif hook == "memory-detail-saved":
+                detail = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory/details/" + env["MEMORY_DETAIL_SLUG"])
+                assert detail["content"] == env["MEMORY_DETAIL_DRAFT"]
+            elif hook == "memory-detail-deleted":
+                index = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")
+                assert env["MEMORY_DETAIL_SLUG"] not in index["details"]
+                assert "/details/" + env["MEMORY_DETAIL_SLUG"] + "/" not in index["content"]
+            elif hook == "memory-shared-cross-agent":
+                ad("press", 'id=' + json.dumps("agent-row-" + env["MEMORY_MEMBER_ID"]))
+                ad("press", 'id="chat-agent-profile"')
+                ad("press", 'id="profile-tab-memory"')
+                ad("wait", 'id="profile-empty-memory"', "10000")
+                nodes = ad("snapshot", "-i")["nodes"]
+                assert not any(node.get("id", node.get("identifier")) == "profile-memory-content"
+                               for node in nodes), "Independent Agent work memory leaked across profiles"
+                ad("press", 'id="profile-about-you"')
+                ad("wait", 'id="profile-shared-memory-content"', "10000")
+                nodes = ad("snapshot", "-i")["nodes"]
+                assert env["MEMORY_PROFILE_TEXT"] in json.dumps(nodes, ensure_ascii=False)
+                home()
             elif hook == "memory-member-link":
                 fixture = api("/conversations", "POST", {"agent_id": env["MEMORY_PARENT_ID"]})
                 fixtures.append(fixture["id"])
@@ -1634,9 +1645,9 @@ def replay_steps(group, env, browser_server=None, pairing=None, source=None):
                 api(conversation_path(fixture["id"]) + "/messages", "POST", {
                     "client_id": "e2e-member-" + uuid4().hex,
                     "text": (
-                        f"请委派给 {env['MEMORY_MEMBER_ID']}：用户明确要求长期记住，"
-                        f"本项目发布说明的固定标签是 {marker}。请成员保存到它自己的记忆，"
-                        "完成后只回复已记住。你自己不要写记忆。"
+                        f"请委派给 {env['MEMORY_MEMBER_ID']}，转达我对其工作方式的长期反馈："
+                        f"今后给我做代码审查时，先列风险和复现场景，再列结论，因为我需要据此复核。"
+                        f"这条反馈编号 {marker}，请成员判断是否存入自己的工作记忆。你自己不要写记忆。"
                     ),
                 })
                 wait_api(
@@ -1646,8 +1657,9 @@ def replay_steps(group, env, browser_server=None, pairing=None, source=None):
                 )
                 events = api(conversation_path(fixture["id"]) + "/events?limit=200")["events"]
                 updates = [row for row in events if row["type"] == "memory.updated"]
-                assert updates and all(row["data"]["agent_id"] == env["MEMORY_MEMBER_ID"] for row in updates), (
-                    "Delegated memory update must belong to member and source root conversation"
+                assert updates and all(row["data"]["agent_id"] == env["MEMORY_MEMBER_ID"]
+                                       and row["data"]["scope"] == "work" for row in updates), (
+                    "Delegated work memory update must belong to member and source root conversation"
                 )
                 ad("press", 'id=' + json.dumps("agent-row-" + env["MEMORY_PARENT_ID"]))
                 target = "memory-updated-" + str(updates[-1]["seq"])
@@ -1661,7 +1673,7 @@ def replay_steps(group, env, browser_server=None, pairing=None, source=None):
                 ad("press", 'id=' + json.dumps(target))
                 ad("wait", 'id="profile-memory-content"', "10000")
                 nodes = ad("snapshot", "-i")["nodes"]
-                assert marker in json.dumps(nodes, ensure_ascii=False), "Memory event opened the wrong Agent's memory"
+                assert "代码审查" in json.dumps(nodes, ensure_ascii=False), "Memory event opened the wrong Agent's memory"
                 if PRESERVE_SYSTEM_THEME:
                     skipped_dark_screenshots.append(str(OUT / "13-member-memory-link-dark.png"))
                 else:
@@ -2065,6 +2077,7 @@ def run_group(group):
     error = None
     browser_server = None
     settings_original = None
+    memory_profile_original = None
     pairing = None
     env = {"ARTIFACTS": str(OUT),
            "NEW_NAME": "E2E Agent " + run_id, "RENAMED_NAME": "E2E Edited " + run_id,
@@ -2088,19 +2101,19 @@ def run_group(group):
             env.update(profile_fixture())
         elif group == "memory":
             name = "E2E memory " + run_id
+            memory_profile_original = api("/memory/profile")
             env.update({
                 "MEMORY_NAME": name,
                 "MEMORY_SAVED": "# E2E saved " + run_id,
                 "MEMORY_SAVED_TEXT": "E2E saved " + run_id,
-                "MEMORY_REMOTE": "## E2E remote " + run_id + "\n\n- Write summaries in Chinese; preserve API names.\n- Deliver Markdown without title emojis.\n\n## Project\n\nUse npm to manage dependencies.",
-                "MEMORY_REMOTE_TEXT": "E2E remote " + run_id,
-                "MEMORY_FILE_BODY": "E2E external file " + run_id,
-                "MEMORY_DRAFT": "Draft-" + run_id,
+                "MEMORY_PROFILE_TEXT": "E2E shared profile " + run_id,
+                "MEMORY_DETAIL_SLUG": "e2e-" + run_id,
+                "MEMORY_DETAIL_CONTENT": "Detail " + run_id,
+                "MEMORY_DETAIL_DRAFT": "Revised-" + run_id,
             })
             env["MEMORY_AGENT_ID"] = create_owned_agent(name)
             fixture = api("/conversations", "POST", {"agent_id": env["MEMORY_AGENT_ID"]})
             fixtures.append(fixture["id"])
-            env["MEMORY_CONVERSATION_ID"] = fixture["id"]
             env["MEMORY_MEMBER_ID"] = create_owned_agent("E2E memory member " + run_id)
             env["MEMORY_PARENT_ID"] = create_owned_agent(
                 "E2E memory parent " + run_id, [env["MEMORY_MEMBER_ID"]]
@@ -2180,6 +2193,8 @@ def run_group(group):
             ("browser fixture server", lambda: stop_browser_fixture(browser_server) if browser_server else None),
             ("original e2e file", lambda: cleanup_file_fixture(env) if group == "files" else None),
             ("default settings", lambda: restore_settings(settings_original)),
+            ("shared profile", lambda: restore_memory_profile(memory_profile_original, env["MEMORY_PROFILE_TEXT"])
+             if group == "memory" and memory_profile_original and "MEMORY_PROFILE_TEXT" in env else None),
             ("fixture schedules", lambda: cleanup_schedules() if group == "schedules" else None),
             ("fixture conversations", cleanup_conversations),
             ("compaction archive", lambda: compaction.cleanup(sys.modules[__name__], env) if group == "compaction" else None),

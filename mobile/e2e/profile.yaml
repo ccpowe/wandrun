@@ -40,7 +40,7 @@ appId: host.exp.exponent
     id: profile-tab-memory
 - extendedWaitUntil:
     visible:
-      id: profile-memory-modified
+      id: profile-empty-memory
     timeout: 10000
 - takeScreenshot: ${ARTIFACTS}/18-profile-memory-light.png
 - tapOn:

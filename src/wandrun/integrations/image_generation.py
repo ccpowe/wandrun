@@ -7,8 +7,9 @@ when an image_generation_call has already delivered its base64 result.
 import base64
 import binascii
 import json
+import os
 import re
-from contextlib import aclosing
+from contextlib import aclosing, nullcontext
 
 import httpx
 
@@ -131,67 +132,92 @@ async def generate_image(
         "tools": [{"type": "image_generation", "size": "1024x1024", "quality": "low", "output_format": "png"}],
         "tool_choice": {"type": "image_generation"},
     }
-    result = None
-    completed = False
-    try:
-        with record_request(model_name) as trace:
-            async with aclosing(model._arequest(body)) as events:
-                async for event in events:
-                    if not isinstance(event, dict):
-                        raise ImageGenerationError("image_generation_failed", "图片生成返回了无效的 SSE 事件")
-                    kind = event.get("type")
-                    if kind in {"response.completed", "response.failed", "response.incomplete"}:
-                        response = event.get("response")
-                        if response is not None and not isinstance(response, dict):
-                            raise ImageGenerationError("image_generation_failed", "图片生成返回了无效的响应")
-                    if trace is not None:
-                        trace.observe(event)
-                    if kind in {"error", "response.failed", "response.incomplete"}:
-                        raise _failure(event.get("response") or event, f"图片生成失败：{kind}")
-                    if kind == "response.output_item.done":
-                        item = event.get("item")
-                        if _image_item(item) and item.get("status") == "completed":
-                            result = result or item.get("result")
-                        elif _image_item(item):
-                            raise _failure(item, "图片生成未完成")
-                        elif isinstance(item, dict):
-                            refusal = _refusal([item])
-                            if refusal:
-                                raise ImageGenerationError("image_generation_failed", refusal)
-                    if kind == "response.completed":
-                        response = event.get("response")
-                        if not isinstance(response, dict):
-                            response = {}
-                        if response.get("status") != "completed":
-                            raise _failure(response, "图片生成响应未完成")
-                        items = response.get("output") or []
-                        refusal = _refusal(items)
-                        if refusal:
-                            raise ImageGenerationError("image_generation_failed", refusal)
-                        for item in items:
+    span_context = nullcontext(None)
+    if os.environ.get("LANGSMITH_TRACING", "").lower() == "true":
+        from wandrun.runtime.tracing import capture_tool_context, tool_span
+
+        context = capture_tool_context()
+        if context is not None:
+            span_context = tool_span(context, "image_generation.responses", body, run_type="llm")
+    with span_context as span:
+        result = None
+        completed = False
+        usage = None
+        try:
+            with record_request(model_name) as trace:
+                async with aclosing(model._arequest(body)) as events:
+                    async for event in events:
+                        if not isinstance(event, dict):
+                            raise ImageGenerationError("image_generation_failed", "图片生成返回了无效的 SSE 事件")
+                        kind = event.get("type")
+                        if kind in {"response.completed", "response.failed", "response.incomplete"}:
+                            response = event.get("response")
+                            if response is not None and not isinstance(response, dict):
+                                raise ImageGenerationError("image_generation_failed", "图片生成返回了无效的响应")
+                        if trace is not None:
+                            trace.observe(event)
+                        if kind in {"error", "response.failed", "response.incomplete"}:
+                            raise _failure(event.get("response") or event, f"图片生成失败：{kind}")
+                        if kind == "response.output_item.done":
+                            item = event.get("item")
                             if _image_item(item) and item.get("status") == "completed":
                                 result = result or item.get("result")
                             elif _image_item(item):
                                 raise _failure(item, "图片生成未完成")
-                        completed = True
-                        break
-            if not completed:
-                raise ImageGenerationError("image_generation_failed", "图片生成 SSE 提前结束，未收到 response.completed")
-            if not isinstance(result, str) or not result:
-                raise ImageGenerationError("image_generation_failed", "图片生成完成，但未返回图片")
-            try:
-                image = base64.b64decode(result, validate=True)
-            except (ValueError, binascii.Error):
-                raise ImageGenerationError("image_generation_failed", "图片生成返回了无效的 base64") from None
-            if not image.startswith(_PNG_SIGNATURE):
-                raise ImageGenerationError("image_generation_failed", "图片生成返回的不是 PNG")
-            return image
-    except CodexSubscriptionHTTPError as error:
-        raise _http_failure(error) from None
-    except ImageGenerationError:
-        raise
-    except json.JSONDecodeError:
-        raise ImageGenerationError("image_generation_failed", "图片生成返回了无效的 SSE JSON") from None
-    except (httpx.HTTPError, RuntimeError) as error:
-        detail = _safe_detail(str(error)) or type(error).__name__
-        raise ImageGenerationError("image_generation_failed", f"{type(error).__name__}：{detail}") from None
+                            elif isinstance(item, dict):
+                                refusal = _refusal([item])
+                                if refusal:
+                                    raise ImageGenerationError("image_generation_failed", refusal)
+                        if kind == "response.completed":
+                            response = event.get("response")
+                            if not isinstance(response, dict):
+                                response = {}
+                            if response.get("status") != "completed":
+                                raise _failure(response, "图片生成响应未完成")
+                            items = response.get("output") or []
+                            refusal = _refusal(items)
+                            if refusal:
+                                raise ImageGenerationError("image_generation_failed", refusal)
+                            for item in items:
+                                if _image_item(item) and item.get("status") == "completed":
+                                    result = result or item.get("result")
+                                elif _image_item(item):
+                                    raise _failure(item, "图片生成未完成")
+                            usage = response.get("usage")
+                            completed = True
+                            break
+                if not completed:
+                    raise ImageGenerationError("image_generation_failed", "图片生成 SSE 提前结束，未收到 response.completed")
+                if not isinstance(result, str) or not result:
+                    raise ImageGenerationError("image_generation_failed", "图片生成完成，但未返回图片")
+                try:
+                    image = base64.b64decode(result, validate=True)
+                except (ValueError, binascii.Error):
+                    raise ImageGenerationError("image_generation_failed", "图片生成返回了无效的 base64") from None
+                if not image.startswith(_PNG_SIGNATURE):
+                    raise ImageGenerationError("image_generation_failed", "图片生成返回的不是 PNG")
+                if span is not None:
+                    outputs = {
+                        "status": "completed",
+                        "image_format": "png",
+                        "image_size": body["tools"][0]["size"],
+                        "response_metadata": {"model_name": model_name},
+                    }
+                    if isinstance(usage, dict):
+                        tokens = {
+                            key: usage[key] for key in ("input_tokens", "output_tokens", "total_tokens")
+                            if type(usage.get(key)) is int and usage[key] >= 0
+                        }
+                        if tokens:
+                            outputs["usage_metadata"] = tokens
+                    span.end(outputs=outputs)
+                return image
+        except CodexSubscriptionHTTPError as error:
+            raise _http_failure(error) from None
+        except ImageGenerationError:
+            raise
+        except json.JSONDecodeError:
+            raise ImageGenerationError("image_generation_failed", "图片生成返回了无效的 SSE JSON") from None
+        except (httpx.HTTPError, RuntimeError) as error:
+            detail = _safe_detail(str(error)) or type(error).__name__
+            raise ImageGenerationError("image_generation_failed", f"{type(error).__name__}：{detail}") from None

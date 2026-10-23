@@ -1,22 +1,23 @@
 import * as Clipboard from "expo-clipboard";
-import { Copy, ExternalLink } from "lucide-react-native";
-import { cloneElement, isValidElement, memo, useMemo, useState } from "react";
-import type MarkdownIt from "markdown-it";
-import type { Token } from "markdown-it";
+import { ChevronRight, Copy, ExternalLink } from "lucide-react-native";
+import { cloneElement, isValidElement, memo, useMemo, useState, type ReactElement } from "react";
+import type { default as MarkdownIt, Token } from "markdown-it";
 import Markdown, { renderRules as defaultRules, type ASTNode, type RenderRules } from "react-native-markdown-display";
-import { AccessibilityInfo, Alert, Linking, Platform, Text as NativeText, View, type TextProps, type TextStyle } from "react-native";
+import { AccessibilityInfo, Alert, Linking, Platform, Pressable, ScrollView, Text as NativeText, View, type TextProps, type TextStyle } from "react-native";
 import { useCSSVariable } from "uniwind";
 
 import { Text } from "@/components/ui/text.tsx";
 import { DropdownMenu, DropdownMenuAnchor, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu.tsx";
 import { Icon } from "@/components/ui/icon.tsx";
 import { MediaPicture } from "@/components/rich-message/media.tsx";
-import type { GatewayApi } from "@/gateway/api.ts";
+import { DrawerHorizontalGesture } from "@/components/chat/drawer-horizontal-gesture.tsx";
+import type { AgentMemory, GatewayApi } from "@/gateway/api.ts";
 import type { MessageMarkdownTokens } from "@/lib/agent-message-markdown.ts";
 import { MathContent } from "@/components/rich-message/math.tsx";
 import { containsMath, groupMarkdownBlocks, mathBlockHtml } from "@/lib/math-html.ts";
 import { createMarkdown } from "@/lib/markdown.ts";
 import { groupSelectableMarkdown, type SelectablePart, type SelectableSpan } from "@/lib/selectable-markdown.ts";
+import { managedMemorySlug } from "@/lib/agent-memory.ts";
 import { userErrorMessage } from "@/lib/user-error.ts";
 import { t, useTranslation } from "@/lib/i18n.ts";
 
@@ -107,7 +108,62 @@ for (const name of ["text", "textgroup", "strong", "em", "s", "code_inline", "co
     return isValidElement<TextProps>(element) ? cloneElement(element, { selectable: true }) : element;
   };
 }
+
+/** An unconstrained horizontal text surface preserves source columns and explicit newlines.
+ * Keep the library's text/selection styling; do not impose a new vertical cap on long blocks. */
+function horizontalCodeBlock(text: ReactElement<TextProps>) {
+  return <DrawerHorizontalGesture key={text.key}>
+    <ScrollView horizontal style={{ flexGrow: 0, width: "100%" }} contentContainerStyle={{ flexGrow: 1 }}
+      testID="markdown-code-scroll" showsHorizontalScrollIndicator={false}>
+      {cloneElement(text, { testID: "markdown-code-text", style: [text.props.style, {
+        flexGrow: 1, flexShrink: 0, fontFamily: Platform.select({ ios: "Courier", default: "monospace" }),
+      }] })}
+    </ScrollView>
+  </DrawerHorizontalGesture>;
+}
 const openWebLink = (url: string) => /^https?:\/\//i.test(url);
+
+/** A list item's own prose must precede its nested lists to form one row. */
+function indexRowBoundary(node: ASTNode): number | null {
+  const firstNested = node.children.findIndex(child => child.type === 'bullet_list' || child.type === 'ordered_list');
+  if (firstNested < 0) return node.children.length;
+  // A loose item can resume prose after a sublist; preserve its original block order.
+  for (let index = firstNested + 1; index < node.children.length; index++) {
+    const type = node.children[index].type;
+    if (type !== 'bullet_list' && type !== 'ordered_list') return null;
+  }
+  return firstNested;
+}
+
+/** undefined signals competing destinations; nested lists belong to their own rows. */
+function ownLinkTarget(node: ASTNode, target: string | null): string | null | undefined {
+  if (node.type === 'bullet_list' || node.type === 'ordered_list') return target;
+  if (node.type === 'link' || node.type === 'blocklink') {
+    const url = node.attributes.href as string;
+    if (target !== null && target !== url) return undefined;
+    target = url;
+  }
+  for (const child of node.children ?? []) {
+    const next = ownLinkTarget(child, target);
+    if (next === undefined) return undefined;
+    target = next;
+  }
+  return target;
+}
+
+/** Only one active destination may claim a whole index row. Inspect the renderer's AST,
+ * not Markdown source: reference links, formatting and nested list items all share this path. */
+function indexRowSlug(node: ASTNode, memory: AgentMemory): string | null {
+  const boundary = indexRowBoundary(node);
+  if (boundary === null) return null;
+  let target: string | null = null;
+  for (let index = 0; index < boundary; index++) {
+    const next = ownLinkTarget(node.children[index], target);
+    if (next === undefined) return null;
+    target = next;
+  }
+  return target !== null ? managedMemorySlug(target, memory) : null;
+}
 
 type LinkTarget = { url: string; pageX: number; pageY: number };
 
@@ -145,7 +201,7 @@ export type ProjectedMarkdownPart = Exclude<SelectablePart, { kind: 'text' }> |
 
 // Markdown's parser assigns fresh random AST keys on every render. A persisted message must
 // retain its rendered tree when only its parent's UI/submission state changes.
-export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, tokens, media, selectable = false, readOnly = false, compact = false, projectedParts }: {
+export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, tokens, media, selectable = false, readOnly = false, compact = false, projectedParts, scrollCodeBlocks = false, managedMemory, memoryIndex = false }: {
   content: string; tokens?: MessageMarkdownTokens;
   /** Chat text selects natively; pressable links offer URL actions on long press. */
   selectable?: boolean;
@@ -156,8 +212,13 @@ export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, 
   compact?: boolean;
   /** Already projected text for an incrementally parsed, non-interactive draft. */
   projectedParts?: ProjectedMarkdownPart[];
+  /** Chat opts in; memory, skills and compact attachment previews keep their existing layout. */
+  scrollCodeBlocks?: boolean;
+  /** Only active canonical references open the in-app detail route. */
+  managedMemory?: { memory: AgentMemory; onOpen(slug: string): void };
+  /** Index typography and whole-row navigation; detail, conflict and chat stay ordinary Markdown. */
+  memoryIndex?: boolean;
 }) {
-  const { language } = useTranslation();
   const parsed = useMemo(() => projectedParts ? [] : tokens ?? markdown.parse(content, {}), [content, tokens, projectedParts]);
   // Preview/interrupted content must not mount MathContent (which opens links and toggles source).
   const blocks = useMemo(() => !readOnly && containsMath(parsed) ? groupMarkdownBlocks(parsed) : null, [parsed, readOnly]);
@@ -183,20 +244,87 @@ export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, 
     flush();
     return result;
   }, [parsed, selectable, readOnly, projectedParts]);
-  const baseRules = useMemo<RenderRules>(() => !selectable ? { ...rules } : {
-    ...selectableRules,
-    link: (node, children, _parents, styles) => {
-      const url = node.attributes.href;
-      const web = openWebLink(url);
-      return <NativeText key={node.key} style={styles.link}
-        onPress={web ? () => { void Linking.openURL(url); } : undefined}
-        onLongPress={web ? (event) => {
-          // Keep the menu open after long press, including release/movement away.
-          const { pageX, pageY } = event.nativeEvent;
-          setLinkTarget({ url, pageX, pageY });
-        } : undefined}>{children}</NativeText>;
-    },
-  }, [selectable, language]);
+  const [foreground, muted, border, mutedForeground] = useCSSVariable([
+    "--color-foreground", "--color-muted", "--color-border", "--color-muted-foreground",
+  ]);
+  const textColor = String(foreground ?? "#141414");
+  const mutedColor = String(muted ?? "#F0F0ED");
+  const borderColor = String(border ?? "#E3E3DF");
+  const secondaryColor = String(mutedForeground ?? "#777773");
+  const baseRules = useMemo<RenderRules>(() => {
+    const base: RenderRules = !selectable ? { ...rules } : {
+      ...selectableRules,
+      link: (node, children, _parents, styles) => {
+        const url = node.attributes.href;
+        const web = openWebLink(url);
+        return <NativeText key={node.key} style={styles.link}
+          onPress={web ? () => { void Linking.openURL(url); } : undefined}
+          onLongPress={web ? (event) => {
+            // Keep the menu open after long press, including release/movement away.
+            const { pageX, pageY } = event.nativeEvent;
+            setLinkTarget({ url, pageX, pageY });
+          } : undefined}>{children}</NativeText>;
+      },
+    };
+    if (managedMemory) {
+      const managedLink: NonNullable<RenderRules["link"]> = (node, children, parents, styles) => {
+        const url = node.attributes.href;
+        const slug = managedMemorySlug(url, managedMemory.memory);
+        const row = parents.find(parent => parent.type === 'list_item');
+        const rowOwnsLink = memoryIndex && !readOnly && slug && row &&
+          parents.find(parent => parent.type === 'bullet_list' || parent.type === 'ordered_list')?.type === 'bullet_list' &&
+          indexRowSlug(row, managedMemory.memory) === slug;
+        return <NativeText key={node.key} style={rowOwnsLink ? [styles.link, { textDecorationColor: borderColor }] : styles.link}
+          onPress={rowOwnsLink ? undefined : slug ? () => managedMemory.onOpen(slug)
+            : openWebLink(url) ? () => { void Linking.openURL(url); } : undefined}>{children}</NativeText>;
+      };
+      base.link = managedLink;
+      base.blocklink = managedLink;
+    }
+    if (memoryIndex && managedMemory && !readOnly) {
+      base.list_item = (node, children, parents, styles, inheritedStyles) => {
+        const nearestList = parents.find(parent => parent.type === 'bullet_list' || parent.type === 'ordered_list');
+        if (nearestList?.type !== 'bullet_list') return defaultRules.list_item!(node, children, parents, styles, inheritedStyles);
+        const boundary = indexRowBoundary(node);
+        if (boundary === null || boundary === 0) return defaultRules.list_item!(node, children, parents, styles, inheritedStyles);
+        const slug = indexRowSlug(node, managedMemory.memory);
+        const own = children.slice(0, boundary);
+        const nested = children.slice(boundary);
+        const markerSize = 5;
+        const markerGap = 10;
+        const row = <View style={{ flexDirection: 'row', alignItems: 'flex-start', paddingVertical: 8 }}>
+          <View accessible={false} style={{ width: markerSize, height: markerSize, borderRadius: 3, backgroundColor: secondaryColor,
+            marginRight: markerGap, marginTop: 9, flexShrink: 0 }} />
+          <View style={{ flex: 1, minWidth: 0 }}>{own}</View>
+          {slug ? <Icon as={ChevronRight} size={18} color={secondaryColor}
+            style={{ marginLeft: 10, marginTop: 2 }} /> : null}
+        </View>;
+        return <View key={node.key}>{slug
+          ? <Pressable accessibilityRole="button" testID={`memory-index-detail-${slug}`}
+              onPress={() => managedMemory.onOpen(slug)}>{row}</Pressable>
+          : row}
+          {/* Align sublists with the parent's content, outside its press target. */}
+          {nested.length ? <View style={{ paddingLeft: markerSize + markerGap }}>{nested}</View> : null}
+        </View>;
+      };
+      base.textgroup = (node, children, parents, styles) => {
+        const row = parents.find(parent => parent.type === 'list_item');
+        const slug = row && parents.find(parent => parent.type === 'bullet_list' || parent.type === 'ordered_list')?.type === 'bullet_list'
+          ? indexRowSlug(row, managedMemory.memory) : null;
+        return <NativeText key={node.key} style={slug
+          ? [styles.textgroup, { textDecorationLine: 'underline', textDecorationColor: borderColor }]
+          : styles.textgroup}>{children}</NativeText>;
+      };
+    }
+    if (!scrollCodeBlocks) return base;
+    const codeBlock = base.code_block!;
+    const fence = base.fence!;
+    return {
+      ...base,
+      code_block: (...args) => horizontalCodeBlock(codeBlock(...args) as ReactElement<TextProps>),
+      fence: (...args) => horizontalCodeBlock(fence(...args) as ReactElement<TextProps>),
+    };
+  }, [selectable, scrollCodeBlocks, managedMemory, memoryIndex, readOnly, borderColor, secondaryColor]);
   const renderRules = useMemo<RenderRules>(() => !readOnly && api && conversationId !== undefined && messageSeq !== undefined ? {
     ...baseRules,
     image: (node) => {
@@ -231,16 +359,12 @@ export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, 
     link: (node, children) => <NativeText key={node.key}>{children}</NativeText>,
     blocklink: (node, children) => <NativeText key={node.key}>{children}</NativeText>,
   } : baseRules, [api, conversationId, messageSeq, baseRules, readOnly, selectable]);
-  const [foreground, muted, border, mutedForeground] = useCSSVariable([
-    "--color-foreground", "--color-muted", "--color-border", "--color-muted-foreground",
-  ]);
-  const textColor = String(foreground ?? "#141414");
-  const mutedColor = String(muted ?? "#F0F0ED");
-  const borderColor = String(border ?? "#E3E3DF");
   const style = useMemo(() => ({
     body: { color: textColor, fontSize: compact ? 12 : 16, lineHeight: compact ? 18 : 26 },
     heading1: { color: textColor, fontSize: compact ? 14 : 26, lineHeight: compact ? 20 : undefined, fontWeight: "700" as const, marginTop: compact ? 0 : 12 },
-    heading2: { color: textColor, fontSize: compact ? 14 : 22, lineHeight: compact ? 20 : undefined, fontWeight: "700" as const, marginTop: compact ? 0 : 12 },
+    heading2: memoryIndex ? { color: secondaryColor, fontSize: 13, lineHeight: 18, fontWeight: "500" as const,
+      marginTop: 16, marginBottom: 4 } : { color: textColor, fontSize: compact ? 14 : 22,
+      lineHeight: compact ? 20 : undefined, fontWeight: "700" as const, marginTop: compact ? 0 : 12 },
     heading3: { color: textColor, fontSize: compact ? 14 : 19, lineHeight: compact ? 20 : undefined, fontWeight: "600" as const, marginTop: compact ? 0 : 10 },
     heading4: { color: textColor, fontSize: compact ? 14 : 16, lineHeight: compact ? 20 : undefined, fontWeight: "600" as const },
     heading5: { color: textColor, fontSize: compact ? 12 : 13, lineHeight: compact ? 18 : undefined, fontWeight: "600" as const },
@@ -249,6 +373,7 @@ export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, 
     // Long paths must wrap inside the paragraph rather than widen a summary dialog.
     textgroup: { flexShrink: 1, maxWidth: "100%" as const },
     link: { color: textColor, textDecorationLine: "underline" as const },
+    ...(memoryIndex ? { bullet_list_content: { fontSize: 15, lineHeight: 22 } } : {}),
     blockquote: { backgroundColor: mutedColor, borderColor, marginLeft: 0, padding: compact ? 6 : 10 },
     code_inline: { backgroundColor: mutedColor, borderColor, color: textColor, padding: compact ? 2 : 3,
       fontFamily: Platform.select({ ios: "Courier", default: "monospace" }) },
@@ -257,20 +382,28 @@ export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, 
     hr: { backgroundColor: borderColor },
     table: { borderColor },
     tr: { borderColor },
-  }), [textColor, mutedColor, borderColor, compact]);
+  }), [textColor, mutedColor, borderColor, secondaryColor, compact, memoryIndex]);
   const linkMenu = selectable && !readOnly && linkTarget
     ? <LinkMenu target={linkTarget} onClose={() => setLinkTarget(null)} /> : null;
+  const onManagedLink = managedMemory ? (url: string) => {
+    const slug = managedMemorySlug(url, managedMemory.memory);
+    if (!slug) return false;
+    managedMemory.onOpen(slug);
+    return true;
+  } : undefined;
   const renderMath = (block: Token[], index: number) => {
     const parts = media ? splitMathParagraphImages(block) : null;
     if (parts) return parts.map((part, offset) => 'image' in part
       ? renderImageToken(part.image, `${index}:${offset}`, api, conversationId, messageSeq)
       : containsMath(part.tokens)
-        ? <MathContent key={`${index}:${offset}`} html={mathBlockHtml(part.tokens)} source={part.source} />
+        ? <MathContent key={`${index}:${offset}`} html={mathBlockHtml(part.tokens, managedMemory?.memory)} source={part.source}
+          onManagedLink={onManagedLink} />
         : <NativeMarkdownBlock key={`${index}:${offset}`} tokens={part.tokens} style={style} rules={renderRules} />);
     // A nested/format-spanning image cannot be extracted without corrupting its Markdown structure.
     // Keep the authenticated image in native Markdown and show the formula's source as text.
     if (media && containsImageTokens(block)) return [<NativeMarkdownBlock key={index} tokens={block} style={style} rules={renderRules} />];
-    return [<MathContent key={index} html={mathBlockHtml(block)} source={block.map(token => token.content).filter(Boolean).join("\n")} />];
+    return [<MathContent key={index} html={mathBlockHtml(block, managedMemory?.memory)} source={block.map(token => token.content).filter(Boolean).join("\n")}
+      onManagedLink={onManagedLink} />];
   };
   // Match the 8px Markdown/UI segment gap without letting the menu add layout space.
   if (selectableParts) return <><View style={{ gap: 8 }}>
@@ -294,8 +427,9 @@ export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, 
     {linkMenu}
   </View>;
 }, (before, after) => before.content === after.content && before.tokens === after.tokens && before.selectable === after.selectable &&
-  before.projectedParts === after.projectedParts &&
-  before.readOnly === after.readOnly && before.compact === after.compact &&
+  before.projectedParts === after.projectedParts && before.scrollCodeBlocks === after.scrollCodeBlocks &&
+  before.readOnly === after.readOnly && before.compact === after.compact && before.memoryIndex === after.memoryIndex &&
+  before.managedMemory?.memory === after.managedMemory?.memory && before.managedMemory?.onOpen === after.managedMemory?.onOpen &&
   before.media?.api === after.media?.api &&
   before.media?.conversationId === after.media?.conversationId &&
   before.media?.messageSeq === after.media?.messageSeq);

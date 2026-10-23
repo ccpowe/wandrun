@@ -11,6 +11,7 @@ import asyncio
 import inspect
 import json
 import keyword
+import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack
@@ -144,8 +145,9 @@ def _mcp_result(message: ToolMessage, name: str) -> Any:
 class _Execution:
     """一次 run_code 的作用域；Monty 退出时不会替宿主取消调用，收尾由这里负责。"""
 
-    def __init__(self, timeout: float):
+    def __init__(self, timeout: float, trace_context: dict | None = None):
         self.timeout = timeout
+        self.trace_context = trace_context
         self.calls: set[asyncio.Task] = set()
         self.records: list[dict] = []
         self.dropped_records = 0
@@ -153,7 +155,9 @@ class _Execution:
         self.interrupt: GraphBubbleUp | None = None
         self.feed: asyncio.Future | None = None
 
-    async def call(self, name: str, operation: Callable[[], Awaitable[Any]]) -> Any:
+    async def call(
+        self, name: str, operation: Callable[[], Awaitable[Any]], span_inputs: dict | None = None
+    ) -> Any:
         if self.closed:
             raise RuntimeError(f"run_code 已结束，拒绝调用 {name}")
         record = {"name": name, "status": "started"}
@@ -164,7 +168,14 @@ class _Execution:
         task = asyncio.current_task()
         self.calls.add(task)
         try:
-            result = await operation()
+            if self.trace_context is None or span_inputs is None:
+                result = await operation()
+            else:
+                from wandrun.runtime.tracing import tool_span
+
+                with tool_span(self.trace_context, name, span_inputs) as span:
+                    result = await operation()
+                    span.end(outputs=result)
         except GraphBubbleUp as error:
             record["status"] = "interrupted"
             # 经 Monty 后会变成脚本可捕获的普通异常；宿主保存原异常并主动终止本次执行。
@@ -258,7 +269,7 @@ def _script_functions(catalog: CodeModeCatalog, backend, execution: _Execution |
     类型检查存根也由这些函数的签名生成（execution 为 None，只读签名），运行时与预检使用同一份接口。
     """
 
-    async def file_operation(name: str, start: Callable[[], Awaitable[Any]]) -> dict:
+    async def file_operation(name: str, start: Callable[[], Awaitable[Any]], inputs: dict | None) -> dict:
         async def operation():
             result = await start()
             if result.error:
@@ -267,32 +278,54 @@ def _script_functions(catalog: CodeModeCatalog, backend, execution: _Execution |
             data.pop("error")
             return data
 
-        return await execution.call(name, operation)
+        return await execution.call(name, operation, inputs)
 
     async def read(file_path: str, offset: int = 0, limit: int = 2000):
-        return await file_operation("read", lambda: backend.aread(file_path, offset, limit))
+        return await file_operation(
+            "read", lambda: backend.aread(file_path, offset, limit),
+            {"file_path": file_path, "offset": offset, "limit": limit} if execution.trace_context is not None else None,
+        )
 
     async def write(file_path: str, content: str):
-        return await file_operation("write", lambda: backend.awrite(file_path, content))
+        return await file_operation(
+            "write", lambda: backend.awrite(file_path, content),
+            {"file_path": file_path, "content": content} if execution.trace_context is not None else None,
+        )
 
     async def edit(file_path: str, old_string: str, new_string: str, replace_all: bool = False):
-        return await file_operation("edit", lambda: backend.aedit(file_path, old_string, new_string, replace_all))
+        return await file_operation(
+            "edit", lambda: backend.aedit(file_path, old_string, new_string, replace_all),
+            {"file_path": file_path, "old_string": old_string, "new_string": new_string, "replace_all": replace_all}
+            if execution.trace_context is not None else None,
+        )
 
     async def ls(path: str = "."):
-        return await file_operation("ls", lambda: backend.als(path))
+        return await file_operation(
+            "ls", lambda: backend.als(path),
+            {"path": path} if execution.trace_context is not None else None,
+        )
 
     async def glob(pattern: str, path: str | None = None):
-        return await file_operation("glob", lambda: backend.aglob(pattern, path))
+        return await file_operation(
+            "glob", lambda: backend.aglob(pattern, path),
+            {"pattern": pattern, "path": path} if execution.trace_context is not None else None,
+        )
 
     async def grep(pattern: str, path: str | None = None, glob: str | None = None):
-        return await file_operation("grep", lambda: backend.agrep(pattern, path, glob))
+        return await file_operation(
+            "grep", lambda: backend.agrep(pattern, path, glob),
+            {"pattern": pattern, "path": path, "glob": glob} if execution.trace_context is not None else None,
+        )
 
     async def execute(command: str, timeout: int | None = None):
         async def operation():
             response = await backend.aexecute(command, timeout=timeout)
             return {"output": response.output, "exit_code": response.exit_code, "truncated": response.truncated}
 
-        return await execution.call("execute", operation)
+        return await execution.call(
+            "execute", operation,
+            {"command": command, "timeout": timeout} if execution.trace_context is not None else None,
+        )
 
     async def call_tool(name: str, **arguments):
         return await _invoke(catalog.resolve(name), arguments, execution)
@@ -431,7 +464,12 @@ def code_mode_tool(pool: pm.AsyncMonty, backend, catalog: CodeModeCatalog) -> Ba
     ) -> ToolMessage:
         """Run a Python script that orchestrates tool calls."""
         timeout = max(1, min(int(timeout), MAX_TIMEOUT))
-        execution = _Execution(timeout)
+        trace_context = None
+        if os.environ.get("LANGSMITH_TRACING", "").lower() == "true":
+            from wandrun.runtime.tracing import capture_tool_context
+
+            trace_context = capture_tool_context()
+        execution = _Execution(timeout, trace_context)
         # Monty external lookups can execute in host callback tasks whose contextvars
         # do not inherit the graph tool task's context. Bind this one invocation's
         # observed version explicitly, never on the shared role backend.

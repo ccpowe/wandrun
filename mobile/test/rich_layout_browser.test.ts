@@ -6,16 +6,23 @@ import { test } from 'node:test';
 
 type Bounds = { x: number; y: number; width: number; height: number; right: number; bottom: number };
 type LayoutResult = {
-  kind: 'metrics' | 'labels' | 'extreme' | 'heading' | 'tabs' | 'tabs-scroll' | 'source-grid' | 'source-nested'; width: number; fontScale?: number;
+  kind: 'metrics' | 'labels' | 'extreme' | 'heading' | 'tabs' | 'tabs-scroll' | 'source-grid' | 'source-nested' | 'chat-code' | 'link-grid' | 'link-card' | 'link-stack' | 'link-mixed' | 'link-list' | 'link-titles' | 'link-thumbnails'; width: number; fontScale?: number;
   measuredWidth?: number; text?: string; cells?: Bounds[];
   headingBottom?: number; plotTop?: number; sectionsTop?: number;
   tabs?: { trigger: Bounds; pill: Bounds; label: Bounds; text: string; scrollWidth: number; lineHeight: number }[];
   cell?: Bounds; toggle?: Bounds; label?: Bounds; arrow?: Bounds; lineHeight?: number;
   charts?: { bounds: Bounds; legend?: Bounds; plot?: Bounds; circles?: Bounds[]; yLabels?: string[];
     labels?: { text: string; bounds: Bounds; scrollHeight: number }[] }[];
+  lines?: number; viewportWidth?: number; scrollWidth?: number; scrollLeft?: number; codeHeight?: number;
+  expectedHeight?: number; frameScrollWidth?: number; inlineOutsideScroll?: boolean; fontFamily?: string;
+  links?: { bounds: Bounds; text: Bounds; thumbnail: Bounds | null; scrollWidth: number }[];
+  groups?: number[][];
+  titles?: { caption: string; text: string; last: Bounds; arrow: Bounds;
+    arrowUnderline: string; underlinedText: string; embeddedViews: number }[];
+  colors?: number[][]; explicitEdgeColors?: number[][]; fallback?: string;
 };
 
-test('browser layout preserves chart readability, long tab labels and Source Grid summaries', { timeout: 180000 }, (context) => {
+test('browser layout preserves charts, tabs, Source summaries and unwrapped chat code', { timeout: 180000 }, (context) => {
   const python = fileURLToPath(new URL('../../.venv/bin/python', import.meta.url));
   // The layout probe drives Chrome from the backend venv; app-only checkouts skip it.
   if (!existsSync(python)) { context.skip('backend .venv not installed'); return; }
@@ -29,6 +36,50 @@ test('browser layout preserves chart readability, long tab labels and Source Gri
   const results: LayoutResult[] = JSON.parse(run.stdout);
   for (const result of results) {
     const where = `${result.kind} ${result.width}/${result.fontScale ?? 1}`;
+    if (result.kind === 'link-thumbnails') {
+      assert.deepEqual(result.colors, [[200, 40, 40, 255], [40, 200, 40, 255]],
+        'website icons and explicit images must display their own authenticated pixels through real Renderer coordinates');
+      assert.deepEqual(result.explicitEdgeColors, [[40, 200, 40, 255], [40, 200, 40, 255]],
+        'an explicit wide image must retain its center crop');
+      assert.equal(result.fallback, 'S', 'a 404 icon must retain its source mark, even when image bytes exist');
+      continue;
+    }
+    if (result.kind === 'link-titles') {
+      for (const title of result.titles!) {
+        assert.equal(title.text, `${title.caption}\u2060\u00a0↗\ufe0e`, where);
+        assert.equal(title.embeddedViews, 0, `${where}: title must not use embedded-view baseline layout`);
+        assert.equal(title.underlinedText, title.caption, `${where}: underline must cover the complete title only`);
+        assert.equal(title.arrowUnderline, 'none', `${where}: arrow must not be underlined`);
+        assert.ok(Math.abs(title.last.y - title.arrow.y) <= 1, `${where}: last character and arrow separated vertically`);
+        assert.ok(title.arrow.x >= title.last.right - 1, `${where}: arrow must follow the final character`);
+      }
+      continue;
+    }
+    if (result.kind.startsWith('link-')) {
+      assert.deepEqual(result.groups, result.kind === 'link-mixed' ? [[0, 1], [0]] : [[0, 1]], `${where}: adjacent rows must group through the real Renderer`);
+      for (const link of result.links!) {
+        assert.ok(link.text.width >= Math.min(160, link.bounds.width) - 1, `${where}: decorative art crushed the text column`);
+        assert.ok(link.text.right <= link.bounds.right + 1, `${where}: text escaped the row`);
+        assert.ok(link.scrollWidth <= link.bounds.width + 1, `${where}: row overflow`);
+        if (link.thumbnail) {
+          assert.equal(link.thumbnail.width, 64, where);
+          assert.equal(link.thumbnail.height, 64, where);
+        } else {
+          assert.ok(Math.abs(link.text.width - link.bounds.width) <= 1, `${where}: narrow rows must give text the full width`);
+        }
+      }
+      continue;
+    }
+    if (result.kind === 'chat-code') {
+      assert.ok(Math.abs(result.viewportWidth! - result.width) <= 1, `${where}: code viewport does not fit the message`);
+      assert.ok(result.scrollWidth! > result.viewportWidth!, `${where}: long code must overflow horizontally`);
+      assert.ok(result.scrollLeft! > 0, `${where}: the surface cannot scroll to the long-line suffix`);
+      assert.ok(Math.abs(result.codeHeight! - result.expectedHeight!) <= 1, `${where}: source lines wrapped or were vertically capped`);
+      assert.ok(result.frameScrollWidth! <= result.width + 1, `${where}: code widens the whole page`);
+      assert.equal(result.inlineOutsideScroll, true, `${where}: inline code was moved into the block scroller`);
+      assert.match(result.fontFamily!, /monospace/);
+      continue;
+    }
     if (result.kind === 'tabs' || result.kind === 'tabs-scroll') {
       const tabs = result.tabs!;
       assert.equal(tabs.length, result.kind === 'tabs' ? 4 : 5, where);

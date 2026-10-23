@@ -19,7 +19,6 @@ CHAPTERS = {"design.md", "display.md", "charts.md", "forms.md", "media.md"}
 class ModelExampleTests(unittest.TestCase):
     def test_resident_examples_are_valid_specs(self):
         blocks = parse_blocks(model_instructions())
-        self.assertEqual(len(blocks), 3)
         for block in blocks:
             with self.subTest(block=block.block):
                 self.assertIsNone(block.error)

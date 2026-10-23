@@ -1,4 +1,6 @@
 import type { Token } from 'markdown-it';
+import type { AgentMemory } from '../gateway/api.ts';
+import { managedMemorySlug } from './agent-memory.ts';
 
 import { createMarkdown } from './markdown.ts';
 
@@ -9,9 +11,10 @@ const escape = markdown.utils.escapeHtml;
 markdown.renderer.rules.math_inline = (tokens, index) => mathNode(tokens[index].content, false);
 markdown.renderer.rules.math_block = (tokens, index) => mathNode(tokens[index].content, true) + '\n';
 markdown.renderer.rules.image = (tokens, index) => `[图片：${escape(tokens[index].content || tokens[index].attrGet('src') || '')}]`;
-markdown.renderer.rules.link_open = (tokens, index) => {
+markdown.renderer.rules.link_open = (tokens, index, _options, env) => {
   const url = tokens[index].attrGet('href') || '';
-  return safeWebLink(url) ? `<a href="${escape(url)}">` : '<a>';
+  const memory: AgentMemory | undefined = env.managedMemory;
+  return safeWebLink(url) || memory && managedMemorySlug(url, memory) ? `<a href="${escape(url)}">` : '<a>';
 };
 markdown.renderer.rules.link_close = () => '</a>';
 
@@ -43,6 +46,6 @@ export function groupMarkdownBlocks(tokens: readonly Token[]): Token[][] {
   return result;
 }
 
-export function mathBlockHtml(tokens: readonly Token[]): string {
-  return markdown.renderer.render(tokens as Token[], markdown.options, {});
+export function mathBlockHtml(tokens: readonly Token[], managedMemory?: AgentMemory): string {
+  return markdown.renderer.render(tokens as Token[], markdown.options, { managedMemory });
 }

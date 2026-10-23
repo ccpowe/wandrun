@@ -1,11 +1,11 @@
 import { router } from "expo-router";
 import { Clock, Pencil, Plus, Search, Trash2 } from "lucide-react-native";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { BackHandler, Keyboard, Pressable, ScrollView, type GestureResponderEvent, useWindowDimensions, View } from "react-native";
+import { Drawer } from "react-native-drawer-layout";
 import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
-import Animated, { Easing, useAnimatedStyle, useSharedValue, withTiming } from "react-native-reanimated";
+import Animated, { useAnimatedStyle } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { scheduleOnRN } from "react-native-worklets";
 
 import { Button } from "@/components/ui/button.tsx";
 import {
@@ -17,7 +17,6 @@ import { Input } from "@/components/ui/input.tsx";
 import { Text } from "@/components/ui/text.tsx";
 import { WandrunAvatar } from "@/components/wandrun-avatar.tsx";
 import { TypingDots } from "./typing-dots.tsx";
-import { drawerTransition } from "@/lib/drawer-flow.ts";
 import { cn } from "@/lib/utils.ts";
 import { useTranslation } from "@/lib/i18n.ts";
 
@@ -28,8 +27,14 @@ export type DrawerConversation = {
 };
 
 type Props = {
-  /** 受控：是否打开。关闭是动画，动画结束后才调用 onClosed。 */
+  /** Wraps the entire chat; the library owns the drag, overlay and animation. */
+  children: ReactNode;
+  /** Controlled target. onClosed is called only after this target actually finishes closing. */
   open: boolean;
+  /** Flow has requested a close; block interaction until actual animation completion. */
+  closing: boolean;
+  onOpen(): void;
+  swipeEnabled?: boolean;
   agentName: string;
   conversations: DrawerConversation[];
   collaborations: DrawerConversation[];
@@ -42,25 +47,21 @@ type Props = {
   onRename(id: string, title: string): Promise<boolean>;
   onDelete(id: string): Promise<boolean>;
   failureMessage(): string | null;
-  /** 用户想关掉（点遮罩、系统返回键）。是否真的关闭由父组件改 open 决定。 */
   onRequestClose(): void;
-  /** 关闭动画结束：父组件在这里执行“关闭后再做”的事（如切换对话），保证切换不打断动画。 */
+  /** Real close completion retains the callback/Flow owner from the closing target. */
   onClosed(): void;
 };
 
-const OPEN_MS = 240;
-const CLOSE_MS = 200;
 type Target = { id: string; title: string };
 type Menu = Target & { top: number };
 
-/**
- * 聊天页的对话列表抽屉（pages.md 第 6 条）：从左侧滑出，右侧聊天内容上有遮罩，抽屉内右下悬浮“新对话”（随抽屉平移）。
- * 覆盖在父视图上（绝对定位），父视图须是定位容器。动画用 Reanimated：一个 0..1 的进度驱动遮罩淡入与抽屉平移；
- * 目标关闭时只让覆盖层吞触摸，子控件不再响应；退出动画完成后才允许触摸底层聊天页。
- * 搜索只限当前入口 Agent，不罗列工作目录中的中间文件。
- */
+/** The library owns drawer gestures/scrim. Rows, search, menus and dialogs retain their appearance. */
 export function ConversationDrawer({
+  children,
   open,
+  closing,
+  onOpen,
+  swipeEnabled = true,
   agentName,
   agentId,
   conversations,
@@ -85,7 +86,10 @@ export function ConversationDrawer({
   ];
   const { width } = useWindowDimensions();
   const drawerWidth = Math.min(300, width * 0.82);
-  const progress = useSharedValue(0);
+  const configureGestureHandler = useCallback((gesture: Parameters<NonNullable<ComponentProps<typeof Drawer>["configureGestureHandler"]>>[0]) =>
+    gesture.activeOffsetX([-12, 12]).failOffsetY([-10, 10])
+      // iOS system-back arbitration cannot be guaranteed by JS hitSlop; keep its edge clear and verify on device.
+      .hitSlop(open ? { left: 0 } : { left: -20, width: Math.max(0, width - 20) }), [open, width]);
   const drawerContent = useRef<View>(null);
   const [drawerHeight, setDrawerHeight] = useState(0);
   const [menu, setMenu] = useState<Menu | null>(null);
@@ -174,46 +178,32 @@ export function ConversationDrawer({
   useEffect(() => {
     if (editing) return () => Keyboard.dismiss();
   }, [editing]);
-  const [transition, setTransition] = useState({ open: false, visible: false, generation: 0 });
-  if (transition.open !== open) setTransition(drawerTransition(transition, { type: "target", open }));
-  const { generation, visible } = transition;
-  const pendingClose = useRef<{ generation: number; notify: () => void } | null>(null);
-  // 关闭动画结束时由 UI 线程回调。传给 scheduleOnRN 的必须是 RN 运行时上定义的函数引用：
-  // 不能在 worklet 里现造闭包，worklet 也不能捕获 ref 对象（捕获后在 JS 侧改写会报错）。
-  // notifyClosed 只在 RN 侧读取本次关闭的 owner；已排队的旧通知不能释放新一轮覆盖层或消费新动作。
+  const pendingClose = useRef<{ notify: () => void; started: boolean } | null>(null);
+  const previousOpen = useRef(open);
   const onClosedRef = useRef(onClosed);
+  useLayoutEffect(() => { onClosedRef.current = onClosed; });
+  // Capture the Flow owner at the controlled close, not when the library later reports completion.
   useLayoutEffect(() => {
-    onClosedRef.current = onClosed;
-  });
-  const notifyClosed = useCallback((completedGeneration: number) => {
+    if (previousOpen.current !== open) {
+      pendingClose.current = open ? null : { notify: onClosedRef.current, started: false };
+      previousOpen.current = open;
+      if (open) Keyboard.dismiss();
+    }
+  }, [open]);
+  const handleTransitionStart = useCallback((isClosing: boolean) => {
+    if (isClosing && !previousOpen.current && pendingClose.current) pendingClose.current.started = true;
+  }, []);
+  const handleTransitionEnd = useCallback((isClosing: boolean) => {
     const pending = pendingClose.current;
-    if (!pending || pending.generation !== completedGeneration) return;
+    if (!isClosing || previousOpen.current || !pending?.started) return;
     pendingClose.current = null;
-    setTransition((state) => drawerTransition(state, { type: "closed", generation: completedGeneration }));
     pending.notify();
   }, []);
-
-  // 提交时即撤销旧通知，不能等 passive cleanup，否则 RN 队列可能先消费上一轮关闭。
-  useLayoutEffect(() => {
-    if (generation === 0) return; // 首次渲染时不触发“关闭完成”
-    if (open) {
-      Keyboard.dismiss();
-      progress.value = withTiming(1, { duration: OPEN_MS, easing: Easing.out(Easing.cubic) });
-    } else {
-      pendingClose.current = { generation, notify: onClosedRef.current };
-      progress.value = withTiming(0, { duration: CLOSE_MS, easing: Easing.in(Easing.cubic) }, (finished) => {
-        "worklet";
-        if (finished) scheduleOnRN(notifyClosed, generation);
-      });
-    }
-    return () => {
-      pendingClose.current = null;
-    };
-  }, [open, generation, progress, notifyClosed]);
+  useEffect(() => () => { pendingClose.current = null; }, []);
 
   // 退出动画仍可见时继续消费返回键，但不覆盖已经选定的切换动作。
   useEffect(() => {
-    if (!visible) return;
+    if (!open && !closing) return;
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
       if (deleting) {
         if (!operation.current) {
@@ -231,31 +221,41 @@ export function ConversationDrawer({
       return true;
     });
     return () => subscription.remove();
-  }, [open, visible, onRequestClose, menu, editing, deleting]);
+  }, [open, closing, onRequestClose, menu, editing, deleting]);
 
-  const scrimStyle = useAnimatedStyle(() => ({ opacity: progress.value }));
-  const drawerStyle = useAnimatedStyle(() => ({ transform: [{ translateX: -drawerWidth * (1 - progress.value) }] }));
   const { progress: keyboardProgress, height: keyboardHeight } = useReanimatedKeyboardAnimation();
-  // 抽屉是绝对定位，不受聊天页 padding 避让影响；由库提供的键盘位移抬起弹层。
+  // This sheet is above the drawer and chat; keyboard-controller moves only the editing panel.
   const sheetInset = useAnimatedStyle(() => ({
     paddingBottom: 24 + insets.bottom * (1 - keyboardProgress.value),
     transform: [{ translateY: keyboardHeight.value }],
   }));
 
   return (
-    <View
-      pointerEvents={!visible ? "none" : open ? "auto" : "box-only"}
-      onStartShouldSetResponder={() => !open && !editing}
-      className="absolute inset-0"
-    >
-      <Animated.View style={scrimStyle} className="absolute inset-0 bg-black/40">
-        <Pressable className="flex-1" onPress={onRequestClose} accessibilityLabel={t("关闭对话列表")} />
-      </Animated.View>
-      <Animated.View
-        style={[drawerStyle, { width: drawerWidth, paddingTop: insets.top + 16 }]}
-        className="absolute inset-y-0 left-0 border-r border-border bg-background shadow-lg"
-      >
-        <View ref={drawerContent} className="flex-1" onLayout={(event) => setDrawerHeight(event.nativeEvent.layout.height)}>
+    <View className="flex-1" pointerEvents={closing ? "box-only" : "auto"}
+      onStartShouldSetResponder={() => closing}>
+      {/* onClose fires at spring start; onTransitionEnd reports actual completion.
+          Swipes are native-only; Web retains the menu button/overlay.
+          The half-width threshold is finger travel, not visible progress on far-right starts. */}
+      <Drawer
+        open={open}
+        onOpen={() => { if (!open) onOpen(); }}
+        onClose={() => { if (open) onRequestClose(); }}
+        onTransitionStart={handleTransitionStart}
+        onTransitionEnd={handleTransitionEnd}
+        drawerType="front"
+        drawerPosition="left"
+        drawerStyle={{ width: drawerWidth }}
+        overlayStyle={{ backgroundColor: "rgba(0, 0, 0, 0.4)" }}
+        overlayAccessibilityLabel={t("关闭对话列表")}
+        swipeEnabled={swipeEnabled && !closing}
+        swipeEdgeWidth={width}
+        swipeMinDistance={drawerWidth / 2}
+        swipeMinVelocity={500}
+        keyboardDismissMode="on-drag"
+        configureGestureHandler={configureGestureHandler}
+        renderDrawerContent={() => (
+          <View ref={drawerContent} className="flex-1 border-r border-border bg-background shadow-lg"
+            style={{ paddingTop: insets.top + 16 }} onLayout={(event) => setDrawerHeight(event.nativeEvent.layout.height)}>
         <View className="flex-row items-center gap-2 px-6 pb-2">
           <Text className="min-w-0 flex-1 text-[26px] font-bold leading-[34px] tracking-tight" numberOfLines={1}>{agentName}</Text>
           <Button testID="drawer-search" variant="ghost" size="icon" aria-label={t("搜索此 Agent")} onPress={() => router.push({ pathname: "/search", params: { agent_id: agentId } })}>
@@ -299,7 +299,7 @@ export function ConversationDrawer({
                 openMenu(conversation, event);
               }}
               onPress={() => {
-                if (!longPressed.current && !menu) onSelect(conversation.id);
+                if (open && !longPressed.current && !menu) onSelect(conversation.id);
               }}
               className={cn(
                 "mx-2.5 min-h-[50px] flex-row items-center gap-2.5 rounded-[25px] px-3.5 active:bg-muted",
@@ -328,10 +328,10 @@ export function ConversationDrawer({
           <Button
             testID="new-conversation"
             variant="outline"
-            onPress={onNewConversation}
+            onPress={() => { if (open) onNewConversation(); }}
             className="h-[52px] gap-2 border-[1.5px] border-foreground bg-background px-[22px] shadow-lg"
           >
-            <Icon as={Plus} className="size-5" strokeWidth={2} />
+            <Icon as={Plus} className="size-5" strokeWidth={1.75} />
             <Text>{t("新对话")}</Text>
           </Button>
         </View>
@@ -364,7 +364,10 @@ export function ConversationDrawer({
           </View>
         )}
         </View>
-      </Animated.View>
+        )}
+      >
+        {children}
+      </Drawer>
       {editing && (
         <View className="absolute inset-0">
           <Pressable

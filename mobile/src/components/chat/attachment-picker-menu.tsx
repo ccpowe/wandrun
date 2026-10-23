@@ -56,8 +56,8 @@ export function AttachmentPickerMenu({ onPick }: {
   return (
     <DropdownMenu onOpenChange={(value) => { open.current = value; }}>
       <DropdownMenuTrigger ref={trigger} asChild>
-        <Button testID="composer-add" variant="ghost" size="icon" className="size-10 bg-card" aria-label={t("添加附件")}>
-          <Icon as={Plus} className="size-5 text-foreground" strokeWidth={1.75} />
+        <Button testID="composer-add" variant="ghost" size="icon" className="size-10 bg-transparent" aria-label={t("添加附件")}>
+          <Icon as={Plus} size={22} className="text-foreground" style={{ width: 22, height: 22 }} />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent

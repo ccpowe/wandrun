@@ -1,14 +1,9 @@
 # agent-device 0.21.16 Maestro subset; run via python3 mobile/e2e/run.py memory.
-# All gestures resolve semantic IDs; fixture Agent/conversation are removed by runner.
+# Temporary Agents and the shared-profile test marker are restored by the runner.
 appId: host.exp.exponent
 ---
 - tapOn:
     id: agent-row-${MEMORY_AGENT_ID}
-- extendedWaitUntil:
-    visible:
-      id: chat-agent-name
-      text: ${MEMORY_NAME}
-    timeout: 10000
 - tapOn:
     id: chat-agent-profile
 - tapOn:
@@ -17,9 +12,13 @@ appId: host.exp.exponent
     visible:
       id: profile-empty-memory
     timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/01-memory-empty-light.png
+- assertVisible:
+    id: profile-about-you
+- assertNotVisible:
+    id: profile-shared-memory-content
+- takeScreenshot: ${ARTIFACTS}/01-work-memory-light.png
 # @dark-mode
-- takeScreenshot: ${ARTIFACTS}/01-memory-empty-dark.png
+- takeScreenshot: ${ARTIFACTS}/01-work-memory-dark.png
 # @light-mode
 - tapOn:
     id: profile-memory-edit
@@ -27,14 +26,10 @@ appId: host.exp.exponent
     visible:
       id: memory-editor-input
     timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/02-memory-editor-light.png
 - tapOn:
     id: memory-editor-input
 - inputText: ${MEMORY_SAVED}
 - back
-- assertVisible:
-    id: memory-editor-count
-- takeScreenshot: ${ARTIFACTS}/03-memory-draft-light.png
 - tapOn:
     id: memory-editor-save
 # @memory-ui-saved
@@ -43,92 +38,145 @@ appId: host.exp.exponent
       id: profile-memory-content
     timeout: 10000
 - assertVisible: ${MEMORY_SAVED_TEXT}
-- takeScreenshot: ${ARTIFACTS}/04-memory-markdown-light.png
-# @memory-external-view
+# @memory-profile-shared
+- tapOn:
+    id: profile-about-you
 - extendedWaitUntil:
-    visible: ${MEMORY_REMOTE_TEXT}
+    visible: ${MEMORY_PROFILE_TEXT}
     timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/05-memory-external-light.png
+- takeScreenshot: ${ARTIFACTS}/02-about-you-light.png
 # @dark-mode
-- takeScreenshot: ${ARTIFACTS}/05-memory-external-dark.png
+- takeScreenshot: ${ARTIFACTS}/02-about-you-dark.png
 # @light-mode
-# @memory-external-file
-- assertVisible: ${MEMORY_REMOTE_TEXT}
+- tapOn:
+    id: about-you-back
 - tapOn:
     id: profile-memory-edit
+- tapOn:
+    id: memory-editor-new-detail
 - extendedWaitUntil:
     visible:
-      id: memory-editor-input
-      text: ${MEMORY_FILE_BODY}
-    timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/05a-memory-external-file-editor.png
-- tapOn:
-    id: memory-editor-save
-- extendedWaitUntil:
-    visible: ${MEMORY_FILE_BODY}
-    timeout: 10000
-- assertVisible:
-    id: profile-memory-content
-# @memory-unchanged-saved
-- takeScreenshot: ${ARTIFACTS}/05b-memory-unchanged-save-return.png
-- tapOn:
-    id: profile-memory-edit
-- extendedWaitUntil:
-    visible:
-      id: memory-editor-input
+      id: memory-detail-slug
     timeout: 10000
 - tapOn:
-    id: memory-editor-input
-# @select-all
-- inputText: ${MEMORY_DRAFT}
+    id: memory-detail-slug
+- inputText: ${MEMORY_DETAIL_SLUG}
 - back
-# @memory-external-conflict
+- tapOn:
+    id: memory-detail-input
+- inputText: ${MEMORY_DETAIL_CONTENT}
+- back
+- assertVisible:
+    id: memory-detail-count
+- tapOn:
+    id: memory-detail-save
+# @memory-detail-created
 - extendedWaitUntil:
     visible:
-      id: memory-editor-conflict
+      id: memory-editor-input
     timeout: 10000
-# @memory-draft-retained
-- takeScreenshot: ${ARTIFACTS}/06-memory-conflict-light.png
+- tapOn:
+    id: memory-editor-back
+- extendedWaitUntil:
+    visible:
+      id: memory-index-detail-${MEMORY_DETAIL_SLUG}
+    timeout: 10000
+- tapOn:
+    id: memory-index-detail-${MEMORY_DETAIL_SLUG}
+- extendedWaitUntil:
+    visible:
+      id: memory-detail-content
+    timeout: 10000
+- assertVisible: ${MEMORY_DETAIL_CONTENT}
+- takeScreenshot: ${ARTIFACTS}/03-detail-light.png
 # @dark-mode
-- takeScreenshot: ${ARTIFACTS}/06-memory-conflict-dark.png
+- takeScreenshot: ${ARTIFACTS}/03-detail-dark.png
 # @light-mode
 - tapOn:
-    id: memory-editor-view-current
-- assertVisible:
-    id: memory-editor-current
-- takeScreenshot: ${ARTIFACTS}/07-memory-compare-light.png
+    id: memory-detail-edit
 - tapOn:
-    id: memory-editor-reload
+    id: memory-detail-input
+# @select-all
+- inputText: ${MEMORY_DETAIL_DRAFT}
+- back
+# @memory-detail-conflict
+- extendedWaitUntil:
+    visible:
+      id: memory-detail-conflict
+    timeout: 10000
+# @memory-detail-draft-retained
+- tapOn:
+    id: memory-detail-reload
 - extendedWaitUntil:
     notVisible:
-      id: memory-editor-conflict
+      id: memory-detail-conflict
     timeout: 10000
-# @memory-draft-retained
+# @memory-detail-draft-retained
 - tapOn:
-    id: memory-editor-save
-# @memory-conflict-saved
+    id: memory-detail-save
+# @memory-detail-saved
+- tapOn:
+    id: memory-index-detail-${MEMORY_DETAIL_SLUG}
+- tapOn:
+    id: memory-detail-delete
+- scrollUntilVisible:
+    element:
+      id: memory-detail-base-index
+    direction: DOWN
+- assertVisible:
+    id: memory-detail-base-index
+- scrollUntilVisible:
+    element:
+      id: memory-detail-delete-index
+    direction: DOWN
+- assertVisible:
+    id: memory-detail-delete-index
+- scrollUntilVisible:
+    element:
+      id: memory-detail-delete-confirm
+    direction: DOWN
+- tapOn:
+    id: memory-detail-delete-confirm
+- tapOn: 删除
 - extendedWaitUntil:
     visible:
       id: profile-memory-content
     timeout: 10000
 - extendedWaitUntil:
-    visible: ${MEMORY_DRAFT}
+    notVisible:
+      id: memory-index-detail-${MEMORY_DETAIL_SLUG}
     timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/08-memory-saved-light.png
-# @dark-mode
-- takeScreenshot: ${ARTIFACTS}/09-memory-saved-dark.png
+# @memory-detail-deleted
 - tapOn:
-    id: profile-memory-edit
+    id: profile-about-you
+- tapOn:
+    id: profile-shared-memory-edit
 - extendedWaitUntil:
     visible:
       id: memory-editor-input
     timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/10-memory-editor-dark.png
+- takeScreenshot: ${ARTIFACTS}/04-about-you-editor-light.png
 - tapOn:
     id: memory-editor-back
 - tapOn:
+    id: about-you-back
+- tapOn:
     id: profile-close
 - tapOn: 返回
-- assertVisible: 设置
-# @light-mode
+- tapOn: 设置
+- extendedWaitUntil:
+    visible:
+      id: settings-about-you
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/05-settings-about-you-light.png
+- tapOn:
+    id: settings-about-you
+- extendedWaitUntil:
+    visible: ${MEMORY_PROFILE_TEXT}
+    timeout: 10000
+- tapOn:
+    id: about-you-back
+- tapOn:
+    id: settings-back
+# @memory-shared-cross-agent
 # @memory-member-link

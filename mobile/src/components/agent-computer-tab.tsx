@@ -81,10 +81,10 @@ export function AgentComputerTab({ id, session, viewport }: {
             onPress={() => open(task.id, page.id)} />
         </SwipeRow>)}</ListGroup>}
       </>}
-      <Text className="mx-8 mt-3 text-xs leading-[17px] text-muted-foreground">{t("汇总该 Agent 所有对话及成员代办的页面；左滑可确认关闭所在任务的全部页面，电脑总览见 设置 › 电脑。")}</Text>
+      <Text className="mx-8 mt-3 text-xs leading-[17px] text-muted-foreground">{t("包含成员代办的页面。左滑可关闭该任务的全部页面。")}</Text>
     </> : !session.browserError && session.browserRevision === 0 ? <Text className="mt-12 text-center text-sm text-muted-foreground">{t("正在加载浏览器页面…")}</Text> :
       !session.browserError ? <View testID="profile-computer-empty" className="min-h-[320px] flex-1">
-        <EmptyState title={t("没有正在使用的浏览器页面")} />
+        <EmptyState title={t("没有浏览器页面")} />
       </View> : null}
     {closing && <BrowserTaskCloseDialog session={session} task={closing} onDismiss={() => setClosing(null)} testIDPrefix="profile-computer" />}
   </View>;

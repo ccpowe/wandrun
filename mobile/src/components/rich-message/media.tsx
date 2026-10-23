@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, FlatList, Platform, Pressable, View } from 'react-native';
+import { ActivityIndicator, Animated, FlatList, Platform, Pressable, View } from 'react-native';
 import { Image as ExpoImage } from 'expo-image';
 import { router } from 'expo-router';
+import { DrawerHorizontalGesture } from '@/components/chat/drawer-horizontal-gesture.tsx';
 
 import { Text } from '@/components/ui/text.tsx';
 import { RichText } from '@/components/rich-message/math.tsx';
@@ -107,6 +108,56 @@ export function MediaPicture({ api, location, fileId, alt, height = richGeometry
   </View>;
 }
 
+/** A LinkCard thumbnail is purely decorative. Only persisted message coordinates can reach
+ * the authenticated media endpoint; unavailable images or icons retain the source-site mark. */
+export function LinkThumbnail({ api, location, letter, color }: {
+  api?: GatewayApi; location?: MediaLocation; letter: string; color: string;
+}) {
+  const [loaded, setLoaded] = useState<{ api: GatewayApi; key: string; uri: string } | null>(null);
+  const lease = useRef<{ key: string; dispose: () => void } | null>(null);
+  const [opacity] = useState(() => new Animated.Value(0));
+  const key = api && location ? JSON.stringify([api.config.computerId, location]) : '';
+  const conversationId = location?.conversationId;
+  const messageSeq = location?.messageSeq;
+  const block = location?.block;
+  const element = location?.element;
+  const index = location?.index;
+  useEffect(() => {
+    if (!api || conversationId === undefined || messageSeq === undefined || block === undefined || element === undefined || index === undefined) return;
+    let active = true;
+    const controller = new AbortController();
+    opacity.setValue(0);
+    void api.getMessageMedia(conversationId, messageSeq, block, element, index)
+      .then(async () => {
+        const image = await loadLocalImage(api, api.mediaContentPath(conversationId, messageSeq, block, element, index), controller.signal);
+        if (active && !api.signal.aborted) {
+          lease.current = { key, dispose: image.dispose };
+          setLoaded({ api, key, uri: image.uri });
+        } else image.dispose();
+      }).catch(() => { if (active) setLoaded(null); });
+    return () => {
+      active = false;
+      controller.abort();
+      if (lease.current?.key === key) { lease.current.dispose(); lease.current = null; }
+    };
+  }, [api, key, conversationId, messageSeq, block, element, index, opacity]);
+  return <View testID="rich-link-thumbnail" accessible={false} aria-hidden accessibilityElementsHidden
+    importantForAccessibility="no-hide-descendants" className="items-center justify-center overflow-hidden border-border border"
+    style={{ width: 64, height: 64, flexShrink: 0, borderRadius: 14, backgroundColor: color }}>
+    <Text allowFontScaling={false} className="text-white" style={{ fontSize: 26, fontWeight: '600' }}>{letter}</Text>
+    {loaded && loaded.api === api && loaded.key === key && key ? <Animated.View pointerEvents="none"
+      style={{ position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, opacity, backgroundColor: color }}>
+      <ExpoImage source={{ uri: loaded.uri }} cachePolicy="none" contentFit="cover"
+        style={{ width: '100%', height: '100%' }}
+        onLoad={() => Animated.timing(opacity, { toValue: 1, duration: 180, useNativeDriver: true }).start()}
+        onError={() => {
+          if (lease.current?.key === key) { lease.current.dispose(); lease.current = null; }
+          setLoaded(null);
+        }} />
+    </Animated.View> : null}
+  </View>;
+}
+
 export function MediaCard({ item, title, description, tags, direction, api, location, fileId }: {
   item: ImageItem; title: string; description?: string; tags?: string[]; direction?: 'horizontal' | 'vertical';
   api?: GatewayApi; location?: MediaLocation; fileId?: string;
@@ -160,7 +211,7 @@ export function MediaGallery({ items, api, locate, fileFor }: {
   return <View className="border-border border bg-card" style={{ gap: richSpace.sm, borderRadius: richRadius.medium, padding: richSpace.sm }}
     onLayout={(event) => setWidth(event.nativeEvent.layout.width - 2 * richSpace.sm - 2)} testID="rich-gallery">
     {width > 0 ? scrollable
-      ? <FlatList ref={list} horizontal data={items} keyExtractor={(_, index) => String(index)}
+      ? <DrawerHorizontalGesture><FlatList ref={list} horizontal data={items} keyExtractor={(_, index) => String(index)}
         style={{ height: richGeometry.galleryHeight, ...(Platform.OS === 'web' ? { scrollSnapType: 'x mandatory' as const } : {}) }}
         contentContainerStyle={{ paddingRight: width - tileWidth }} ItemSeparatorComponent={() => <View style={{ width: gap }} />}
         initialNumToRender={3} maxToRenderPerBatch={3} windowSize={3} showsHorizontalScrollIndicator={false}
@@ -169,7 +220,7 @@ export function MediaGallery({ items, api, locate, fileFor }: {
         scrollEventThrottle={16}
         onMomentumScrollEnd={(event) => { if (Platform.OS !== 'web') observePage(event.nativeEvent.contentOffset.x); }}
         getItemLayout={(_, index) => ({ index, length: interval, offset: index * interval })}
-        renderItem={({ item, index }) => picture(item, index)} />
+        renderItem={({ item, index }) => picture(item, index)} /></DrawerHorizontalGesture>
       : <View className="flex-row" style={{ gap }}>{items.map(picture)}</View> : null}
     {scrollable && items[page]?.caption ? <RichText testID="rich-gallery-caption" className="text-muted-foreground"
       style={{ ...richType.subtle, paddingHorizontal: richSpace.xs }}>{items[page].caption}</RichText> : null}

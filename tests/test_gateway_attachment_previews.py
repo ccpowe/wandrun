@@ -37,11 +37,21 @@ def image_bytes(width: int = 1200, height: int = 600) -> bytes:
     return output.getvalue()
 
 
-def video_file(path: Path) -> None:
+def video_file(path: Path, *, audio_first: bool = False) -> None:
     with av.open(str(path), mode="w", format="mp4") as container:
+        if audio_first:
+            audio = container.add_stream("aac", rate=8000)
         stream = container.add_stream("mpeg4", rate=2)
         stream.width, stream.height = 320, 180
         stream.pix_fmt = "yuv420p"
+        if audio_first:
+            frame = av.AudioFrame(format="fltp", layout="mono", samples=8000)
+            frame.sample_rate = 8000
+            frame.planes[0].update(b"\0" * frame.planes[0].buffer_size)
+            for packet in audio.encode(frame):
+                container.mux(packet)
+            for packet in audio.encode():
+                container.mux(packet)
         for color in ((200, 20, 20), (20, 200, 20), (20, 20, 200), (200, 200, 20)):
             frame = av.VideoFrame.from_image(Image.new("RGB", (320, 180), color))
             for packet in stream.encode(frame):
@@ -159,6 +169,36 @@ class AttachmentPreviewTests(unittest.IsolatedAsyncioTestCase):
                 if name.endswith((".mp4", ".pdf")):
                     thumbnail = await self.client.get(f"/files/{record['id']}/thumbnail?w=240")
                     self.assertEqual((thumbnail.status_code, thumbnail.headers["content-type"]), (200, "image/jpeg"))
+
+    async def test_audio_first_video_generates_cover(self):
+        path = self.root / "audio-first.mp4"
+        video_file(path, audio_first=True)
+        with av.open(str(path)) as container:
+            self.assertEqual([stream.type for stream in container.streams], ["audio", "video"])
+        record = self.deliver(path, "video/mp4")
+        response = await self.client.get(f"/files/{record['id']}/thumbnail?w=240")
+        self.assertEqual(response.status_code, 200, response.text)
+        with Image.open(io.BytesIO(response.content)) as image:
+            self.assertEqual(image.size, (240, 135))
+
+    async def test_exif_dimensions_match_displayed_thumbnail(self):
+        for orientation, expected in ((2, (1200, 600)), (6, (600, 1200)), (8, (600, 1200))):
+            with self.subTest(orientation=orientation):
+                path = self.root / f"oriented-{orientation}.jpg"
+                exif = Image.Exif()
+                exif[274] = orientation
+                Image.new("RGB", (1200, 600), (20, 80, 140)).save(path, exif=exif)
+                record = self.deliver(path, "image/jpeg")
+                metadata = await self.client.get(f"/files/{record['id']}/preview")
+                thumbnail = await self.client.get(f"/files/{record['id']}/thumbnail?w=240")
+                self.assertEqual((metadata.status_code, thumbnail.status_code), (200, 200))
+                dimensions = metadata.json()
+                with Image.open(io.BytesIO(thumbnail.content)) as image:
+                    self.assertEqual(
+                        dimensions["width"] * image.height,
+                        dimensions["height"] * image.width,
+                    )
+                self.assertEqual((dimensions["width"], dimensions["height"]), expected)
 
     async def test_thumbnail_width_whitelist_and_aspect_ratio(self):
         path = self.root / "photo.png"

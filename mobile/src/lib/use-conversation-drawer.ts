@@ -17,7 +17,7 @@ import { agentDisplayName } from "@/lib/agent-display-name.ts";
 export function useConversationDrawer(session: ChatSession | null, currentId: string, agentId: string | undefined, focused: boolean) {
   const owner = useMemo(() => ({ session, currentId, agentId, focused }), [session, currentId, agentId, focused]);
   const flowRef = useRef<{ owner: typeof owner; flow: DrawerFlow } | null>(null);
-  const [view, setView] = useState<{ owner: typeof owner; open: boolean; onClosed(): void } | null>(null);
+  const [view, setView] = useState<{ owner: typeof owner; open: boolean; closing: boolean; onClosed(): void } | null>(null);
   useEffect(() => {
     if (session?.connection === "open" && agentId && focused) void session.refreshCollaborations(agentId);
   }, [session, agentId, focused, session?.connection]);
@@ -31,7 +31,11 @@ export function useConversationDrawer(session: ChatSession | null, currentId: st
         session && agentId !== undefined ? session.blankConversation(agentId) : Promise.reject(new Error(t("对话还没加载"))),
       hasConversation: (id) => !!session?.chat(id),
       navigate: (id) => switchConversation(id, (params) => router.setParams(params)),
-      setOpen: (open) => setView({ owner, open, onClosed: () => next.onClosed() }),
+      // Only a real Flow close emits false; keep its input barrier until animation completion.
+      setOpen: (open) => setView({ owner, open, closing: !open, onClosed: () => {
+        next.onClosed();
+        setView((current) => current?.owner === owner && !current.open ? { ...current, closing: false } : current);
+      } }),
       failed: (error) => Alert.alert(t("无法新建对话"), error instanceof Error ? t(error.message) : String(error)),
     });
     flowRef.current = { owner, flow: next };
@@ -77,8 +81,11 @@ export function useConversationDrawer(session: ChatSession | null, currentId: st
       if (session && agentId) void session.refreshCollaborations(agentId);
       currentFlow()?.show();
     },
+    /** 与抽屉内按钮共用同步 busy 防重和关闭后导航规则。 */
+    newConversation: () => void currentFlow()?.newConversation(),
     drawerProps: {
       open: view?.owner === owner && view.open,
+      closing: view?.owner === owner && view.closing,
       agentName,
       agentId: agentId ?? "",
       conversations,

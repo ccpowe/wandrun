@@ -20,7 +20,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 import uvicorn
 from uvicorn.protocols.websockets.wsproto_impl import WSProtocol
-from dotenv import load_dotenv
 
 from wandrun.config import load_config
 from wandrun.gateway.http import create_app
@@ -39,8 +38,6 @@ from wandrun.metrics import RunMetrics
 from wandrun.runtime.session import open_runtime
 from wandrun.runtime.workers import SchedulerFailure
 from wandrun.runtime.workspace import Workspace
-
-load_dotenv()
 
 
 def _is_loopback(host: str) -> bool:

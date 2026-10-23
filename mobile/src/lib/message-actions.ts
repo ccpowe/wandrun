@@ -3,6 +3,9 @@ import type { Token } from "markdown-it";
 import { splitAgentMessage } from "./agent-message.ts";
 import { parseMessageMarkdown } from "./agent-message-markdown.ts";
 import type { Item } from "./chat-timeline.ts";
+import { buildFileTree, type FileTreeNode } from "../components/rich-message/file-tree-model.ts";
+import { parseRichSpec, type RichSpec } from "../components/rich-message/spec.ts";
+import { t } from "./i18n.ts";
 
 export type MessageText = { copy: string; quote: string };
 
@@ -10,7 +13,7 @@ function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-/** Only display text from reachable UI elements; never include state, bindings, URLs or raw JSON. */
+/** Only reachable display text; link summaries include hostnames, never destination paths, state or raw JSON. */
 function summarizeUi(source: string): string {
   let spec: Record<string, unknown> | null;
   try { spec = record(JSON.parse(source)); } catch { return ""; }
@@ -19,6 +22,7 @@ function summarizeUi(source: string): string {
   const result: string[] = [];
   const seen = new Set<string>();
   const stack = [spec.root];
+  let validatedSpec: RichSpec | null | undefined;
   const displayFields = ["title", "text", "label", "description", "caption", "alt", "note", "hint"];
   const collect = (value: unknown) => {
     const props = record(value);
@@ -34,6 +38,34 @@ function summarizeUi(source: string): string {
     seen.add(id);
     const element = record(elements[id]);
     const props = record(element?.props);
+    if (element?.type === "FileTree") {
+      // Historical malformed trees must not reach the model builder; other summaries stay best-effort.
+      if (validatedSpec === undefined) validatedSpec = parseRichSpec(source);
+      const tree = validatedSpec?.elements[id];
+      if (tree) {
+        result.push(tree.props.title || t("目录结构"));
+        const appendTree = (nodes: FileTreeNode[], depth: number) => {
+          for (const node of nodes) {
+            result.push(`${"  ".repeat(depth)}${node.name}${node.kind === "folder" ? "/" : ""}${node.note ? `  # ${node.note}` : ""}`);
+            appendTree(node.children, depth + 1);
+          }
+        };
+        appendTree(buildFileTree(tree.props.nodes), 0);
+      }
+      continue;
+    }
+    if (element?.type === "LinkCard") {
+      if (typeof props?.title === "string" && typeof props.url === "string") {
+        try {
+          const url = new URL(props.url);
+          if (url.protocol === "http:" || url.protocol === "https:") {
+            result.push(`${props.title} — ${url.hostname.replace(/^www\./, "")}`);
+            if (typeof props.description === "string" && props.description.trim()) result.push(props.description.trim());
+          }
+        } catch { /* Invalid historical URLs have no displayable domain. */ }
+      }
+      continue;
+    }
     collect(props);
     if (element?.type === "Table") {
       if (Array.isArray(props?.columns)) result.push(props.columns.filter((column): column is string => typeof column === "string").join("\t"));

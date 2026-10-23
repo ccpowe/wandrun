@@ -62,8 +62,11 @@ test("缺失成员不能被解释为没有委派关系，列表补齐后恢复�
 });
 
 test("资料状态只聚合该 Agent 的直接对话，不误用其他 Agent 或最近已停止对话", () => {
-  assert.equal(profileStatus("a", [{ agent_id: "a", status: "idle" }, { agent_id: "a", status: "working" }]), "对话进行中");
-  assert.equal(profileStatus("a", [{ agent_id: "b", status: "working" }, { agent_id: "a", status: "failed" }]), "暂无进行中的对话");
+  const idle = profileStatus("a", []);
+  const active = profileStatus("a", [{ agent_id: "a", status: "working" }]);
+  assert.notEqual(active, idle);
+  assert.equal(profileStatus("a", [{ agent_id: "a", status: "idle" }, { agent_id: "a", status: "working" }]), active);
+  assert.equal(profileStatus("a", [{ agent_id: "b", status: "working" }, { agent_id: "a", status: "failed" }]), idle);
 });
 
 test("列表快照先到、资料仍旧时，迟到的更新和删除事件让成员与不存在状态收敛", async (t) => {

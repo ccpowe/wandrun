@@ -1,6 +1,8 @@
 import asyncio
+import tempfile
 import unittest
 from contextvars import ContextVar
+from pathlib import Path
 from unittest.mock import patch
 
 from langchain.agents import create_agent
@@ -9,11 +11,196 @@ from langchain.tools import tool
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langgraph.checkpoint.memory import InMemorySaver
 
+from wandrun.runtime.memory import MemoryStore
 from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime.workers import CommunicationMiddleware, WorkerManager, worker_tools
+from wandrun.runtime.scheduler_store import SchedulerStore
+from wandrun.runtime.workers import (
+    CommunicationMiddleware, WorkerManager, current_execution_generation, worker_tools,
+)
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_profile_permission_is_root_interaction_not_role_identity(self):
+        entered = asyncio.Queue()
+        release = asyncio.Event()
+        async def run(prompts, task_id):
+            await entered.put(task_id)
+            await release.wait()
+            return AgentOutput(messages=[], next="done")
+        manager = WorkerManager(
+            run, agent_workers={"main": ("main",)}, default_agent="main",
+        )
+        self.addAsyncCleanup(manager.close)
+        manager.start("user", "root", direct_user=True)
+        manager.start("same role delegate", "member", sender_id="root", agent_name="main")
+        manager.start("timer", "timer", agent_name="main")
+        self.assertEqual({await entered.get(), await entered.get(), await entered.get()},
+                         {"root", "member", "timer"})
+        leases = {task: manager.execution_generation(task) for task in ("root", "member", "timer")}
+        manager.authorize_memory("root", "main", leases["root"], profile=True)
+        manager.authorize_memory("member", "main", leases["member"], profile=False)
+        manager.authorize_memory("timer", "main", leases["timer"], profile=False)
+        for task in ("member", "timer"):
+            with self.assertRaisesRegex(ValueError, "入口任务"):
+                manager.authorize_memory(task, "main", leases[task], profile=True)
+        for task in ("missing", "root"):
+            with self.assertRaisesRegex(ValueError, "失效"):
+                manager.authorize_memory(task, "other", leases["root"], profile=False)
+        release.set()
+        await manager.wait("root")
+        self.assertFalse(manager.memory_permission("root", "main", leases["root"]))
+        with self.assertRaisesRegex(ValueError, "失效"):
+            manager.authorize_memory("root", "main", leases["root"], profile=False)
+
+    async def test_agent_retirement_revokes_live_memory_lease(self):
+        entered = asyncio.Event()
+        async def run(prompts, task_id):
+            entered.set()
+            await asyncio.Event().wait()
+        manager = WorkerManager(run, agent_workers={"main": ()}, default_agent="main")
+        self.addAsyncCleanup(manager.close)
+        manager.start("user", "root", direct_user=True)
+        await entered.wait()
+        generation = manager.execution_generation("root")
+        manager.retire_agent("main")
+        for profile in (False, True):
+            with self.assertRaisesRegex(ValueError, "失效"):
+                manager.authorize_memory("root", "main", generation, profile=profile)
+        await manager.cancel("root")
+
+    async def test_waiting_root_resumes_interaction_but_old_generation_is_revoked(self):
+        entered = asyncio.Queue()
+        release = asyncio.Event()
+        async def run(prompts, task_id):
+            generation = current_execution_generation.get()
+            await entered.put(generation)
+            if generation == 1:
+                return AgentOutput(messages=[], next="wait")
+            await release.wait()
+            return AgentOutput(messages=[], next="done")
+        manager = WorkerManager(run, agent_workers={"main": ()}, default_agent="main")
+        self.addAsyncCleanup(manager.close)
+        manager.start("user", "root", direct_user=True)
+        first = await entered.get()
+        self.assertEqual((await manager.wait("root"))["status"], "waiting")
+        self.assertFalse(manager.memory_permission("root", "main", first))
+        manager.notify("root", {"member": "completed"})
+        second = await entered.get()
+        self.assertNotEqual(first, second)
+        manager.authorize_memory("root", "main", second, profile=True)
+        with self.assertRaisesRegex(ValueError, "失效"):
+            manager.authorize_memory("root", "main", first, profile=False)
+        release.set()
+        self.assertEqual((await manager.wait("root"))["status"], "completed")
+        self.assertFalse(manager.memory_permission("root", "main", second))
+
+    async def test_interrupt_cancel_and_late_execution_cannot_reclaim_profile(self):
+        entered = asyncio.Queue()
+        release_old = asyncio.Event()
+        release_new = asyncio.Event()
+        async def run(prompts, task_id):
+            generation = current_execution_generation.get()
+            await entered.put(generation)
+            if generation == 1:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await release_old.wait()
+                    raise
+            await release_new.wait()
+            return AgentOutput(messages=[], next="done")
+        manager = WorkerManager(run, agent_workers={"main": ()}, default_agent="main")
+        self.addAsyncCleanup(manager.close)
+        manager.start("user", "root", direct_user=True)
+        old = await entered.get()
+        manager.interrupt("new user input", "root", direct_user=True)
+        with self.assertRaisesRegex(ValueError, "失效"):
+            manager.authorize_memory("root", "main", old, profile=True)
+        release_old.set()
+        new = await entered.get()
+        self.assertNotEqual(old, new)
+        manager.authorize_memory("root", "main", new, profile=True)
+        with self.assertRaisesRegex(ValueError, "失效"):
+            manager.authorize_memory("root", "main", old, profile=False)
+        stopped = await manager.cancel("root")
+        self.assertIn("root", stopped["stopped"])
+        with self.assertRaisesRegex(ValueError, "失效"):
+            manager.authorize_memory("root", "main", new, profile=False)
+        release_new.set()
+
+    async def test_staged_cleanup_failure_reports_unconfirmed_without_reauthorizing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entered = asyncio.Event()
+            async def run(prompts, task_id):
+                entered.set()
+                await asyncio.Event().wait()
+            store = MemoryStore(Path(directory) / "memory")
+            manager = WorkerManager(run)
+            manager.bind_memory(store)
+            self.addAsyncCleanup(manager.close)
+            manager.start("user", "root", direct_user=True)
+            await entered.wait()
+            generation = manager.execution_generation("root")
+            owner = f"root:{generation}"
+            prepared = store.prepare_detail(
+                "worker", "style", "unpublished", store.read("worker").version,
+                owner=owner,
+                authorize=lambda: manager.authorize_memory(
+                    "root", "worker", generation, profile=False,
+                ),
+            )
+            staged_file = store.root / "agents" / "worker" / "details" / "style" / f"{prepared.sha256}.md"
+            self.assertTrue(staged_file.exists())
+            cleanup = store._cleanup
+            attempts = 0
+            def failing_cleanup(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise OSError("staged cleanup failed")
+                return cleanup(*args, **kwargs)
+            with patch.object(store, "_cleanup", side_effect=failing_cleanup):
+                stopped = await manager.cancel("root")
+                self.assertEqual(stopped["cleanup_unconfirmed"], [f"memory:{owner}"])
+                with self.assertRaisesRegex(ValueError, "失效"):
+                    manager.authorize_memory("root", "worker", generation, profile=False)
+                await manager.close()
+            self.assertEqual(attempts, 3)
+            self.assertFalse(staged_file.exists())
+
+    async def test_restart_resumption_does_not_inherit_direct_user_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.sqlite"
+            entered = asyncio.Event()
+            async def blocked(prompts, task_id):
+                entered.set()
+                await asyncio.Event().wait()
+            store = SchedulerStore(path)
+            manager = WorkerManager(blocked, store=store)
+            manager.start("user", "root", direct_user=True)
+            await entered.wait()
+            generation = manager.execution_generation("root")
+            manager.authorize_memory("root", "worker", generation, profile=True)
+            await manager.close()
+            store.close()
+            resumed = asyncio.Event()
+            async def second_run(prompts, task_id):
+                resumed.set()
+                await asyncio.Event().wait()
+            store = SchedulerStore(path)
+            manager = WorkerManager(second_run, store=store)
+            try:
+                self.assertFalse(manager.memory_permission("root", "worker", generation))
+                manager.start("timer resume", "root")
+                await resumed.wait()
+                current = manager.execution_generation("root")
+                with self.assertRaisesRegex(ValueError, "入口任务"):
+                    manager.authorize_memory("root", "worker", current, profile=True)
+                manager.authorize_memory("root", "worker", current, profile=False)
+            finally:
+                await manager.close()
+                store.close()
+
     async def test_terminal_and_message_share_one_execution(self):
         from wandrun.terminal.chat import TerminalOutput, chat
 

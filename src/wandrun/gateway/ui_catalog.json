@@ -14,6 +14,7 @@
     {"intent": "分组选项卡", "components": ["Tabs"]},
     {"intent": "渐进展示详情", "components": ["Accordion"]},
     {"intent": "引用网页来源", "components": ["Source", "LinkCard"]},
+    {"intent": "展示目录结构", "components": ["FileTree"]},
     {"intent": "展示步骤、提示、原话或紧凑列表", "components": ["List", "Callout", "Quote", "Icon"]},
     {"intent": "展示公式", "components": ["Math"]},
     {"intent": "展示截图或图片（同条消息附件路径或可靠来源的真实图片 URL）", "components": ["Image"]},
@@ -22,6 +23,8 @@
   ],
   "examples": [
     {"title":"对比摘要","chapter":"display.md","spec":{"root":"r","elements":{"r":{"type":"Stack","props":{},"children":["h","t"]},"h":{"type":"Heading","props":{"text":"方案 A 更适合当前需求"},"children":[]},"t":{"type":"Table","props":{"columns":["方案","差异"],"rows":[["A","功能完整"],["B","配置更少"]]},"children":[]}},"state":{}}},
+    {"title":"目录结构","chapter":"display.md","spec":{"root":"r","elements":{"r":{"type":"FileTree","props":{"title":"项目结构","nodes":[{"path":"src/components/","note":"界面组件"},{"path":"src/components/App.tsx","note":"应用入口"},{"path":"src/utils/format.ts","kind":"file"}]},"children":[]}},"state":{}}},
+    {"title":"链接清单","chapter":"display.md","spec":{"root":"r","elements":{"r":{"type":"Stack","props":{},"children":["a","b"]},"a":{"type":"LinkCard","props":{"url":"https://example.org/guide","title":"入门指南","description":"基础用法与示例","tags":["文档"]},"children":[]},"b":{"type":"LinkCard","props":{"url":"https://example.org/api","title":"接口参考","description":"接口与参数说明"},"children":[]}},"state":{}}},
     {"title":"趋势","chapter":"charts.md","spec":{"root":"r","elements":{"r":{"type":"LineChart","props":{"title":"完成项","xLabels":["周一","周二","周三"],"series":[{"name":"项目","values":[2,3,5]}],"unit":"项"},"children":[]}},"state":{}}},
     {"title":"收集偏好","chapter":"forms.md","spec":{"root":"r","elements":{"r":{"type":"Stack","props":{},"children":["f","m","n","s"]},"f":{"type":"Segmented","props":{"stateKey":"frequency","label":"频率","options":[{"value":"week","label":"每周"},{"value":"month","label":"每月"}]},"children":[]},"m":{"type":"MultiSelect","props":{"stateKey":"topics","label":"内容","options":[{"value":"progress","label":"进度"},{"value":"risks","label":"风险"}]},"children":[]},"n":{"type":"Switch","props":{"stateKey":"notify","label":"提醒"},"children":[]},"s":{"type":"Submit","props":{"label":"提交偏好"},"children":[]}},"state":{"frequency":"week","topics":["progress"],"notify":true}}},
     {"title":"流程图","chapter":"media.md","spec":{"root":"r","elements":{"r":{"type":"Mermaid","props":{"source":"flowchart LR\n  A[开始] --> B{检查}\n  B -->|通过| C[完成]","title":"处理流程"},"children":[]}},"state":{}}}
@@ -152,8 +155,12 @@
       "props": {"type":"object","properties":{"items":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"url":{"$ref":"#/$defs/webUrl"},"title":{"type":"string","maxLength":80}},"required":["url"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}
     },
     "LinkCard": {
-      "description": "模型提供标题与简介，域名由 URL 解析，点击系统浏览器；不抓取 favicon。", "container": false,
-      "props": {"type":"object","properties":{"url":{"$ref":"#/$defs/webUrl"},"title":{"type":"string","maxLength":80},"description":{"type":"string","maxLength":500}},"required":["url","title"],"additionalProperties":false}
+      "description": "相邻链接卡片组成无框清单；模型提供标题与简介，域名由 URL 解析，点击系统浏览器。不编号、不套 Card；只有工具提供可靠的真实图片 URL 才填写 image 并由网关代理，否则省略 image，网关仅将链接主机名交给 Google s2 获取第三方站点图标，不抓取原网页；失败显示首字母。", "container": false,
+      "props": {"type":"object","properties":{"url":{"$ref":"#/$defs/webUrl"},"title":{"type":"string","maxLength":80},"description":{"type":"string","maxLength":500},"image":{"$ref":"#/$defs/webUrl"},"tags":{"type":"array","maxItems":3,"items":{"type":"string","maxLength":12}}},"required":["url","title"],"additionalProperties":false}
+    },
+    "FileTree": {
+      "description": "目录结构用 FileTree，不用代码块画树。扁平相对路径保留输入顺序，缺失父目录自动补全；省略 kind 时，有子项或路径末尾 / 即目录。路径不以 / 开头、无空段或 . / .. 段、每段 ≤64 码点、最多 8 层；不可重复或挂在文件下。", "container": false,
+      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":40},"nodes":{"type":"array","minItems":1,"maxItems":80,"items":{"type":"object","properties":{"path":{"type":"string","minLength":1,"maxLength":200},"kind":{"enum":["folder","file"]},"note":{"type":"string","maxLength":60},"collapsed":{"type":"boolean"}},"required":["path"],"additionalProperties":false}}},"required":["nodes"],"additionalProperties":false}
     },
     "Icon": {
       "description": "受控 lucide 常用图标名；可给独立语义的图标添加无障碍标签。", "container": false,

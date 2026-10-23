@@ -358,6 +358,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         from langchain_core.messages import ToolMessage
         from wandrun.config import load_config
         from wandrun.runtime.compaction_summary import SUMMARY_INSTRUCTION
+        from compaction_fixtures import SUMMARY_TEXT
 
         report = "trace row\n" * 20000 + "deep.wire_crc=8E91C2A4\n" + "tail row\n" * 2000
         @tool
@@ -375,7 +376,13 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 output = [{"type": "function_call", "call_id": "report", "name": "diagnostic_report",
                            "arguments": "{}"}]
             elif body["input"][-1].get("content") == SUMMARY_INSTRUCTION:
-                yield answer("诊断报告已卸载；请按工具结果路径读取完整文件。")
+                yield answer(SUMMARY_TEXT.replace(
+                    "已读 /reports/a.txt 第 1～80 行，覆盖全文；result=67，信息已足够回答。",
+                    "诊断报告已卸载；只看到工具给出的预览，尚未核对深处校验值，完整文件可按工具结果路径读取。",
+                ).replace(
+                    "仅剩向 human 发送 result=67，不需要再次读取报告。",
+                    "按留存的工具结果路径读取必要范围，核对深处校验值后交付。",
+                ))
                 return
             else:
                 yield answer("报告已保存")
@@ -741,11 +748,12 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalog_window_refresh_only_changes_compaction_after_commit(self):
         from wandrun.runtime.compaction_summary import SUMMARY_INSTRUCTION
+        from compaction_fixtures import SUMMARY_TEXT
 
         requests = []
         async def respond(model, body):
             requests.append(body)
-            yield answer("旧任务约束：不得覆盖已有文件。" if body["input"][-1].get("content") == SUMMARY_INSTRUCTION else "done")
+            yield answer(SUMMARY_TEXT if body["input"][-1].get("content") == SUMMARY_INSTRUCTION else "done")
 
         with tempfile.TemporaryDirectory() as directory:
             workspace = configure(Path(directory))

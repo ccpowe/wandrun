@@ -253,7 +253,7 @@ function ScheduleEditor({ id, agentId, session }: { id?: string; agentId: string
         <View className="gap-1 border-b border-border px-4 py-3"><Text>{t("时区")}</Text>
           <Input testID="schedule-timezone" value={draft.timezone} editable={!locked} autoCapitalize="none" placeholder={t("例如 Asia/Shanghai")}
             onChangeText={(timezone) => change({ ...draft, timezone })} />
-          <Text className="text-xs text-muted-foreground">{t("使用 IANA 时区，新建时默认电脑时区，自动处理夏令时。")}</Text></View>
+          <Text className="text-xs text-muted-foreground">{t("使用 IANA 时区，默认电脑时区，自动处理夏令时。")}</Text></View>
         <View className="min-h-[52px] flex-row items-center justify-between px-4"><Text>{t("启用")}</Text>
           <Switch testID="schedule-enabled" value={draft.enabled} disabled={locked}
             trackColor={{ false: String(muted ?? "#F0F0ED"), true: String(foreground ?? "#141414") }}
@@ -261,7 +261,7 @@ function ScheduleEditor({ id, agentId, session }: { id?: string; agentId: string
         </View>
       </View>
       {detail && <Text testID="schedule-next" className="mx-8 mt-3 text-sm text-muted-foreground">{scheduleNext(detail)}</Text>}
-      {saveError ? <Text testID="schedule-save-error" className="mx-6 mt-3 text-sm text-destructive">{t(saveError)}{createUnknown ? t("。结果未知，请沿用同一请求重试；确认前不能修改或退出。") : ""}</Text> : null}
+      {saveError ? <Text testID="schedule-save-error" className="mx-6 mt-3 text-sm text-destructive">{t(saveError)}{createUnknown ? t("。结果未确认，请重试本次操作；确认前不能修改或退出。") : ""}</Text> : null}
       {id && <>
         <Text className="mx-8 mt-6 mb-2 text-xs text-muted-foreground">{t("最近运行")}</Text>
         <View className="mx-4 overflow-hidden rounded-xl border border-border bg-card">

@@ -37,7 +37,7 @@ export default function AppearanceSettings() {
         <SelectionRow testID="appearance-theme-dark" label={t("深色")} single selected={state.theme === "dark"}
           leading={<Icon as={Moon} className="size-[22px] text-muted-foreground" />} disabled={state.saving} onPress={() => change({ theme: "dark" })} />
       </ListGroup>
-      <Text className="mx-8 mt-3 text-xs leading-[18px] text-muted-foreground">{t("外观设置会保存在此设备上，不影响其他设备。")}</Text>
+      <Text className="mx-8 mt-3 text-xs leading-[18px] text-muted-foreground">{t("仅保存在此设备")}</Text>
       {state.error ? <Text testID="appearance-save-error" accessibilityRole="alert" className="mx-8 mt-3 text-sm text-destructive">{t(state.error)}</Text> : null}
     </ScrollView>
   </View>;

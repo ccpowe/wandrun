@@ -129,7 +129,7 @@ function ProfileScreen({ id, initialTab, session }: { id: string; initialTab: Pr
               !error && <Text className="mt-12 text-center text-sm text-muted-foreground">{t("正在加载成员…")}</Text>
             ) : detail.workers.length === 0 ? (
               <View testID="profile-empty-members" className="min-h-[320px] flex-1">
-                <EmptyState title={t("它没有可以委派的成员")} description={t("成员就是它能直接委派的 Agent。")} />
+                <EmptyState title={t("没有成员")} />
               </View>
             ) : (
               <>

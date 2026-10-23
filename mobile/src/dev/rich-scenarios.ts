@@ -350,6 +350,47 @@ ${fence(showcaseMermaid)}
 ## 08. 其他依赖外部数据的专用组件
 ${fence(showcaseExternal)}`;
 
+const linkList = spec(node("Stack", { gap: "md" },
+  node("Text", { text: "按和你当前问题的关联程度排序：" }),
+  node("LinkCard", { title: "React Native Storybook", url: "https://storybookjs.github.io/react-native/",
+    image: "https://storybookjs.github.io/react-native/preview.png",
+    tags: ["组件隔离开发", "状态预览"], description: "最值得先学的工具。重点看 Stories、Mock 数据、组件状态和 Expo 集成。" }),
+  node("LinkCard", { title: "React 状态管理官方教程（中文）", url: "https://zh-hans.react.dev/learn/managing-state",
+    tags: ["状态设计"], description: "状态结构、Reducer、状态提升、保留与重置状态，决定页面是否容易测试和维护。" }),
+  node("LinkCard", { title: "Expo Router 文档", url: "https://docs.expo.dev/router/introduction/",
+    image: "https://docs.expo.dev/assets/not-available.png", tags: ["页面路由", "导航架构"],
+    description: "路由组织、Layout、动态路由、路由分组以及导航边界。" }),
+  node("Text", { text: "中间的文字结束上一组，下一条是独立链接。" }),
+  node("LinkCard", { title: "Expo 官方博客：如何组织一个会持续增长的 React Native 项目目录，以及 features 与 shared 的边界该怎么划",
+    url: "https://expo.dev/blog", tags: ["项目结构"],
+    description: "从路由、功能模块、共享 UI 到工具函数，逐层说明每个目录该放什么、不该放什么。" })));
+
+const fileTree = spec(node("FileTree", { title: "项目结构", nodes: [
+  { path: "src/features/orders/screens/", note: "业务页面" },
+  { path: "src/features/orders/components/", note: "订单专用组件" },
+  { path: "src/features/orders/api/", note: "请求和数据转换" },
+  { path: "src/features/orders/model/", note: "类型、纯业务规则" },
+  { path: "src/features/orders/fixtures/", note: "开发和测试用固定数据" },
+  { path: "src/features/orders/hooks/", note: "页面逻辑" },
+  { path: "src/app/", note: "路由、布局、导航组装" },
+  { path: "src/features/", note: "业务能力", collapsed: false },
+  { path: "src/shared/ui/", note: "跨业务基础组件" },
+  { path: "src/shared/theme/", note: "设计 Token" },
+  { path: "src/shared/lib/", note: "公共基础函数" },
+  { path: "src/App.tsx", note: "入口" },
+] }));
+const longFileTree = spec(node("FileTree", { title: "项目结构", nodes: [
+  { path: "src/features/customer-profile-and-loyalty-points/useLoyaltyPointsBalanceWithOptimisticUpdates.ts",
+    note: "乐观更新，失败时回滚" },
+  { path: "src/features/customer-profile-and-loyalty-points/", note: "会员资料、积分与等级；和订单共用地址选择，但不共用支付状态", collapsed: false },
+  ...Array.from({ length: 24 }, (_, index) => ({
+    path: `src/features/orders/module-${String(index + 1).padStart(2, "0")}/index.ts`,
+    note: `第 ${index + 1} 组业务功能与共享模块之间的集成说明，故意写得很长以观察换行`,
+  })),
+  { path: "src/features/orders/", collapsed: true },
+  { path: "src/shared/index.ts", note: "跨业务入口" },
+] }));
+
 type Scenario = { id: string; title: string; text: string; state: Record<string, unknown>;
   submitted?: boolean; invalid?: boolean; files?: Record<string, string>;
   attachments?: { id: string; media_type: string }[] };
@@ -361,6 +402,9 @@ export const richScenarios: Scenario[] = [
   { id: "math-budget", title: "500 段公式", text: "价格 $20、$30；$20和$30；USD $20–$30。\n\n" +
     Array.from({ length: 500 }, (_, index) => `第 ${index + 1} 段公式 $x^2+${index + 1}$`).join("\n\n"), state: {} },
   { id: "sources", title: "来源", text: fence(sources), state: sources.state },
+  { id: "link-list-v3", title: "链接列表 v3 · 图片失败与长标题", text: fence(linkList), state: linkList.state },
+  { id: "file-tree-v3", title: "目录树 v3 · 缺失父目录", text: fence(fileTree), state: fileTree.state },
+  { id: "file-tree-large", title: "目录树 v3 · 超过 24 项与长注释", text: fence(longFileTree), state: longFileTree.state },
   { id: "responsive", title: "窄屏回归", text: fence(responsive), state: responsive.state },
   { id: "grid-state", title: "换列状态", text: fence(gridState), state: gridState.state },
   { id: "components", title: "P2 组件", text: fence(components), state: components.state },

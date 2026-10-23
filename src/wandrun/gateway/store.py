@@ -29,8 +29,8 @@ from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.gateway.connectors import UnknownConnector, public_connector
 from wandrun.gateway.schedules import UnknownSchedule, next_run_at
 
-# 22：应用唯一绑定及 OAuth 注册、凭据和代际与连接器同库；升级须清空 state。
-SCHEMA_VERSION = 22
+# 23：画像与工作记忆分归属持久化作者；升级须清空 state。
+SCHEMA_VERSION = 23
 AVATAR_COUNT = 8
 
 
@@ -76,10 +76,14 @@ CREATE TABLE agent_workers (
 -- 删除跨检查点与调度库，必须先保存意图；最后只在没有对话和外部成员引用时删定义。
 CREATE TABLE deleting_agents (id TEXT PRIMARY KEY REFERENCES agents(id));
 CREATE TABLE memory_metadata (
-    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    scope TEXT NOT NULL CHECK (scope IN ('profile', 'work')),
+    agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,
     version TEXT NOT NULL,
-    updated_by TEXT NOT NULL CHECK (updated_by IN ('user', 'agent'))
+    updated_by TEXT NOT NULL CHECK (updated_by IN ('user', 'agent')),
+    CHECK ((scope = 'profile' AND agent_id IS NULL) OR (scope = 'work' AND agent_id IS NOT NULL))
 );
+CREATE UNIQUE INDEX memory_metadata_profile ON memory_metadata(scope) WHERE scope = 'profile';
+CREATE UNIQUE INDEX memory_metadata_work ON memory_metadata(agent_id) WHERE scope = 'work';
 CREATE TABLE deleted_agents (
     id TEXT PRIMARY KEY,
     event_seq INTEGER NOT NULL REFERENCES events(seq)
@@ -991,42 +995,47 @@ class GatewayStore:
                 )
             return self.agent(identity), self._resource_changed(identity, "updated")
 
-    def memory_author(self, identity: str, version: str) -> str | None:
-        """只有正文版本仍匹配最后一次受管写入时才归属其修改者。"""
+    def memory_author(self, identity: str | None, version: str) -> str | None:
+        """仅在该归属的文档版本仍与最后一次受管写入匹配时归属修改者。"""
+        scope = "profile" if identity is None else "work"
         row = self._connection.execute(
-            "SELECT version, updated_by FROM memory_metadata WHERE agent_id = ?", (identity,)
+            "SELECT version, updated_by FROM memory_metadata"
+            " WHERE scope = ? AND agent_id IS ?",
+            (scope, identity),
         ).fetchone()
         return row[1] if row is not None and row[0] == version else None
 
     def record_memory_change(
-        self, identity: str, version: str, updated_by: str, conversation_id: str | None,
+        self, identity: str | None, version: str, updated_by: str,
+        conversation_id: str | None, *, writer_agent_id: str | None = None,
     ) -> None:
-        """文件已保存后，将作者与全部通知原子提交；失败必须交由网关停服。"""
+        """文件发布后的作者和两类通知同事务持久化，失败交由网关停服。"""
+        scope = "profile" if identity is None else "work"
         with self._connection:
-            self._require_agent(identity)
-            if self.agent_deleting(identity):
-                raise RuntimeError(f"Agent 正在删除：{identity}")
+            if identity is not None:
+                self._require_agent(identity)
+                if self.agent_deleting(identity):
+                    raise RuntimeError(f"Agent 正在删除：{identity}")
             self._connection.execute(
-                "INSERT INTO memory_metadata (agent_id, version, updated_by) VALUES (?, ?, ?)"
-                " ON CONFLICT(agent_id) DO UPDATE SET version = excluded.version,"
-                " updated_by = excluded.updated_by",
-                (identity, version, updated_by),
+                "INSERT INTO memory_metadata (scope, agent_id, version, updated_by)"
+                " VALUES (?, ?, ?, ?) ON CONFLICT DO UPDATE SET"
+                " version = excluded.version, updated_by = excluded.updated_by",
+                (scope, identity, version, updated_by),
             )
             now = time.time()
-            self._insert(
-                None, "resource.changed", {"kind": "memory", "id": identity, "op": "updated"},
-                None, now,
-            )
+            resource = {"kind": "memory", "scope": scope, "op": "updated"}
+            if identity is not None:
+                resource["id"] = identity
+            self._insert(None, "resource.changed", resource, None, now)
             if conversation_id is not None and self._connection.execute(
                 "SELECT 1 FROM conversations WHERE id = ? AND NOT EXISTS"
                 " (SELECT 1 FROM deleting_conversations WHERE id = ?)",
                 (conversation_id, conversation_id),
             ).fetchone() is not None:
-                self._insert(
-                    conversation_id, "memory.updated",
-                    {"agent_id": identity, "version": version, "summary": "已记住"},
-                    None, now,
-                )
+                message = {"scope": scope, "version": version, "summary": "已记住"}
+                if writer_agent_id is not None:
+                    message["agent_id"] = writer_agent_id
+                self._insert(conversation_id, "memory.updated", message, None, now)
                 self._connection.execute(
                     "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id)
                 )
@@ -2108,12 +2117,12 @@ class GatewayStore:
         return self._conversations("WHERE c.agent_id = ?", (agent_id,))
 
     def _conversations(self, where: str, params: tuple) -> list[dict]:
-        # 未读：存在已读位置之后的 Agent 消息。最后一条摘要取最近的用户或 Agent 消息。
+        # 未读与实际最后根回复位置共用同一查询；全局快照水位不是本对话的消息位置。
         rows = self._connection.execute(
             "SELECT c.id, c.agent_id, c.title, c.created_at, c.updated_at, c.read_seq, c.status,"
             " c.source, c.schedule_origin,"
-            " EXISTS (SELECT 1 FROM events e WHERE e.conversation_id = c.id"
-            "  AND e.type = 'message.agent' AND json_extract(e.data, '$.timeline_ids') IS NULL AND e.seq > c.read_seq),"
+            " COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.conversation_id = c.id"
+            "  AND e.type = 'message.agent' AND json_extract(e.data, '$.timeline_ids') IS NULL), 0),"
             " (SELECT e.data FROM events e WHERE e.conversation_id = c.id"
             "  AND json_extract(e.data, '$.timeline_ids') IS NULL"
             "  AND e.type IN ('message.user', 'message.agent') ORDER BY e.seq DESC LIMIT 1)"
@@ -2131,11 +2140,12 @@ class GatewayStore:
                 "updated_at": updated_at,
                 "read_seq": read_seq,
                 "status": status,
-                "unread": bool(unread),
+                "last_agent_seq": last_agent_seq,
+                "unread": last_agent_seq > read_seq,
                 "last_text": json.loads(last)["text"] if last else None,
             }
             for identity, agent_id, title, created_at, updated_at, read_seq, status, source,
-            schedule_origin, unread, last in rows
+            schedule_origin, last_agent_seq, last in rows
         ]
 
     # ---- 浏览器任务：租约状态与全局事件同一事务提交 ----
