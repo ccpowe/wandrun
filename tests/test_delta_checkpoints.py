@@ -13,8 +13,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing_extensions import TypedDict
 
-from wandrun.runtime.agents import MESSAGE_SNAPSHOT_FREQUENCY, _MessageDeltaChannel
-from wandrun.runtime.conversations import conversation_config
+from wandrun.runtime.agent.agents import MESSAGE_SNAPSHOT_FREQUENCY, _MessageDeltaChannel
+from wandrun.runtime.agent.conversations import conversation_config
 
 
 class DeltaState(TypedDict):

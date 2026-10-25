@@ -12,9 +12,9 @@ from wandrun.integrations.codex_subscription import (
     CodexSubscriptionModel, CodexSubscriptionStreamError, _ResponseStream,
 )
 from wandrun.integrations.human_preview import HumanPreviewParser
-from wandrun.runtime.messages import AgentOutput
-from wandrun.runtime.preview import PreviewExecution, PreviewPersistenceError, current_preview
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.communication.messages import AgentOutput
+from wandrun.runtime.communication.preview import PreviewExecution, PreviewPersistenceError, current_preview
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 FORMAT = {"type": "json_schema", "json_schema": {

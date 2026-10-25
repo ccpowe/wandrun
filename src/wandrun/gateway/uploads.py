@@ -18,7 +18,7 @@ from uuid import uuid4
 from weakref import WeakValueDictionary
 
 from wandrun.gateway.store import GatewayStore
-from wandrun.runtime.files import TaskFiles, link_completed_file
+from wandrun.runtime.execution.files import TaskFiles, link_completed_file
 
 DEFAULT_MAX_UPLOAD_SIZE = 1024 ** 3
 UPLOAD_LIFETIME = 24 * 60 * 60

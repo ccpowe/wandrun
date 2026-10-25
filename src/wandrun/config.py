@@ -33,6 +33,7 @@ class AgentDefinition:
     environment: str | None = None
     # 显示名不参与检查点、收件人或委派图的身份；None 表示沿用 id。
     name: str | None = None
+    fast_mode: bool = False
 
 
 @dataclass(frozen=True)
@@ -416,6 +417,7 @@ def _parse_catalog(agents_data: object, default_environment: str) -> AgentCatalo
                 "name", "description", "system_prompt", "model", "reasoning_effort", "mcp_servers",
                 "searchable_mcp_servers", "workers", "skills", "code_mode", "environment",
                 "context_window", "compaction_keep_tokens", "compaction_model",
+                "fast_mode",
             },
         )
         # 只做来源解码：TOML 数组 → tuple，缺省值补齐；类型和取值是否合法交给 _check_definition，
@@ -439,6 +441,7 @@ def _parse_catalog(agents_data: object, default_environment: str) -> AgentCatalo
             code_mode=definition.get("code_mode", True),
             environment=definition.get("environment", default_environment),
             name=definition.get("name"),
+            fast_mode=definition.get("fast_mode", False),
         )
     return AgentCatalog(main_agent, agents)
 
@@ -484,6 +487,8 @@ def _check_definition(name: str, definition: AgentDefinition) -> None:
         _text(definition.compaction_model, f"{location}.compaction_model")
     if not isinstance(definition.code_mode, bool):
         raise ValueError(f"{location}.code_mode 必须是布尔值")
+    if not isinstance(definition.fast_mode, bool):
+        raise ValueError(f"{location}.fast_mode 必须是布尔值")
     _selection(definition.mcp_servers, f"{location}.mcp_servers")
     _selection(definition.searchable_mcp_servers, f"{location}.searchable_mcp_servers")
     _skill_names(definition.skills, f"{location}.skills")

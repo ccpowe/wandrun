@@ -12,8 +12,8 @@ from unittest.mock import patch
 
 from wandrun.config import load_config
 from wandrun.gateway.skills import inspect_skill
-from wandrun.runtime.environments import open_environments, open_ssh
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.execution.environments import open_environments, open_ssh
+from wandrun.runtime.execution.workspace import Workspace
 
 
 class WorkspaceConfigTests(unittest.TestCase):
@@ -71,7 +71,7 @@ class SSHOpeningFailureTests(unittest.IsolatedAsyncioTestCase):
 
         from wandrun.config import EnvironmentDefinition
         from wandrun.integrations.shell_backend import CleanupUnconfirmedError
-        from wandrun.runtime import environments
+        from wandrun.runtime.execution import environments
 
         class Connection:
             def get_extra_info(self, name):
@@ -171,8 +171,8 @@ class SSHBuiltinEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         from wandrun.config import EnvironmentDefinition
         from wandrun.integrations.shell_backend import ManagedShellBackend
         from wandrun.integrations.ssh_backend import _PREPARE, remote_script
-        from wandrun.runtime import environments
-        from wandrun.runtime.agents import _ConfiguredSkillsMiddleware
+        from wandrun.runtime.execution import environments
+        from wandrun.runtime.agent.agents import _ConfiguredSkillsMiddleware
 
         class Connection:
             def get_extra_info(self, name):

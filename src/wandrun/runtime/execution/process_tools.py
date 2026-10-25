@@ -14,7 +14,7 @@ from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 
 from wandrun.integrations.local_processes import Execution, ProcessTable
-from wandrun.runtime.browser import BrowserRejected
+from wandrun.runtime.browser.leases import BrowserRejected
 
 DEFAULT_YIELD_SECONDS = 30
 MAX_YIELD_SECONDS = 3600

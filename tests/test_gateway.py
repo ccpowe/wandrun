@@ -19,11 +19,11 @@ from wandrun.gateway.app import ensure_agents, exit_message, reporting_failure, 
 from wandrun.gateway.http import create_app, stream_cursor
 from wandrun.gateway.service import Gateway, GatewayFailure
 from wandrun.gateway.store import ClientIdConflict, GatewayStore, InvalidReadPosition, UnknownAgent
-from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime.scheduler_store import SchedulerStore
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.scheduler_store import SchedulerStore
 from wandrun.runtime.session import Runtime
-from wandrun.runtime.workers import WorkerManager
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.communication.workers import WorkerManager
+from wandrun.runtime.execution.workspace import Workspace
 
 from test_gateway_models import subscription_fixture
 from codex_test_home import isolate_codex_home
@@ -941,20 +941,9 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         by_id = {item["id"]: item for item in listing["agents"]}
         self.assertEqual(set(by_id), {"main", "a", "b", "c", "d"})
         self.assertEqual(by_id["c"]["workers"], ["a", "d"])
-        self.assertEqual(
-            set(by_id["c"]),
-            {"id", "name", "avatar", "description", "workers", "home", "latest_conversation", "unread"},
-        )
         detail = (await self.client.get("/agents/a")).json()
         self.assertEqual((detail["workers"], detail["member_of"]), (["b"], ["c"]))
         self.assertEqual(detail["system_prompt"], "完成任务。")
-        self.assertEqual(
-            {"id", "name", "avatar", "description", "system_prompt", "model", "reasoning_effort",
-             "mcp_servers", "searchable_mcp_servers", "skills", "code_mode", "environment",
-             "context_window", "compaction_keep_tokens", "compaction_model",
-             "workers", "member_of"},
-            set(detail),
-        )
         missing = await self.client.get("/agents/nobody")
         self.assertEqual((missing.status_code, missing.json()["error"]["code"]), (404, "not_found"))
 

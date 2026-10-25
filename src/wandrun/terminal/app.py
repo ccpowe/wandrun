@@ -8,8 +8,8 @@ from langchain.messages import AIMessage, ToolMessage
 
 from wandrun.metrics import RunMetrics
 from wandrun.runtime.session import open_runtime
-from wandrun.runtime.workers import SchedulerFailure
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.communication.workers import SchedulerFailure
+from wandrun.runtime.execution.workspace import Workspace
 from wandrun.terminal.chat import TerminalOutput, chat
 
 

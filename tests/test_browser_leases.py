@@ -23,9 +23,9 @@ from wandrun.config import AgentCatalog, AgentDefinition, BrowserDefinition
 from wandrun.integrations.browser_dev import ChromeDev
 from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import GatewayStore
-from wandrun.runtime.browser import BrowserLeases, BrowserRejected
-from wandrun.runtime.browser_cdp import CDPError, CDPSocket
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.browser.leases import BrowserLeases, BrowserRejected
+from wandrun.runtime.browser.cdp import CDPError, CDPSocket
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 async def until(predicate, timeout=3):
@@ -633,8 +633,8 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                 return await original_sleep(.005)
             return await original_sleep(delay)
         with patch.object(self.browser, "_close_target", side_effect=fail_once), \
-                patch("wandrun.runtime.browser.asyncio.sleep", side_effect=fast_idle), \
-                self.assertLogs("wandrun.runtime.browser", level="WARNING") as reported:
+                patch("wandrun.runtime.browser.leases.asyncio.sleep", side_effect=fast_idle), \
+                self.assertLogs("wandrun.runtime.browser.leases", level="WARNING") as reported:
             await until(lambda: self.browser.detail(second)["state"] == "released", timeout=8)
             self.assertEqual(self.browser.detail(first)["state"], "stopping")
             self.assertEqual(self.browser.capacity()["slots_used"], 1)

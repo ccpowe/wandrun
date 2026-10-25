@@ -29,11 +29,11 @@ from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
 from wandrun.integrations.codex_subscription import ContextWindowExceededError
-from wandrun.runtime.compaction_archive import CompactionArchive
-from wandrun.runtime.compaction_summary import (
+from wandrun.runtime.context.compaction_archive import CompactionArchive
+from wandrun.runtime.context.compaction_summary import (
     memory_execution_barriers, request_model_kwargs, summarize_request,
 )
-from wandrun.runtime.messages import read_file_media_tool_call_id
+from wandrun.runtime.communication.messages import read_file_media_tool_call_id
 
 logger = logging.getLogger(__name__)
 _SUMMARY_HEADER = (

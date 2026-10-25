@@ -14,14 +14,15 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
-from wandrun.runtime.agents import COMMUNICATION, _system_prompt, build_agents, run_conversation
-from wandrun.runtime.files import TaskFiles, _current_task
+from wandrun.runtime.agent.agents import COMMUNICATION, _system_prompt, build_agents, create_models, run_conversation
+from wandrun.runtime.execution.files import TaskFiles, _current_task
 from wandrun.integrations.shell_backend import ManagedShellBackend
 from wandrun.config import AgentDefinition
-from wandrun.runtime.conversations import conversation_config
-from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime.workers import CommunicationMiddleware, WorkerManager
-from wandrun.runtime.environments import Environment
+from wandrun.runtime.agent.conversations import conversation_config
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.workers import CommunicationMiddleware, WorkerManager
+from wandrun.runtime.execution.environments import Environment
+from wandrun.runtime.context.compaction import CompactionMiddleware
 
 
 DEFINITIONS = {
@@ -186,6 +187,44 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     )},
                     checkpointer=InMemorySaver(),
                 )
+
+    async def test_fast_mode_survives_model_overrides_and_compaction_model_selection(self):
+        async def unused_run(prompts, task_id):
+            raise AssertionError("Graph construction must not execute a task")
+
+        manager = self.manager(unused_run)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                definitions = {"coder": AgentDefinition(
+                    "coder", "write code", "primary", reasoning_effort="high", fast_mode=enabled,
+                    compaction_model="summary", context_window=100000, code_mode=False,
+                )}
+                models = create_models(
+                    definitions, model_name="override", reasoning_effort="low", max_model_requests=2,
+                )
+                primary = models["coder"]
+                self.assertEqual(primary.model_name, "override")
+                self.assertEqual(primary.reasoning_effort, "low")
+                self.assertIs(primary.fast_mode, enabled)
+                with patch("wandrun.runtime.agent.agents.CompactionMiddleware", wraps=CompactionMiddleware) as compaction:
+                    build_agents(
+                        manager, definitions=definitions, models=models, tools={"coder": []},
+                        environments={"coder": Environment(
+                            "local", LocalShellBackend(root_dir=directory, virtual_mode=True), "/skills", "/",
+                        )},
+                        checkpointer=InMemorySaver(),
+                    )
+                summary = compaction.call_args.kwargs["summary_model"]
+                self.assertEqual(summary.model_name, "summary")
+                self.assertEqual(summary.reasoning_effort, "low")
+                self.assertIs(summary.fast_mode, enabled)
+                self.assertIs(summary.credentials, primary.credentials)
+                self.assertIs(summary.request_budget, primary.request_budget)
+                body = summary.project_request([HumanMessage(content="summarize")])
+                if enabled:
+                    self.assertEqual(body["service_tier"], "priority")
+                else:
+                    self.assertNotIn("service_tier", body)
 
     async def test_model_retry_retries_transport_error_only_at_model_boundary(self):
         calls = 0

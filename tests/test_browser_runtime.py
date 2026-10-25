@@ -25,13 +25,13 @@ from wandrun.config import BrowserDefinition
 from wandrun.integrations.browser_dev import ChromeDev
 from wandrun.integrations.local_processes import ProcessTable
 from wandrun.integrations.shell_backend import ManagedShellBackend
-from wandrun.runtime.browser_tools import BrowserTakeoverMiddleware
-from wandrun.runtime.browser import BrowserLeases, BrowserRejected
-from wandrun.runtime.code_mode import CodeModeCatalog, code_mode_tool
-from wandrun.runtime.files import TaskBackend
+from wandrun.runtime.browser.tools import BrowserTakeoverMiddleware
+from wandrun.runtime.browser.leases import BrowserLeases, BrowserRejected
+from wandrun.runtime.execution.code_mode import CodeModeCatalog, code_mode_tool
+from wandrun.runtime.execution.files import TaskBackend
 from wandrun.runtime.session import _browser_notify
-from wandrun.runtime.process_tools import process_tools
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.execution.process_tools import process_tools
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 # The child opens the actual task endpoint, then queries CDP targets. Environment

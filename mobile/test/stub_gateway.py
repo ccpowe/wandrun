@@ -31,11 +31,11 @@ from wandrun.gateway.http import create_app
 from wandrun.gateway.subscription import SubscriptionData
 from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import GatewayStore
-from wandrun.runtime.memory import MemoryStore
-from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime.files import TaskFiles
-from wandrun.runtime.capabilities import ResolvedCapabilities, resolve_capabilities
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.context.memory import MemoryStore
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+from wandrun.runtime.execution.files import TaskFiles
+from wandrun.runtime.agent.capabilities import ResolvedCapabilities, resolve_capabilities
+from wandrun.runtime.communication.workers import WorkerManager
 
 def codex_upstream(request):
     """Only the Codex HTTP boundary is faked; gateway routes and SQLite remain real."""

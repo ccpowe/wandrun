@@ -10,25 +10,31 @@ appId: host.exp.exponent
 # @image-request
 - extendedWaitUntil:
     visible:
-      id: attachment-${IMAGE_FILE_ID}
+      text: "查看图片 ${IMAGE_FILE_NAME}"
     timeout: 10000
 - takeScreenshot: ${ARTIFACTS}/01-image-card-light.png
 # @dark-mode
 - takeScreenshot: ${ARTIFACTS}/01-image-card-dark.png
-- tapOn:
-    id: attachment-${IMAGE_FILE_ID}
+- tapOn: "查看图片 ${IMAGE_FILE_NAME}"
 - extendedWaitUntil:
     visible:
-      id: file-image-preview
+      id: media-attachment-gallery
     timeout: 30000
+- assertVisible:
+    id: media-download
+- assertVisible:
+    id: media-share
 - takeScreenshot: ${ARTIFACTS}/02-image-preview-dark.png
 # @light-mode
 - assertVisible:
-    id: file-image-preview
+    id: media-attachment-gallery
+- assertVisible:
+    id: media-download
+- assertVisible:
+    id: media-share
 - takeScreenshot: ${ARTIFACTS}/02-image-preview-light.png
 - tapOn: 返回
-- assertVisible:
-    id: attachment-${IMAGE_FILE_ID}
+- assertVisible: "查看图片 ${IMAGE_FILE_NAME}"
 - tapOn: 返回
 - extendedWaitUntil:
     visible:

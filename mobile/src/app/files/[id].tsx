@@ -1,4 +1,3 @@
-import { Directory, File, Paths } from "expo-file-system";
 import { router, Stack, useFocusEffect, useIsFocused, useLocalSearchParams } from "expo-router";
 import * as Sharing from "expo-sharing";
 import { ArrowLeft, Download, Share2 } from "lucide-react-native";
@@ -12,34 +11,12 @@ import { Icon } from "@/components/ui/icon.tsx";
 import { Text } from "@/components/ui/text.tsx";
 import { AgentMemoryMarkdown } from "@/components/agent-memory-markdown.tsx";
 import type { FileDetail } from "@/gateway/api.ts";
-import { DeliveryCache, previewKind, TEXT_PREVIEW_BYTES, type CachedDownload } from "@/lib/file-delivery.ts";
+import { previewKind, TEXT_PREVIEW_BYTES, type CachedDownload } from "@/lib/file-delivery.ts";
+import { nativeDeliveryCache } from "@/lib/native-delivery-cache.ts";
 import { saveNativeFile } from "@/lib/native-file-save.ts";
 import { useTranslation } from "@/lib/i18n.ts";
 import { useSession } from "@/lib/session-context.tsx";
 import { UserFacingError, userErrorMessage } from "@/lib/user-error.ts";
-
-const deliveryCaches = new Map<string, DeliveryCache>();
-function nativeDeliveryCache(computerId: string): DeliveryCache {
-  // Expo's web FileSystem has no Directory implementation. Never construct it
-  // when a route module is imported by the web router/server renderer.
-  let cache = deliveryCaches.get(computerId);
-  if (!cache) {
-    const directory = new Directory(Paths.cache, "wandrun-delivery", encodeURIComponent(computerId));
-    cache = new DeliveryCache({
-      create: () => directory.create({ intermediates: true, idempotent: true }),
-      list: () => directory.list().filter((entry): entry is File => entry instanceof File),
-      file: (name) => new File(directory, name),
-      download: async (url, destination, headers) => {
-        // SDK 57 Android may leave a cancelled buffered read unsettled. Let the
-        // old request finish in its original computer's private cache instead.
-        const task = File.createDownloadTask(url, new File(destination.uri), { headers });
-        if (!await task.downloadAsync()) throw new Error("下载未完成");
-      },
-    });
-    deliveryCaches.set(computerId, cache);
-  }
-  return cache;
-}
 
 type FileAction = "download" | "share";
 type FileActionScope = { key: string; valid: boolean; pending: boolean; probe: AbortController };

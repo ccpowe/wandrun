@@ -87,9 +87,6 @@ function ModelsScreen({ session }: { session: ChatSession }) {
   if (usageView.kind === "rows") {
     for (const { item } of usageView.rows) maximum = Math.max(maximum, agentTokens(item));
   }
-  const recheckSubscription = () => {
-    void loadSubscriptionUsage(api, true).then(setSubscription);
-  };
   const defaultModel = selectedModel(catalog?.models ?? [], settings?.default_model ?? "");
   const defaultEffort = settings?.default_reasoning_effort ?? defaultModel?.default_reasoning_effort;
   const effortLabel = reasoningOptions(defaultModel).find(({ value }) => value === defaultEffort)?.label ?? defaultEffort;
@@ -115,7 +112,7 @@ function ModelsScreen({ session }: { session: ChatSession }) {
         </>
       ) : (
         <ScrollView contentContainerClassName="pb-10">
-          <ModelSubscription view={subscription} nowSeconds={now.getTime() / 1000} onRecheck={recheckSubscription} />
+          <ModelSubscription view={subscription} nowSeconds={now.getTime() / 1000} />
           <View className="h-3" />
           <ListGroup>
             <Pressable testID="settings-model-default" disabled={!settings} onPress={() => { setDraft(settings); setSaveError(""); setSelecting(true); }} className="min-h-[60px] flex-row items-center gap-2 px-4 active:bg-accent">
@@ -139,7 +136,6 @@ function ModelsScreen({ session }: { session: ChatSession }) {
               }</Text>}
             </View>
           </View>
-          <Text className="mx-8 mt-2.5 text-xs leading-[18px] text-muted-foreground">{t("单个 Agent 的模型和推理强度请在其编辑页设置。")}</Text>
         </ScrollView>
       )}
     </View>

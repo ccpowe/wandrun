@@ -14,8 +14,8 @@ from wandrun.gateway.http import create_app
 from wandrun.gateway.service import Gateway, UIBlockNotFound
 from wandrun.gateway.store import GatewayStore
 from wandrun.gateway.ui_blocks import frozen_preview_text
-from wandrun.runtime.preview import PreviewExecution, PreviewPersistenceError
-from wandrun.runtime.messages import AgentOutput
+from wandrun.runtime.communication.preview import PreviewExecution, PreviewPersistenceError
+from wandrun.runtime.communication.messages import AgentOutput
 
 
 class GatewayPreviewTests(unittest.IsolatedAsyncioTestCase):

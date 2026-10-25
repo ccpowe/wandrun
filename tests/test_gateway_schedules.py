@@ -16,8 +16,8 @@ from wandrun.gateway.http import create_app
 from wandrun.gateway.schedules import InvalidSchedule, schedule_fields
 from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import ClientIdConflict, GatewayStore
-from wandrun.runtime.messages import AgentOutput
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.communication.messages import AgentOutput
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 def stamp(value: str) -> float:

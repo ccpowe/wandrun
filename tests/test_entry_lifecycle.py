@@ -14,7 +14,7 @@ from langchain.tools import tool
 from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.capabilities import EntryCapabilityDefinition
+from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
 from wandrun.runtime.session import open_runtime
 
 from test_capabilities import tool_call, tool_names

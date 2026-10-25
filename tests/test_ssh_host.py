@@ -21,9 +21,9 @@ from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.integrations.shell_backend import CleanupUnconfirmedError
 from wandrun.integrations.ssh_backend import SESSION_HASH, SSHBackend, SessionChannel
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.environments import Environment
+from wandrun.runtime.execution.environments import Environment
 from wandrun.runtime.session import RuntimeCleanupError, open_runtime
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.execution.workspace import Workspace
 
 GRACE = 0.2
 UNCONFIRMED = "可能仍在 fake 上运行"
@@ -184,10 +184,10 @@ class HostWithLocalSessionTests(unittest.IsolatedAsyncioTestCase):
 
         import pydantic_monty as pm
 
-        from wandrun.runtime.code_mode import CodeModeCatalog, code_mode_tool
-        from wandrun.runtime.memory import MemoryStore
-        from wandrun.runtime.memory_runtime import WORK_MEMORY_PATH, MemoryMiddleware
-        from wandrun.runtime.workers import WorkerManager
+        from wandrun.runtime.execution.code_mode import CodeModeCatalog, code_mode_tool
+        from wandrun.runtime.context.memory import MemoryStore
+        from wandrun.runtime.context.memory_runtime import WORK_MEMORY_PATH, MemoryMiddleware
+        from wandrun.runtime.communication.workers import WorkerManager
 
         with tempfile.TemporaryDirectory() as host:
             store = MemoryStore(Path(host) / "memory")

@@ -30,7 +30,7 @@ from wandrun.gateway.http import create_app
 from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import GatewayStore
 from wandrun.integrations.browser_dev import ChromeDev
-from wandrun.runtime.browser import BrowserLeases
+from wandrun.runtime.browser.leases import BrowserLeases
 
 
 ADMIN = "management-test-secret-not-a-device-token"

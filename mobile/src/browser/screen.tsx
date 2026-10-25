@@ -1,5 +1,4 @@
 import { Skia } from "@shopify/react-native-skia";
-import * as ScreenOrientation from "expo-screen-orientation";
 import { useFocusEffect, router } from "expo-router";
 import { ChevronLeft, Hand, Keyboard, LockKeyhole, MoreHorizontal, Mouse, MouseLeft, MousePointer2, MouseRight, RotateCw, Smartphone, X } from "lucide-react-native";
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
@@ -64,13 +63,15 @@ function BrowserSwitch({ testID, label, value, onValueChange }: {
 }
 
 /** A formal browser lease view; only the control variant sends input or changes pages. */
-export function BrowserScreen({ id, page, control }: { id: string; page?: string; control: boolean }) {
+export function BrowserScreen(props: { id: string; page?: string; control: true; landscapeEnabled: boolean; onLandscapeChange(value: boolean): void } | { id: string; page?: string; control: false }) {
+  const { id, page, control } = props;
   const { t, locale } = useTranslation();
   const session = useSession();
   const api = session?.api;
   const insets = useSafeAreaInsets();
   const window = useWindowDimensions();
   const landscape = control && window.width > window.height;
+  const landscapeEnabled = props.control && props.landscapeEnabled;
   const [focused, setFocused] = useState(false);
   const focusedRef = useRef(false);
   const [active, setActive] = useState(AppState.currentState !== "background" && AppState.currentState !== "inactive");
@@ -131,16 +132,11 @@ export function BrowserScreen({ id, page, control }: { id: string; page?: string
   useFocusEffect(useCallback(() => {
     focusedRef.current = true;
     setFocused(true);
-    if (control) void ScreenOrientation.unlockAsync().catch((reason) => {
-      console.warn("[browser-orientation] unlock failed", reason);
-      setError("无法恢复自动旋转，请检查设备的屏幕方向设置");
-    });
     return () => {
       focusedRef.current = false;
       setFocused(false);
-      if (control) void ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(console.warn);
     };
-  }, [control]));
+  }, []));
   useEffect(() => {
     if (!api || !id || !focused) return;
     let cancelled = false;
@@ -623,7 +619,7 @@ export function BrowserScreen({ id, page, control }: { id: string; page?: string
         {(pages.snapshot?.pages ?? lease?.pages ?? []).map((item) => <View key={item.id} className={`mb-1 flex-row items-center rounded-[14px] ${item.id === pages.snapshot?.current ? "border border-foreground" : ""}`}><Pressable testID={`takeover-page-${item.id}`} accessibilityRole="button" accessibilityLabel={t("切换{page}", { page: pageLabel(item) })} onPress={() => { stream.current?.switchPage(item.id); setSheet(null); }} className="min-w-0 flex-1 px-3 py-2"><Text numberOfLines={1} className="text-base font-semibold text-foreground">{pageLabel(item)}</Text><Text numberOfLines={1} className="text-xs text-muted-foreground">{hostOf(item.url)}{item.id === pages.snapshot?.current ? ` · ${t("当前")}` : ""}</Text></Pressable><IconButton icon={X} testID={`takeover-close-page-${item.id}`} label={t("关闭{page}", { page: pageLabel(item) })} onPress={() => closePage(item.id)} disabled={!human}/></View>)}
       </ScrollView><Pressable testID="takeover-new-page" accessibilityRole="button" accessibilityLabel={t("新建页面")} disabled={!human || streamState !== "open" || pages.snapshot?.state !== "human" || pageCount >= pageMax || stopped} onPress={() => { stream.current?.newPage(); setSheet(null); }} className="h-11 items-center justify-center rounded-full border border-foreground disabled:opacity-40"><Text className="text-sm font-semibold text-foreground">{t("新建页面")}</Text></Pressable><Text className="text-center text-xs text-muted-foreground">{t("新页面需手动切换")}</Text></>
         : <ScrollView style={{ flexGrow: 0 }}><Text className="text-lg font-semibold text-foreground">{t("更多")}</Text>
-          <View className="flex-row items-center gap-3 py-3"><Icon as={Smartphone} className="size-5 text-foreground" style={{ transform: [{ rotate: landscape ? "90deg" : "0deg" }] }} /><Text className="flex-1 text-base text-foreground">{t("横屏")}</Text><BrowserSwitch testID="takeover-landscape" label={t("横屏")} value={landscape} onValueChange={() => void toggleLandscape()} /></View>
+          <View className="flex-row items-center gap-3 py-3"><Icon as={Smartphone} className="size-5 text-foreground" style={{ transform: [{ rotate: landscapeEnabled ? "90deg" : "0deg" }] }} /><Text className="flex-1 text-base text-foreground">{t("横屏")}</Text><BrowserSwitch testID="takeover-landscape" label={t("横屏")} value={landscapeEnabled} onValueChange={(value) => { if (props.control) { props.onLandscapeChange(value); setSheet(null); } }} /></View>
           <Text className="text-xs font-semibold text-muted-foreground">{t("鼠标模式怎么操作")}</Text>{[
           ["轻点", "在指针处左键单击；快速轻点两次可双击"], ["单指滑动", "移动指针"], ["左 / 右键", "点击左键或右键；按住左键并滑动另一指可拖动"], ["右侧滚动条", "往下拖页面向下滚，松手回中"], ["双指", "缩放、平移画面；捏回即 1 倍"],
         ].map(([title, detail]) => <View key={title} className="flex-row border-t border-border py-2"><Text className="w-24 text-sm font-semibold text-foreground">{t(title)}</Text><Text className="min-w-0 flex-1 text-sm text-muted-foreground">{t(detail)}</Text></View>)}<Text className="text-xs text-muted-foreground">{t("触控模式：轻点 = 左键，长按 = 右键，单指拖动 = 平移画面，双指缩放。")}</Text><View className="flex-row items-center justify-between border-t border-border py-3"><View className="flex-1"><Text className="text-base text-foreground">{t("显示调试信息")}</Text><Text className="text-xs text-muted-foreground">{t("开启后每 5 秒输出调试日志")}</Text></View><BrowserSwitch testID="takeover-debug" label={t("显示调试信息")} value={debug} onValueChange={setDebug} /></View>
@@ -637,14 +633,5 @@ export function BrowserScreen({ id, page, control }: { id: string; page?: string
       <Pressable testID="takeover-keyboard" accessibilityRole="button" accessibilityLabel={t("打开键盘")} disabled={!human || emptyControlPages || streamState !== "open" || !inputReady} onPress={() => input.current?.focus()} className="min-w-[70px] items-center justify-center gap-0.5 py-1 disabled:opacity-40"><Icon as={Keyboard} className="size-6 text-foreground"/><Text className="text-xs text-foreground">{t("键盘")}</Text></Pressable>
       <Pressable testID="takeover-more" accessibilityRole="button" accessibilityLabel={t("更多")} onPress={() => openSheet("more")} className="min-w-[70px] items-center justify-center gap-0.5 py-1"><Icon as={MoreHorizontal} className="size-6 text-foreground"/><Text className="text-xs text-foreground">{t("更多")}</Text></Pressable>
     </>;
-  }
-  async function toggleLandscape() {
-    try {
-      await ScreenOrientation.lockAsync(landscape ? ScreenOrientation.OrientationLock.PORTRAIT_UP : ScreenOrientation.OrientationLock.LANDSCAPE);
-      setSheet(null);
-    } catch (reason) {
-      console.warn("[browser-orientation] lock failed", reason);
-      setError("无法切换屏幕方向，请检查设备是否允许旋转后重试");
-    }
   }
 }

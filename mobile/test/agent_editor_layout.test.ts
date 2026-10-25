@@ -37,7 +37,7 @@ const hosts: Record<string, string> = {
   "@/components/ui/textarea.tsx": "export const Textarea='Input';",
   "@/components/ui/switch.tsx": "export const Switch='Switch';",
   "@/components/wandrun-avatar.tsx": "export const AVATAR_COUNT=8,WandrunAvatar='Avatar';",
-  "@/components/model-picker.tsx": "export const ModelPicker='ModelPicker',ReasoningPicker='ReasoningPicker';",
+  "@/components/model-picker.tsx": "export const FastModeToggle='FastModeToggle',ModelPicker='ModelPicker',ReasoningPicker='ReasoningPicker';",
   "@/lib/connection-banner.tsx": "export const ConnectionBanner=()=>null;",
   "@/lib/session-context.tsx": "export const useSession=()=>globalThis.__editorLayoutSession;",
   "@/lib/model-catalog.ts": "export const useModelCatalog=()=>({catalog:{models:[]}});",
@@ -106,7 +106,7 @@ function layoutRow(host: TestInstance, available: number) {
 
 test("Agent form labels, capability values and connector choices fit at 360dp in both languages", async () => {
   const detail = { id: "planner", name: "Planner", avatar: 0, description: "Plan work", system_prompt: "Plan", model: "model", reasoning_effort: null,
-    code_mode: true, skills: [], workers: [], mcp_servers: ["docs"], searchable_mcp_servers: [] };
+    fast_mode: false, code_mode: true, skills: [], workers: [], mcp_servers: ["docs"], searchable_mcp_servers: [] };
   Object.assign(globalThis, { __editorLayoutSession: { agents: { deletedIds: new Set(), agents: [] },
     api: { getAgent: async () => detail, listAgents: async () => ({ agents: [] }) } } });
   const root = createRoot({ textComponentTypes: ["Text"] });

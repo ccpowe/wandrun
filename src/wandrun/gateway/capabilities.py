@@ -12,8 +12,8 @@ from langchain.tools import BaseTool
 
 from wandrun.gateway.ui_blocks import model_instructions, skill_files
 from wandrun.integrations.image_generation import DEFAULT_IMAGE_MODEL
-from wandrun.runtime.capabilities import EntryCapabilityDefinition
-from wandrun.runtime.human_message_guidance import HumanMessageGuidanceMiddleware
+from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
+from wandrun.runtime.communication.human_message_guidance import HumanMessageGuidanceMiddleware
 
 
 class ScheduleMiddleware(AgentMiddleware):

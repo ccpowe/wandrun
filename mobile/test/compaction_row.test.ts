@@ -11,7 +11,7 @@ import Yoga, { type Node as YogaNode } from "yoga-layout";
 import MarkdownIt from "markdown-it";
 import ts from "typescript";
 
-import type { BrowserTask, GatewayEvent } from "../src/gateway/api.ts";
+import { GatewayApi, type BrowserTask, type GatewayEvent } from "../src/gateway/api.ts";
 import { ChatSession } from "../src/gateway/session.ts";
 import { buildItems } from "../src/lib/chat-timeline.ts";
 import { collaborationEvents } from "./fixtures/collaboration-timeline.ts";
@@ -25,6 +25,8 @@ globalThis.__compactionRowReact = React;
 globalThis.__compactionMarkdownIt = MarkdownIt;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 Object.assign(globalThis, { __DEV__: false });
+const galleryHost = { os: "web", focused: true, pickerRequests: 0 };
+Object.assign(globalThis, { __galleryHost: galleryHost });
 
 // This suite runs the real SessionProvider on its web branch, including persistence.
 const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -55,7 +57,7 @@ const platform: Record<string, string> = {
       React.useImperativeHandle(ref,()=>({scrollToIndex(){}}),[]);
       return React.createElement('FlatList',props);
     }
-    export const Platform={OS:'web',select:({web})=>web};
+    export const Platform={get OS(){return globalThis.__galleryHost.os},select(options){return options[this.OS]??options.default}};
     export const StyleSheet={create:(styles)=>styles,flatten:(style)=>style,absoluteFill:{}};
     export const Alert={alert:()=>{}}; export const Linking={openURL:async()=>{}};
     export const AppState={currentState:'active',addEventListener:()=>({remove(){}})};
@@ -63,13 +65,16 @@ const platform: Record<string, string> = {
     export const AccessibilityInfo={setAccessibilityFocus(){}},findNodeHandle=()=>null;
     export const Dimensions={get:()=>({width:390,height:800})};
     export const useWindowDimensions=()=>({width:390,height:800});`,
-  "expo-router": `export const router={push(route){globalThis.__attachmentRoutes.push(route)}}; export const Stack={Screen:'StackScreen'}; export const useLocalSearchParams=()=>globalThis.__attachmentParams; export const useIsFocused=()=>true;`,
+  "expo-router": `export const router={push(route){globalThis.__attachmentRoutes.push(route)}}; export const Stack={Screen:'StackScreen'}; export const useLocalSearchParams=()=>globalThis.__attachmentParams; export const useIsFocused=()=>globalThis.__galleryHost.focused;`,
   "expo-secure-store": `export async function getItemAsync(){return null} export async function setItemAsync(){} export async function deleteItemAsync(){}`,
   "expo-network": `export const NetworkStateType={NONE:'NONE'}; export const addNetworkStateListener=()=>({remove(){}});`,
   "expo": `export const requireOptionalNativeModule=()=>null;`,
-  "expo-file-system": `export class Directory {} export class File {} export const FileMode={ReadOnly:0}; export const Paths={document:'/mock-documents'};`,
+  "expo-file-system": `export class Directory {
+    static async pickDirectoryAsync(){globalThis.__galleryHost.pickerRequests++; throw new Error('Unexpected native directory picker')}
+  } export class File {} export const FileMode={ReadOnly:0}; export const Paths={document:'/mock-documents'};`,
   "expo-image": `export const Image=props=>globalThis.__compactionRowReact.createElement('ExpoImage',props);`,
   "expo-clipboard": `export const setStringAsync=async()=>true;`,
+  "expo-sharing": `export const isAvailableAsync=async()=>false; export const shareAsync=async()=>{throw new Error('Native sharing is unavailable in this Web fixture')};`,
   "react-native-safe-area-context": `export const useSafeAreaInsets=()=>({top:0,right:0,bottom:0,left:0});`,
   "react-native-gesture-handler": `const gesture=()=>({onStart(){return this},onUpdate(){return this},onEnd(){return this},maxPointers(){return this},activeOffsetY(){return this},failOffsetX(){return this},enabled(){return this}}); export const Gesture={Pinch:gesture,Pan:gesture,Simultaneous:()=>({})}; export const GestureDetector='GestureDetector';`,
   "react-native-worklets": `export const scheduleOnRN=(fn,value)=>fn(value);`,
@@ -105,7 +110,7 @@ const platform: Record<string, string> = {
 };
 const icons = ["Copy", "ExternalLink", "Brain", "ChevronRight", "CircleAlert", "Clock", "Hand", "RefreshCw", "Square",
   "Monitor", "Clapperboard", "File", "FileText", "Image", "CalendarDays", "Check", "X", "ChevronDown", "ChevronUp",
-  "ArrowLeft", "ArrowUpRight", "Folder", "FolderOpen", "FolderTree", "FileCode2", "Minus", "Plus", "Code2", "Expand", "Play", "RotateCcw"];
+  "ArrowLeft", "ArrowUpRight", "Folder", "FolderOpen", "FolderTree", "FileCode2", "Minus", "Plus", "Code2", "Expand", "Play", "RotateCcw", "Download", "Share2"];
 const richIconNames: string[] = JSON.parse(readFileSync(new URL("../../src/wandrun/gateway/ui_icons.json", import.meta.url), "utf8"));
 const iconExports = new Set([...icons, ...richIconNames.map(name => name.split("-").map(part => part[0].toUpperCase() + part.slice(1)).join(""))]);
 platform["lucide-react-native"] = [...iconExports].map((name) => `export const ${name}='Icon${name}';`).join("\n");
@@ -212,6 +217,51 @@ test("成员及深层任务附件点击按所在时间线定位完整图片组",
     Reflect.deleteProperty(globalThis, "__attachmentParams");
   }
 });
+test("a native drag without end events keeps the visible image actionable and rejects the old image's late work", async () => {
+  const requests: string[] = [];
+  const oldMetadata = Promise.withResolvers<Response>();
+  const api = new GatewayApi({ baseUrl: "http://gallery.test", token: "test", computerId: "gallery" }, async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    requests.push(pathname);
+    return pathname === "/files/one" ? oldMetadata.promise
+      : Response.json({ id: "two", name: "two.png", media_type: "image/png", available: false });
+  });
+  Object.assign(globalThis, {
+    __attachmentSession: { api },
+    __attachmentParams: { file_id: "one", file_ids: JSON.stringify(["one", "two"]) },
+  });
+  galleryHost.os = "android";
+  galleryHost.pickerRequests = 0;
+  const root = createRoot({ textComponentTypes: ["Text"] });
+  const download = () => root.container.queryAll(node => node.props.testID === "media-download")[0];
+  try {
+    await act(async () => root.render(React.createElement(MediaViewer)));
+    await act(async () => download().props.onPress());
+    assert.equal(download().props.disabled, true);
+    const gallery = root.container.queryAll(node => node.type === "FlatList")[0];
+    await act(async () => {
+      gallery.props.onScrollBeginDrag?.();
+      gallery.props.onScroll({ nativeEvent: { contentOffset: { x: 100 }, layoutMeasurement: { width: 390 } } });
+    });
+    assert.equal(download().props.disabled, true, "scrolling within one image must preserve its pending action");
+    // Native gesture cancellation can omit all JS end/cancel events.
+    await act(async () => gallery.props.onScroll({ nativeEvent: { contentOffset: { x: 312 }, layoutMeasurement: { width: 390 } } }));
+    assert.equal(download().props.disabled, false, "the new visible image must not inherit a stale drag or action lock");
+    await act(async () => download().props.onPress());
+    assert.equal(requests.at(-1), "/files/two", "delivery must resolve the image now visible");
+    oldMetadata.resolve(Response.json({ id: "one", name: "one.png", media_type: "image/png", available: true }));
+    await act(async () => { await oldMetadata.promise; });
+    assert.equal(galleryHost.pickerRequests, 0, "the image left behind cannot open a late native picker");
+  } finally {
+    oldMetadata.resolve(Response.json({ available: false }));
+    await act(async () => root.unmount());
+    api.close();
+    galleryHost.os = "web";
+    Reflect.deleteProperty(globalThis, "__attachmentSession");
+    Reflect.deleteProperty(globalThis, "__attachmentParams");
+  }
+});
+
 
 function summary(seq: number, text: string): GatewayEvent {
   return event(seq, "context.compacted", {

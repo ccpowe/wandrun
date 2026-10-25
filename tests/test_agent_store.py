@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.gateway.store import ClientIdConflict, GatewayStore, UnknownAgent
-from wandrun.runtime.memory import MemoryStore
+from wandrun.runtime.context.memory import MemoryStore
 
 
 def definition(**changes) -> AgentDefinition:
@@ -97,6 +97,70 @@ class AgentPersistenceTests(unittest.TestCase):
                     store.update_agent("root", definition(), "改名", avatar)
             self.assertEqual(store.agent("root")["avatar"], 0)
             self.assertEqual(store.last_seq(), 0)
+
+    def test_fast_mode_import_roundtrip_edit_replay_and_noop(self):
+        fast = definition(fast_mode=True, reasoning_effort="high")
+        with closing(GatewayStore(self.path)) as store:
+            store.import_agents(AgentCatalog("root", {"root": fast}))
+            self.assertIs(store.agent("root")["fast_mode"], True)
+            self.assertTrue(store.agent_catalog().agents["root"].fast_mode)
+            first, created, is_new = store.create_agent("fast", fast, "Fast", 0, "fast-create")
+            self.assertTrue(is_new)
+            self.assertIs(first["fast_mode"], True)
+            self.assertIs(store.agent_catalog().agents["fast"].fast_mode, True)
+            changed, event = store.update_agent("fast", replace(fast, fast_mode=False), "Fast", 0)
+            self.assertIs(changed["fast_mode"], False)
+            self.assertEqual(changed["reasoning_effort"], "high")
+            self.assertEqual(event.data, {"kind": "agent", "id": "fast", "op": "updated"})
+            seq = store.last_seq()
+            unchanged, no_event = store.update_agent("fast", replace(fast, fast_mode=False), "Fast", 0)
+            self.assertEqual(unchanged, changed)
+            self.assertIsNone(no_event)
+            self.assertEqual(store.last_seq(), seq)
+            self.assertEqual(store.replay_create_agent("fast-create"), (first, created))
+        with closing(GatewayStore(self.path)) as store:
+            self.assertIs(store.agent("root")["fast_mode"], True)
+            self.assertIs(store.agent("fast")["fast_mode"], False)
+            self.assertIs(store.agent_catalog().agents["root"].fast_mode, True)
+            self.assertIs(store.agent_catalog().agents["fast"].fast_mode, False)
+            self.assertEqual(store.replay_create_agent("fast-create"), (first, created))
+
+    def test_invalid_fast_mode_never_coerces_or_writes(self):
+        with closing(GatewayStore(self.path)) as store:
+            store.import_agents(AgentCatalog("root", {"root": definition()}))
+            for index, value in enumerate((None, "true", "false", 0, 1, [], {})):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(ValueError, "fast_mode"):
+                        store.create_agent(f"bad{index}", definition(fast_mode=value), "Bad", 0, f"bad{index}")
+                    self.assertIsNone(store.replay_create_agent(f"bad{index}"))
+                    with self.assertRaisesRegex(ValueError, "fast_mode"):
+                        store.update_agent("root", definition(fast_mode=value), "root", 0)
+                    self.assertIs(store.agent("root")["fast_mode"], False)
+                    self.assertEqual(store.last_seq(), 0)
+
+    def test_fast_mode_event_failure_rolls_back_definition(self):
+        with closing(GatewayStore(self.path)) as store:
+            store.import_agents(AgentCatalog("root", {"root": definition()}))
+            with patch.object(store, "_resource_changed", side_effect=sqlite3.OperationalError("disk full")):
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.update_agent("root", definition(fast_mode=True), "root", 0)
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.create_agent("new", definition(fast_mode=True), "new", 0, "fast-failed")
+            self.assertIs(store.agent("root")["fast_mode"], False)
+            self.assertFalse(store.agent_catalog().agents["root"].fast_mode)
+            self.assertIsNone(store.agent("new"))
+            self.assertIsNone(store.replay_create_agent("fast-failed"))
+            self.assertEqual(store.last_seq(), 0)
+
+    def test_previous_schema_is_rejected_without_modifying_user_data(self):
+        with closing(GatewayStore(self.path)) as store:
+            store.import_agents(AgentCatalog("root", {"root": definition(fast_mode=True)}))
+            store._connection.execute("PRAGMA user_version = 23")
+        with self.assertRaisesRegex(RuntimeError, "23.*24.*不兼容"):
+            GatewayStore(self.path)
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 23)
+            self.assertEqual(connection.execute("SELECT id, fast_mode FROM agents").fetchall(), [("root", 1)])
 
     def test_create_replay_retains_original_result_after_edit_and_delete_across_restart(self):
         with closing(GatewayStore(self.path)) as store:

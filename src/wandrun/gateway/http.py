@@ -45,10 +45,10 @@ from wandrun.gateway.skills import InvalidSkill, SkillBoundaryError
 from wandrun.gateway.uploads import UploadError
 from wandrun.gateway.store import ClientIdConflict, InvalidReadPosition, UnknownAgent
 from wandrun.gateway.subscription import SubscriptionUnavailable
-from wandrun.runtime.memory import InvalidMemory, MemoryConflict, MemoryRetired
-from wandrun.runtime.browser import BrowserRejected, UnknownBrowserTask
-from wandrun.runtime.preview import PreviewPersistenceError
-from wandrun.runtime.workers import CollaborationStopped
+from wandrun.runtime.context.memory import InvalidMemory, MemoryConflict, MemoryRetired
+from wandrun.runtime.browser.leases import BrowserRejected, UnknownBrowserTask
+from wandrun.runtime.communication.preview import PreviewPersistenceError
+from wandrun.runtime.communication.workers import CollaborationStopped
 
 MAX_TEXT = 20_000
 MAX_CLIENT_ID = 128
@@ -729,7 +729,10 @@ def create_app(
         return value == "true"
 
     async def models(request):
-        return JSONResponse(await gateway.subscription.models(refresh=refresh(request)))
+        return JSONResponse({
+            **await gateway.subscription.models(refresh=refresh(request)),
+            "capabilities": {"fast_mode": True},
+        })
 
     async def settings(request):
         if request.method in ("GET", "HEAD"):
@@ -908,6 +911,7 @@ def create_app(
         return JSONResponse({
             **request.state.identity, "computer_name": computer_name,
             "gateway_version": gateway_version,
+            "capabilities": {"fast_mode": True},
         }, headers={"Cache-Control": "no-store"})
 
     async def disconnect(request):

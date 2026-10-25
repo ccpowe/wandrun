@@ -17,10 +17,10 @@ from wandrun.gateway.http import create_app
 from wandrun.gateway.service import CollaborationUnavailable, Gateway, UnknownConversation
 from wandrun.gateway.store import ClientIdConflict, GatewayStore
 from wandrun.integrations.shell_backend import ManagedShellBackend
-from wandrun.runtime.files import ResolvedAttachment, TaskFiles
-from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime.scheduler_store import SchedulerStore
-from wandrun.runtime.workers import CollaborationStopped, CommunicationMiddleware, SchedulerFailure, WorkerManager
+from wandrun.runtime.execution.files import ResolvedAttachment, TaskFiles
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.scheduler_store import SchedulerStore
+from wandrun.runtime.communication.workers import CollaborationStopped, CommunicationMiddleware, SchedulerFailure, WorkerManager
 
 
 class CollaborationTests(unittest.IsolatedAsyncioTestCase):

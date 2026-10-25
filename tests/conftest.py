@@ -3,7 +3,7 @@
 
 import pytest
 
-from wandrun.runtime.browser import BrowserLeases
+from wandrun.runtime.browser.leases import BrowserLeases
 
 _start = BrowserLeases.start
 

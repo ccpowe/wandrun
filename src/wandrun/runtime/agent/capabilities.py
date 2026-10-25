@@ -8,14 +8,14 @@ from typing import TYPE_CHECKING, Literal
 from langchain.agents.middleware import AgentMiddleware
 
 from wandrun.config import AgentDefinition
-from wandrun.runtime.browser import BrowserLeases
-from wandrun.runtime.environments import Environment
-from wandrun.runtime.files import ResolvedAttachment, TaskFiles
-from wandrun.runtime.memory import MemoryStore
-from wandrun.runtime.tool_search import ToolNamespace
+from wandrun.runtime.browser.leases import BrowserLeases
+from wandrun.runtime.execution.environments import Environment
+from wandrun.runtime.execution.files import ResolvedAttachment, TaskFiles
+from wandrun.runtime.context.memory import MemoryStore
+from wandrun.runtime.agent.tool_search import ToolNamespace
 
 if TYPE_CHECKING:
-    from wandrun.runtime.workers import WorkerManager
+    from wandrun.runtime.communication.workers import WorkerManager
 
 
 CapabilityStatus = Literal["enabled", "disabled", "not_applicable"]

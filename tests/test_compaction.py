@@ -19,17 +19,17 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel, ContextWindowExceededError
-from wandrun.runtime.compaction import (
+from wandrun.runtime.context.compaction import (
     CompactionMiddleware, ContextBudgetExhausted, context_messages, message_groups,
 )
-from wandrun.runtime.compaction_archive import CompactionArchive
-from wandrun.runtime.conversations import conversation_config, prepare_conversation_input
-from wandrun.runtime.agents import ConversationState
-from wandrun.runtime.memory import MemoryStore
-from wandrun.runtime.memory_runtime import WORK_MEMORY_PATH, ManagedMemoryBackend, MemoryMiddleware
-from wandrun.runtime.compaction_summary import _summary_history
-from wandrun.runtime.compaction_summary import SummaryGenerationError
-from wandrun.runtime.tool_search import ToolNamespace, ToolSearchMiddleware, loaded_tool_names
+from wandrun.runtime.context.compaction_archive import CompactionArchive
+from wandrun.runtime.agent.conversations import conversation_config, prepare_conversation_input
+from wandrun.runtime.agent.agents import ConversationState
+from wandrun.runtime.context.memory import MemoryStore
+from wandrun.runtime.context.memory_runtime import WORK_MEMORY_PATH, ManagedMemoryBackend, MemoryMiddleware
+from wandrun.runtime.context.compaction_summary import _summary_history
+from wandrun.runtime.context.compaction_summary import SummaryGenerationError
+from wandrun.runtime.agent.tool_search import ToolNamespace, ToolSearchMiddleware, loaded_tool_names
 from langchain.tools import tool
 
 from compaction_fixtures import SUMMARY_TEXT
@@ -111,7 +111,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("never overwrite", r.messages[0].content)
             self.assertEqual(r.messages[-1].content, "latest instruction")
             return ModelResponse(result=[reply()])
-        with patch("wandrun.runtime.compaction.summarize_request", summary):
+        with patch("wandrun.runtime.context.compaction.summarize_request", summary):
             result = await middleware.awrap_model_call(req, main)
             update = result.command.update
             self.assertEqual([m.model_dump() for m in req.messages], saved)
@@ -141,7 +141,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 return ModelResponse(result=[reply()])
 
             first = request()
-            with patch("wandrun.runtime.compaction.summarize_request", summary):
+            with patch("wandrun.runtime.context.compaction.summarize_request", summary):
                 result = await middleware.awrap_model_call(first, main)
                 event1 = result.command.update["compaction_events"][-1]
                 self.assertIn("early constraint", str((await backend.aread(event1["archive_path"])).file_data))
@@ -218,7 +218,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 on_compaction=lambda task, event: failures.append(event))
             req = request()
             main = AsyncMock()
-            with patch("wandrun.runtime.compaction.summarize_request",
+            with patch("wandrun.runtime.context.compaction.summarize_request",
                        AsyncMock(return_value=reply("summary"))), patch.object(
                            archive, "_publish", AsyncMock(side_effect=OSError("archive unavailable"))):
                 with self.assertRaisesRegex(OSError, "archive unavailable"):
@@ -243,7 +243,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                     raise ContextWindowExceededError("overflow")
                 return ModelResponse(result=[reply()])
 
-            with patch("wandrun.runtime.compaction.summarize_request",
+            with patch("wandrun.runtime.context.compaction.summarize_request",
                        AsyncMock(return_value=reply("summary"))):
                 result = await CompactionMiddleware(
                     context_window=10_000, keep_tokens=100, archive=archive,
@@ -258,11 +258,11 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(calls), 2)
 
     async def test_missing_capacity_does_not_summarize(self):
-        with self.assertLogs("wandrun.runtime.compaction", level="WARNING") as logs:
+        with self.assertLogs("wandrun.runtime.context.compaction", level="WARNING") as logs:
             middleware = CompactionMiddleware(context_window=None)
         self.assertIn("context_window", logs.output[0])
         handler = AsyncMock(return_value=ModelResponse(result=[reply()]))
-        with patch("wandrun.runtime.compaction.summarize_request", new_callable=AsyncMock) as summarize:
+        with patch("wandrun.runtime.context.compaction.summarize_request", new_callable=AsyncMock) as summarize:
             await middleware.awrap_model_call(request(), handler)
         summarize.assert_not_awaited()
         self.assertEqual(handler.call_args.args[0].messages[0].id, "old")
@@ -277,7 +277,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                     req = request()
                     summary = AsyncMock(side_effect=failure) if failure_at == "summary" else AsyncMock(return_value=reply("summary"))
                     main = AsyncMock(side_effect=failure)
-                    with patch("wandrun.runtime.compaction.summarize_request", summary):
+                    with patch("wandrun.runtime.context.compaction.summarize_request", summary):
                         with self.assertRaises(type(failure)):
                             await middleware.awrap_model_call(req, main)
                     self.assertNotIn("compaction_events", req.state)
@@ -286,12 +286,12 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
     async def test_overflow_has_one_recovery_and_preserves_failure(self):
         middleware = CompactionMiddleware(context_window=1_000_000, keep_tokens=100)
         handler = AsyncMock(side_effect=[ContextWindowExceededError("overflow"), ModelResponse(result=[reply()])])
-        with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
+        with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
             result = await middleware.awrap_model_call(request(), handler)
         self.assertEqual(result.command.update["compaction_events"][0]["reason"], "overflow")
         self.assertEqual(handler.await_count, 2)
         handler = AsyncMock(side_effect=ContextWindowExceededError("overflow"))
-        with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
+        with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
             with self.assertRaises(ContextWindowExceededError):
                 await middleware.awrap_model_call(request(), handler)
         self.assertEqual(handler.await_count, 2)
@@ -315,7 +315,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 raw.append(HumanMessage(content="short latest instruction", id="latest"))
                 req = request(raw)
                 middleware = CompactionMiddleware(context_window=window, keep_tokens=keep)
-                with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
+                with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
                     event, candidate, _ = await middleware._compact(req, req, None, "threshold")
                 ids = [m.id for m in candidate.messages]
                 self.assertIn("latest", ids)
@@ -357,7 +357,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                     on_compaction=lambda task, event: notices.append(event),
                 )
                 main = AsyncMock(return_value=ModelResponse(result=[reply("read again")]))
-                with patch("wandrun.runtime.compaction.summarize_request",
+                with patch("wandrun.runtime.context.compaction.summarize_request",
                            AsyncMock(return_value=reply("Read the media again"))):
                     with self.assertRaisesRegex(ContextBudgetExhausted, "分批读取"):
                         await middleware.awrap_model_call(req, main)
@@ -382,7 +382,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 if consumed:
                     raw.extend([reply("I have read it"), HumanMessage(content="Continue", id="continue")])
                 main = AsyncMock(return_value=ModelResponse(result=[reply()]))
-                with patch("wandrun.runtime.compaction.summarize_request",
+                with patch("wandrun.runtime.context.compaction.summarize_request",
                            AsyncMock(return_value=reply("facts"))):
                     await CompactionMiddleware(context_window=272_000, keep_tokens=1).awrap_model_call(
                         request(raw), main)
@@ -400,7 +400,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         ]
         main = AsyncMock(side_effect=ContextWindowExceededError("overflow"))
         req = request(raw)
-        with patch("wandrun.runtime.compaction.summarize_request",
+        with patch("wandrun.runtime.context.compaction.summarize_request",
                    AsyncMock(return_value=reply("facts"))):
             with self.assertRaisesRegex(ContextBudgetExhausted, "分批读取"):
                 await CompactionMiddleware(context_window=30_000, keep_tokens=100).awrap_model_call(req, main)
@@ -437,7 +437,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 ], checkpointer=saver)
                 config = conversation_config("bounded-turn")
                 summaries = AsyncMock(return_value=reply("report facts"))
-                with patch("wandrun.runtime.compaction.summarize_request", summaries):
+                with patch("wandrun.runtime.context.compaction.summarize_request", summaries):
                     with self.assertRaisesRegex(ContextBudgetExhausted, "4 次上限"):
                         await graph.ainvoke({"messages": [HumanMessage(content="read")]}, config,
                                             context={"task_id": "bounded-turn"})
@@ -468,7 +468,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 graph = create_agent(Model(), state_schema=ConversationState, middleware=[
                     memory, CompactionMiddleware(context_window=10_000, keep_tokens=100, memory=memory),
                 ], checkpointer=saver)
-                with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("task summary"))):
+                with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("task summary"))):
                     await graph.ainvoke({"messages": history()}, config, context={"task_id": "memory-compaction"})
                 saved = (await graph.aget_state(config)).values
                 self.assertEqual(saved.get("memory_versions"), {})
@@ -500,7 +500,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 graph = create_agent(Model(), state_schema=ConversationState, middleware=[
                     memory, CompactionMiddleware(context_window=10_000, keep_tokens=100, memory=memory),
                 ], checkpointer=saver)
-                with patch("wandrun.runtime.compaction.summarize_request", new_callable=AsyncMock) as summarize:
+                with patch("wandrun.runtime.context.compaction.summarize_request", new_callable=AsyncMock) as summarize:
                     await graph.ainvoke({"messages": [HumanMessage(content="继续")]}, config,
                                         context={"task_id": "memory-compaction"})
                 summarize.assert_not_awaited()
@@ -530,7 +530,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 config = conversation_config("cut-memory")
                 await graph.ainvoke({"messages": [HumanMessage(content="start")]}, config,
                                     context={"task_id": "cut-memory"})
-                with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
+                with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
                     await graph.ainvoke({"messages": history()}, config, context={"task_id": "cut-memory"})
                 for _ in range(2):
                     await graph.ainvoke({"messages": [HumanMessage(content="continue")]}, config,
@@ -561,7 +561,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         output = ToolMessage(content="loaded", id="search-result", tool_call_id="search", artifact=artifact)
         raw = [ai, output, *history()]
         req = request(raw)
-        with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
+        with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
             result = await CompactionMiddleware(context_window=10_000, keep_tokens=100).awrap_model_call(req, AsyncMock(return_value=ModelResponse(result=[reply()])))
         event = result.command.update["compaction_events"][-1]
         view = context_messages(req.state, event=event)
@@ -621,12 +621,12 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
             async with AsyncSqliteSaver.from_conn_string(path) as saver:
                 model = Model()
                 graph = create_agent(model, middleware=[CompactionMiddleware(context_window=10_000, keep_tokens=100)], checkpointer=saver)
-                with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("first summary"))):
+                with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("first summary"))):
                     await graph.ainvoke({"messages": history()}, config, context={"task_id": "restart"}, durability="sync")
                 before = (await graph.aget_state(config)).values
                 self.assertEqual(len(before["compaction_events"]), 1)
                 model.fail = True
-                with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("uncommitted summary"))):
+                with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("uncommitted summary"))):
                     with self.assertRaisesRegex(RuntimeError, "main failed"):
                         await graph.ainvoke({"messages": [HumanMessage(content="new " * 10000, id="new"), HumanMessage(content="finish", id="finish")]}, config, context={"task_id": "restart"}, durability="sync")
             async with AsyncSqliteSaver.from_conn_string(path) as saver:
@@ -647,7 +647,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         b = ToolMessage(content="second result", tool_call_id="b", id="b-result")
         notice = HumanMessage(content="先前发送未被接收，不要假定已创建任务", id="undelivered:response")
         req = request([notice, *history(), call, a, b])
-        with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
+        with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
             result = await CompactionMiddleware(context_window=10_000, keep_tokens=100).awrap_model_call(
                 req, AsyncMock(return_value=ModelResponse(result=[reply()])),
             )
@@ -668,7 +668,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
             return reply("summary for " + r.runtime.context["task_id"])
         left, right = request(), request()
         right.runtime.context["task_id"] = "other"
-        with patch("wandrun.runtime.compaction.summarize_request", summary):
+        with patch("wandrun.runtime.context.compaction.summarize_request", summary):
             results = await asyncio.gather(*(
                 middleware.awrap_model_call(r, AsyncMock(return_value=ModelResponse(result=[reply()])))
                 for r in (left, right)
@@ -691,7 +691,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
             *req.messages, reply("replacement without the original reasoning"), following.messages[-1],
         ])
         self.assertLess(middleware._usage(changed, 0)[0], 7500)
-        with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply(SUMMARY_TEXT))):
+        with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply(SUMMARY_TEXT))):
             compacted = await middleware.awrap_model_call(
                 following, AsyncMock(return_value=ModelResponse(result=[reply()])),
             )
@@ -706,7 +706,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(single=len(raw) == 1):
                 handler = AsyncMock()
                 req = request(raw)
-                with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply(summary))):
+                with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply(summary))):
                     with self.assertRaises(ContextBudgetExhausted):
                         await middleware.awrap_model_call(req, handler)
                 handler.assert_not_awaited()
@@ -751,7 +751,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 graph = create_agent(Model(), tools=[save_memory], state_schema=ConversationState, middleware=[
                     memory, CompactionMiddleware(context_window=10_000, keep_tokens=100, memory=memory),
                 ])
-                with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
+                with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("summary"))):
                     state = await graph.ainvoke({"messages": history()},
                                                 context={"task_id": "memory-write", "execution_generation": 1})
                 self.assertEqual(store.read("agent").content, "外部新背景" if concurrent_edit else "模型新背景")
@@ -774,7 +774,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 graph = create_agent(Model(), middleware=[
                     CompactionMiddleware(context_window=10_000, keep_tokens=100),
                 ], checkpointer=saver)
-                with patch("wandrun.runtime.compaction.summarize_request", blocked_summary):
+                with patch("wandrun.runtime.context.compaction.summarize_request", blocked_summary):
                     running = asyncio.create_task(graph.ainvoke(
                         {"messages": history()}, config, context={"task_id": "cancelled"}, durability="sync",
                     ))
@@ -792,7 +792,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 inputs = await prepare_conversation_input(graph, config, [
                     HumanMessage(content="latest instruction", id="latest"),
                 ])
-                with patch("wandrun.runtime.compaction.summarize_request", AsyncMock(return_value=reply("retry summary"))):
+                with patch("wandrun.runtime.context.compaction.summarize_request", AsyncMock(return_value=reply("retry summary"))):
                     await graph.ainvoke(inputs, config, context={"task_id": "cancelled"}, durability="sync")
                 resumed = (await graph.aget_state(config)).values
                 self.assertEqual([e["summary_text"] for e in resumed["compaction_events"]], ["retry summary"])
@@ -808,7 +808,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         raw[-1].id = "large-result"
         req = request(raw)
         projected = list(reversed([m.model_copy() for m in raw]))
-        with patch("wandrun.runtime.compaction.summarize_request",
+        with patch("wandrun.runtime.context.compaction.summarize_request",
                    AsyncMock(return_value=reply(SUMMARY_TEXT))):
             event, candidate, _ = await CompactionMiddleware(
                 context_window=10000, keep_tokens=1,
@@ -840,7 +840,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
             on_compaction=lambda task, event: notices.append(event),
         )
         initial = request()
-        with patch("wandrun.runtime.compaction.summarize_request",
+        with patch("wandrun.runtime.context.compaction.summarize_request",
                    AsyncMock(return_value=reply(SUMMARY_TEXT))):
             committed = await middleware.awrap_model_call(
                 initial, AsyncMock(return_value=ModelResponse(result=[reply()])),
@@ -887,7 +887,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
                 if len(main_views) == 1:
                     raise ContextWindowExceededError("overflow")
                 return ModelResponse(result=[reply()])
-            with patch("wandrun.runtime.compaction.summarize_request", summarize):
+            with patch("wandrun.runtime.context.compaction.summarize_request", summarize):
                 result = await CompactionMiddleware(
                     context_window=40000, keep_tokens=100, archive=archive,
                 ).awrap_model_call(request(raw), main)

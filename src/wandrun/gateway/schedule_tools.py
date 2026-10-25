@@ -10,7 +10,7 @@ from langchain_core.runnables import RunnableConfig
 from wandrun.gateway.schedules import InvalidSchedule
 from wandrun.gateway.service import AgentConflict, Gateway
 from wandrun.gateway.store import ClientIdConflict, UnknownAgent
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 def schedule_tools(gateway: Gateway, manager: WorkerManager) -> list[BaseTool]:

@@ -158,6 +158,31 @@ class CodexSubscriptionTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CodexSubscriptionModel(reasoning_effort="")
 
+    def test_fast_mode_requests_priority_independently_of_reasoning(self):
+        for effort in (None, "low", "high", "future-level"):
+            for enabled in (False, True):
+                with self.subTest(effort=effort, enabled=enabled):
+                    model = CodexSubscriptionModel(reasoning_effort=effort, fast_mode=enabled)
+                    model.invoke("work")
+                    body = self.requests[-1][0]
+                    headers = {key.lower(): value for key, value in self.requests[-1][1].items()}
+                    if enabled:
+                        self.assertEqual(body["service_tier"], "priority")
+                        self.assertEqual(
+                            headers["x-codex-routing-hint"], f"model={model.model_name};tier=priority"
+                        )
+                    else:
+                        self.assertNotIn("service_tier", body)
+                        self.assertNotIn("x-codex-routing-hint", headers)
+                    if effort is None:
+                        self.assertNotIn("reasoning", body)
+                    else:
+                        self.assertEqual(body["reasoning"], {"effort": effort})
+        self.assertNotIn("service_tier", CodexSubscriptionModel().project_request([HumanMessage(content="work")]))
+        for invalid in (None, "true", "false", 0, 1, [], {}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                CodexSubscriptionModel(fast_mode=invalid)
+
     def test_distinct_models_share_one_request_budget(self):
         budget = ModelRequestBudget(2)
         planner = CodexSubscriptionModel(model_name="planner-test", request_budget=budget)

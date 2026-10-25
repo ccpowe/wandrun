@@ -5,22 +5,32 @@ import base64
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from PIL import Image
 
 from wandrun.integrations.image_generation import (
     DEFAULT_IMAGE_MODEL,
+    GeneratedImage,
     ImageGenerationError,
+    MAX_REFERENCE_BYTES,
+    MAX_REFERENCE_IMAGES,
     generate_image,
 )
 from wandrun.metrics import RunMetrics
 from codex_test_home import isolate_codex_home
 
 
+def image_bytes(format="PNG", size=(3, 2)):
+    data = BytesIO()
+    Image.new("RGB", size, "teal").save(data, format=format)
+    return data.getvalue()
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"test-content"
+
+PNG = image_bytes()
 ENCODED = base64.b64encode(PNG).decode()
 
 
@@ -28,12 +38,15 @@ def sse(*events):
     return "".join(f"data: {json.dumps(event)}\n\n" for event in events).encode()
 
 
-def image_item(result=ENCODED):
-    return {"type": "image_generation_call", "id": "img_1", "status": "completed", "result": result}
+def image_item(result=ENCODED, *, quality=None):
+    item = {"type": "image_generation_call", "id": "img_1", "status": "completed", "result": result}
+    if quality is not None:
+        item["quality"] = quality
+    return item
 
 
-def done(result=ENCODED):
-    return {"type": "response.output_item.done", "item": image_item(result)}
+def done(result=ENCODED, *, quality=None):
+    return {"type": "response.output_item.done", "item": image_item(result, quality=quality)}
 
 
 def completed(output=None):
@@ -75,30 +88,83 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(detail, caught.exception.detail)
 
     async def test_request_shape_and_done_result_survives_empty_completed_output(self):
-        self.assertEqual(await generate_image("draw a circle"), PNG)
+        generated = await generate_image("draw a circle")
+        self.assertEqual(generated, GeneratedImage(PNG, None, 3, 2))
         request, = self.requests
         self.assertEqual(request.url.path, "/backend-api/codex/responses")
         self.assertEqual(request.headers["authorization"], "Bearer TEST")
-        self.assertEqual(json.loads(request.content), {
-            "model": DEFAULT_IMAGE_MODEL,
-            "instructions": "You are a helpful assistant.",
-            "input": [{"role": "user", "content": "draw a circle"}],
-            "reasoning": {"effort": "low"},
-            "store": False,
-            "stream": True,
-            "include": ["reasoning.encrypted_content"],
-            "tools": [{"type": "image_generation", "size": "1024x1024", "quality": "low", "output_format": "png"}],
-            "tool_choice": {"type": "image_generation"},
-        })
+        body = json.loads(request.content)
+        self.assertEqual(body["model"], DEFAULT_IMAGE_MODEL)
+        self.assertEqual(body["input"], [{"role": "user", "content": [
+            {"type": "input_text", "text": "draw a circle"},
+        ]}])
+        self.assertEqual(body["tools"][0]["type"], "image_generation")
+        self.assertEqual(body["tools"][0]["output_format"], "png")
+        self.assertNotIn("input_fidelity", body["tools"][0])
+        self.assertTrue(body["stream"])
+
+    async def test_multiple_references_preserve_order_mime_and_requested_settings(self):
+        references = [image_bytes("JPEG"), image_bytes("WEBP"), PNG]
+        self.payload = sse(done(quality="medium"), completed())
+        generated = await generate_image(
+            "edit these", reference_images=references, size="1024x1536", quality="high",
+        )
+        self.assertEqual(generated, GeneratedImage(PNG, "medium", 3, 2))
+        body = json.loads(self.requests[0].content)
+        self.assertEqual(body["tools"][0]["size"], "1024x1536")
+        self.assertEqual(body["tools"][0]["quality"], "high")
+        parts = body["input"][0]["content"]
+        self.assertEqual(parts[0], {"type": "input_text", "text": "edit these"})
+        for part, data, mime in zip(
+            parts[1:], references, ("image/jpeg", "image/webp", "image/png"), strict=True,
+        ):
+            self.assertEqual(part["type"], "input_image")
+            self.assertEqual(
+                part["image_url"], f"data:{mime};base64,{base64.b64encode(data).decode()}",
+            )
+        self.assertEqual(len(parts), 4)
+
+    async def test_actual_metadata_merges_done_and_completed(self):
+        self.payload = sse(done(quality="low"), completed([image_item(None, quality="high")]))
+        self.assertEqual(
+            await generate_image("circle", size="1536x1024", quality="medium"),
+            GeneratedImage(PNG, "high", 3, 2),
+        )
+        self.payload = sse(completed([image_item(quality="medium")]))
+        self.assertEqual((await generate_image("circle")).quality, "medium")
+        self.payload = sse(done(quality="low"), completed([image_item(None)]))
+        self.assertEqual((await generate_image("circle")).quality, "low")
+        self.assertEqual(len(self.requests), 3)
+
+    async def test_invalid_settings_and_references_never_send_request(self):
+        invalid = [
+            {"size": "300x300"}, {"quality": "ultra"},
+            {"reference_images": [PNG] * (MAX_REFERENCE_IMAGES + 1)},
+            {"reference_images": [b"x" * (MAX_REFERENCE_BYTES + 1)]},
+            {"reference_images": [b"not an image"]},
+            {"reference_images": [PNG[:20]]},
+            {"reference_images": [image_bytes("GIF")]},
+            {"reference_images": [b""]},
+            {"reference_images": [bytearray(PNG)]},
+            {"reference_images": (PNG,)},
+        ]
+        for arguments in invalid:
+            with self.subTest(arguments=tuple(arguments)):
+                with self.assertRaises(ImageGenerationError):
+                    await generate_image("circle", **arguments)
+        with patch("wandrun.integrations.image_generation.MAX_REFERENCE_PIXELS", 5):
+            with self.assertRaisesRegex(ImageGenerationError, "像素"):
+                await generate_image("circle", reference_images=[PNG])
+        self.assertEqual(self.requests, [])
 
     async def test_duplicate_completed_item_and_configurable_model(self):
         self.payload = sse(done(), completed([image_item()]))
-        self.assertEqual(await generate_image("circle", model_name="alternate-model"), PNG)
+        self.assertEqual((await generate_image("circle", model_name="alternate-model")).data, PNG)
         self.assertEqual(json.loads(self.requests[0].content)["model"], "alternate-model")
 
     async def test_completed_output_can_supply_result_without_done_event(self):
         self.payload = sse(completed([image_item()]))
-        self.assertEqual(await generate_image("circle"), PNG)
+        self.assertEqual((await generate_image("circle")).data, PNG)
 
     async def test_result_requires_completed_event(self):
         self.payload = sse(done())
@@ -227,6 +293,8 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_failure(detail="base64")
         self.payload = sse(done(base64.b64encode(b"not a png").decode()), completed())
         await self.assert_failure(detail="不是 PNG")
+        self.payload = sse(done(base64.b64encode(PNG[:20]).decode()), completed())
+        await self.assert_failure(detail="PNG 无效")
         self.payload = sse({"type": "error", "error": {"message": "X" * 1000}})
         with self.assertRaises(ImageGenerationError) as caught:
             await generate_image("draw a circle")
@@ -245,7 +313,7 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             metrics = RunMetrics(Path(directory))
             with metrics.agent_scope("task", "executor"):
-                self.assertEqual(await generate_image("circle"), PNG)
+                self.assertEqual((await generate_image("circle")).data, PNG)
             summary = metrics.summary()
             self.assertEqual(summary["model_request_count"], 1)
             self.assertEqual(summary["input_tokens"], 12)

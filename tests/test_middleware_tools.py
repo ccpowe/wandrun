@@ -21,11 +21,11 @@ from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import GatewayStore
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.integrations.shell_backend import ManagedShellBackend
-from wandrun.runtime.agents import build_agents, run_conversation
-from wandrun.runtime.capabilities import EntryCapabilityDefinition
-from wandrun.runtime.environments import Environment
-from wandrun.runtime.tool_search import ToolNamespace
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.agent.agents import build_agents, run_conversation
+from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
+from wandrun.runtime.execution.environments import Environment
+from wandrun.runtime.agent.tool_search import ToolNamespace
+from wandrun.runtime.communication.workers import WorkerManager
 
 from test_capabilities import tool_call, tool_names
 from test_runtime import answer
@@ -81,7 +81,7 @@ class MiddlewareToolsTests(unittest.IsolatedAsyncioTestCase):
                     # Even a later, normally tool-free middleware participates in the guard.
                     extra = AgentMiddleware()
                     extra.tools = [duplicate]
-                    with patch("wandrun.runtime.agents.ModelRetryMiddleware", return_value=extra):
+                    with patch("wandrun.runtime.agent.agents.ModelRetryMiddleware", return_value=extra):
                         with self.assertRaisesRegex(ValueError, "Agent main.*工具名重复：cancel_worker"):
                             self.build()
                 elif source == "direct_mcp":
@@ -104,7 +104,7 @@ class MiddlewareToolsTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_search_reservation_includes_middleware_tools(self):
         extra = AgentMiddleware()
         extra.tools = [echo.model_copy(update={"name": "tool_search"})]
-        with patch("wandrun.runtime.agents.ModelRetryMiddleware", return_value=extra):
+        with patch("wandrun.runtime.agent.agents.ModelRetryMiddleware", return_value=extra):
             with self.assertRaisesRegex(ValueError, "Agent main.*tool_search.*按需搜索冲突"):
                 self.build(searchable={"main": [ToolNamespace("remote", "Remote", (echo,))]})
 

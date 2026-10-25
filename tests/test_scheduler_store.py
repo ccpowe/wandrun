@@ -25,13 +25,13 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from wandrun.config import AgentDefinition
-from wandrun.runtime.agents import build_agents, run_conversation
-from wandrun.runtime.conversations import conversation_config, prepare_conversation_input
-from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime import scheduler_store
-from wandrun.runtime.scheduler_store import SchedulerStore, TaskSnapshot, paired_store_path
-from wandrun.runtime.workers import CommunicationMiddleware, SchedulerFailure, WorkerManager
-from wandrun.runtime.environments import Environment
+from wandrun.runtime.agent.agents import build_agents, run_conversation
+from wandrun.runtime.agent.conversations import conversation_config, prepare_conversation_input
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication import scheduler_store
+from wandrun.runtime.communication.scheduler_store import SchedulerStore, TaskSnapshot, paired_store_path
+from wandrun.runtime.communication.workers import CommunicationMiddleware, SchedulerFailure, WorkerManager
+from wandrun.runtime.execution.environments import Environment
 
 
 def send(manager, sender, target, text, to="worker"):
@@ -582,9 +582,9 @@ class StaleCallbackTests(unittest.IsolatedAsyncioTestCase):
 CRASH_SCRIPT = textwrap.dedent('''
     import asyncio, os, sys
     from pathlib import Path
-    from wandrun.runtime.messages import AgentOutput, SendMessage
-    from wandrun.runtime.scheduler_store import SchedulerStore
-    from wandrun.runtime.workers import WorkerManager
+    from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+    from wandrun.runtime.communication.scheduler_store import SchedulerStore
+    from wandrun.runtime.communication.workers import WorkerManager
 
     path, mode = Path(sys.argv[1]), sys.argv[2]
 
@@ -625,8 +625,8 @@ CRASH_SCRIPT = textwrap.dedent('''
 RECOVERY_CRASH_SCRIPT = textwrap.dedent('''
     import os, sys
     from pathlib import Path
-    from wandrun.runtime.scheduler_store import SchedulerStore
-    from wandrun.runtime.workers import WorkerManager
+    from wandrun.runtime.communication.scheduler_store import SchedulerStore
+    from wandrun.runtime.communication.workers import WorkerManager
 
     class CrashingStore(SchedulerStore):
         def _write(self, snapshot):
@@ -722,11 +722,11 @@ GRAPH_CRASH_SCRIPT = textwrap.dedent('''
     from langchain_core.outputs import ChatGeneration, ChatResult
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
     from wandrun.config import AgentDefinition
-    from wandrun.runtime import workers
-    from wandrun.runtime.agents import build_agents, run_conversation
-    from wandrun.runtime.environments import Environment
-    from wandrun.runtime.messages import AgentOutput, SendMessage
-    from wandrun.runtime.scheduler_store import SchedulerStore
+    from wandrun.runtime.communication import workers
+    from wandrun.runtime.agent.agents import build_agents, run_conversation
+    from wandrun.runtime.execution.environments import Environment
+    from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+    from wandrun.runtime.communication.scheduler_store import SchedulerStore
 
     state, mode = Path(sys.argv[1]), sys.argv[2]
 

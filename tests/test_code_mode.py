@@ -17,10 +17,10 @@ from wandrun.config import load_config
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.integrations.shell_backend import ManagedShellBackend
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.code_mode import CodeModeCatalog, CodeModeMiddleware, code_mode_tool, script_name
+from wandrun.runtime.execution.code_mode import CodeModeCatalog, CodeModeMiddleware, code_mode_tool, script_name
 from wandrun.runtime.session import open_runtime
-from wandrun.runtime.tool_search import ToolNamespace
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.agent.tool_search import ToolNamespace
+from wandrun.runtime.execution.workspace import Workspace
 
 
 def make_tool(name, coroutine, description="", **kwargs):

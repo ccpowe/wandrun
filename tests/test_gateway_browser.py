@@ -19,8 +19,8 @@ from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.gateway.http import create_app
 from wandrun.gateway.service import Gateway, GatewayFailure
 from wandrun.gateway.store import ClientIdConflict, GatewayStore, SCHEMA_VERSION
-from wandrun.runtime.browser import BrowserRejected, UnknownBrowserTask
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.browser.leases import BrowserRejected, UnknownBrowserTask
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 def snapshot(root, *, identity="lease-a", state="agent", agent_id="worker"):

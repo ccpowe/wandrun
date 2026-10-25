@@ -7,7 +7,7 @@ import { chooseModel, modelName, reasoningOptions, selectedModel } from "../src/
 
 const detail: AgentDetail = {
   id: "agent-7", name: "研究员", avatar: 3, description: "查证", system_prompt: "给出来源",
-  model: "model-a", reasoning_effort: "medium", skills: ["browser"], workers: ["writer"],
+  model: "model-a", reasoning_effort: "medium", fast_mode: false, skills: ["browser"], workers: ["writer"],
   mcp_servers: ["secret"], searchable_mcp_servers: [], code_mode: true, environment: "local", member_of: ["team"],
 };
 
@@ -48,6 +48,20 @@ test("Code Mode drafts default on, preserve stored off, and diff only a changed 
   assert.deepEqual(changedAgentFields(original, unsaved), { code_mode: true });
   assert.deepEqual(changedAgentFields(unsaved, { ...unsaved, code_mode: false }), { code_mode: false });
   assert.equal(prepareCreateCommand({ ...blank, code_mode: false }, "new-off", null).fields.code_mode, false);
+});
+
+test("Fast defaults off, preserves saved state through reset and unrelated edits, and retries the exact create choice", () => {
+  const blank = blankAgentDraft({ default_model: "model-a", default_reasoning_effort: "high" }, []);
+  assert.equal(blank.fast_mode, false);
+  assert.equal("fast_mode" in prepareCreateCommand(blank, "unsupported", null).fields, false);
+  const original = draftFromAgent({ ...detail, fast_mode: true });
+  assert.equal(original.fast_mode, true);
+  assert.deepEqual(changedAgentFields(original, { ...original, reasoning_effort: "max" }), { reasoning_effort: "max" });
+  assert.deepEqual(changedAgentFields(original, { ...original, fast_mode: false }), { fast_mode: false });
+  assert.deepEqual(draftFromAgent({ ...detail, fast_mode: true }), original);
+  const command = prepareCreateCommand({ ...blank, fast_mode: true }, "fast-create", null, true);
+  assert.equal(command.fields.fast_mode, true);
+  assert.equal(prepareCreateCommand(blank, "later", command).fields.fast_mode, true);
 });
 
 test("Removing a connector remains a PATCH even if another device has already removed the same relationship", () => {

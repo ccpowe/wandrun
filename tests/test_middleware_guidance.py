@@ -18,17 +18,17 @@ from wandrun.config import AgentDefinition
 from wandrun.gateway.ui_blocks import model_instructions
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.integrations.shell_backend import ManagedShellBackend
-from wandrun.runtime.agents import build_agents, run_conversation
-from wandrun.runtime.capabilities import EntryCapabilityDefinition
-from wandrun.runtime.human_message_guidance import HumanMessageGuidanceMiddleware
-from wandrun.runtime.compaction import message_groups
-from wandrun.runtime.compaction_summary import SUMMARY_INSTRUCTION
-from wandrun.runtime.conversations import conversation_config
-from wandrun.runtime.environments import Environment
-from wandrun.runtime.files import TaskFiles, _current_task
-from wandrun.runtime.memory import MemoryStore
-from wandrun.runtime.memory_runtime import WORK_MEMORY_PATH
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.agent.agents import build_agents, run_conversation
+from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
+from wandrun.runtime.communication.human_message_guidance import HumanMessageGuidanceMiddleware
+from wandrun.runtime.context.compaction import message_groups
+from wandrun.runtime.context.compaction_summary import SUMMARY_INSTRUCTION
+from wandrun.runtime.agent.conversations import conversation_config
+from wandrun.runtime.execution.environments import Environment
+from wandrun.runtime.execution.files import TaskFiles, _current_task
+from wandrun.runtime.context.memory import MemoryStore
+from wandrun.runtime.context.memory_runtime import WORK_MEMORY_PATH
+from wandrun.runtime.communication.workers import WorkerManager
 
 from test_capabilities import tool_call
 from test_runtime import answer

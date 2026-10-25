@@ -3,7 +3,7 @@
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import END
 
-from wandrun.runtime.messages import (
+from wandrun.runtime.communication.messages import (
     read_file_media_tool_call_id,
     unaccepted_send_notice,
 )

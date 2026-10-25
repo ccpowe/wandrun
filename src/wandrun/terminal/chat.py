@@ -3,8 +3,8 @@
 import asyncio
 import json
 
-from wandrun.runtime.files import ResolvedAttachment
-from wandrun.runtime.workers import SchedulerFailure, WorkerManager
+from wandrun.runtime.execution.files import ResolvedAttachment
+from wandrun.runtime.communication.workers import SchedulerFailure, WorkerManager
 from wandrun.metrics import RunMetrics
 
 

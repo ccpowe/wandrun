@@ -14,7 +14,7 @@ from unittest.mock import patch
 from codex_test_home import isolate_codex_home
 from wandrun.gateway.app import serve
 from wandrun.integrations.codex_credentials import CodexCredentials
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.execution.workspace import Workspace
 
 
 PORT = 8785

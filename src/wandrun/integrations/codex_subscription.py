@@ -38,9 +38,9 @@ from langchain_core.utils.function_calling import (
 from langgraph.errors import GraphBubbleUp
 from pydantic import Field, PrivateAttr, TypeAdapter
 
-from wandrun.runtime.messages import AgentOutput, merge_response_outputs
+from wandrun.runtime.communication.messages import AgentOutput, merge_response_outputs
 from wandrun.integrations.human_preview import HumanPreviewParser
-from wandrun.runtime.preview import current_preview
+from wandrun.runtime.communication.preview import current_preview
 from wandrun.metrics import record_request
 from wandrun.integrations.codex_credentials import CodexCredentials, CredentialSnapshot
 
@@ -222,6 +222,7 @@ class CodexSubscriptionModel(BaseChatModel):
     model_name: str = "gpt-5.5"
     timeout: float = 60
     reasoning_effort: ReasoningEffort | None = None
+    fast_mode: bool = Field(default=False, strict=True)
     request_budget: ModelRequestBudget | None = Field(default=None, exclude=True)
     credentials: CodexCredentials = Field(default_factory=CodexCredentials, exclude=True, repr=False)
     prompt_cache_key: CacheKey | None = None
@@ -313,6 +314,9 @@ class CodexSubscriptionModel(BaseChatModel):
         }
         if self.reasoning_effort is not None:
             body["reasoning"] = {"effort": self.reasoning_effort}
+        if self.fast_mode:
+            # Codex ServiceTier::Fast.request_value() is "priority", not "fast".
+            body["service_tier"] = "priority"
         if cache_key is not None:
             body["prompt_cache_key"] = cache_key
         tools = kwargs.get("tools", [])
@@ -464,6 +468,9 @@ class CodexSubscriptionModel(BaseChatModel):
 
             remember_credentials(credential)
         headers = dict(credential.headers)
+        if tier := body.get("service_tier"):
+            # Match Codex's routing signal as well as its Responses body field.
+            headers["x-codex-routing-hint"] = f"model={body['model']};tier={tier}"
         if cache_key := body.get("prompt_cache_key"):
             headers["session-id"] = cache_key
         request = Request(

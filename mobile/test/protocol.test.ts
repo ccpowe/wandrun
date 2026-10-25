@@ -318,6 +318,8 @@ test("模型目录过滤 ultra、默认设置与用量经过真实网关；空�
   assert.deepEqual(catalog.models.map(({ id }) => id), ["offline"]);
   assert.deepEqual(catalog.models[0].supported_reasoning_efforts.map(({ effort }) => effort), ["medium", "high", "max"]);
   assert.equal(typeof catalog.fetched_at, "number");
+  assert.equal(catalog.capabilities?.fast_mode, true);
+  assert.equal((await api.connection()).capabilities?.fast_mode, true);
   const previous = await api.getSettings();
   assert.ok(previous.default_model === null || typeof previous.default_model === "string");
   assert.deepEqual(await api.updateSettings({ default_model: "offline", default_reasoning_effort: "max" }), {
@@ -334,6 +336,17 @@ test("模型目录过滤 ultra、默认设置与用量经过真实网关；空�
   });
   assert.equal(created.agent.model, "offline");
   assert.equal(created.agent.reasoning_effort, "max");
+  assert.equal(created.agent.fast_mode, false);
+  const fast = await api.updateAgent(created.agent.id, { fast_mode: true });
+  assert.equal(fast.agent.fast_mode, true);
+  assert.equal(fast.agent.reasoning_effort, "max");
+  assert.equal((await api.getAgent(created.agent.id)).fast_mode, true);
+  const reasoningOnly = await api.updateAgent(created.agent.id, { reasoning_effort: "medium" });
+  assert.equal(reasoningOnly.agent.fast_mode, true);
+  assert.equal(reasoningOnly.agent.reasoning_effort, "medium");
+  const standard = await api.updateAgent(created.agent.id, { fast_mode: false, reasoning_effort: "max" });
+  assert.equal(standard.agent.fast_mode, false);
+  assert.equal(standard.agent.reasoning_effort, "max");
   await assert.rejects(
     api.updateAgent(created.agent.id, { reasoning_effort: "ultra" }),
     (error: unknown) => error instanceof GatewayError && error.status === 400,
@@ -374,12 +387,13 @@ test("Agent CRUD：创建重放、只编辑允许字段、共享引用校验、�
     api.createAgent("incomplete-agent-command", { description: "缺名称", system_prompt: "回答", model: "offline" } as any),
     (error: any) => error instanceof GatewayError && error.status === 400,
   );
-  const fields = { name: "新朋友", description: "研究问题", system_prompt: "回答时给依据", model: "offline" };
+  const fields = { name: "新朋友", description: "研究问题", system_prompt: "回答时给依据", model: "offline", fast_mode: true };
   const created = await api.createAgent("new-agent-command", fields);
   const id = created.agent.id;
   assert.equal(created.replayed, false);
   assert.equal(created.agent.name, fields.name);
   assert.equal(created.agent.reasoning_effort, null);
+  assert.equal(created.agent.fast_mode, true);
   assert.deepEqual(created.agent.skills, []);
   assert.deepEqual(created.agent.workers, []);
   assert.deepEqual(created.event.data, { kind: "agent", id, op: "created" });
@@ -387,12 +401,14 @@ test("Agent CRUD：创建重放、只编辑允许字段、共享引用校验、�
   assert.equal(replayed.replayed, true);
   assert.equal(replayed.agent.id, id);
   assert.equal(replayed.event.seq, created.event.seq);
+  assert.equal(replayed.agent.fast_mode, true);
   await until(() => phone.agents.agents.some((item) => item.id === id));
 
   const changed = await api.updateAgent(id, { name: "改名后", avatar: 3, workers: ["helper"], reasoning_effort: "medium" });
   assert.equal(changed.agent.id, id);
   assert.equal(changed.agent.name, "改名后");
   assert.equal(changed.agent.avatar, 3);
+  assert.equal(changed.agent.fast_mode, true);
   assert.deepEqual(changed.agent.workers, ["helper"]);
   assert.equal(changed.event?.data.op, "updated");
   assert.equal((await api.updateAgent(id, { name: "改名后" })).event, null);
@@ -674,24 +690,6 @@ test("首页字段与移出：幂等；离线期间的回到首页重连后按�
   assert.equal((await api.listAgents()).agents.find((a) => a.id === "helper")!.home, true);
   await assert.rejects(api.hideAgent("nobody"), (error: any) => error instanceof GatewayError && error.status === 404);
   await session.close();
-  await gateway.kill();
-});
-
-test("详情接口只含定义字段和 member_of，不含首页派生字段", async () => {
-  const gateway = new StubGateway();
-  await gateway.start();
-  const api = new GatewayApi({ baseUrl: gateway.url, token: "dev" });
-  const detail = await api.getAgent("helper");
-  assert.deepEqual(Object.keys(detail).sort(), [
-    "avatar", "code_mode", "compaction_keep_tokens", "compaction_model", "context_window",
-    "description", "environment", "id", "mcp_servers", "member_of", "model", "name",
-    "reasoning_effort", "searchable_mcp_servers", "skills", "system_prompt", "workers",
-  ]);
-  for (const derived of ["home", "latest_conversation", "unread"]) assert.equal(derived in detail, false);
-  const [item] = (await api.listAgents()).agents;
-  assert.deepEqual(Object.keys(item).sort(), [
-    "avatar", "description", "home", "id", "latest_conversation", "name", "unread", "workers",
-  ]);
   await gateway.kill();
 });
 

@@ -21,10 +21,10 @@ from langsmith.run_helpers import get_current_run_tree
 from test_runtime import answer, configure
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 from wandrun.runtime.session import open_runtime
 from wandrun.runtime.tracing import RuntimeTracing, TraceRedactor, _create_client
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 class RecordingSession(requests.Session):

@@ -14,15 +14,15 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from wandrun.runtime.conversations import (
+from wandrun.runtime.agent.conversations import (
     conversation_config,
     missing_tool_results,
     prepare_conversation_input,
 )
 from types import SimpleNamespace
-from wandrun.runtime.messages import AgentOutput, SendMessage, merge_response_outputs
-from wandrun.runtime.files import TaskFiles
-from wandrun.runtime.workers import CommunicationMiddleware, WorkerManager, worker_tools
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage, merge_response_outputs
+from wandrun.runtime.execution.files import TaskFiles
+from wandrun.runtime.communication.workers import CommunicationMiddleware, WorkerManager, worker_tools
 
 
 def output(*messages, next="done"):

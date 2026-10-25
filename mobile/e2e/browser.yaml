@@ -41,6 +41,25 @@ appId: host.exp.exponent
       id: takeover-frame
     timeout: 10000
 # @browser-taken-over
+- assertVisible:
+    id: takeover-url
+- tapOn:
+    id: takeover-more
+- tapOn:
+    id: takeover-landscape
+- extendedWaitUntil:
+    visible:
+      id: takeover-landscape-back
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/05-takeover-landscape-light.png
+- tapOn:
+    id: takeover-more
+- tapOn:
+    id: takeover-landscape
+- extendedWaitUntil:
+    visible:
+      id: takeover-url
+    timeout: 10000
 - takeScreenshot: ${ARTIFACTS}/05-takeover-light.png
 # @dark-mode
 - takeScreenshot: ${ARTIFACTS}/06-takeover-dark.png

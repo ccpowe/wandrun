@@ -14,9 +14,9 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from wandrun.runtime.conversations import conversation_config, missing_tool_results, prepare_conversation_input
-from wandrun.runtime.agents import ConversationState
-from wandrun.runtime.workers import CommunicationMiddleware, WorkerManager
+from wandrun.runtime.agent.conversations import conversation_config, missing_tool_results, prepare_conversation_input
+from wandrun.runtime.agent.agents import ConversationState
+from wandrun.runtime.communication.workers import CommunicationMiddleware, WorkerManager
 
 
 def texts(messages):

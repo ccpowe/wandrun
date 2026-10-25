@@ -72,6 +72,16 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "code_mode 必须是布尔值"):
             self.load(agents=invalid)
 
+    def test_fast_mode_defaults_false_and_requires_a_boolean(self):
+        self.assertFalse(self.load().agents["lead"].fast_mode)
+        for value, expected in (("true", True), ("false", False)):
+            configured = AGENTS.replace('model = "model-two"', f'model = "model-two"\nfast_mode = {value}')
+            self.assertIs(self.load(agents=configured).agents["coder"].fast_mode, expected)
+        for value in ('"false"', "0", "1", "[]", "{}"):
+            configured = AGENTS.replace('model = "model-two"', f'model = "model-two"\nfast_mode = {value}')
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "fast_mode 必须是布尔值"):
+                self.load(agents=configured)
+
     def test_browser_settings_are_local_and_bounded(self):
         browser = '\n[environments.local.browser]\ncdp_url = "http://127.0.0.1:9222"\n'
         config = self.load(environments=ENVIRONMENTS + browser)
@@ -343,6 +353,10 @@ class CatalogSourceTests(unittest.TestCase):
             ("description", ""),
             ("model", None),
             ("code_mode", "yes"),
+            ("fast_mode", "yes"),
+            ("fast_mode", 0),
+            ("fast_mode", 1),
+            ("fast_mode", None),
             ("mcp_servers", ["x"]),  # 必须是 tuple，列表说明解码没做完
             ("environment", " local"),
         ):

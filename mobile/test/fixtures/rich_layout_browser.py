@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
 from wandrun.integrations.browser_dev import ChromeDev
-from wandrun.runtime.browser_cdp import CDPSocket
+from wandrun.runtime.browser.cdp import CDPSocket
 from PIL import Image
 
 

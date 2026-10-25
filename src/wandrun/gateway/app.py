@@ -36,8 +36,8 @@ from wandrun.gateway.attachment_previews import AttachmentPreviewService
 from wandrun.gateway.rich_media import ImageProxy, MediaCache
 from wandrun.metrics import RunMetrics
 from wandrun.runtime.session import open_runtime
-from wandrun.runtime.workers import SchedulerFailure
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.communication.workers import SchedulerFailure
+from wandrun.runtime.execution.workspace import Workspace
 
 
 def _is_loopback(host: str) -> bool:

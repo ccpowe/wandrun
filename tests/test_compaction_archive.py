@@ -13,7 +13,7 @@ from deepagents.backends import FilesystemBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from wandrun.runtime.compaction_archive import CompactionArchive
+from wandrun.runtime.context.compaction_archive import CompactionArchive
 
 
 class ArchiveTests(unittest.IsolatedAsyncioTestCase):

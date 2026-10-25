@@ -60,7 +60,7 @@ appId: host.exp.exponent
 - waitForAnimationToEnd
 - scrollUntilVisible:
     element:
-      id: model-catalog-updated
+      id: model-row-${DEFAULT_MODEL}
     direction: DOWN
 - takeScreenshot: ${ARTIFACTS}/03-default-picker-updated-light.png
 # @dark-mode
@@ -107,7 +107,7 @@ appId: host.exp.exponent
 - waitForAnimationToEnd
 - scrollUntilVisible:
     element:
-      id: model-catalog-updated
+      id: model-row-${DEFAULT_MODEL}
     direction: DOWN
 # @light-mode
 - scrollUntilVisible:
@@ -118,10 +118,9 @@ appId: host.exp.exponent
     id: model-row-${DEFAULT_MODEL}
 - scrollUntilVisible:
     element:
-      id: model-effort-${DEFAULT_EFFORT}
+      id: model-effort-slider
     direction: DOWN
-- tapOn:
-    id: model-effort-${DEFAULT_EFFORT}
+# @reasoning-default
 - tapOn:
     id: settings-model-save
 - extendedWaitUntil:
@@ -140,7 +139,7 @@ appId: host.exp.exponent
     direction: DOWN
 - extendedWaitUntil:
     visible:
-      id: editor-reasoning-${DEFAULT_EFFORT}
+      id: editor-reasoning-slider
     timeout: 10000
 - assertVisible: ${DEFAULT_MODEL_NAME}
 # @new-form-default
@@ -173,7 +172,7 @@ appId: host.exp.exponent
     id: editor-model
 - scrollUntilVisible:
     element:
-      id: model-catalog-updated
+      id: model-row-${CHANGED_MODEL}
     direction: DOWN
 - scrollUntilVisible:
     element:
@@ -183,10 +182,9 @@ appId: host.exp.exponent
     id: model-row-${CHANGED_MODEL}
 - scrollUntilVisible:
     element:
-      id: model-effort-${CHANGED_EFFORT}
+      id: model-effort-slider
     direction: DOWN
-- tapOn:
-    id: model-effort-${CHANGED_EFFORT}
+# @reasoning-changed
 - takeScreenshot: ${ARTIFACTS}/08-agent-model-effort-light.png
 # @dark-mode
 - takeScreenshot: ${ARTIFACTS}/09-agent-model-effort-dark.png
@@ -221,10 +219,9 @@ appId: host.exp.exponent
     id: model-row-${ORIGINAL_MODEL}
 - scrollUntilVisible:
     element:
-      id: model-effort-${ORIGINAL_EFFORT}
+      id: model-effort-slider
     direction: DOWN
-- tapOn:
-    id: model-effort-${ORIGINAL_EFFORT}
+# @reasoning-original
 - tapOn:
     id: editor-done
 - tapOn:

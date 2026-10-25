@@ -35,7 +35,7 @@ appId: host.exp.exponent
     id: editor-model
 - scrollUntilVisible:
     element:
-      id: model-catalog-updated
+      id: model-row-${EDIT_MODEL}
     direction: DOWN
 - takeScreenshot: ${ARTIFACTS}/27-agent-model-light.png
 - tapOn:
@@ -103,10 +103,9 @@ appId: host.exp.exponent
 - back
 - scrollUntilVisible:
     element:
-      id: editor-reasoning-${EDIT_EFFORT}
+      id: editor-reasoning-slider
     direction: DOWN
-- tapOn:
-    id: editor-reasoning-${EDIT_EFFORT}
+# @reasoning-editor
 - tapOn:
     id: editor-save
 # @edited-agent

@@ -33,8 +33,8 @@ from wandrun.gateway.browser_stream import (
 from wandrun.gateway.pairing import DeviceAuth
 from wandrun.gateway.store import GatewayStore
 from wandrun.integrations.browser_dev import ChromeDev
-from wandrun.runtime.browser import BrowserLeases
-from wandrun.runtime.browser_cdp import CDPSocket
+from wandrun.runtime.browser.leases import BrowserLeases
+from wandrun.runtime.browser.cdp import CDPSocket
 
 
 @asynccontextmanager

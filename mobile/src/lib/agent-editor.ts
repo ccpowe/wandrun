@@ -2,13 +2,13 @@ import { GatewayError, type AgentDeleteConflictDetails, type AgentDetail, type A
 import { t } from "./i18n.ts";
 
 export type AgentDraft = AgentEditableFields & { mcp_servers: string[]; searchable_mcp_servers: string[] };
-export type CreateCommand = { clientId: string; fields: Omit<AgentDraft, "model"> & { model?: string } };
+export type CreateCommand = { clientId: string; fields: Omit<AgentDraft, "model" | "fast_mode"> & { model?: string; fast_mode?: boolean } };
 
 /** Once a create request could have reached the gateway, retries must replay both its id and exact payload. */
-export function prepareCreateCommand(draft: AgentDraft, clientId: string, pending: CreateCommand | null): CreateCommand {
+export function prepareCreateCommand(draft: AgentDraft, clientId: string, pending: CreateCommand | null, fastModeSupported = false): CreateCommand {
   if (pending) return pending;
-  const { model, ...fields } = draft;
-  return { clientId, fields: { ...fields, ...(model ? { model } : {}), skills: [...draft.skills], workers: [...draft.workers],
+  const { model, fast_mode, ...fields } = draft;
+  return { clientId, fields: { ...fields, ...(model ? { model } : {}), ...(fastModeSupported ? { fast_mode } : {}), skills: [...draft.skills], workers: [...draft.workers],
     mcp_servers: [...draft.mcp_servers], searchable_mcp_servers: [...draft.searchable_mcp_servers] } };
 }
 
@@ -21,7 +21,7 @@ export function blankAgentDraft(settings: ModelSettings, agents: Pick<AgentSumma
   return {
     name: "", avatar: leastUsedAvatar(agents), description: "", system_prompt: "",
     model: settings.default_model ?? "", reasoning_effort: settings.default_reasoning_effort,
-    code_mode: true, skills: [], workers: [], mcp_servers: [], searchable_mcp_servers: [],
+    fast_mode: false, code_mode: true, skills: [], workers: [], mcp_servers: [], searchable_mcp_servers: [],
   };
 }
 
@@ -38,14 +38,14 @@ export function draftFromAgent(agent: AgentDetail): AgentDraft {
   return {
     name: agent.name, avatar: agent.avatar, description: agent.description,
     system_prompt: agent.system_prompt, model: agent.model, reasoning_effort: agent.reasoning_effort,
-    code_mode: agent.code_mode, skills: [...agent.skills], workers: [...agent.workers],
+    fast_mode: agent.fast_mode === true, code_mode: agent.code_mode, skills: [...agent.skills], workers: [...agent.workers],
     mcp_servers: [...agent.mcp_servers], searchable_mcp_servers: [...agent.searchable_mcp_servers],
   };
 }
 
 export function changedAgentFields(before: AgentDraft, after: AgentDraft): Partial<AgentEditableFields> {
   const patch: Partial<AgentEditableFields> = {};
-  for (const key of ["name", "avatar", "description", "system_prompt", "model", "reasoning_effort", "code_mode"] as const) {
+  for (const key of ["name", "avatar", "description", "system_prompt", "model", "reasoning_effort", "fast_mode", "code_mode"] as const) {
     if (before[key] !== after[key]) (patch as Record<string, unknown>)[key] = after[key];
   }
   for (const key of ["skills", "workers", "mcp_servers", "searchable_mcp_servers"] as const) {

@@ -19,9 +19,9 @@ from wandrun.gateway.skills import InvalidSkill, MAX_SKILL_CONTENT_BYTES, inspec
 from wandrun.gateway.store import GatewayStore
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.conversations import conversation_config
+from wandrun.runtime.agent.conversations import conversation_config
 from wandrun.runtime.session import open_runtime
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.execution.workspace import Workspace
 from test_runtime import answer
 
 

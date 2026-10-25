@@ -10,25 +10,45 @@ import json
 import os
 import re
 from contextlib import aclosing, nullcontext
+from dataclasses import dataclass
+from io import BytesIO
+from typing import Literal
 
 import httpx
+from PIL import Image
 
 from wandrun.integrations.codex_subscription import (
     CodexSubscriptionHTTPError,
     CodexSubscriptionModel,
     _safe_detail,
 )
-from wandrun.metrics import record_request
 from wandrun.integrations.codex_credentials import CodexCredentials
+from wandrun.metrics import record_request
 
 
 DEFAULT_IMAGE_MODEL = "gpt-6-astra"
+MAX_REFERENCE_IMAGES = 3
+MAX_REFERENCE_BYTES = 10 * 1024 * 1024
+MAX_REFERENCE_PIXELS = 25_000_000
+ImageSize = Literal["auto", "1024x1024", "1024x1536", "1536x1024"]
+ImageQuality = Literal["auto", "low", "medium", "high"]
+_IMAGE_MIME = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _QUOTA_CODES = {
     "usage_limit_reached", "insufficient_quota",
     "image_gen_limit_reached", "image_generation_limit_reached",
     "image_gen_quota_exhausted", "image_generation_quota_exhausted",
 }
+
+
+@dataclass(frozen=True)
+class GeneratedImage:
+    """Decoded PNG and the provider-reported quality (not the requested quality)."""
+
+    data: bytes
+    quality: str | None
+    width: int
+    height: int
 
 
 class ImageGenerationError(RuntimeError):
@@ -108,15 +128,60 @@ def _refusal(items):
     return None
 
 
-async def generate_image(
-    prompt: str, *, model_name: str = DEFAULT_IMAGE_MODEL,
-    credentials: CodexCredentials | None = None,
-) -> bytes:
-    """Return complete PNG bytes or raise ImageGenerationError; never retry a request.
+def _image_info(data: bytes, *, reference: bool) -> tuple[str, int, int]:
+    """Decode fully before trusting format or dimensions; reject corrupt media."""
+    try:
+        with Image.open(BytesIO(data)) as image:
+            if reference and image.width * image.height > MAX_REFERENCE_PIXELS:
+                raise ImageGenerationError("image_generation_failed", "参考图片像素超出限制")
+            if image.format not in (_IMAGE_MIME if reference else {"PNG": "image/png"}):
+                raise ImageGenerationError(
+                    "image_generation_failed", "参考图片仅支持 PNG、JPEG、WebP" if reference
+                    else "图片生成返回的不是 PNG",
+                )
+            image.load()
+            return (_IMAGE_MIME[image.format], image.width, image.height)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        raise ImageGenerationError(
+            "image_generation_failed", "参考图片无效或已损坏" if reference
+            else "图片生成返回的 PNG 无效或已损坏",
+        ) from None
 
-    Auth and HTTP/SSE lifecycle come from the subscription adapter. Only the
-    ordinary Responses usage is recorded; image-generation cost is not measured.
+
+def _input_content(prompt: str, reference_images: list[bytes] | None) -> list[dict]:
+    if reference_images is None:
+        reference_images = []
+    if not isinstance(reference_images, list) or len(reference_images) > MAX_REFERENCE_IMAGES:
+        raise ImageGenerationError("image_generation_failed", "参考图片数量超出限制")
+    content = [{"type": "input_text", "text": prompt}]
+    for data in reference_images:
+        if not isinstance(data, bytes) or not data or len(data) > MAX_REFERENCE_BYTES:
+            raise ImageGenerationError("image_generation_failed", "参考图片字节大小无效或超出限制")
+        mime, _, _ = _image_info(data, reference=True)
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}",
+        })
+    return content
+
+
+async def generate_image(
+    prompt: str, *, reference_images: list[bytes] | None = None,
+    size: ImageSize = "1024x1024", quality: ImageQuality = "auto",
+    model_name: str = DEFAULT_IMAGE_MODEL,
+    credentials: CodexCredentials | None = None,
+) -> GeneratedImage:
+    """Generate a decoded PNG with actual dimensions and provider quality.
+
+    References and requested size/quality are validated before any billable request.
+    The provider may ignore requested size/quality. Never retry a request; only
+    ordinary Responses usage is recorded, not image-generation cost.
     """
+    if size not in ("auto", "1024x1024", "1024x1536", "1536x1024"):
+        raise ImageGenerationError("image_generation_failed", "图片尺寸参数无效")
+    if quality not in ("auto", "low", "medium", "high"):
+        raise ImageGenerationError("image_generation_failed", "图片质量参数无效")
+    content = _input_content(prompt, reference_images)
     model = CodexSubscriptionModel(
         model_name=model_name, timeout=180,
         credentials=credentials if credentials is not None else CodexCredentials(),
@@ -124,12 +189,12 @@ async def generate_image(
     body = {
         "model": model_name,
         "instructions": "You are a helpful assistant.",
-        "input": [{"role": "user", "content": prompt}],
+        "input": [{"role": "user", "content": content}],
         "reasoning": {"effort": "low"},
         "store": False,
         "stream": True,
         "include": ["reasoning.encrypted_content"],
-        "tools": [{"type": "image_generation", "size": "1024x1024", "quality": "low", "output_format": "png"}],
+        "tools": [{"type": "image_generation", "size": size, "quality": quality, "output_format": "png"}],
         "tool_choice": {"type": "image_generation"},
     }
     span_context = nullcontext(None)
@@ -141,6 +206,8 @@ async def generate_image(
             span_context = tool_span(context, "image_generation.responses", body, run_type="llm")
     with span_context as span:
         result = None
+        result_item_id = None
+        actual_quality = None
         completed = False
         usage = None
         try:
@@ -161,7 +228,11 @@ async def generate_image(
                         if kind == "response.output_item.done":
                             item = event.get("item")
                             if _image_item(item) and item.get("status") == "completed":
-                                result = result or item.get("result")
+                                if not result:
+                                    result = item.get("result")
+                                    result_item_id = item.get("id")
+                                if item.get("id") == result_item_id and isinstance(item.get("quality"), str):
+                                    actual_quality = item["quality"]
                             elif _image_item(item):
                                 raise _failure(item, "图片生成未完成")
                             elif isinstance(item, dict):
@@ -180,7 +251,11 @@ async def generate_image(
                                 raise ImageGenerationError("image_generation_failed", refusal)
                             for item in items:
                                 if _image_item(item) and item.get("status") == "completed":
-                                    result = result or item.get("result")
+                                    if not result:
+                                        result = item.get("result")
+                                        result_item_id = item.get("id")
+                                    if item.get("id") == result_item_id and isinstance(item.get("quality"), str):
+                                        actual_quality = item["quality"]
                                 elif _image_item(item):
                                     raise _failure(item, "图片生成未完成")
                             usage = response.get("usage")
@@ -196,11 +271,13 @@ async def generate_image(
                     raise ImageGenerationError("image_generation_failed", "图片生成返回了无效的 base64") from None
                 if not image.startswith(_PNG_SIGNATURE):
                     raise ImageGenerationError("image_generation_failed", "图片生成返回的不是 PNG")
+                _, width, height = _image_info(image, reference=False)
                 if span is not None:
                     outputs = {
                         "status": "completed",
                         "image_format": "png",
-                        "image_size": body["tools"][0]["size"],
+                        "image_size": f"{width}x{height}",
+                        "image_quality": actual_quality,
                         "response_metadata": {"model_name": model_name},
                     }
                     if isinstance(usage, dict):
@@ -211,7 +288,7 @@ async def generate_image(
                         if tokens:
                             outputs["usage_metadata"] = tokens
                     span.end(outputs=outputs)
-                return image
+                return GeneratedImage(image, actual_quality, width, height)
         except CodexSubscriptionHTTPError as error:
             raise _http_failure(error) from None
         except ImageGenerationError:

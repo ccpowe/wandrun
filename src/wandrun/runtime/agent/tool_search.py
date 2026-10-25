@@ -19,7 +19,7 @@ from wandrun.integrations.codex_subscription import (
     raw_tool_call,
     tool_search_namespace,
 )
-from wandrun.runtime.compaction import context_messages
+from wandrun.runtime.context.compaction import context_messages
 
 SEARCH_LIMIT = 8
 

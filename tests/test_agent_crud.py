@@ -20,10 +20,10 @@ from wandrun.gateway.service import Gateway, GatewayFailure
 from wandrun.gateway.store import GatewayStore
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.scheduler_store import paired_store_path
-from wandrun.runtime.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.scheduler_store import paired_store_path
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 from wandrun.runtime.session import open_runtime
-from wandrun.runtime.memory import MemoryReadError, MemoryRetired
+from wandrun.runtime.context.memory import MemoryReadError, MemoryRetired
 from test_runtime import answer, configure
 from test_gateway_models import subscription_fixture
 from codex_test_home import isolate_codex_home
@@ -48,9 +48,11 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         self.block = False
+        self.requests = []
         owner = self
 
         async def respond(model, body):
+            owner.requests.append(body)
             owner.entered.set()
             if owner.block:
                 await owner.release.wait()
@@ -100,6 +102,65 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("agents.", blank.json()["error"]["message"])
         self.assertEqual(self.store.agent("main"), before)
         self.assertEqual(self.store.last_seq(), seq)
+
+    async def test_fast_mode_crud_runtime_replay_and_strict_noop(self):
+        self.assertIs(self.store.agent("main")["fast_mode"], False)
+        models = await self.client.get("/models")
+        self.assertEqual(models.json()["capabilities"], {"fast_mode": True})
+        connection = await self.client.get("/connection")
+        self.assertEqual(connection.json()["capabilities"], {"fast_mode": True})
+        default = await self.client.post("/agents", json=self.payload(client_id="fast-default", code_mode=False))
+        self.assertEqual(default.status_code, 201, default.text)
+        self.assertIs(default.json()["agent"]["fast_mode"], False)
+        payload = self.payload(client_id="fast-enabled", fast_mode=True, reasoning_effort="xhigh", code_mode=False)
+        created = await self.client.post("/agents", json=payload)
+        self.assertEqual(created.status_code, 201, created.text)
+        first = created.json()
+        identity = first["agent"]["id"]
+        self.assertIs(first["agent"]["fast_mode"], True)
+        self.assertTrue(self.store.agent_catalog().agents[identity].fast_mode)
+        root = self.gateway.create_conversation("Fast request", identity)["id"]
+        self.gateway.send_message(root, "fast-request", "完成")
+        self.assertEqual((await self.runtime.workers.wait(root))["status"], "completed")
+        self.assertEqual(self.requests[-1]["service_tier"], "priority")
+        self.assertEqual(self.requests[-1]["reasoning"], {"effort": "xhigh"})
+        detail = await self.client.get(f"/agents/{identity}")
+        self.assertIs(detail.json()["fast_mode"], True)
+        seq = self.store.last_seq()
+        original = self.runtime._assembly_for(identity)
+        same = await self.client.patch(f"/agents/{identity}", json={"fast_mode": True})
+        self.assertEqual(same.status_code, 200, same.text)
+        self.assertIsNone(same.json()["event"])
+        self.assertIs(self.runtime._assembly_for(identity), original)
+        self.assertEqual(self.store.last_seq(), seq)
+        # 1 == True and 0 == False must not bypass validation via no-op equality.
+        for value in (None, "true", "false", 0, 1, [], {}):
+            with self.subTest(value=value):
+                rejected = await self.client.patch(f"/agents/{identity}", json={"fast_mode": value})
+                self.assertEqual(rejected.status_code, 400, rejected.text)
+                rejected = await self.client.post(
+                    "/agents", json=self.payload(client_id=f"bad-fast-{value}", fast_mode=value, code_mode=False),
+                )
+                self.assertEqual(rejected.status_code, 400, rejected.text)
+                self.assertEqual(self.store.last_seq(), seq)
+        self.upstream["status"] = 503
+        disabled = await self.client.patch(f"/agents/{identity}", json={"fast_mode": False})
+        self.assertEqual(disabled.status_code, 200, disabled.text)
+        self.assertIs(disabled.json()["agent"]["fast_mode"], False)
+        self.assertEqual(disabled.json()["agent"]["reasoning_effort"], "xhigh")
+        self.assertEqual(disabled.json()["event"]["data"], {"kind": "agent", "id": identity, "op": "updated"})
+        self.assertFalse(self.store.agent_catalog().agents[identity].fast_mode)
+        replay = await self.client.post("/agents", json=payload)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertTrue(replay.json()["replayed"])
+        self.assertEqual(replay.json()["agent"], first["agent"])
+        self.assertEqual(replay.json()["event"], first["event"])
+        self.assertEqual(self.store.last_seq(), seq + 1)
+        root = self.gateway.create_conversation("Standard request", identity)["id"]
+        self.gateway.send_message(root, "standard-request", "完成")
+        self.assertEqual((await self.runtime.workers.wait(root))["status"], "completed")
+        self.assertNotIn("service_tier", self.requests[-1])
+        self.assertEqual(self.requests[-1]["reasoning"], {"effort": "xhigh"})
 
     async def test_code_mode_default_explicit_value_edits_and_validation(self):
         self.assertFalse(self.store.agent("main")["code_mode"])  # Imported definitions keep their saved value.

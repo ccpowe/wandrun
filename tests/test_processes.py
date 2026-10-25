@@ -18,9 +18,9 @@ from wandrun.evaluation.headless import LifecycleError, _wait_for_root
 from wandrun.integrations import local_processes
 from wandrun.integrations.local_processes import ProcessTable
 from wandrun.integrations.shell_backend import CleanupUnconfirmedError
-from wandrun.runtime.browser import BrowserLeases
-from wandrun.runtime.process_tools import CommandMiddleware, process_tools
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.browser.leases import BrowserLeases
+from wandrun.runtime.execution.process_tools import CommandMiddleware, process_tools
+from wandrun.runtime.communication.workers import WorkerManager
 
 GRACE = 0.3
 

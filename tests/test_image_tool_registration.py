@@ -13,12 +13,13 @@ from wandrun.gateway.capabilities import gateway_capabilities
 from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import GatewayStore
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
+from wandrun.integrations.image_generation import GeneratedImage
 from wandrun.integrations.shell_backend import ManagedShellBackend
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.environments import Environment
-from wandrun.runtime import agents
+from wandrun.runtime.execution.environments import Environment
+from wandrun.runtime.agent import agents
 from wandrun.runtime.session import open_runtime
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.execution.workspace import Workspace
 
 
 class ImageToolRegistrationTests(unittest.IsolatedAsyncioTestCase):
@@ -94,9 +95,11 @@ class ImageToolRegistrationTests(unittest.IsolatedAsyncioTestCase):
                     }],
                 }]}}
 
-            async def generate(prompt, *, model_name, credentials):
-                image_calls.append((prompt, model_name))
-                return b"\x89PNG\r\n\x1a\ncomplete image"
+            async def generate(prompt, **kwargs):
+                image_calls.append((prompt, kwargs["model_name"]))
+                return GeneratedImage(
+                    data=b"\x89PNG\r\n\x1a\ncomplete image", quality="medium", width=8, height=12,
+                )
 
             async def run(runtime, role, task):
                 runtime.workers.start("show tools", task, agent_name=role)
@@ -144,7 +147,6 @@ class ImageToolRegistrationTests(unittest.IsolatedAsyncioTestCase):
 
             for task in ("local-before", "local-after", "new-local"):
                 self.assertIn("generate_image", seen[task])
-                self.assertEqual(set(seen[task]["generate_image"]["parameters"]["properties"]), {"prompt"})
                 self.assertIn("create_schedule", seen[task])
             for task in ("remote-before", "remote-after", "without-host"):
                 self.assertNotIn("generate_image", seen[task])

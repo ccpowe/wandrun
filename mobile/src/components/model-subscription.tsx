@@ -2,7 +2,6 @@ import { Box } from "lucide-react-native";
 import { View } from "react-native";
 
 import { ListGroup } from "@/components/list-group.tsx";
-import { Button } from "@/components/ui/button.tsx";
 import { Icon } from "@/components/ui/icon.tsx";
 import { Text } from "@/components/ui/text.tsx";
 import { useTranslation } from "../lib/i18n.ts";
@@ -10,7 +9,7 @@ import { quotaWarning, resetLabel, usedPercent, windowTitle } from "@/lib/model-
 import type { SubscriptionView } from "@/lib/model-usage.ts";
 
 /** Show current gateway authentication separately from the most recent quota observation. */
-export function ModelSubscription({ view, nowSeconds, onRecheck }: { view: SubscriptionView; nowSeconds: number; onRecheck: () => void }) {
+export function ModelSubscription({ view, nowSeconds }: { view: SubscriptionView; nowSeconds: number }) {
   const { t, locale } = useTranslation();
   const { auth, usage, networkError } = view;
   const needsLogin = !networkError && (auth?.status === "reauth_required" || auth?.status === "relogin_required" || auth?.status === "login_required");
@@ -36,7 +35,7 @@ export function ModelSubscription({ view, nowSeconds, onRecheck }: { view: Subsc
         </View>
       </View>
       {needsLogin && auth ? <View testID="settings-subscription-login" className="gap-2 px-4 pb-3">
-        <Text className="text-[13px] leading-[19px]">{t("先在电脑上停止网关，再使用网关的 CODEX_HOME（{home}）重新登录。成功后重启网关，点“重新检查”；不要使用日常 Codex 目录。", { home: auth.codex_home })}</Text>
+        <Text className="text-[13px] leading-[19px]">{t("先在电脑上停止网关，再使用网关的 CODEX_HOME（{home}）重新登录。成功后重启网关并重新进入此页面；不要使用日常 Codex 目录。", { home: auth.codex_home })}</Text>
         <Text selectable className="text-[13px] leading-[19px] font-mono">{auth.login_command}</Text>
       </View> : null}
       {usage?.windows.map((window, index) => (
@@ -51,6 +50,5 @@ export function ModelSubscription({ view, nowSeconds, onRecheck }: { view: Subsc
       {!usage && <Text className="px-4 pb-3 text-[13px] text-muted-foreground">{t("暂时无法获取额度")}</Text>}
     </ListGroup>
     {usage ? <Text testID="settings-subscription-quota-date" className="mx-8 mt-2 text-xs text-muted-foreground">{t("额度更新于 {time}{stale}", { time: new Date(usage.fetched_at * 1000).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", hour12: false }), stale: auth?.status !== "ready" || networkError ? t(" · 历史额度，不代表当前登录状态") : "" })}</Text> : null}
-    <Button testID="settings-subscription-recheck" variant="outline" size="sm" className="mx-4 mt-3 self-start" onPress={onRecheck}><Text>{t("重新检查")}</Text></Button>
   </>;
 }

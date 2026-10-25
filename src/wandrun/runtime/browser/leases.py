@@ -25,7 +25,7 @@ from websockets.asyncio.server import serve
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 
-from wandrun.runtime.browser_cdp import BrowserRelay, CDPError, CDPRejected, CDPSocket
+from wandrun.runtime.browser.cdp import BrowserRelay, CDPError, CDPRejected, CDPSocket
 
 _log = logging.getLogger(__name__)
 _STREAM_PROFILES = {"high": (75, 1600, 1000), "medium": (55, 1600, 1000),

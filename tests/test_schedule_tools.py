@@ -18,8 +18,8 @@ from wandrun.gateway.store import GatewayStore
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.metrics import RunMetrics
 from wandrun.runtime.session import open_runtime
-from wandrun.runtime.workers import WorkerManager
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.communication.workers import WorkerManager
+from wandrun.runtime.execution.workspace import Workspace
 
 
 RULE = {"kind": "once", "local_at": "2099-01-02T10:00"}

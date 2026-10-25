@@ -29,18 +29,19 @@ and only asks you when it really needs a human — a login, a captcha, a decisio
 
 ## Highlights
 
-- **Updated chat interface** — a conversation drawer, revised message layout and a simpler composer.
+- **Updated chat interface (v0.2.1)** — a conversation drawer, revised message layout, a simpler composer and a discrete reasoning-effort slider.
 - **Rich, interactive replies** — charts, tables, forms, link lists and expandable file trees mixed with text; agents are guided to use components when they fit. Form submissions become the next message. Link icons are fetched by the gateway from Google s2 with only the hostname, not the page path or query.
 - **A team that works in parallel** — an agent can hand pieces of a task to other agents, keep working, and pull the results together. You see each member's progress live.
-- **A browser you can take over** — agents drive a real Chrome on your machine. Watch the page from your phone and take over for logins or captchas, then hand it back.
+- **A browser you can take over** — agents drive a real Chrome on your machine. Watch the page from your phone and take over for logins or captchas, then hand it back. In takeover, choose **More → Landscape** explicitly; leaving the screen resets it to portrait.
 - **Agents you design** — give each agent its own prompt, model, reasoning effort, skills, MCP connectors and team members, all from the app.
 - **Runs on your ChatGPT subscription** — models come from your own Codex login. The app shows your quota and per-agent usage; no API keys to manage.
+- **Independent Fast control** — the lightning toggle beside an agent's model requests priority processing without changing reasoning effort. It is off by default and may consume more subscription quota; gateway support is not account entitlement or a latency guarantee. See [Fast support](docs/deploy.md#fast-support).
 
 <!-- case study: added later -->
 
 ## More features
 
-- **Files both ways** — send photos, videos and documents with resumable uploads; agent output arrives as cards you can preview, download and share.
+- **Files both ways** — send photos, videos and documents with resumable uploads; agent output arrives as cards you can preview, download and share. Image viewers also offer download and system sharing of the original image.
 - **Schedules** — one-off, daily, weekly or cron; each run opens a new conversation, and agents can schedule work for you.
 - **Shared profile, separate working memory** — edit your shared profile in Settings → About you, and each agent's working memory on its profile page; both support a short Markdown index and on-demand details.
 - **Long conversations** — automatic context compaction now checks summary structure and length and carries completed work and next steps forward; original history stays on disk. Validation does not guarantee summary accuracy or prevent all repeated work.
@@ -109,7 +110,7 @@ For an always-on server with HTTPS, the agent browser and systemd services, foll
 
 ## Getting the app
 
-- **APK:** download from [Releases](https://github.com/ccpowe/wandrun/releases).
+- **APK:** download from [Releases](https://github.com/ccpowe/wandrun/releases). The v0.2.1 release reuses the existing signed APK (app version **0.2.0**, Android versionCode **3**); it is not a rebuilt APK.
 - **Build it yourself:** see [Build the Android app](docs/deploy.md#build-the-android-app).
 
 iOS builds are not tested yet.
@@ -118,7 +119,7 @@ iOS builds are not tested yet.
 
 | Path | What it is |
 | --- | --- |
-| `src/wandrun/runtime/` | Agent loop, multi-agent scheduler, memory, compaction, browser leases |
+| `src/wandrun/runtime/` | `agent`, `communication`, `context`, `execution` and `browser` responsibilities; shared session and tracing |
 | `src/wandrun/integrations/` | Codex subscription model, MCP + OAuth, local / SSH execution |
 | `src/wandrun/gateway/` | HTTP / SSE API for the app, pairing, uploads, schedules, rich UI validation |
 | `src/wandrun/terminal/` | Terminal chat entry (`python -m wandrun.terminal`) |
@@ -129,7 +130,7 @@ iOS builds are not tested yet.
 ## Status
 
 Wandrun is an early, actively developed project. The persisted state format is **not stable**
-yet: upgrades may require clearing `workspace/.wandrun/state`. Issues and pull requests are welcome.
+yet. v0.2.1 requires gateway schema **24** with no automatic migration; see [upgrade options](docs/deploy.md#upgrades) before changing existing state. Issues and pull requests are welcome.
 
 ## License
 

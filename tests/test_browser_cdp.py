@@ -11,7 +11,7 @@ import unittest
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
-from wandrun.runtime.browser_cdp import BrowserRelay, CDPError, CDPSocket
+from wandrun.runtime.browser.cdp import BrowserRelay, CDPError, CDPSocket
 
 
 def url(server):
@@ -318,7 +318,7 @@ class SocketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         socket.ws = FlakyConnection()
         socket._send_worker = asyncio.create_task(socket._send_notifications())
         try:
-            with self.assertLogs("wandrun.runtime.browser_cdp", level="ERROR"):
+            with self.assertLogs("wandrun.runtime.browser.cdp", level="ERROR"):
                 socket.notify("Page.screencastFrameAck", {"sessionId": 1})
                 socket.notify("Page.screencastFrameAck", {"sessionId": 2})
                 await asyncio.wait_for(sent.wait(), 2)

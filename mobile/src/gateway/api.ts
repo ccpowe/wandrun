@@ -84,6 +84,7 @@ export type AgentEditableFields = {
   system_prompt: string;
   model: string;
   reasoning_effort: string | null;
+  fast_mode: boolean;
   code_mode: boolean;
   skills: string[];
   workers: string[];
@@ -188,7 +189,7 @@ export type ModelInfo = {
   default_reasoning_effort: string | null;
   supported_reasoning_efforts: { effort: string; description: string }[];
 };
-export type ModelCatalog = { models: ModelInfo[]; fetched_at: number };
+export type ModelCatalog = { models: ModelInfo[]; fetched_at: number; capabilities?: { fast_mode?: boolean } };
 export type ModelSettings = { default_model: string | null; default_reasoning_effort: string | null };
 export type SubscriptionUsage = {
   plan_type: string | null;
@@ -268,6 +269,7 @@ export type AgentDetail = AgentCore & {
   system_prompt: string;
   model: string;
   reasoning_effort: string | null;
+  fast_mode: boolean;
   mcp_servers: string[];
   searchable_mcp_servers: string[];
   skills: string[];
@@ -436,6 +438,7 @@ export type ConnectionInfo = {
   gateway_version: string;
   paired_at: string | null;
   pairing_method: "manual" | "qr" | "development";
+  capabilities?: { fast_mode?: boolean };
 };
 export type PairingExchange = ConnectionInfo & { token: string; device_id: string };
 

@@ -11,7 +11,7 @@ function agent(id: string, over: Partial<AgentSummary> = {}): AgentSummary {
 
 const detail: AgentDetail = {
   ...agent("planner", { workers: ["writer"] }),
-  system_prompt: "", model: "test", reasoning_effort: null,
+  system_prompt: "", model: "test", reasoning_effort: null, fast_mode: false,
   mcp_servers: [], searchable_mcp_servers: [], skills: [],
   code_mode: false, environment: "local", member_of: [],
 };

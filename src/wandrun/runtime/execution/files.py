@@ -45,11 +45,14 @@ class ResolvedAttachment:
     # None means a host-local path; SSH identity is captured at preflight, not inferred at download.
     remote_environment: str | None = None
 
-def open_delivery_file(root: Path, path: str) -> tuple[int, Path, os.stat_result]:
+def open_delivery_file(
+    root: Path, path: str, *, follow_symlinks: bool = True,
+) -> tuple[int, Path, os.stat_result]:
     """Open a live regular workspace file, excluding lexical and canonical control paths.
 
-    The caller owns the returned fd. Every failure closes it here; a later reader
-    must use the fd, not reopen the path returned alongside it.
+    With follow_symlinks=False, reject every symlink and lexical parent traversal
+    below root before opening the file. The caller owns the returned fd and must
+    read it rather than reopening the returned path.
     """
     candidate = Path(path)
     if not candidate.is_absolute():
@@ -60,7 +63,25 @@ def open_delivery_file(root: Path, path: str) -> tuple[int, Path, os.stat_result
         lexical = candidate.parts
     if ".wandrun" in lexical:
         raise ValueError("不能交付 workspace 控制文件")
-    descriptor = os.open(candidate, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    if follow_symlinks:
+        descriptor = os.open(candidate, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    else:
+        parts = candidate.relative_to(root).parts
+        if not parts or ".." in parts:
+            raise ValueError("文件必须位于当前对话目录内")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        parent_fd = os.open(root, flags)
+        try:
+            for component in parts[:-1]:
+                child_fd = os.open(component, flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = child_fd
+            descriptor = os.open(
+                parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+        finally:
+            os.close(parent_fd)
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
@@ -198,6 +219,26 @@ class TaskFiles:
             os.close(directory_fd)
             raise
         return directory, directory_fd
+
+    def read_local_file(self, task_id: str, path: str, *, max_bytes: int) -> bytes:
+        """Read a bounded regular file in this task's conversation; never follow links."""
+        directory, directory_fd = self.open_local_conversation_directory(task_id)
+        os.close(directory_fd)
+        if not path or "://" in path or path.startswith("data:"):
+            raise ValueError("文件路径必须位于当前对话目录内，不能是 URL")
+        candidate = Path(path)
+        absolute = candidate if candidate.is_absolute() else directory / candidate
+        descriptor, _, info = open_delivery_file(directory, str(absolute), follow_symlinks=False)
+        try:
+            if info.st_size > max_bytes:
+                raise ValueError(f"文件不能超过 {max_bytes} 字节")
+            with os.fdopen(descriptor, "rb", closefd=False) as source:
+                content = source.read(max_bytes + 1)
+            if len(content) > max_bytes:
+                raise ValueError(f"文件不能超过 {max_bytes} 字节")
+            return content
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _verify_local_conversation_directory(directory: Path, directory_fd: int) -> None:

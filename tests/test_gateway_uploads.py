@@ -21,7 +21,7 @@ from wandrun.gateway.http import create_app
 from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import GatewayStore
 from wandrun.gateway.uploads import UPLOAD_LIFETIME
-from wandrun.runtime.files import ResolvedAttachment
+from wandrun.runtime.execution.files import ResolvedAttachment
 
 
 def metadata(conversation_id, filename="报告.pdf", filetype="application/pdf"):

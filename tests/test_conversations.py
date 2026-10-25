@@ -13,8 +13,8 @@ from langchain.tools import tool
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from wandrun.runtime.conversations import conversation_config, prepare_conversation_input
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.agent.conversations import conversation_config, prepare_conversation_input
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 async def worker(database, phase):

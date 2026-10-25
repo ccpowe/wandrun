@@ -21,14 +21,14 @@ from langchain.agents.middleware import AgentMiddleware
 from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.capabilities import EntryCapabilityDefinition
-from wandrun.runtime.conversations import conversation_config
-from wandrun.runtime.code_mode import CodeModeCatalog, _Execution, _script_functions
-from wandrun.runtime.messages import AgentOutput, SendMessage
+from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
+from wandrun.runtime.agent.conversations import conversation_config
+from wandrun.runtime.execution.code_mode import CodeModeCatalog, _Execution, _script_functions
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 from wandrun.runtime.session import RuntimeCleanupError, open_runtime
-from wandrun.runtime.workspace import Workspace
-from wandrun.runtime.scheduler_store import SchedulerStore
-from wandrun.runtime.files import TaskBackend, TaskFiles, _current_task
+from wandrun.runtime.execution.workspace import Workspace
+from wandrun.runtime.communication.scheduler_store import SchedulerStore
+from wandrun.runtime.execution.files import TaskBackend, TaskFiles, _current_task
 from wandrun.integrations.shell_backend import ManagedShellBackend
 from wandrun.integrations.local_processes import ProcessTable
 
@@ -70,7 +70,7 @@ def created_backends(cls=ManagedShellBackend):
             super().__init__(*args, **kwargs)
             created.append(self)
 
-    with patch("wandrun.runtime.environments.ManagedShellBackend", Recording):
+    with patch("wandrun.runtime.execution.environments.ManagedShellBackend", Recording):
         yield created
 
 
@@ -357,7 +357,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         from langchain_core.tools import tool
         from langchain_core.messages import ToolMessage
         from wandrun.config import load_config
-        from wandrun.runtime.compaction_summary import SUMMARY_INSTRUCTION
+        from wandrun.runtime.context.compaction_summary import SUMMARY_INSTRUCTION
         from compaction_fixtures import SUMMARY_TEXT
 
         report = "trace row\n" * 20000 + "deep.wire_crc=8E91C2A4\n" + "tail row\n" * 2000
@@ -747,7 +747,7 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
                     self.fail("不应打开")
 
     async def test_catalog_window_refresh_only_changes_compaction_after_commit(self):
-        from wandrun.runtime.compaction_summary import SUMMARY_INSTRUCTION
+        from wandrun.runtime.context.compaction_summary import SUMMARY_INSTRUCTION
         from compaction_fixtures import SUMMARY_TEXT
 
         requests = []
@@ -1072,7 +1072,7 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(pools[0].closed)
 
     async def test_new_ssh_role_executes_in_prepared_conversation_after_catalog_commit(self):
-        from wandrun.runtime.environments import Environment
+        from wandrun.runtime.execution.environments import Environment
 
         with tempfile.TemporaryDirectory() as directory:
             workspace = configure(Path(directory))
@@ -1613,7 +1613,7 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
 
 class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
     async def test_task_cwd_is_shared_by_descendants_not_other_roots_across_file_shell_and_process(self):
-        from wandrun.runtime.workers import WorkerManager
+        from wandrun.runtime.communication.workers import WorkerManager
 
         async def run(prompts, task_id):
             return AgentOutput(messages=[], next="wait")
@@ -1757,7 +1757,7 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
                 return original_rmdir(name, dir_fd=dir_fd)
 
             files = TaskFiles(root, None, {}, conversation_workdirs=True)
-            with patch("wandrun.runtime.files.os.rmdir", side_effect=replace_parent):
+            with patch("wandrun.runtime.execution.files.os.rmdir", side_effect=replace_parent):
                 await files.cleanup_conversation("empty")
             self.assertFalse((root / "original-parent" / "empty").exists())
             self.assertTrue((outside / "empty").is_dir())
@@ -1926,7 +1926,7 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
                 return actual
 
             files = TaskFiles(root, None, {}, conversation_workdirs=False)
-            with patch("wandrun.runtime.files.os.readlink", side_effect=replace_after_fd_readlink):
+            with patch("wandrun.runtime.execution.files.os.readlink", side_effect=replace_after_fd_readlink):
                 with self.assertRaises(ValueError):
                     files.resolve_delivery(str(root / "alias/secret"))
             self.assertTrue((control / "held").is_file())
@@ -1946,12 +1946,12 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
                 return descriptor
 
             files = TaskFiles(root, None, {}, conversation_workdirs=False)
-            with patch("wandrun.runtime.files.os.open", side_effect=unlink_after_open):
+            with patch("wandrun.runtime.execution.files.os.open", side_effect=unlink_after_open):
                 with self.assertRaisesRegex(ValueError, "替换或删除"):
                     files.resolve_delivery(str(candidate))
 
     async def test_delivery_rejects_control_escape_directory_and_fifo_without_blocking(self):
-        from wandrun.runtime.workers import WorkerManager
+        from wandrun.runtime.communication.workers import WorkerManager
 
         async def run(prompts, task_id):
             return AgentOutput(messages=[], next="wait")
@@ -1982,7 +1982,7 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
             code = (
                 "import signal, sys\n"
                 "from pathlib import Path\n"
-                "from wandrun.runtime.files import TaskFiles\n"
+                "from wandrun.runtime.execution.files import TaskFiles\n"
                 "f = TaskFiles(Path(sys.argv[1]), None, {}, conversation_workdirs=True)\n"
                 "def timeout(signum, frame):\n"
                 "    raise TimeoutError('FIFO_OPEN_BLOCKED')\n"
@@ -2005,7 +2005,7 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("普通文件", result.stderr)
 
     async def test_restored_member_keeps_original_root_workdir(self):
-        from wandrun.runtime.workers import WorkerManager
+        from wandrun.runtime.communication.workers import WorkerManager
 
         async def run(prompts, task_id):
             return AgentOutput(messages=[], next="wait")

@@ -4,7 +4,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 
-from wandrun.runtime.browser import BrowserRejected
+from wandrun.runtime.browser.leases import BrowserRejected
 
 
 class BrowserTakeoverMiddleware(AgentMiddleware):

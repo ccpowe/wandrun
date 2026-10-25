@@ -17,6 +17,21 @@ const EXTENSION_BY_MIME: Record<string, string> = {
   "application/pdf": ".pdf", "text/plain": ".txt", "text/markdown": ".md",
   "text/csv": ".csv", "application/json": ".json",
 };
+
+/** A persisted media position names an image without trusting its remote URL or alt text. */
+export function messageImageFile(location: {
+  conversationId: string; messageSeq: number; block: number | "markdown"; element: string; index: number;
+}, mime: string): Pick<FileRecord, "name" | "media_type"> {
+  const mediaType = mime.split(";", 1)[0].trim().toLowerCase();
+  const extension = EXTENSION_BY_MIME[mediaType];
+  if (!extension || previewKind({ media_type: mediaType }) !== "image") throw new UserFacingError("不支持的图片格式");
+  let hash = 2166136261;
+  for (const char of `${location.conversationId}:${location.element}`) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+  return {
+    name: `image-${location.messageSeq}-${location.block}-${location.index}-${(hash >>> 0).toString(36)}${extension}`,
+    media_type: mediaType,
+  };
+}
 // Disjoint namespace: a legitimate original can itself end in `.keep`.
 const MARKER_PREFIX = "keep-";
 

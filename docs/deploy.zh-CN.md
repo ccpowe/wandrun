@@ -261,6 +261,21 @@ npx eas-cli build --platform android --profile preview  # 生成可安装的 APK
 
 本地开发可用 `npx expo run:android`，在连接的设备上构建并安装调试版。
 
+## Fast 支持
+
+v0.2.1 网关发布支持已有 App 中每个 Agent 模型旁的独立闪电开关与离散档位推理强度滑条。
+随发布提供的是已有签名 APK（App 版本 **0.2.0**、Android versionCode **3**），不重新构建。
+Fast 默认关闭，作用于该 Agent 的主模型与压缩模型请求，不改变推理强度。
+开启时发送 `service_tier=priority` 和 `x-codex-routing-hint`，关闭时两者均不发送。
+上游拒绝请求时，客户端不会自动关闭 Fast 降级重试。
+
+只有网关通过 `/models` 或 `/connection` 声明 `capabilities.fast_mode=true` 后，
+App 才启用该控件。这表示实现支持，**不代表**账户有权限或上游可用。
+优先处理请求可能消耗更多订阅额度，不承诺响应更快或特定延迟。
+
+原生 App 也支持下载原图／通过系统分享原图，以及接管浏览器时主动选择**更多 → 横屏**
+（离开页面恢复竖屏）。现有概览截图仅作示意，可能未展示这些控件。
+
 ## 可选 LangSmith 追踪
 
 追踪**默认关闭**。确需开启时，按上文给网关 unit 显式添加环境文件，内容如下：
@@ -280,19 +295,61 @@ LANGSMITH_PROJECT=wandrun
 
 ## 升级
 
-1. 阅读发布说明，停止服务：`systemctl --user stop wandrun-chrome wandrun-xvfb`（网关随 Chrome 一起停止）。
+1. 阅读发布说明，停止服务：`systemctl --user stop wandrun-gateway wandrun-chrome wandrun-xvfb`。
 2. 停服备份 `~/wandrun-workspace` 和 `~/wandrun-chrome`，包括 SQLite 附属文件；凭据备份保密，回滚限制见下文。
 3. 切换到新 tag，执行 `uv sync --locked --no-dev`。
-4. 按下面两条路径处理状态，然后启动服务，按上面的方法等到 401。
+4. 按下面的路径处理状态：按说明移走旧 state，或先将保留的网关数据库转换到结构版本 **24**，再启动服务。
+   按上面的方法等到 401。首次启动会创建全新结构版本 24 的状态；应用拒绝旧结构版本，不会自动迁移。
 
-### 从 v0.1.x 升级（网关结构 22 → 23）
+### 全新 state
 
-新旧格式不兼容，项目不含迁移代码。优先选择**全新 state**：停服后把
+无需保留历史时，优先选择**全新 state**：停服后把
 `~/wandrun-workspace/.wandrun/state` 移到备份位置。对话、定时和设备配对重新开始；
 Agent 和连接器从 TOML 重新导入，不会恢复旧数据库中经 App 做的编辑；旧记忆不导入。
 
-也可保留网关数据库：安装 `sqlite3` 命令行工具，仅对**已停服、已备份的结构版本 22 数据库**
-执行以下一次性 SQL。它丢弃记忆修改者元数据，重建 `memory_metadata` 并设版本 23，不是通用状态迁移。
+### 从 v0.2.0 升级（网关结构 23 → 24）
+
+要保留 Agent、对话、定时和设备配对，安装支持 JSON 的 `sqlite3` 命令行工具，
+仅对**已停服、已备份的结构版本 23 数据库**执行以下一次性运维 SQL。
+它为现有 Agent 添加 `fast_mode=0`，并为每一条保存的原始 Agent 创建响应添加 JSON
+`fast_mode=false`，包括后来已编辑或删除的 Agent。不能从当前 Agent 重建这些回放快照：
+重试必须保留首次结果。这只是有界的离线转换，不是应用迁移，也不保证旧执行检查点兼容；
+升级后新建对话，不继续旧检查点。
+
+```bash
+sqlite3 -bail "$HOME/wandrun-workspace/.wandrun/state/gateway.sqlite" <<'SQL'
+.bail on
+PRAGMA foreign_keys = ON;
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE upgrade_guard (version INTEGER CHECK (version = 23));
+INSERT INTO upgrade_guard SELECT user_version FROM pragma_user_version;
+CREATE TEMP TABLE upgrade_assert (ok INTEGER NOT NULL CHECK (ok = 1));
+INSERT INTO upgrade_assert
+    SELECT count(*) = 0 FROM created_agent_results WHERE NOT json_valid(detail);
+INSERT INTO upgrade_assert
+    SELECT count(*) = 0 FROM created_agent_results
+    WHERE json_type(detail) != 'object' OR json_type(detail, '$.fast_mode') IS NOT NULL;
+ALTER TABLE agents ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0 CHECK (fast_mode IN (0, 1));
+UPDATE created_agent_results SET detail = json_set(detail, '$.fast_mode', json('false'));
+CREATE TEMP TABLE upgrade_integrity (result TEXT NOT NULL CHECK (result = 'ok'));
+INSERT INTO upgrade_integrity SELECT integrity_check FROM pragma_integrity_check;
+INSERT INTO upgrade_assert SELECT count(*) = 0 FROM pragma_foreign_key_check;
+PRAGMA user_version = 24;
+COMMIT;
+PRAGMA user_version;
+PRAGMA integrity_check;
+PRAGMA foreign_key_check;
+SQL
+```
+
+预期输出 `24` 和 `ok`，且没有外键检查结果行。任何错误都应保持停服；`.bail on` 会退出，
+未提交的事务随之回滚。基于备份排查，不绕过守卫，也不要只改 `user_version`。
+列的 SQL 默认值只用于初始化旧 Agent，不会开启 Fast。命令不可重复执行，也不能用于结构版本 22 或 24。
+
+### 从 v0.1.x 升级（网关结构 22 → 23 → 24）
+
+也可保留网关数据库：先仅对**已停服、已备份的结构版本 22 数据库**执行以下一次性 SQL。
+它丢弃记忆修改者元数据，重建 `memory_metadata` 并设版本 23。这只是中间步骤，**此时不要启动 v0.2.1**。
 旧记忆不转换为画像或工作记忆，需要的内容在 App 重新录入；升级后新建对话，不继续旧执行检查点。
 
 ```bash
@@ -319,7 +376,8 @@ PRAGMA integrity_check;
 SQL
 ```
 
-预期输出 `23` 和 `ok`。出错时保持停服并核对备份，不绕过版本守卫；这段 SQL 不处理其他结构版本。
+预期输出 `23` 和 `ok`，然后**保持停服，执行上方 23 → 24 SQL**，确认输出 `24`、`ok` 且无外键检查结果行后
+才可启动。出错时保持停服并核对备份，不绕过版本守卫；这段 SQL 不处理其他结构版本。
 
 **回滚与 OAuth：** 验收可能使令牌轮换。不要把备份中的旧 Codex `auth.json` 或连接器 refresh token
 覆盖回当前凭据。回滚代码／状态不等于回滚凭据；无法一致保留当前凭据时，重新登录或授权，不重放旧 refresh token。

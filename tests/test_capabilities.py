@@ -18,7 +18,7 @@ from wandrun.gateway.store import GatewayStore
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.metrics import RunMetrics
 from wandrun.runtime.session import open_runtime
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.execution.workspace import Workspace
 
 from test_runtime import answer
 
@@ -380,9 +380,9 @@ class CapabilityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         from langgraph.checkpoint.memory import InMemorySaver
 
         from wandrun.integrations.shell_backend import ManagedShellBackend
-        from wandrun.runtime.agents import build_agents, run_conversation
-        from wandrun.runtime.environments import Environment
-        from wandrun.runtime.workers import WorkerManager
+        from wandrun.runtime.agent.agents import build_agents, run_conversation
+        from wandrun.runtime.execution.environments import Environment
+        from wandrun.runtime.communication.workers import WorkerManager
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -11,10 +11,10 @@ from langchain.tools import tool
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langgraph.checkpoint.memory import InMemorySaver
 
-from wandrun.runtime.memory import MemoryStore
-from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime.scheduler_store import SchedulerStore
-from wandrun.runtime.workers import (
+from wandrun.runtime.context.memory import MemoryStore
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.scheduler_store import SchedulerStore
+from wandrun.runtime.communication.workers import (
     CommunicationMiddleware, WorkerManager, current_execution_generation, worker_tools,
 )
 
@@ -238,7 +238,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.endswith("colleague message"))
 
     async def test_without_human_receiver_rejects_delivery_and_keeps_failure_queryable(self):
-        from wandrun.runtime.messages import AgentOutput, SendMessage
+        from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 
         async def run(prompt, task_id):
             raise ValueError("execution failed")

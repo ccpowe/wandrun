@@ -22,7 +22,9 @@ const hosts: Record<string, string> = {
       return createElement('ScrollView',props);
     }`,
   "react-native-safe-area-context": "export const useSafeAreaInsets=()=>({top:0,bottom:0});",
-  "lucide-react-native": "export const Brain='Brain', ChevronRight='ChevronRight', Clock='Clock', Monitor='Monitor', Pencil='Pencil', Users='Users', X='X', WifiOff='WifiOff';",
+  "@react-native-community/slider": "export default 'Slider';",
+  "uniwind": "export const useCSSVariable=()=>['#141414','#dddddd'];",
+  "lucide-react-native": "export const Zap='Zap',Brain='Brain', ChevronRight='ChevronRight', Clock='Clock', Monitor='Monitor', Pencil='Pencil', Users='Users', X='X', WifiOff='WifiOff';",
   "@/lib/session-context.tsx": "export const useSession=()=>globalThis.__profileLayoutSession;",
   "@/lib/use-open-agent-chat.ts": "export const useOpenAgentChat=()=>()=>{};",
   "@/components/agent-memory-tab.tsx": "export const AgentMemoryTab='AgentMemoryTab';",
@@ -222,29 +224,56 @@ test("profile labels fit one row at 360dp in both languages through every select
   } finally { await f.close(); applyLanguage("zh"); }
 });
 
-test("reasoning options wrap as whole cells in full-width and nested editors", async () => {
+test("reasoning slider uses catalog ordinals and full labels without endpoint text or render-driven draft changes", async () => {
   const root = createRoot({ textComponentTypes: ["Text"] });
-  const model = {
-    default_reasoning_effort: "medium",
-    supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"].map((effort) => ({ effort, description: "" })),
-  } as ModelInfo;
-  let choice = "";
+  let choices: string[] = [];
+  const render = async (efforts: string[], effort: string | null, disabled = false, available = true) => {
+    const model = { default_reasoning_effort: "high",
+      supported_reasoning_efforts: efforts.map((effort) => ({ effort, description: "" })) } as ModelInfo;
+    await act(async () => root.render(createElement(ReasoningPicker, {
+      model: available ? model : undefined, effort, disabled, onChange: (value) => choices.push(value), testIDPrefix: "effort",
+    })));
+    return root.container.queryAll((node) => node.type === "Slider")[0];
+  };
   try {
     for (const language of ["en", "zh"] as const) {
       await act(async () => applyLanguage(language));
-      for (const effort of model.supported_reasoning_efforts.map((item) => item.effort)) {
-        await act(async () => root.render(createElement(ReasoningPicker, {
-          model, effort, onChange: (value) => { choice = value; }, testIDPrefix: "effort",
-        })));
-        const cells = root.container.queryAll((node) => node.props.accessibilityRole === "radio");
-        for (const screenWidth of [360, 390, 430]) {
-          // ListGroup margins/borders + editor padding add 66dp to the nested path.
-          for (const inset of [38, 104]) checkSingleLineLayout(cells, screenWidth - inset, false);
-        }
-        const selected = cells.find((cell) => cell.props.accessibilityState.selected)!;
-        await act(async () => selected.props.onPress());
-        assert.equal(choice, effort);
+      for (const efforts of [["medium", "max"], ["low", "medium", "high", "xhigh", "max"], ["minimal", "high", "max"]]) {
+        choices = [];
+        const slider = await render(efforts, "max");
+        assert.equal(slider.props.maximumValue, efforts.length - 1);
+        assert.equal(slider.props.step, 1);
+        assert.equal(slider.props.value, efforts.length - 1);
+        assert.equal(slider.props.accessibilityValue.text, language === "en" ? "Maximum" : "最高");
+        assert.deepEqual(choices, []);
+        await act(async () => slider.props.onValueChange(0));
+        assert.deepEqual(choices, [efforts[0]]);
+        assert.equal(root.container.queryAll((node) => node.props.accessibilityRole === "radio").length, 0);
       }
     }
+    choices = [];
+    const unknown = await render(["medium", "high"], "retired-effort");
+    assert.equal(unknown.props.accessibilityValue.text, "retired-effort");
+    assert.deepEqual(choices, []);
+    const refreshed = await render(["low", "max"], "retired-effort");
+    assert.deepEqual(choices, []);
+    // A touch can explicitly choose the first stop even when the native thumb was already there.
+    await act(async () => refreshed.props.onSlidingComplete(0));
+    assert.deepEqual(choices, ["low"]);
+    choices = [];
+    const locked = await render(["medium", "high"], "medium", true);
+    await act(async () => locked.props.onValueChange(1));
+    assert.deepEqual(choices, []);
+    assert.equal(locked.props.accessibilityState.disabled, true);
+    const implicit = await render(["medium", "high", "max"], null);
+    assert.equal(implicit.props.value, 1);
+    assert.deepEqual(choices, []);
+    await act(async () => implicit.props.onValueChange(0.5));
+    await act(async () => implicit.props.onValueChange(99));
+    assert.deepEqual(choices, []);
+    assert.equal(await render([], "saved"), undefined);
+    assert.equal(await render(["medium"], "saved"), undefined);
+    assert.equal(await render(["medium", "high"], "saved", false, false), undefined);
+    assert.deepEqual(choices, []);
   } finally { await act(async () => root.unmount()); applyLanguage("zh"); }
 });

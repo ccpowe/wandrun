@@ -17,15 +17,15 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
-from wandrun.runtime.agents import ConversationState
-from wandrun.runtime.code_mode import CodeModeCatalog, code_mode_tool
-from wandrun.runtime.compaction import (
+from wandrun.runtime.agent.agents import ConversationState
+from wandrun.runtime.execution.code_mode import CodeModeCatalog, code_mode_tool
+from wandrun.runtime.context.compaction import (
     CompactionMiddleware, ContextBudgetExhausted, context_messages, message_groups,
 )
-from wandrun.runtime.compaction_archive import CompactionArchive
-from wandrun.runtime.compaction_summary import _summary_history, SUMMARY_INSTRUCTION
-from wandrun.runtime.memory import MemoryStore
-from wandrun.runtime.memory_runtime import MemoryMiddleware, PROFILE_MEMORY_PATH
+from wandrun.runtime.context.compaction_archive import CompactionArchive
+from wandrun.runtime.context.compaction_summary import _summary_history, SUMMARY_INSTRUCTION
+from wandrun.runtime.context.memory import MemoryStore
+from wandrun.runtime.context.memory_runtime import MemoryMiddleware, PROFILE_MEMORY_PATH
 
 from compaction_fixtures import SUMMARY_TEXT
 
@@ -246,7 +246,7 @@ class MixedExecutionCompactionTests(unittest.IsolatedAsyncioTestCase):
             async def summary(_request, **_kwargs):
                 return AIMessage(content=SUMMARY_TEXT)
             before = [m.model_dump() for m in raw]
-            with patch("wandrun.runtime.compaction.summarize_request", summary):
+            with patch("wandrun.runtime.context.compaction.summarize_request", summary):
                 with self.assertRaises(ContextBudgetExhausted) as failure:
                     await CompactionMiddleware(context_window=10000, keep_tokens=1, archive=archive)._compact(
                         request, request, None, "threshold",

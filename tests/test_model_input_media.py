@@ -13,7 +13,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 
 from wandrun.integrations.codex_subscription import CodexSubscriptionHTTPError, CodexSubscriptionModel
-from wandrun.runtime.conversations import conversation_config, prepare_conversation_input
+from wandrun.runtime.agent.conversations import conversation_config, prepare_conversation_input
 from codex_test_home import isolate_codex_home
 
 

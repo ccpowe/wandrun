@@ -12,12 +12,12 @@ from deepagents.backends import LocalShellBackend
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from wandrun.runtime.agents import build_agents, run_conversation
+from wandrun.runtime.agent.agents import build_agents, run_conversation
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.config import AgentDefinition
-from wandrun.runtime.messages import AgentOutput, merge_response_outputs
-from wandrun.runtime.workers import WorkerManager
-from wandrun.runtime.environments import Environment
+from wandrun.runtime.communication.messages import AgentOutput, merge_response_outputs
+from wandrun.runtime.communication.workers import WorkerManager
+from wandrun.runtime.execution.environments import Environment
 
 DEFINITIONS = {
     "planner": AgentDefinition(

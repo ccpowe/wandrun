@@ -79,8 +79,6 @@ export const browserMessages = {
   "无法接管浏览器": "Unable to take over browser",
   "无法交还浏览器": "Unable to hand back browser",
   "关闭页面失败": "Unable to close page",
-  "无法恢复自动旋转，请检查设备的屏幕方向设置": "Unable to restore auto-rotation. Check your device's screen orientation settings",
-  "无法切换屏幕方向，请检查设备是否允许旋转后重试": "Unable to change screen orientation. Check that rotation is enabled on your device and try again",
   "画面数据无法读取，请重新打开浏览器连接": "Unable to read image data. Reopen the browser connection",
   "画面连接失败": "Image connection failed",
   "画面无法显示，请重新打开浏览器连接": "Unable to display image. Reopen the browser connection",

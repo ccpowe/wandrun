@@ -3,8 +3,8 @@ import unittest
 from unittest.mock import patch
 
 from wandrun.terminal.chat import TerminalOutput, chat
-from wandrun.runtime.files import ResolvedAttachment
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.execution.files import ResolvedAttachment
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 class TerminalTests(unittest.IsolatedAsyncioTestCase):
@@ -180,7 +180,7 @@ class TerminalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.get("one")["status"], "not_found")
 
     async def test_cancel_stops_root_branch_and_resets_reply_target(self):
-        from wandrun.runtime.messages import AgentOutput, SendMessage
+        from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 
         received, states_after_cancel = [], []
         output = TerminalOutput()
@@ -225,7 +225,7 @@ class TerminalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.get("child")["status"], "cancelled")
 
     async def test_rejected_input_prints_reason_and_terminal_keeps_accepting_commands(self):
-        from wandrun.runtime.messages import AgentOutput
+        from wandrun.runtime.communication.messages import AgentOutput
 
         received = []
 
@@ -258,7 +258,7 @@ class TerminalTests(unittest.IsolatedAsyncioTestCase):
 
 class HumanRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_human_reply_returns_to_questioning_worker(self):
-        from wandrun.runtime.messages import AgentOutput, SendMessage
+        from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 
         lines = asyncio.Queue()
         answered = asyncio.Event()
@@ -293,7 +293,7 @@ class HumanRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.get("root")["status"], "not_found")
 
     async def test_independent_terminal_outputs_route_to_their_own_worker(self):
-        from wandrun.runtime.messages import AgentOutput, SendMessage
+        from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 
         answered = []
         outputs = [TerminalOutput(), TerminalOutput()]
@@ -327,7 +327,7 @@ class HumanRoutingTests(unittest.IsolatedAsyncioTestCase):
 
 class TerminalExitTests(unittest.TestCase):
     def test_scheduler_failure_shows_its_notes(self):
-        from wandrun.runtime.workers import SchedulerFailure
+        from wandrun.runtime.communication.workers import SchedulerFailure
         from wandrun.terminal import app
 
         async def failing(*args, **kwargs):

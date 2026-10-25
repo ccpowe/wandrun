@@ -5,7 +5,7 @@ import unittest
 
 from langchain.messages import AIMessage, HumanMessage
 
-from wandrun.runtime.messages import (
+from wandrun.runtime.communication.messages import (
     AgentOutput,
     SendMessage,
     runtime_message,

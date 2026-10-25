@@ -18,7 +18,7 @@ from wandrun.config import EnvironmentDefinition, RuntimeConfig
 from wandrun.integrations.local_processes import ProcessTable
 from wandrun.integrations.shell_backend import ManagedShellBackend
 from wandrun.integrations.ssh_backend import SSHBackend, remote_script, sftp_client
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.execution.workspace import Workspace
 
 
 @dataclass(frozen=True)

@@ -12,12 +12,12 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
-from wandrun.runtime.agents import _ConfiguredSkillsMiddleware, build_agents, run_conversation
+from wandrun.runtime.agent.agents import _ConfiguredSkillsMiddleware, build_agents, run_conversation
 from wandrun.config import AgentDefinition
-from wandrun.runtime.capabilities import EntryCapabilityDefinition
-from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime.workers import WorkerManager
-from wandrun.runtime.environments import Environment
+from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.workers import WorkerManager
+from wandrun.runtime.execution.environments import Environment
 
 
 class SkillsTests(unittest.IsolatedAsyncioTestCase):

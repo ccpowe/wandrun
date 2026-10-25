@@ -15,7 +15,7 @@ from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.gateway.http import _OpenedFileResponse, create_app
 from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import GatewayStore
-from wandrun.runtime.files import ResolvedAttachment, TaskFiles
+from wandrun.runtime.execution.files import ResolvedAttachment, TaskFiles
 
 
 class FileDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -153,7 +153,7 @@ class FileDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 (self.root / "safe.txt").write_bytes(b"public")
             return actual
 
-        with patch("wandrun.runtime.files.os.readlink", side_effect=replace_after_fd_readlink):
+        with patch("wandrun.runtime.execution.files.os.readlink", side_effect=replace_after_fd_readlink):
             with self.assertRaises(OSError):
                 self.gateway.open_file(record["id"])
         self.assertEqual(len(opened_fd), 1)

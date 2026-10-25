@@ -48,18 +48,18 @@ from wandrun.gateway.store import ClientIdConflict, Event, GatewayStore, Invalid
 from wandrun.gateway.rich_media import ImageProxy, MediaData, MediaError
 from wandrun.gateway.ui_blocks import delivery_blocks, frozen_preview_text, image_attachments, markdown_image_urls, parse_blocks, submission_text, validate_values
 from wandrun.gateway.subscription import SubscriptionData, SubscriptionUnavailable
-from wandrun.runtime.capabilities import EntryCapabilityDefinition
+from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
 from wandrun.integrations.mcp import MCPConnectionError
-from wandrun.runtime.memory import (
+from wandrun.runtime.context.memory import (
     MEMORY_LIMIT, MEMORY_DETAIL_LIMIT, InvalidMemory, MemoryChange, MemoryConflict,
     MemoryDetailSnapshot, MemoryRetired, MemorySnapshot, MemoryStore,
 )
-from wandrun.runtime.preview import PreviewPersistenceError
+from wandrun.runtime.communication.preview import PreviewPersistenceError
 from wandrun.runtime.session import Runtime
 from wandrun.gateway.uploads import DEFAULT_MAX_UPLOAD_SIZE, UploadError, Uploads
-from wandrun.runtime.files import ResolvedAttachment, TaskFiles, open_delivery_file
-from wandrun.runtime.workers import SchedulerFailure, WorkerManager
-from wandrun.runtime.browser import BrowserRejected, UnknownBrowserTask
+from wandrun.runtime.execution.files import ResolvedAttachment, TaskFiles, open_delivery_file
+from wandrun.runtime.communication.workers import SchedulerFailure, WorkerManager
+from wandrun.runtime.browser.leases import BrowserRejected, UnknownBrowserTask
 
 logger = logging.getLogger(__name__)
 
@@ -1170,6 +1170,7 @@ class Gateway:
             "name", "avatar", "description", "system_prompt", "model",
             "reasoning_effort", "skills", "workers", "mcp_servers", "searchable_mcp_servers",
             "context_window", "compaction_keep_tokens", "compaction_model", "code_mode",
+            "fast_mode",
         }
         if extra := fields.keys() - allowed:
             raise InvalidAgent("Agent 包含不可编辑的字段")
@@ -1188,6 +1189,8 @@ class Gateway:
         avatar = fields.get("avatar")
         if "avatar" in fields and (type(avatar) is not int or not 0 <= avatar <= 7):
             raise InvalidAgent("头像必须是 0～7 的整数")
+        if "fast_mode" in fields and type(fields["fast_mode"]) is not bool:
+            raise InvalidAgent("Fast 模式必须是布尔值")
         values = {key: value for key, value in fields.items() if key != "avatar"}
         labels = {"skills": "技能", "workers": "成员", "mcp_servers": "连接器",
                   "searchable_mcp_servers": "按需搜索连接器"}

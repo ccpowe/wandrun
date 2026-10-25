@@ -7,7 +7,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { EditorRow, SelectionRow } from "@/components/agent-editor-controls.tsx";
 import { ListGroup } from "@/components/list-group.tsx";
-import { ModelPicker, ReasoningPicker } from "@/components/model-picker.tsx";
+import { FastModeToggle, ModelPicker, ReasoningPicker } from "@/components/model-picker.tsx";
 import { ScreenBar } from "@/components/screen-bar.tsx";
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog.tsx";
 import { Button } from "@/components/ui/button.tsx";
@@ -58,6 +58,8 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const skillCatalog = useSkillCatalog(session);
   const capabilityCatalog = useAgentCapabilities(session, id);
+  const { catalog, loading: catalogLoading } = useModelCatalog(session.api, false);
+  const fastModeSupported = catalog?.capabilities?.fast_mode === true;
   const [memberQuery, setMemberQuery] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
@@ -174,6 +176,10 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
     const invalidName = memberOnly ? null : validateAgentName(draft.name);
     if (invalidName) { setNameError(invalidName); setPanel("main"); return; }
     const patch = original ? changedAgentFields(original, draft) : null;
+    if (!memberOnly && !createCommand.current && (id ? patch?.fast_mode !== undefined : draft.fast_mode) && !fastModeSupported) {
+      setSaveError("当前网关尚未确认支持 Fast，请更新网关并重新加载后再保存。");
+      return;
+    }
     if (!memberOnly && !createCommand.current) {
       if (!draft.system_prompt.trim()) {
         setSaveError("请填写 Agent 提示词");
@@ -208,7 +214,7 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
         if (focused.current && navigationEpoch.current === epoch && !session.agents.deletedIds.has(id)) router.back();
       } else {
         // An unreadable success response or unexpected exception leaves the result unknown.
-        const command = createCommand.current ?? prepareCreateCommand(draft, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`, null);
+        const command = createCommand.current ?? prepareCreateCommand(draft, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`, null, fastModeSupported);
         createCommand.current = command;
         const result = await session.api.createAgent(command.clientId, command.fields);
         session.connectorChanged(result.event);
@@ -284,7 +290,9 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
   const done = panel === "main" || memberOnly ? save : () => { setPanel("main"); };
   const actionLabel = createdId ? t("进入聊天") : memberOnly ? t("完成") : panel === "main" ? id ? t("保存") : t("创建") : t("完成");
   const draftLocked = saving || deleting || createUnknown || !!createdId;
-  const { catalog } = useModelCatalog(session.api, false);
+  const fastModeDisabledReason = fastModeSupported ? undefined : t(catalogLoading
+    ? "正在检查 Fast 支持…"
+    : catalog ? "当前网关不支持 Fast，请更新网关。" : "无法确认 Fast 支持，请重新加载模型列表。");
   const currentModel = draft ? selectedModel(catalog?.models ?? [], draft.model) : undefined;
   const availableSkills = draft ? selectableSkills(skillCatalog.skills, draft.skills) : [];
   const members = agents.filter((agent) => agent.id !== id && (`${agent.name} ${agent.description}`).toLowerCase().includes(memberQuery.trim().toLowerCase()));
@@ -336,14 +344,24 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
           </ListGroup>
           {nameError ? <Text className="mx-8 mt-1 text-sm text-destructive">{t(nameError)}</Text> : null}
           <ListGroup label={t("模型")}>
-            <EditorRow testID="editor-model" label={t("模型")} value={draft.model ? modelName(catalog?.models ?? [], draft.model) : t("沿用默认模型")} onPress={draftLocked ? undefined : () => setPanel("model")} />
-            <View className="min-h-[52px] gap-2 px-4 py-2">
-              <Text className="text-[15px]">{t("推理强度")}</Text>
+            <View className="min-h-[52px] flex-row items-center px-4 py-1">
+              <Pressable testID="editor-model" accessibilityRole="button" accessibilityLabel={t("模型")}
+                accessibilityState={{ disabled: draftLocked }} disabled={draftLocked} onPress={() => setPanel("model")}
+                className="min-h-11 min-w-0 flex-1 flex-row items-center gap-2 active:bg-muted">
+                <Text className="text-[15px]">{t("模型")}</Text>
+                <Text numberOfLines={1} className="min-w-0 flex-1 text-right text-sm text-muted-foreground">{draft.model ? modelName(catalog?.models ?? [], draft.model) : t("沿用默认模型")}</Text>
+                <Icon as={ChevronRight} className="size-[18px] text-muted-foreground" />
+              </Pressable>
+              <FastModeToggle enabled={draft.fast_mode} disabled={draftLocked || !fastModeSupported}
+                disabledReason={fastModeDisabledReason} onChange={(fast_mode) => change({ fast_mode })} />
+            </View>
+            <View className="min-h-[52px] px-4 py-2">
               <ReasoningPicker model={currentModel} effort={draft.reasoning_effort} onChange={(reasoning_effort) => change({ reasoning_effort })}
                 disabled={draftLocked || !catalog} testIDPrefix="editor-reasoning" />
-              {!currentModel && draft.reasoning_effort !== null ? <Text className="text-xs text-muted-foreground">{t("当前强度为 {effort}；目录不可用时保持原值。", { effort: draft.reasoning_effort })}</Text> : null}
             </View>
           </ListGroup>
+          {fastModeDisabledReason ? <Text testID="editor-fast-unavailable" className="mx-8 mt-2 text-xs leading-[17px] text-muted-foreground">{fastModeDisabledReason}</Text> : null}
+          {draft.fast_mode && fastModeSupported ? <Text testID="editor-fast-note" accessibilityLiveRegion="polite" className="mx-8 mt-2 text-xs leading-[17px] text-muted-foreground">{t("Fast 已开启 · 请求优先处理，可能消耗更多订阅额度。")}</Text> : null}
           <ListGroup label={t("能力")}>
             <View className="min-h-[72px] flex-row items-center gap-3 px-4 py-2.5">
               <View className="min-w-0 flex-1">
@@ -360,7 +378,6 @@ function AgentEditor({ session, id, memberOnly }: { session: ChatSession; id?: s
               value={capabilityCatalog.capabilities ? t("{count} 项已启用", { count: capabilityCatalog.capabilities.filter((item) => item.status === "enabled").length }) : capabilityCatalog.error ? t("无法加载") : t("加载中")}
               onPress={() => router.push({ pathname: "/agent-capabilities", params: { id } })} /> : null}
           </ListGroup>
-          {id ? <Text className="mx-8 mt-3 text-xs leading-[17px] text-muted-foreground">{t("影响直接对话及所在团队，进行中的工作从下一轮生效。")}</Text> : null}
           {id ? <Button testID="editor-delete" variant="ghost" className="mt-3 self-center bg-transparent" disabled={saving || deleting} onPress={() => void requestDeletion()}><Text className="font-normal text-destructive">{t("删除 Agent")}</Text></Button> : null}
         </KeyboardAwareScrollView>
       ) : panel === "model" ? (

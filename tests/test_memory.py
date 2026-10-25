@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from wandrun.runtime.memory import (
+from wandrun.runtime.context.memory import (
     InvalidMemory, MEMORY_DETAIL_LIMIT, MemoryCleanupError, MemoryConflict,
     MemoryReadError, MemoryRetired, MemoryStore,
 )
@@ -234,7 +234,7 @@ class MemoryStoreTests(unittest.TestCase):
     def test_manifest_failure_keeps_old_index_and_restart_cleans_orphan(self):
         base = self.store.read("main")
         prepared = self.store.prepare_detail("main", "item", "prepared", base.version, owner="task")
-        with patch("wandrun.runtime.memory.os.replace", side_effect=OSError("disk failure")):
+        with patch("wandrun.runtime.context.memory.os.replace", side_effect=OSError("disk failure")):
             with self.assertRaises(OSError):
                 self.store.save("main", prepared.path, base.version, owner="task")
         self.assertEqual(self.store.read("main"), base)
@@ -330,7 +330,7 @@ class MemoryStoreTests(unittest.TestCase):
             for path in self.manifest().parent.glob("details/*/*.md"):
                 path.unlink()
             raise OSError("interrupted recursive deletion")
-        with patch("wandrun.runtime.memory.shutil.rmtree", side_effect=interrupted_delete):
+        with patch("wandrun.runtime.context.memory.shutil.rmtree", side_effect=interrupted_delete):
             with self.assertRaises(OSError):
                 self.store.delete("main")
         reopened = MemoryStore(self.root)

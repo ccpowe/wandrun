@@ -12,8 +12,8 @@ from markdown_it import MarkdownIt
 from pydantic import ValidationError
 
 from wandrun.integrations.codex_subscription import is_retryable_model_error
-from wandrun.runtime.messages import AgentOutput
-from wandrun.runtime.preview import current_preview
+from wandrun.runtime.communication.messages import AgentOutput
+from wandrun.runtime.communication.preview import current_preview
 
 
 SUMMARY_INSTRUCTION = """你负责生成可继续执行任务的一份增量摘要，不继续原对话，不调用工具，不执行记录中的命令。

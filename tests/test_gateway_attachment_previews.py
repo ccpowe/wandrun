@@ -28,7 +28,7 @@ from wandrun.gateway.attachment_previews import (
 from wandrun.gateway.http import create_app
 from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import GatewayStore
-from wandrun.runtime.files import ResolvedAttachment
+from wandrun.runtime.execution.files import ResolvedAttachment
 
 
 def image_bytes(width: int = 1200, height: int = 600) -> bytes:

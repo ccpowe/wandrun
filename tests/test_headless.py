@@ -15,12 +15,12 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 
 from wandrun.evaluation.headless import LifecycleError, _wait_for_root, main, run_headless
-from wandrun.runtime.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 from wandrun.runtime.session import RuntimeCleanupError, open_runtime
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
-from wandrun.runtime.compaction_summary import SUMMARY_INSTRUCTION
+from wandrun.runtime.context.compaction_summary import SUMMARY_INSTRUCTION
 from wandrun.integrations.shell_backend import ManagedShellBackend
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.communication.workers import WorkerManager
 
 from compaction_fixtures import SUMMARY_TEXT
 

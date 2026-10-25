@@ -8,7 +8,7 @@ import httpx
 from test_gateway import gateway_manager, open_store, temp_dir
 from wandrun.gateway.http import create_app
 from wandrun.gateway.service import Gateway as GatewayService
-from wandrun.runtime.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 
 from wandrun.evaluation.gateway_replay import RunCaseError
 from wandrun.evaluation.memory_eval import MemoryReplay

@@ -8,6 +8,7 @@ import { scheduleOnRN } from 'react-native-worklets';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { MediaPicture, type MediaLocation } from '@/components/rich-message/media.tsx';
+import { ImageActions } from '@/components/image-actions.tsx';
 import { MermaidViewer } from '@/components/rich-message/mermaid.tsx';
 import { viewerMedia } from '@/components/rich-message/media-viewer-source.ts';
 import { MAX_MEDIA_ZOOM, moveMediaZoom, RESET_ZOOM, type Size } from '@/components/rich-message/media-zoom.ts';
@@ -52,19 +53,22 @@ export default function MediaViewer() {
   const attachment = file_id && attachmentImages[attachmentStart] ? attachmentImages[attachmentStart] : undefined;
   const mermaid = selected?.mermaid;
   const attachmentMode = !!file_id && !!attachment;
+  const richKey = location ? JSON.stringify([location, selected?.fileId]) : '';
   return <View className={attachmentMode ? "flex-1 bg-black" : "flex-1 bg-background"} style={{ paddingTop: insets.top, paddingBottom: insets.bottom }} testID="media-viewer">
     <Stack.Screen options={{ headerShown: false }} />
     {mermaid !== undefined && location && selected
       ? <MermaidViewer key={`${id}:${seq}:${block}:${element}:${index}`} source={mermaid} title={alt || t('流程图')} full onBack={() => router.back()} />
       : attachmentMode
-        ? <AttachmentGallery api={session?.api} files={attachmentImages} initialIndex={attachmentStart} onBack={() => router.back()} />
+        ? <AttachmentGallery key={`${session?.api.config.computerId}:${file_id}:${file_ids}:${attachmentStart}`} api={session?.api} files={attachmentImages} initialIndex={attachmentStart} onBack={() => router.back()} />
         : <>
           <View className="flex-row items-center gap-2 border-b border-border px-4 py-2">
             <Button variant="ghost" size="icon" aria-label={t('返回')} onPress={() => router.back()}><Icon as={ArrowLeft} className="size-5" /></Button>
             <Text numberOfLines={1} className="min-w-0 flex-1 font-semibold">{alt || t('高清查看')}</Text>
+            {location && selected && <ImageActions key={richKey} api={session?.api}
+              source={selected.fileId ? { fileId: selected.fileId } : { location }} />}
           </View>
           <View className="min-h-0 flex-1 p-3">{location && selected
-            ? <ZoomablePicture key={`${id}:${seq}:${block}:${element}:${index}`} api={session?.api} location={location} fileId={selected.fileId} alt={alt ?? t('媒体')} />
+            ? <ZoomablePicture key={richKey} api={session?.api} location={location} fileId={selected.fileId} alt={alt ?? t('媒体')} />
             : <Text className="p-4 text-destructive">{t('媒体位置无效或图片已不可用')}</Text>}</View>
           {selected?.caption ? <ScrollView className="max-h-[40%] border-t border-border px-4 py-3" testID="media-viewer-caption">
             <Text selectable className="text-sm leading-6">{selected.caption}</Text>
@@ -100,6 +104,7 @@ function AttachmentGallery({ api, files, initialIndex, onBack }: { api?: Gateway
   const list = useRef<FlatList<ViewerAttachment>>(null);
   const [page, setPage] = useState(initialIndex);
   const [zoomedPage, setZoomedPage] = useState<number | null>(null);
+  const currentFile = files[page];
   useEffect(() => {
     list.current?.scrollToIndex({ index: initialIndex, animated: false });
   }, [initialIndex]);
@@ -107,15 +112,23 @@ function AttachmentGallery({ api, files, initialIndex, onBack }: { api?: Gateway
     <View className="z-10 flex-row items-center gap-2 px-4 py-2">
       <Button variant="ghost" size="icon" className="bg-transparent" aria-label={t('返回')} onPress={onBack}><Icon as={ArrowLeft} className="size-5 text-white" /></Button>
       <Text className="text-sm text-white">{page + 1} / {files.length}</Text>
+      <View className="min-w-0 flex-1" />
+      {currentFile && <ImageActions key={`${api?.config.computerId}:${currentFile.id}`} api={api} source={{ fileId: currentFile.id }} light />}
     </View>
     <FlatList ref={list} className="min-h-0 flex-1" data={files} horizontal pagingEnabled scrollEnabled={zoomedPage === null}
       initialScrollIndex={initialIndex} keyExtractor={(file) => file.id} showsHorizontalScrollIndicator={false}
       windowSize={3} initialNumToRender={1} maxToRenderPerBatch={3}
       getItemLayout={(_, index) => ({ index, length: width, offset: index * width })}
+      scrollEventThrottle={16}
+      onScroll={(event) => {
+        // The nearest visible image owns the actions even if native scrolling
+        // is cancelled without either end event.
+        setPage(Math.min(files.length - 1, Math.max(0, Math.round(event.nativeEvent.contentOffset.x /
+          Math.max(1, event.nativeEvent.layoutMeasurement.width)))));
+      }}
       onMomentumScrollEnd={(event) => {
-        const next = Math.min(files.length - 1, Math.max(0, Math.round(event.nativeEvent.contentOffset.x /
-          Math.max(1, event.nativeEvent.layoutMeasurement.width))));
-        setPage(next);
+        setPage(Math.min(files.length - 1, Math.max(0, Math.round(event.nativeEvent.contentOffset.x /
+          Math.max(1, event.nativeEvent.layoutMeasurement.width)))));
         setZoomedPage(null);
       }}
       renderItem={({ item, index }) => <View style={{ width }} className="flex-1">

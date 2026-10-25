@@ -29,7 +29,7 @@ from langgraph.pregel._messages import (
 )
 from langgraph.graph.state import CompiledStateGraph
 
-from wandrun.runtime.conversations import conversation_config, prepare_conversation_input
+from wandrun.runtime.agent.conversations import conversation_config, prepare_conversation_input
 from wandrun.integrations.codex_subscription import (
     TOOL_SEARCH,
     CodexSubscriptionModel,
@@ -39,20 +39,20 @@ from wandrun.integrations.codex_subscription import (
 )
 from wandrun.integrations.codex_credentials import CodexCredentials
 from wandrun.config import AgentDefinition
-from wandrun.runtime.messages import AgentOutput
-from wandrun.runtime.files import TaskBackend, TaskFiles, TaskPathMiddleware
-from wandrun.runtime.process_tools import CommandMiddleware
-from wandrun.runtime.code_mode import CodeModeCatalog, CodeModeMiddleware
-from wandrun.runtime.environments import Environment
-from wandrun.runtime.compaction import CompactionMiddleware, CompactionState
-from wandrun.runtime.compaction_archive import CompactionArchive
-from wandrun.runtime.tool_search import ToolNamespace, ToolSearchMiddleware
-from wandrun.runtime.memory import MemoryStore
-from wandrun.runtime.memory_runtime import MemoryMiddleware
-from wandrun.runtime.workers import CommunicationMiddleware, current_execution_generation
-from wandrun.runtime.browser import BrowserLeases
-from wandrun.runtime.browser_tools import BrowserTakeoverMiddleware
-from wandrun.runtime.capabilities import (
+from wandrun.runtime.communication.messages import AgentOutput
+from wandrun.runtime.execution.files import TaskBackend, TaskFiles, TaskPathMiddleware
+from wandrun.runtime.execution.process_tools import CommandMiddleware
+from wandrun.runtime.execution.code_mode import CodeModeCatalog, CodeModeMiddleware
+from wandrun.runtime.execution.environments import Environment
+from wandrun.runtime.context.compaction import CompactionMiddleware, CompactionState
+from wandrun.runtime.context.compaction_archive import CompactionArchive
+from wandrun.runtime.agent.tool_search import ToolNamespace, ToolSearchMiddleware
+from wandrun.runtime.context.memory import MemoryStore
+from wandrun.runtime.context.memory_runtime import MemoryMiddleware
+from wandrun.runtime.communication.workers import CommunicationMiddleware, current_execution_generation
+from wandrun.runtime.browser.leases import BrowserLeases
+from wandrun.runtime.browser.tools import BrowserTakeoverMiddleware
+from wandrun.runtime.agent.capabilities import (
     EntryCapabilityDefinition, ResolvedCapabilities, resolve_capabilities,
 )
 
@@ -119,6 +119,7 @@ def create_models(
                 if reasoning_effort is None
                 else reasoning_effort
             ),
+            fast_mode=definition.fast_mode,
             timeout=model_timeout,
             request_budget=budget,
             credentials=credentials,
@@ -493,6 +494,7 @@ def build_agents(
             CodexSubscriptionModel(
                 model_name=definition.compaction_model,
                 reasoning_effort=primary_model.reasoning_effort,
+                fast_mode=primary_model.fast_mode,
                 timeout=primary_model.timeout,
                 request_budget=primary_model.request_budget,
                 credentials=primary_model.credentials,

@@ -14,10 +14,10 @@ from langchain.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from dataclasses import asdict, dataclass
 
-from wandrun.runtime.files import ResolvedAttachment
-from wandrun.runtime.messages import AgentOutput, runtime_message
-from wandrun.runtime.scheduler_store import SchedulerStore, TaskSnapshot
-from wandrun.runtime.preview import PreviewExecution, PreviewPersistenceError, current_preview
+from wandrun.runtime.execution.files import ResolvedAttachment
+from wandrun.runtime.communication.messages import AgentOutput, runtime_message
+from wandrun.runtime.communication.scheduler_store import SchedulerStore, TaskSnapshot
+from wandrun.runtime.communication.preview import PreviewExecution, PreviewPersistenceError, current_preview
 
 current_execution_generation: ContextVar[int | None] = ContextVar(
     "worker_execution_generation", default=None,

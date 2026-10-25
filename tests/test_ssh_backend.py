@@ -23,13 +23,13 @@ from wandrun.config import EnvironmentDefinition, load_config
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.integrations.ssh_backend import SSHBackend
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.environments import open_environments, open_ssh
-from wandrun.runtime.compaction_archive import CompactionArchive
-from wandrun.runtime.files import TaskBackend, TaskFiles, _current_task
-from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.execution.environments import open_environments, open_ssh
+from wandrun.runtime.context.compaction_archive import CompactionArchive
+from wandrun.runtime.execution.files import TaskBackend, TaskFiles, _current_task
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.workers import WorkerManager
 from wandrun.runtime.session import open_runtime
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.execution.workspace import Workspace
 
 TARGET = os.environ.get("WANDRUN_SSH_TEST")
 q = shlex.quote

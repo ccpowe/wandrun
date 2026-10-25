@@ -25,7 +25,7 @@ from langchain.tools import BaseTool, InjectedToolCallId, tool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.errors import GraphBubbleUp
 
-from wandrun.runtime.tool_search import SEARCH_LIMIT, ToolNamespace, relevance, search_terms
+from wandrun.runtime.agent.tool_search import SEARCH_LIMIT, ToolNamespace, relevance, search_terms
 
 CODE_TOOL = "run_code"
 DEFAULT_TIMEOUT = 60

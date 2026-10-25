@@ -29,14 +29,19 @@ from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.gateway.connectors import UnknownConnector, public_connector
 from wandrun.gateway.schedules import UnknownSchedule, next_run_at
 
-# 23：画像与工作记忆分归属持久化作者；升级须清空 state。
-SCHEMA_VERSION = 23
+# 24：Agent 独立保存 Fast 订阅优先级开关；不兼容旧 state，不执行迁移。
+SCHEMA_VERSION = 24
 AVATAR_COUNT = 8
 
 
 def _validate_avatar(avatar: int) -> None:
     if type(avatar) is not int or not 0 <= avatar < AVATAR_COUNT:
         raise ValueError(f"avatar 必须是 0～{AVATAR_COUNT - 1} 的整数")
+
+
+def _validate_fast_mode(fast_mode: bool) -> None:
+    if type(fast_mode) is not bool:
+        raise ValueError("fast_mode 必须是布尔值")
 
 
 # 消息/定时触发总是产品活动；浏览器事件仅进入 requested 的那次算活动。
@@ -62,6 +67,7 @@ CREATE TABLE agents (
     searchable_mcp_servers TEXT NOT NULL,
     skills TEXT NOT NULL,
     code_mode INTEGER NOT NULL,
+    fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1)),
     environment TEXT NOT NULL,
     -- 移出首页时的全局 seq；空表示没移出。是否在首页由它与对话里的新事件共同决定（见 agents）。
     hidden_after_seq INTEGER
@@ -533,7 +539,7 @@ class GatewayStore:
         rows = self._connection.execute(
             "SELECT id, name, description, system_prompt, model, reasoning_effort,"
             " context_window, compaction_keep_tokens, compaction_model, mcp_servers,"
-            " searchable_mcp_servers, skills, code_mode, environment FROM agents ORDER BY rowid"
+            " searchable_mcp_servers, skills, code_mode, fast_mode, environment FROM agents ORDER BY rowid"
         ).fetchall()
         settings = dict(self._connection.execute("SELECT key, value FROM settings"))
         agents = {
@@ -544,10 +550,10 @@ class GatewayStore:
                 mcp_servers=tuple(json.loads(mcp)),
                 searchable_mcp_servers=tuple(json.loads(searchable)), skills=tuple(json.loads(skills)),
                 workers=tuple(workers.get(identity, ())), code_mode=bool(code_mode),
-                environment=environment, name=name if name != identity else None,
+                fast_mode=bool(fast_mode), environment=environment, name=name if name != identity else None,
             )
             for identity, name, description, system_prompt, model, effort, context_window,
-            keep_tokens, compaction_model, mcp, searchable, skills, code_mode, environment in rows
+            keep_tokens, compaction_model, mcp, searchable, skills, code_mode, fast_mode, environment in rows
         }
         return AgentCatalog(settings.get("main_agent"), agents)
 
@@ -889,17 +895,18 @@ class GatewayStore:
         self, identity: str, definition: AgentDefinition, name: str, avatar: int
     ) -> None:
         _validate_avatar(avatar)
+        _validate_fast_mode(definition.fast_mode)
         self._connection.execute(
             "INSERT INTO agents (id, name, avatar, description, system_prompt, model,"
             " reasoning_effort, context_window, compaction_keep_tokens, compaction_model,"
-            " mcp_servers, searchable_mcp_servers, skills, code_mode, environment)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " mcp_servers, searchable_mcp_servers, skills, code_mode, fast_mode, environment)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identity, name, avatar, definition.description, definition.system_prompt,
                 definition.model, definition.reasoning_effort, definition.context_window,
                 definition.compaction_keep_tokens, definition.compaction_model,
                 json.dumps(definition.mcp_servers), json.dumps(definition.searchable_mcp_servers),
-                json.dumps(definition.skills), int(definition.code_mode), definition.environment,
+                json.dumps(definition.skills), int(definition.code_mode), int(definition.fast_mode), definition.environment,
             ),
         )
 
@@ -953,6 +960,7 @@ class GatewayStore:
     ) -> tuple[dict, Event | None]:
         """修改可编辑定义及关系；完全相同不写事件，执行环境不可通过此接口改动。"""
         _validate_avatar(avatar)
+        _validate_fast_mode(definition.fast_mode)
         with self._connection:
             current = self.agent(identity)
             if current is None:
@@ -966,13 +974,13 @@ class GatewayStore:
                  current["system_prompt"], current["model"], current["reasoning_effort"],
                  current["context_window"], current["compaction_keep_tokens"], current["compaction_model"],
                  current["skills"], current["workers"], current["mcp_servers"], current["searchable_mcp_servers"],
-                 current["code_mode"])
+                 current["code_mode"], current["fast_mode"])
                 != (name, avatar, definition.description, definition.system_prompt,
                     definition.model, definition.reasoning_effort, definition.context_window,
                     definition.compaction_keep_tokens, definition.compaction_model,
                     list(definition.skills), list(definition.workers),
                     list(definition.mcp_servers), list(definition.searchable_mcp_servers),
-                    definition.code_mode)
+                    definition.code_mode, definition.fast_mode)
             )
             if not changed:
                 return current, None
@@ -980,12 +988,13 @@ class GatewayStore:
                 "UPDATE agents SET name = ?, avatar = ?, description = ?, system_prompt = ?,"
                 " model = ?, reasoning_effort = ?, context_window = ?,"
                 " compaction_keep_tokens = ?, compaction_model = ?, skills = ?, mcp_servers = ?,"
-                " searchable_mcp_servers = ?, code_mode = ? WHERE id = ?",
+                " searchable_mcp_servers = ?, code_mode = ?, fast_mode = ? WHERE id = ?",
                 (name, avatar, definition.description, definition.system_prompt,
                  definition.model, definition.reasoning_effort, definition.context_window,
                  definition.compaction_keep_tokens, definition.compaction_model,
                  json.dumps(definition.skills), json.dumps(definition.mcp_servers),
-                 json.dumps(definition.searchable_mcp_servers), int(definition.code_mode), identity),
+                 json.dumps(definition.searchable_mcp_servers), int(definition.code_mode),
+                 int(definition.fast_mode), identity),
             )
             if current["workers"] != list(definition.workers):
                 self._connection.execute("DELETE FROM agent_workers WHERE agent_id = ?", (identity,))
@@ -1224,14 +1233,14 @@ class GatewayStore:
         row = self._connection.execute(
             "SELECT id, name, avatar, description, system_prompt, model, reasoning_effort,"
             " context_window, compaction_keep_tokens, compaction_model,"
-            " mcp_servers, searchable_mcp_servers, skills, code_mode, environment"
+            " mcp_servers, searchable_mcp_servers, skills, code_mode, fast_mode, environment"
             " FROM agents WHERE id = ?",
             (identity,),
         ).fetchone()
         if row is None:
             return None
         (_, name, avatar, description, system_prompt, model, effort, context_window,
-         keep_tokens, compaction_model, mcp, searchable, skills, code_mode, environment) = row
+         keep_tokens, compaction_model, mcp, searchable, skills, code_mode, fast_mode, environment) = row
         return {
             "id": identity, "name": name, "avatar": avatar, "description": description,
             "system_prompt": system_prompt, "model": model, "reasoning_effort": effort,
@@ -1239,6 +1248,7 @@ class GatewayStore:
             "compaction_model": compaction_model,
             "mcp_servers": json.loads(mcp), "searchable_mcp_servers": json.loads(searchable),
             "skills": json.loads(skills), "code_mode": bool(code_mode), "environment": environment,
+            "fast_mode": bool(fast_mode),
             "workers": self._workers(identity).get(identity, []),
             "member_of": [
                 member for (member,) in self._connection.execute(

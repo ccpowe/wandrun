@@ -11,8 +11,8 @@ from tempfile import TemporaryDirectory
 import pydantic_monty as pm
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from wandrun.runtime.agents import AgentAssembly, build_agents, create_models, run_conversation
-from wandrun.runtime.capabilities import CAPABILITY_DEFINITIONS, EntryCapabilityDefinition
+from wandrun.runtime.agent.agents import AgentAssembly, build_agents, create_models, run_conversation
+from wandrun.runtime.agent.capabilities import CAPABILITY_DEFINITIONS, EntryCapabilityDefinition
 from wandrun.integrations.codex_subscription import ModelRequestBudget, ReasoningEffort
 from wandrun.integrations.codex_credentials import CodexCredentials
 from wandrun.config import (
@@ -20,17 +20,17 @@ from wandrun.config import (
 )
 from wandrun.integrations.mcp import MCPConnectionError, MCPConnectionPool, select_mcp_tools
 from wandrun.integrations.mcp_oauth import ConnectorOAuth
-from wandrun.runtime.tool_search import ToolNamespace
+from wandrun.runtime.agent.tool_search import ToolNamespace
 from wandrun.metrics import RunMetrics
 from wandrun.integrations.shell_backend import CleanupUnconfirmedError
-from wandrun.runtime.environments import Environment, open_environments
-from wandrun.runtime.files import ResolvedAttachment, TaskFiles, _current_task
-from wandrun.runtime.scheduler_store import SchedulerStore, paired_store_path
-from wandrun.runtime.memory import MemoryStore
-from wandrun.runtime.browser import BrowserLeases
-from wandrun.runtime.conversations import conversation_config
-from wandrun.runtime.workers import WorkerManager
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.execution.environments import Environment, open_environments
+from wandrun.runtime.execution.files import ResolvedAttachment, TaskFiles, _current_task
+from wandrun.runtime.communication.scheduler_store import SchedulerStore, paired_store_path
+from wandrun.runtime.context.memory import MemoryStore
+from wandrun.runtime.browser.leases import BrowserLeases
+from wandrun.runtime.agent.conversations import conversation_config
+from wandrun.runtime.communication.workers import WorkerManager
+from wandrun.runtime.execution.workspace import Workspace
 
 
 @dataclass

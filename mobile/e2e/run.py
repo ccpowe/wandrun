@@ -442,10 +442,18 @@ def model_options(model):
             if item["effort"] != "ultra"]
 
 
+def effort_point(model, effort):
+    """Tap a catalog ordinal inside the native slider, never a device coordinate."""
+    options = model_options(model)
+    if len(options) < 2 or effort not in options:
+        raise RuntimeError("Reasoning slider regression needs multiple supported efforts")
+    return f"{1 + 98 * options.index(effort) / (len(options) - 1):.4f}%,50%"
+
+
 def model_fixture():
     """Derive two real, valid model/effort combinations without a catalog whitelist."""
     settings = api("/settings")
-    models = [model for model in api("/models")["models"] if model_options(model)]
+    models = [model for model in api("/models")["models"] if len(model_options(model)) > 1]
     if not models:
         raise RuntimeError("Model regression needs a nonempty subscription model catalog")
     original = next((model for model in models if model["id"] == settings["default_model"]), models[0])
@@ -470,6 +478,9 @@ def model_fixture():
         "DEFAULT_MODEL": default_model["id"], "DEFAULT_MODEL_NAME": default_model["display_name"],
         "DEFAULT_EFFORT": default_effort,
         "CHANGED_MODEL": model["id"], "CHANGED_EFFORT": effort,
+        "ORIGINAL_EFFORT_POINT": effort_point(original, original_effort),
+        "DEFAULT_EFFORT_POINT": effort_point(default_model, default_effort),
+        "CHANGED_EFFORT_POINT": effort_point(model, effort),
     }
 
 
@@ -486,7 +497,7 @@ def agent_effort_fixture():
     changed = next((effort for effort in model_options(model) if effort != current), None)
     if changed is None:
         raise RuntimeError("Agent regression needs an alternate supported reasoning effort")
-    return changed
+    return changed, effort_point(model, changed), model["id"]
 
 
 def restore_settings(original):
@@ -612,6 +623,7 @@ def await_media_reply(env, *, image=False):
                 with source.open("rb") as image_file:
                     assert image_file.read(8) == b"\x89PNG\r\n\x1a\n", "Attachment is not a PNG"
                 env["IMAGE_FILE_ID"] = file["id"]
+                env["IMAGE_FILE_NAME"] = file["name"]
                 return
         elif any(env["PDF_MARKER"] in reply.get("text", "") for reply in replies):
             return
@@ -1198,6 +1210,17 @@ def replay_steps(group, env, browser_server=None, pairing=None, source=None):
                 return current
             time.sleep(0.25)
 
+    def select_reasoning(identity, point):
+        # agent-device cannot combine a selector with a relative Maestro point.
+        # Resolve the live element first; never reuse device-specific coordinates.
+        node = ad("get", "attrs", "id=" + json.dumps(identity))
+        assert node.get("enabled") and node.get("hittable"), "Reasoning slider is not interactive"
+        rect = node["rect"]
+        horizontal, vertical = (float(value.removesuffix("%")) / 100 for value in point.split(","))
+        ad("press", str(round(rect["x"] + rect["width"] * horizontal)),
+           str(round(rect["y"] + rect["height"] * vertical)))
+
+
     for line in body.splitlines(keepends=True):
         if line.startswith("- "):
             execute()
@@ -1205,6 +1228,15 @@ def replay_steps(group, env, browser_server=None, pairing=None, source=None):
         elif line.startswith("# @"):
             execute()
             hook = line.strip()[3:]
+            reasoning = {
+                "reasoning-editor": ("editor-reasoning-slider", "EDIT_EFFORT_POINT"),
+                "reasoning-default": ("model-effort-slider", "DEFAULT_EFFORT_POINT"),
+                "reasoning-changed": ("model-effort-slider", "CHANGED_EFFORT_POINT"),
+                "reasoning-original": ("model-effort-slider", "ORIGINAL_EFFORT_POINT"),
+            }.get(hook)
+            if reasoning:
+                select_reasoning(reasoning[0], env[reasoning[1]])
+                continue
             if hook.startswith("collaboration-"):
                 collaboration.action(sys.modules[__name__], env, hook.removeprefix("collaboration-"))
                 continue
@@ -1320,15 +1352,13 @@ def replay_steps(group, env, browser_server=None, pairing=None, source=None):
                 assert api("/settings") == expected, "Saved default model/effort differs from selection"
             elif hook == "new-form-default":
                 nodes = ad("snapshot", "-i")["nodes"]
-                identity = "editor-reasoning-" + env["DEFAULT_EFFORT"]
-                matching = [node for node in nodes
-                            if node.get("id", node.get("identifier")) == identity]
-                assert len(matching) == 1, "New Agent form has no matching reasoning control"
-                state = matching[0].get("state")
-                selected = matching[0].get("selected", matching[0].get("checked"))
-                if selected is None and isinstance(state, dict):
-                    selected = state.get("selected", state.get("checked"))
-                assert selected is True or selected == "true" or "已选" in matching[0].get("label", ""), (
+                slider = next((node for node in nodes
+                               if node.get("id", node.get("identifier")) == "editor-reasoning-slider"), None)
+                assert slider is not None, "New Agent form has no reasoning slider"
+                # Android's snapshot exposes the selected effort as accessible text, not a numeric range.
+                label = {"low": "低", "medium": "中", "high": "高", "xhigh": "极高", "max": "最高"}.get(
+                    env["DEFAULT_EFFORT"], env["DEFAULT_EFFORT"])
+                assert slider.get("label", "").endswith(", " + label), (
                     "New Agent form did not select the saved effort"
                 )
             elif hook in ("agent-model-saved", "agent-model-restored"):
@@ -2130,7 +2160,7 @@ def run_group(group):
             env["SCHEDULE_CHAT_ID"] = fixture["id"]
             fixtures.append(fixture["id"])
         elif group == "agent":
-            env["EDIT_EFFORT"] = agent_effort_fixture()
+            env["EDIT_EFFORT"], env["EDIT_EFFORT_POINT"], env["EDIT_MODEL"] = agent_effort_fixture()
         elif group == "settings":
             settings_original, model_env = model_fixture()
             env.update(model_env)

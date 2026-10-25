@@ -23,12 +23,12 @@ from deepagents.middleware._utils import append_to_system_message
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolMessage
 
-from wandrun.runtime.compaction import context_messages
-from wandrun.runtime.memory import (
+from wandrun.runtime.context.compaction import context_messages
+from wandrun.runtime.context.memory import (
     InvalidMemory, MEMORY_DETAIL_LIMIT, MEMORY_LIMIT, MemoryConflict, MemoryRetired,
     MemoryStore,
 )
-from wandrun.runtime.messages import runtime_message
+from wandrun.runtime.communication.messages import runtime_message
 
 MEMORY_DIRECTORY = "/.wandrun/memory"
 PROFILE_MEMORY_PATH = f"{MEMORY_DIRECTORY}/profile.md"

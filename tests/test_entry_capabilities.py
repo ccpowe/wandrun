@@ -21,14 +21,14 @@ from wandrun.gateway.ui_blocks import model_instructions
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.integrations.shell_backend import ManagedShellBackend
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.agents import build_agents
-from wandrun.runtime.conversations import conversation_config
-from wandrun.runtime.environments import Environment
-from wandrun.runtime.files import TaskFiles
-from wandrun.runtime.messages import AgentOutput, SendMessage
+from wandrun.runtime.agent.agents import build_agents
+from wandrun.runtime.agent.conversations import conversation_config
+from wandrun.runtime.execution.environments import Environment
+from wandrun.runtime.execution.files import TaskFiles
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 from wandrun.runtime.session import open_runtime
-from wandrun.runtime.workers import WorkerManager
-from wandrun.runtime.workspace import Workspace
+from wandrun.runtime.communication.workers import WorkerManager
+from wandrun.runtime.execution.workspace import Workspace
 
 
 class GatewayEntryCapabilityTests(unittest.IsolatedAsyncioTestCase):

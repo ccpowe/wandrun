@@ -11,8 +11,8 @@ from test_gateway import gateway_manager, open_store, temp_dir
 from wandrun.gateway.http import create_app
 from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import GatewayStore
-from wandrun.runtime.files import TaskFiles
-from wandrun.runtime.messages import AgentOutput, SendMessage
+from wandrun.runtime.execution.files import TaskFiles
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 
 
 FORM = {

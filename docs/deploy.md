@@ -274,6 +274,24 @@ npx eas-cli build --platform android --profile preview  # produces an installabl
 
 For local development, `npx expo run:android` builds and installs a debug build on a connected device.
 
+## Fast support
+
+The v0.2.1 gateway release supports the existing app's independent lightning toggle beside each
+agent's model and discrete reasoning-effort slider. Its release APK is the existing signed app
+version **0.2.0**, Android versionCode **3**, not a rebuild. Fast is off by default; it applies to the agent's main and compaction
+model requests without changing reasoning effort. When enabled, it requests `service_tier=priority`
+with `x-codex-routing-hint`; when disabled, neither is sent. There is no client-side fallback
+retry without Fast if the provider rejects the request.
+
+The app enables the control only after the gateway advertises `capabilities.fast_mode=true`
+through `/models` or `/connection`. This declares implementation support, **not** account
+entitlement or provider availability. Priority requests may consume more subscription quota;
+neither a faster response nor a particular latency is promised.
+
+The native app also offers original-image download/system sharing and an explicit
+**More → Landscape** switch during browser takeover (reset to portrait on leaving).
+Existing overview screenshots are illustrative and may not show these controls.
+
 ## Optional LangSmith tracing
 
 Tracing is **off by default**. To opt in, add an explicit environment file to the gateway
@@ -296,23 +314,67 @@ against your LangSmith quota. Harbor forwarding also requires the adapter's
 
 ## Upgrades
 
-1. Read the release notes, then stop services: `systemctl --user stop wandrun-chrome wandrun-xvfb`
-   (the gateway stops with Chrome).
+1. Read the release notes, then stop services: `systemctl --user stop wandrun-gateway wandrun-chrome wandrun-xvfb`.
 2. Back up `~/wandrun-workspace` and `~/wandrun-chrome` while stopped, including SQLite sidecars.
    Keep credentials private; see the token rollback warning below.
 3. Check out the new tag and run `uv sync --locked --no-dev`.
-4. Choose the state path below, then start services and wait for the 401 check above.
+4. Choose the state path below: either remove old state as described, or convert the retained
+   gateway database to schema **24** before starting services. Then wait for the 401 check above.
+   First startup creates fresh schema-24 state; the application rejects older schemas and does not migrate them.
 
-### From v0.1.x (gateway schema 22 → 23)
+### Fresh state
 
-The formats are incompatible; the project contains no migration code. Prefer **fresh state**:
+Prefer **fresh state** if retaining history is unnecessary:
 move `~/wandrun-workspace/.wandrun/state` to a backup location while stopped. Conversations,
 schedules and device pairings start afresh; agents and connectors are re-imported from TOML,
 not recovered from edits in the old database. Old memory is not imported.
 
-Alternatively, to retain the gateway database, install the `sqlite3` CLI and run this
-**one-time SQL only on a stopped, backed-up schema-22 database**. It drops memory authorship
-metadata, rebuilds `memory_metadata` and sets version 23; it is not a general state migration.
+### From v0.2.0 (gateway schema 23 → 24)
+
+To retain agents, conversations, schedules and pairings, install the `sqlite3` CLI with JSON
+support. Run this **one-time operator SQL only on a stopped, backed-up schema-23 database**.
+It adds `fast_mode=0` for all existing agents and JSON `fast_mode=false` to every stored original
+Agent-create response, including agents later edited or deleted. These replay snapshots must not
+be rebuilt from current agents: retries must retain the original result. This is a bounded
+offline conversion, not application migration or a guarantee about old execution checkpoints;
+start new conversations rather than resuming old checkpoints.
+
+```bash
+sqlite3 -bail "$HOME/wandrun-workspace/.wandrun/state/gateway.sqlite" <<'SQL'
+.bail on
+PRAGMA foreign_keys = ON;
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE upgrade_guard (version INTEGER CHECK (version = 23));
+INSERT INTO upgrade_guard SELECT user_version FROM pragma_user_version;
+CREATE TEMP TABLE upgrade_assert (ok INTEGER NOT NULL CHECK (ok = 1));
+INSERT INTO upgrade_assert
+    SELECT count(*) = 0 FROM created_agent_results WHERE NOT json_valid(detail);
+INSERT INTO upgrade_assert
+    SELECT count(*) = 0 FROM created_agent_results
+    WHERE json_type(detail) != 'object' OR json_type(detail, '$.fast_mode') IS NOT NULL;
+ALTER TABLE agents ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0 CHECK (fast_mode IN (0, 1));
+UPDATE created_agent_results SET detail = json_set(detail, '$.fast_mode', json('false'));
+CREATE TEMP TABLE upgrade_integrity (result TEXT NOT NULL CHECK (result = 'ok'));
+INSERT INTO upgrade_integrity SELECT integrity_check FROM pragma_integrity_check;
+INSERT INTO upgrade_assert SELECT count(*) = 0 FROM pragma_foreign_key_check;
+PRAGMA user_version = 24;
+COMMIT;
+PRAGMA user_version;
+PRAGMA integrity_check;
+PRAGMA foreign_key_check;
+SQL
+```
+
+Expect `24` and `ok`, with no foreign-key rows. On any error, keep services stopped; `.bail on`
+exits and rolls back an uncommitted transaction. Investigate against the backup, never bypass
+guards or just change `user_version`. The column's SQL default initializes old agents; it does
+not turn Fast on. The command is not repeatable and must not be used on schema 22 or 24.
+
+### From v0.1.x (gateway schema 22 → 23 → 24)
+
+Alternatively, to retain the gateway database, first run this **one-time SQL only on a stopped,
+backed-up schema-22 database**. It drops memory authorship metadata, rebuilds `memory_metadata`
+and sets version 23. This is only an intermediate step: **do not start v0.2.1 yet**.
 Old memory is not converted to shared profile or working memory: re-enter what you need in
 the app, and start new conversations rather than resuming old execution checkpoints.
 
@@ -340,8 +402,9 @@ PRAGMA integrity_check;
 SQL
 ```
 
-Expect `23` and `ok`. On error, keep services stopped and inspect the backup; do not bypass
-the version guard. This SQL does not update other schema versions.
+Expect `23` and `ok`, then run the **23 → 24 SQL above while still stopped**, and require its
+`24` / `ok` result and no foreign-key rows before startup. On error, keep services stopped and
+inspect the backup; do not bypass the version guard. This SQL does not update other schema versions.
 
 **Rollback and OAuth:** tokens may rotate during acceptance checks. Never restore an older
 Codex `auth.json` or connector refresh token from a database backup over the current credentials.

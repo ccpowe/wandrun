@@ -19,14 +19,14 @@ from wandrun.integrations.codex_subscription import (
     _ResponseStream,
     is_retryable_model_error,
 )
-from wandrun.runtime.compaction_summary import (
+from wandrun.runtime.context.compaction_summary import (
     SummaryGenerationError,
     request_model_kwargs,
     summarize_request,
     _validate_summary,
 )
-from wandrun.runtime.messages import AgentOutput
-from wandrun.runtime.preview import PreviewExecution, current_preview
+from wandrun.runtime.communication.messages import AgentOutput
+from wandrun.runtime.communication.preview import PreviewExecution, current_preview
 
 from compaction_fixtures import SUMMARY_TEXT
 

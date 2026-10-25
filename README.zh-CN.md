@@ -29,18 +29,19 @@ Wandrun 跑在**你自己**的 Linux 机器上，手机揣进兜里它也照常�
 
 ## 亮点
 
-- **新的聊天界面**：对话抽屉、调整后的消息布局和更简洁的输入区。
+- **新的聊天界面（v0.2.1）**：对话抽屉、调整后的消息布局、更简洁的输入区，以及离散档位的推理强度滑条。
 - **富交互回复**：图文穿插图表、表格、表单、链接列表和可展开的文件树（FileTree），引导 Agent 在适合时主动使用组件；表单提交作为下一条消息交回。链接图标由网关向 Google s2 获取，只发送主机名，不发送页面路径或查询参数。
 - **团队并行协作**：Agent 可以把任务拆给其他 Agent 并行处理，自己继续工作，最后汇总结果；每个成员的进度实时可见。
-- **可接管的浏览器**：Agent 在你的机器上操作真实的 Chrome；你在手机上看实时画面，遇到登录、验证码就接管，处理完交还。
+- **可接管的浏览器**：Agent 在你的机器上操作真实的 Chrome；你在手机上看实时画面，遇到登录、验证码就接管，处理完交还。在接管页通过**更多 → 横屏**主动开启横屏，离开页面后恢复竖屏。
 - **自己设计 Agent**：在 App 里为每个 Agent 设置提示词、模型、推理强度、技能、MCP 连接器和团队成员。
 - **直接用 ChatGPT 订阅**：模型通过你自己的 Codex 登录调用，App 里能看到额度和每个 Agent 的用量，不用管理 API Key。
+- **独立 Fast 开关**：Agent 模型旁的闪电开关请求优先处理，不改变推理强度。默认关闭，可能消耗更多订阅额度；网关支持不代表账户有权限，也不保证延迟。见 [Fast 支持](docs/deploy.zh-CN.md#fast-支持)。
 
 <!-- 案例：之后补充 -->
 
 ## 更多功能
 
-- **双向文件**：发送照片、视频和文档，支持断点续传；Agent 产出的文件以卡片出现，可预览、下载、分享。
+- **双向文件**：发送照片、视频和文档，支持断点续传；Agent 产出的文件以卡片出现，可预览、下载、分享。图片查看器也支持下载原图和通过系统分享原图。
 - **定时任务**：单次、每天、每周或 cron，每次触发开一个新对话；Agent 也能替你创建定时。
 - **共享画像、独立工作记忆**：在“设置 → 关于你”编辑所有 Agent 共享的用户画像，在 Agent 资料页编辑各自的工作记忆；都支持简短 Markdown 索引与按需读取的详情。
 - **长对话**：自动压缩上下文，新增摘要结构与长度校验，并交接已完成工作和下一步；原文留在磁盘上。校验不保证摘要语义正确，也不保证完全避免重复工作。
@@ -105,7 +106,7 @@ uv run python -m wandrun.gateway pair --workspace workspace --url http://<电脑
 
 ## 获取 App
 
-- **APK：** 从 [Releases](https://github.com/ccpowe/wandrun/releases) 下载。
+- **APK：** 从 [Releases](https://github.com/ccpowe/wandrun/releases) 下载。v0.2.1 发布复用已有签名 APK（App 版本 **0.2.0**、Android versionCode **3**），不重新构建 APK。
 - **自行构建：** 见[构建 Android App](docs/deploy.zh-CN.md#构建-android-app)。
 
 iOS 尚未测试。
@@ -114,7 +115,7 @@ iOS 尚未测试。
 
 | 路径 | 内容 |
 | --- | --- |
-| `src/wandrun/runtime/` | Agent 循环、多 Agent 调度、记忆、上下文压缩、浏览器租约 |
+| `src/wandrun/runtime/` | `agent`、`communication`、`context`、`execution`、`browser` 职责分组，以及共享会话和追踪 |
 | `src/wandrun/integrations/` | Codex 订阅模型、MCP 与 OAuth、本机 / SSH 执行 |
 | `src/wandrun/gateway/` | 给 App 的 HTTP / SSE 接口、配对、上传、定时、富交互校验 |
 | `src/wandrun/terminal/` | 终端聊天入口（`python -m wandrun.terminal`） |
@@ -124,8 +125,8 @@ iOS 尚未测试。
 
 ## 项目状态
 
-Wandrun 处于早期、活跃开发阶段。持久化格式**尚不稳定**，升级时可能需要清空
-`workspace/.wandrun/state`。欢迎提 Issue 和 PR。
+Wandrun 处于早期、活跃开发阶段，持久化格式**尚不稳定**。v0.2.1 要求网关结构版本 **24**，
+不提供自动迁移；修改现有状态前先看[升级路径](docs/deploy.zh-CN.md#升级)。欢迎提 Issue 和 PR。
 
 ## 许可证
 

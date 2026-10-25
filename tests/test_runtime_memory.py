@@ -15,16 +15,16 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
 from wandrun.config import AgentDefinition
-from wandrun.runtime.agents import build_agents, run_conversation
-from wandrun.runtime.conversations import conversation_config
-from wandrun.runtime.environments import Environment
-from wandrun.runtime.memory import InvalidMemory, MemoryStore
-from wandrun.runtime.memory_runtime import (
+from wandrun.runtime.agent.agents import build_agents, run_conversation
+from wandrun.runtime.agent.conversations import conversation_config
+from wandrun.runtime.execution.environments import Environment
+from wandrun.runtime.context.memory import InvalidMemory, MemoryStore
+from wandrun.runtime.context.memory_runtime import (
     PROFILE_MEMORY_PATH, WORK_MEMORY_PATH, ManagedMemoryBackend, MemoryMiddleware,
     _ToolObservation,
 )
-from wandrun.runtime.messages import AgentOutput
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.communication.messages import AgentOutput
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 def _done():

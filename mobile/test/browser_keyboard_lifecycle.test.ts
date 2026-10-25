@@ -28,7 +28,8 @@ type StreamEvents = { state(value: string): void; pages(value: object): void; fr
 const clients: { events: StreamEvents; accepted: boolean; sent: Input[]; closed: boolean }[] = [];
 const session = { api: { config: {}, browserTask: async () => lease }, browserTasks: new Map([["lease", lease]]) };
 const nativeText = new Map<string, string>();
-const native = { appState, subscribe, session, useEffect, createElement, useImperativeHandle, clients, nativeText };
+const dimensions = { width: 720, height: 1152 };
+const native = { appState, subscribe, session, useEffect, createElement, useImperativeHandle, clients, nativeText, dimensions, focused: true };
 (globalThis as typeof globalThis & { __browserKeyboardTest: typeof native }).__browserKeyboardTest = native;
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -36,8 +37,12 @@ const native = { appState, subscribe, session, useEffect, createElement, useImpe
 // substituted; deliberately omit keyboardDidHide after Home/lock to model the lost event.
 const modules: Record<string, string> = {
   "@shopify/react-native-skia": "export const Skia = { Image: { MakeImageFromEncoded: () => ({}) }, Data: { fromBytes: value => value } };",
-  "expo-screen-orientation": "export const unlockAsync = async () => {}; export const lockAsync = async () => {}; export const OrientationLock = { PORTRAIT_UP: 1 };",
-  "expo-router": "export const router = {}; export function useFocusEffect(callback) { globalThis.__browserKeyboardTest.useEffect(callback, [callback]); }",
+  "expo-router": `export const router = {}; export const Stack = { Screen: 'Stack.Screen' };
+    export function useLocalSearchParams() { return { id: 'lease' }; }
+    export function useFocusEffect(callback) {
+      const test = globalThis.__browserKeyboardTest;
+      test.useEffect(() => test.focused ? callback() : undefined, [callback, test.focused]);
+    }`,
   "lucide-react-native": "export const ChevronLeft='Icon', Hand='Icon', Keyboard='Icon', LockKeyhole='Icon', MoreHorizontal='Icon', Mouse='Icon', MouseLeft='Icon', MousePointer2='Icon', MouseRight='Icon', RotateCw='Icon', Smartphone='Icon', X='Icon';",
   "react-native": `const { createElement, useImperativeHandle } = globalThis.__browserKeyboardTest;
     export const Alert = {}, Vibration = {}, Keyboard = { dismiss() {} };
@@ -48,7 +53,7 @@ const modules: Record<string, string> = {
       useImperativeHandle(ref, () => ({ blur() { props.onBlur?.(); }, clear() { values.set(props.testID, ''); }, focus() { props.onFocus?.(); } }));
       return createElement('TextInput', {...props, onChangeText(value) { values.set(props.testID, value); props.onChangeText(value); }});
     }
-    export const useWindowDimensions = () => ({ width: 720, height: 1152 });`,
+    export const useWindowDimensions = () => globalThis.__browserKeyboardTest.dimensions;`,
   "react-native-gesture-handler": "export const GestureDetector = 'GestureDetector';",
   "react-native-keyboard-controller": "export const KeyboardEvents = { addListener: globalThis.__browserKeyboardTest.subscribe };",
   "react-native-safe-area-context": "export const useSafeAreaInsets = () => ({ top: 24, bottom: 16, left: 0, right: 0 });",
@@ -71,6 +76,7 @@ const modules: Record<string, string> = {
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier in modules) return { url: `data:text/javascript,${encodeURIComponent(modules[specifier])}`, shortCircuit: true };
+    if (specifier === "@/browser/screen.tsx") return { url: new URL("../src/browser/screen.tsx", import.meta.url).href, shortCircuit: true };
     return nextResolve(specifier, context);
   },
   load(url, context, nextLoad) {
@@ -82,6 +88,51 @@ registerHooks({
 });
 // Native-module substitutions must be registered before loading the screen.
 const { BrowserScreen } = await import("../src/browser/screen.tsx");
+const { default: BrowserTakeover } = await import("../src/app/browser-takeover.tsx");
+const { default: BrowserViewer } = await import("../src/app/browser-viewer.tsx");
+const controlProps = { id: "lease", control: true as const, landscapeEnabled: false, onLandscapeChange(_value: boolean) {} };
+
+test("control orientation follows the explicit switch across geometry, blur and re-entry", async () => {
+  const root = createRoot();
+  const viewer = createRoot();
+  const option = () => root.container.queryAll(node => node.type === "Stack.Screen")[0].props.options.orientation;
+  const more = () => root.container.queryAll(node => node.props.testID === "takeover-more")[0];
+  const toggle = () => root.container.queryAll(node => node.props.testID === "takeover-landscape")[0];
+  try {
+    dimensions.width = 1200; dimensions.height = 720;
+    await act(async () => root.render(createElement(BrowserTakeover)));
+    const firstClient = clients.at(-1)!;
+    assert.equal(option(), "portrait", "a wide viewport alone cannot enable landscape orientation");
+    await act(async () => more().props.onPress());
+    assert.equal(toggle().props.value, false, "the switch reflects user selection, not viewport geometry");
+    await act(async () => toggle().props.onValueChange(true));
+    assert.equal(option(), "landscape");
+    assert.equal(firstClient.closed, false, "changing orientation must not interrupt the browser stream");
+    assert.equal(clients.at(-1), firstClient);
+    dimensions.width = 720; dimensions.height = 1152;
+    await act(async () => more().props.onPress());
+    assert.equal(toggle().props.value, true, "viewport changes cannot turn off the selection");
+    await act(async () => toggle().props.onValueChange(false));
+    assert.equal(option(), "portrait");
+    await act(async () => more().props.onPress());
+    await act(async () => toggle().props.onValueChange(true));
+    assert.equal(option(), "landscape");
+    native.focused = false;
+    await act(async () => root.render(createElement(BrowserTakeover)));
+    assert.equal(option(), "portrait", "leaving control resets its route option");
+    await act(async () => viewer.render(createElement(BrowserViewer)));
+    assert.equal(viewer.container.queryAll(node => node.type === "Stack.Screen")[0].props.options.orientation, "portrait");
+    native.focused = true;
+    await act(async () => root.render(createElement(BrowserTakeover)));
+    assert.equal(option(), "portrait", "returning to control does not restore the old selection");
+    await act(async () => more().props.onPress());
+    assert.equal(toggle().props.value, false);
+  } finally {
+    native.focused = true;
+    dimensions.width = 720; dimensions.height = 1152;
+    await act(async () => { viewer.unmount(); root.unmount(); });
+  }
+});
 
 for (const { target, transition } of [
   { target: "remote", transition: ["background", "active"] },
@@ -93,7 +144,7 @@ for (const { target, transition } of [
     const padding = () => root.container.queryAll((node) => node.type === "View")[0].props.style as { paddingBottom: number };
     const has = (id: string) => root.container.queryAll((node) => node.props.testID === id).length > 0;
     try {
-      await act(async () => { root.render(createElement(BrowserScreen, { id: "lease", control: true })); });
+      await act(async () => { root.render(createElement(BrowserScreen, controlProps)); });
       assert.equal(padding().paddingBottom, 16);
       await act(async () => { emit("change", "background"); });
       await act(async () => { emit("change", "active"); });
@@ -185,7 +236,7 @@ test("viewer retains a candidate awaiting UI confirmation across a control-only 
 test("rejected keyboard text remains pending until an explicit successful submit", async () => {
   const root = createRoot();
   try {
-    await act(async () => root.render(createElement(BrowserScreen, { id: "lease", control: true })));
+    await act(async () => root.render(createElement(BrowserScreen, controlProps)));
     const client = await showPage(root);
     await act(async () => root.container.queryAll(node => node.type === "TextInput" && node.props.testID === "takeover-input-text")[0].props.onFocus());
     const input = () => root.container.queryAll(node => node.type === "TextInput" && node.props.testID === "takeover-input-text")[0];
@@ -202,7 +253,7 @@ test("closed browser reconnects in place and waits for a fresh frame before enab
   const root = createRoot();
   const button = (id: string) => root.container.queryAll(node => node.type === "Pressable" && node.props.testID === id)[0];
   try {
-    await act(async () => root.render(createElement(BrowserScreen, { id: "lease", control: true })));
+    await act(async () => root.render(createElement(BrowserScreen, controlProps)));
     const first = await showPage(root);
     await act(async () => { first.closed = true; first.events.state("closed"); });
     assert.equal(button("takeover-keyboard").props.disabled, true);
@@ -222,7 +273,7 @@ test("closed browser reconnects in place and waits for a fresh frame before enab
 test("reconnect reports a pending settle buffer and never replays it on the fresh connection", async () => {
   const root = createRoot();
   try {
-    await act(async () => root.render(createElement(BrowserScreen, { id: "lease", control: true })));
+    await act(async () => root.render(createElement(BrowserScreen, controlProps)));
     const first = await showPage(root);
     await act(async () => root.container.queryAll(node => node.type === "TextInput" && node.props.testID === "takeover-input-text")[0].props.onFocus());
     await act(async () => root.container.queryAll(node => node.type === "TextInput" && node.props.testID === "takeover-input-text")[0].props.onChangeText("pending"));
@@ -246,7 +297,7 @@ for (const change of [
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const root = createRoot();
     try {
-      await act(async () => root.render(createElement(BrowserScreen, { id: "lease", control: true })));
+      await act(async () => root.render(createElement(BrowserScreen, controlProps)));
       const client = await showPage(root);
       const input = root.container.queryAll(node => node.type === "TextInput" && node.props.testID === "takeover-input-text")[0];
       await act(async () => { input.props.onFocus(); input.props.onChangeText("old-page-secret"); });
@@ -280,7 +331,7 @@ for (const change of [
 test("discarded input notice survives unrelated page and input replies until explicitly dismissed", async () => {
   const root = createRoot();
   try {
-    await act(async () => root.render(createElement(BrowserScreen, { id: "lease", control: true })));
+    await act(async () => root.render(createElement(BrowserScreen, controlProps)));
     const client = await showPage(root);
     const input = root.container.queryAll(node => node.type === "TextInput" && node.props.testID === "takeover-input-text")[0];
     await act(async () => { input.props.onFocus(); input.props.onChangeText("not-sent"); });
@@ -304,7 +355,7 @@ test("discarded input notice survives unrelated page and input replies until exp
 test("retained input offers explicit resend, survives unrelated replies, and clears only after buffer acceptance", async () => {
   const root = createRoot();
   try {
-    await act(async () => root.render(createElement(BrowserScreen, { id: "lease", control: true })));
+    await act(async () => root.render(createElement(BrowserScreen, controlProps)));
     const client = await showPage(root);
     const input = root.container.queryAll(node => node.type === "TextInput" && node.props.testID === "takeover-input-text")[0];
     client.accepted = false;

@@ -50,20 +50,14 @@ const usage: SubscriptionUsage = {
   windows: [{ name: "primary", used_percent: 40, window_seconds: 3600, reset_at: 2090000000 }],
 };
 
-async function rendered(view: SubscriptionView, onRecheck?: () => void) {
+async function rendered(view: SubscriptionView) {
   const root = createRoot({ textComponentTypes: ["Text"] });
-  let rechecks = 0;
-  const render = async (next: SubscriptionView) => act(async () => root.render(createElement(ModelSubscription, { view: next, nowSeconds: 100, onRecheck: () => { rechecks++; onRecheck?.(); } })));
+  const render = async (next: SubscriptionView) => act(async () => root.render(createElement(ModelSubscription, { view: next, nowSeconds: 100 })));
   await render(view);
   const texts = () => root.container.queryAll((node) => node.type === "Text")
     .map((node) => Array.isArray(node.props.children) ? node.props.children.join("") : String(node.props.children)).join(" ");
   const hasLogin = () => root.container.queryAll((node) => node.props.testID === "settings-subscription-login").length > 0;
-  const pressRecheck = () => {
-    const button = root.container.queryAll((node) => node.props.testID === "settings-subscription-recheck")[0];
-    (button.props.onPress as () => void)();
-    return rechecks;
-  };
-  return { root, texts, hasLogin, pressRecheck, render };
+  return { root, texts, hasLogin, render };
 }
 
 test("模型页渲染重新登录状态和实际网关登录命令，同时标注历史额度", async () => {
@@ -77,7 +71,6 @@ test("模型页渲染重新登录状态和实际网关登录命令，同时标�
       assert.ok(page.texts().includes(auth.login_command));
       assert.match(page.texts(), /历史额度，不代表当前登录状态/);
       assert.match(page.texts(), /40%/);
-      assert.equal(page.pressRecheck(), 1);
     } finally {
       await act(async () => page.root.unmount());
     }
@@ -95,7 +88,6 @@ test("模型页渲染暂时失败和离线而不误报重新登录", async () =>
       assert.match(page.texts(), /历史额度，不代表当前登录状态/);
       assert.equal(page.hasLogin(), false);
       assert.doesNotMatch(page.texts(), /CODEX_HOME=|停止网关|需要重新登录/);
-      assert.equal(page.pressRecheck(), 1);
     } finally {
       await act(async () => page.root.unmount());
     }
@@ -113,9 +105,8 @@ test("App 消费网关轮换不确定状态，重新检查时不将断线或永�
     if (offline) throw new Error("offline");
     return Response.json(replies.shift());
   });
-  let refresh: Promise<SubscriptionView> | undefined;
   const first = await loadSubscriptionUsage(api, true);
-  const page = await rendered(first, () => { refresh = loadSubscriptionUsage(api, true); });
+  const page = await rendered(first);
   try {
     assert.equal(first.auth?.reason, "refresh_persistence_uncertain");
     assert.equal(subscriptionSummary(first), "凭据轮换结果不确定，需停止网关并重新登录");
@@ -126,8 +117,7 @@ test("App 消费网关轮换不确定状态，重新检查时不将断线或永�
     assert.match(page.texts(), /历史额度，不代表当前登录状态/);
 
     offline = true;
-    assert.equal(page.pressRecheck(), 1);
-    const disconnected = await refresh!;
+    const disconnected = await loadSubscriptionUsage(api, true);
     await page.render(disconnected);
     assert.match(page.texts(), /网关连接失败，登录状态暂时无法检查/);
     assert.equal(subscriptionSummary(disconnected), "登录状态暂不可检查");
@@ -135,15 +125,13 @@ test("App 消费网关轮换不确定状态，重新检查时不将断线或永�
     assert.doesNotMatch(page.texts(), /凭据轮换结果不确定|需要重新登录|CODEX_HOME=/);
 
     offline = false;
-    assert.equal(page.pressRecheck(), 2);
-    const temporary = await refresh!;
+    const temporary = await loadSubscriptionUsage(api, true);
     await page.render(temporary);
     assert.match(page.texts(), /登录暂时不可用，请稍后重试/);
     assert.equal(subscriptionSummary(temporary), "登录暂时不可用");
     assert.equal(page.hasLogin(), false);
 
-    assert.equal(page.pressRecheck(), 3);
-    const rejected = await refresh!;
+    const rejected = await loadSubscriptionUsage(api, true);
     await page.render(rejected);
     assert.match(page.texts(), /登录已失效，需要重新登录/);
     assert.equal(subscriptionSummary(rejected), "需要重新登录");

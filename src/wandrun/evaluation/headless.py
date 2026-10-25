@@ -14,8 +14,8 @@ from uuid import uuid4
 from wandrun.integrations.codex_subscription import ReasoningEffort, is_retryable_model_error
 from wandrun.metrics import RunMetrics
 from wandrun.runtime.session import RuntimeCleanupError, open_runtime
-from wandrun.runtime.workspace import Workspace
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.execution.workspace import Workspace
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 class LifecycleError(RuntimeError):

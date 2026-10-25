@@ -6,9 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime.scheduler_store import SchedulerStore
-from wandrun.runtime.workers import WorkerManager
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+from wandrun.runtime.communication.scheduler_store import SchedulerStore
+from wandrun.runtime.communication.workers import WorkerManager
 
 
 def contents(prompts):

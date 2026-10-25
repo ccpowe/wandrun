@@ -16,16 +16,16 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from wandrun.config import AgentDefinition
-from wandrun.runtime.agents import build_agents, run_conversation
-from wandrun.runtime.conversations import conversation_config
-from wandrun.runtime.messages import AgentOutput, SendMessage
-from wandrun.runtime.tool_search import (
+from wandrun.runtime.agent.agents import build_agents, run_conversation
+from wandrun.runtime.agent.conversations import conversation_config
+from wandrun.runtime.communication.messages import AgentOutput, SendMessage
+from wandrun.runtime.agent.tool_search import (
     ToolNamespace,
     ToolSearchMiddleware,
     loaded_tool_names,
 )
-from wandrun.runtime.workers import WorkerManager
-from wandrun.runtime.environments import Environment
+from wandrun.runtime.communication.workers import WorkerManager
+from wandrun.runtime.execution.environments import Environment
 
 
 @tool
