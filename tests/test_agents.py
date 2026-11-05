@@ -436,7 +436,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_filesystem_tools_resolve_relative_paths_in_conversation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "input.txt").write_text("wrong workspace file")
+            (root / "output.txt").write_text("wrong workspace file")
             backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
             observed = []
 
@@ -448,17 +448,17 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     results = [message for message in messages if isinstance(message, ToolMessage)]
                     if not results:
                         response = AIMessage(content="", tool_calls=[{
-                            "name": "read_file", "args": {"file_path": "input.txt"},
-                            "id": "relative-read", "type": "tool_call",
-                        }])
-                    elif len(results) == 1:
-                        observed.append(str(results[0].content))
-                        response = AIMessage(content="", tool_calls=[{
-                            "name": "write_file",
-                            "args": {"file_path": "output.txt", "content": "from conversation"},
+                            "name": "write_file", "args": {"file_path": "output.txt", "content": "from conversation"},
                             "id": "relative-write", "type": "tool_call",
                         }])
+                    elif len(results) == 1:
+                        response = AIMessage(content="", tool_calls=[{
+                            "name": "read_file",
+                            "args": {"file_path": "output.txt"},
+                            "id": "relative-read", "type": "tool_call",
+                        }])
                     else:
+                        observed.append(str(results[-1].content))
                         response_output = output(next="done")
                         response = AIMessage(
                             content=response_output.model_dump_json(),
@@ -467,7 +467,6 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     return ChatResult(generations=[ChatGeneration(message=response)])
 
             async def run(prompts, task_id):
-                await files.prepare(task_id)
                 token = _current_task.set(task_id)
                 try:
                     return await run_conversation(agents["worker"].graph, prompts, task_id, "worker")
@@ -493,20 +492,17 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 checkpointer=InMemorySaver(),
                 files=files,
             )
-            task_directory = root / "conversations/chat"
-            task_directory.mkdir(parents=True)
-            (task_directory / "input.txt").write_text("conversation input")
             try:
                 manager.start("read and write", "chat")
                 self.assertEqual((await manager.wait("chat"))["status"], "completed")
                 self.assertEqual(len(observed), 1)
-                self.assertIn("conversation input", observed[0])
+                self.assertIn("from conversation", observed[0])
                 self.assertNotIn("wrong workspace file", observed[0])
                 self.assertEqual(
                     (Path(files.directory("chat")) / "output.txt").read_text(),
                     "from conversation",
                 )
-                self.assertFalse((root / "output.txt").exists())
+                self.assertEqual((root / "output.txt").read_text(), "wrong workspace file")
                 self.assertTrue(agents["worker"].capabilities.enabled("files"))
                 self.assertTrue(agents["worker"].capabilities.enabled("task_path"))
             finally:

@@ -1,0 +1,69 @@
+# run.py publishes scroll-row first and expands the live-geometry outside-contact hook below.
+appId: host.exp.exponent
+---
+- scrollUntilVisible:
+    element:
+      text: 横滑区域外
+    direction: UP
+- assertVisible:
+    id: rich-scroll-row
+- takeScreenshot: ${ARTIFACTS}/00-layout-before.png
+- assertVisible: 方案一
+- assertNotVisible: 方案三
+- assertNotVisible: L3 纵向终点
+- swipe:
+    from:
+      id: rich-scroll-row
+    direction: LEFT
+- assertVisible: 方案二
+- assertNotVisible: 关闭对话列表
+- swipe:
+    from:
+      id: rich-scroll-row
+    direction: LEFT
+- assertVisible: 方案三
+- assertNotVisible: 关闭对话列表
+- swipe:
+    from:
+      id: rich-scroll-row
+    direction: LEFT
+- takeScreenshot: ${ARTIFACTS}/00-layout-scrolled.png
+- swipe:
+    from:
+      id: rich-scroll-row
+    direction: RIGHT
+- swipe:
+    from:
+      id: rich-scroll-row
+    direction: RIGHT
+- swipe:
+    from:
+      id: rich-scroll-row
+    direction: RIGHT
+- assertVisible: 方案一
+- assertNotVisible: 关闭对话列表
+- assertNotVisible: 方案三
+# Vertical contact on the rail still belongs to the outer chat list.
+- swipe:
+    from:
+      id: rich-scroll-row
+    direction: UP
+- scrollUntilVisible:
+    element:
+      text: L3 纵向终点
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/00-layout-vertical.png
+- scrollUntilVisible:
+    element:
+      text: 横滑区域外
+    direction: UP
+# Same direction outside the horizontal control must still open the drawer.
+# @rich-scroll-row-outside
+- extendedWaitUntil:
+    visible: 关闭对话列表
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/00-layout-drawer.png
+- back
+- extendedWaitUntil:
+    notVisible: 关闭对话列表
+    timeout: 10000

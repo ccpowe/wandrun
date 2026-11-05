@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { AppState } from "react-native";
+import { useMountEffect } from "./use-mount-effect.ts";
 
 /**
  * 分钟级的“现在”：相对时间（“2 分钟前”）靠它在没有新事件时也能更新。只在使用它的屏幕里放一个定时器，
@@ -7,7 +8,7 @@ import { AppState } from "react-native";
  */
 export function useMinuteClock(): Date {
   const [now, setNow] = useState(() => new Date());
-  useEffect(() => {
+  useMountEffect(() => {
     const timer = setInterval(() => setNow(new Date()), 60_000);
     const subscription = AppState.addEventListener("change", (state) => {
       if (state === "active") setNow(new Date());
@@ -16,6 +17,6 @@ export function useMinuteClock(): Date {
       clearInterval(timer);
       subscription.remove();
     };
-  }, []);
+  });
   return now;
 }

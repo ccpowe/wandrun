@@ -7,9 +7,13 @@ Run serially because ChromeDev owns one disposable Xvfb + Chrome pair.
 import asyncio
 import base64
 import json
+import os
 import shutil
+import socket
+from uuid import uuid4
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from unittest.mock import patch
 import unittest
 from pathlib import Path
@@ -23,7 +27,7 @@ from wandrun.config import AgentCatalog, AgentDefinition, BrowserDefinition
 from wandrun.integrations.browser_dev import ChromeDev
 from wandrun.gateway.service import Gateway
 from wandrun.gateway.store import GatewayStore
-from wandrun.runtime.browser.leases import BrowserLeases, BrowserRejected
+from wandrun.runtime.browser.leases import BrowserEnvironmentError, BrowserLeases, BrowserRejected
 from wandrun.runtime.browser.cdp import CDPError, CDPSocket
 from wandrun.runtime.communication.workers import WorkerManager
 
@@ -40,6 +44,77 @@ async def discovery(env):
         with urlopen(env["WANDRUN_BROWSER_CDP"] + "/json/version", timeout=3) as response:
             return json.load(response)["webSocketDebuggerUrl"]
     return await asyncio.to_thread(fetch)
+
+@asynccontextmanager
+async def delayed_navigation_page():
+    """A real HTTP page whose response headers remain under the test's control."""
+    requested, release, responded = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    handlers = set()
+
+    async def serve(reader, writer):
+        task = asyncio.current_task()
+        handlers.add(task)
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            requested.set()
+            await release.wait()
+            body = b"<title>slow initial navigation</title><p>eventually loaded</p>"
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n"
+                         + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            responded.set()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
+            handlers.discard(task)
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    try:
+        yield f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/", requested, release, responded
+    finally:
+        release.set()
+        server.close()
+        await server.wait_closed()
+        for task in tuple(handlers):
+            task.cancel()
+        await asyncio.gather(*tuple(handlers), return_exceptions=True)
+
+
+@asynccontextmanager
+async def controlled_popup_discovery(browser, lease):
+    """Only explicit deliveries reach the real background event worker.
+
+    Callers disconnect relays first, so their independent discovery cannot race
+    these deliveries. Each delivery waits for the callback and owned creation,
+    including when the worker catches an attachment/cleanup exception.
+    """
+    chrome = browser._chrome
+    delivery = None
+    settled = asyncio.Event()
+
+    async def on_event(message):
+        if message is delivery:
+            try:
+                await browser._chrome_event(message)
+            finally:
+                settled.set()
+
+    async def deliver(method, info):
+        nonlocal delivery
+        delivery = {"method": method, "params": {"targetInfo": info}}
+        settled.clear()
+        chrome._events.put_nowait(delivery)
+        await asyncio.wait_for(settled.wait(), 3)
+        await until(lambda: not lease.creating)
+
+    with patch.object(chrome, "on_event", on_event):
+        yield deliver
+
 
 
 class Client:
@@ -60,6 +135,298 @@ class Client:
 
     async def close(self):
         await self.ws.close()
+
+class TaskBrowserTransport:
+    """A real loopback byte relay stands in for the sandbox's task endpoint."""
+
+    def __init__(self, cdp_url):
+        self.cdp_url = cdp_url
+        self.forbid_cdp = False
+        self.reject_close = False
+        self.relays = {}
+        self.mapping_entered = None
+        self.mapping_release = None
+
+    async def browser_cdp_url(self):
+        if self.forbid_cdp:
+            raise AssertionError("pure environment setup contacted Chrome")
+        return self.cdp_url
+
+    async def browser_command_environment(self, env):
+        from urllib.parse import urlsplit
+        url = env["WANDRUN_BROWSER_CDP"]
+        if self.mapping_entered is not None:
+            self.mapping_entered.set()
+            await self.mapping_release.wait()
+        if url not in self.relays:
+            destination = urlsplit(url)
+            writers, handlers = set(), set()
+
+            async def forward(reader, writer):
+                handlers.add(asyncio.current_task())
+                writers.add(writer)
+                upstream = None
+                try:
+                    source, upstream = await asyncio.open_connection(destination.hostname, destination.port)
+                    writers.add(upstream)
+
+                    async def copy(source, target):
+                        while data := await source.read(65536):
+                            target.write(data)
+                            await target.drain()
+                        if target.can_write_eof():
+                            target.write_eof()
+
+                    await asyncio.gather(copy(reader, upstream), copy(source, writer))
+                except (OSError, ConnectionError):
+                    pass
+                finally:
+                    for stream in (writer, upstream):
+                        if stream is not None:
+                            writers.discard(stream)
+                            stream.close()
+                            await stream.wait_closed()
+                    handlers.discard(asyncio.current_task())
+
+            server = await asyncio.start_server(forward, "127.0.0.1", 0)
+            self.relays[url] = server, writers, handlers
+        server, _, _ = self.relays[url]
+        port = server.sockets[0].getsockname()[1]
+        return {**env, "WANDRUN_BROWSER_CDP": f"http://127.0.0.1:{port}",
+                "WANDRUN_BROWSER_PORT": "9222", "WANDRUN_BROWSER_PROFILE": "/data/home/browser/p",
+                "WANDRUN_BROWSER_START": "/data/home/skills/browser/scripts/start_browser.py"}
+
+    async def drain_browser_endpoint(self, url):
+        relay = self.relays.get(url)
+        if relay is not None:
+            await asyncio.gather(*(asyncio.shield(task) for task in tuple(relay[2])))
+
+    async def close_browser_endpoint(self, url):
+        if self.reject_close:
+            raise OSError("remote relay close not confirmed")
+        relay = self.relays.pop(url, None)
+        if relay is None:
+            return
+        server, writers, handlers = relay
+        server.close()
+        for writer in tuple(writers):
+            writer.close()
+        await server.wait_closed()
+        if handlers:
+            await asyncio.gather(*tuple(handlers), return_exceptions=True)
+
+
+class BrowserEndpointDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_remote_setup_without_chrome_keeps_start_environment_and_explains_both_paths(self):
+        transport = TaskBrowserTransport("http://127.0.0.1:1")
+        transport.forbid_cdp = True
+        browser = BrowserLeases(BrowserDefinition("http://127.0.0.1:9222"), transport=transport)
+        try:
+            await browser.start()
+            browser.register("start", "root", "agent", "entry")
+            env = await browser.command_environment("start")
+            self.assertEqual(env["WANDRUN_BROWSER_START"],
+                             "/data/home/skills/browser/scripts/start_browser.py")
+            transport.forbid_cdp = False
+            async with httpx.AsyncClient(trust_env=False) as http:
+                for path in ("/json/version", "/json/list"):
+                    response = await http.get(env["WANDRUN_BROWSER_CDP"] + path)
+                    self.assertEqual(response.status_code, 503)
+                    error = response.json()["error"]
+                    self.assertIn("Chrome 不可达", error)
+                    self.assertIn('python3 "$WANDRUN_BROWSER_START"', error)
+            async with httpx.AsyncClient(trust_env=False) as http:
+                version = (await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")).json()
+            async with connect(version["webSocketDebuggerUrl"], proxy=None) as socket:
+                await socket.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                reply = json.loads(await socket.recv())
+            self.assertEqual(reply["id"], 1)
+            self.assertIn("Chrome 不可达", reply["error"]["message"])
+            self.assertIn('python3 "$WANDRUN_BROWSER_START"', reply["error"]["message"])
+            self.assertIsNone(browser.lease_for_task("start"))
+            self.assertEqual(browser.capacity()["pages_used"], 0)
+            again = await browser.command_environment("start")
+            self.assertEqual(again["WANDRUN_BROWSER_CDP"], env["WANDRUN_BROWSER_CDP"])
+        finally:
+            await browser.aclose()
+
+    async def test_local_unreachable_explains_external_chrome_without_starting_it(self):
+        browser = BrowserLeases(BrowserDefinition("http://127.0.0.1:1"))
+        browser.register("local", "root", "agent", "entry")
+        try:
+            env = await browser.command_environment("local")
+            self.assertNotIn("WANDRUN_BROWSER_START", env)
+            self.assertNotIn("PATH", env)
+            self.assertNotIn("WANDRUN_BROWSER_CLI_DIR", env)
+            async with httpx.AsyncClient(trust_env=False) as http:
+                response = await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("Local 外部 Chrome 不可达", response.json()["error"])
+            self.assertNotIn('python3 "$WANDRUN_BROWSER_START"', response.json()["error"])
+        finally:
+            await browser.aclose()
+
+    @unittest.skipUnless(shutil.which("agent-browser"), "requires the native browser CLI")
+    async def test_native_cli_reports_unreachable_chrome_and_start_command(self):
+        transport = TaskBrowserTransport("http://127.0.0.1:1")
+        browser = BrowserLeases(BrowserDefinition("http://127.0.0.1:9222"), transport=transport)
+        with tempfile.TemporaryDirectory(prefix="ab") as directory:
+            await browser.start()
+            browser.register("cli-start", "root", "agent", "entry")
+            environment = os.environ | await browser.command_environment("cli-start") | {
+                "AGENT_BROWSER_SOCKET_DIR": directory, "AGENT_BROWSER_SESSION": "no-chrome",
+            }
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "agent-browser", "--cdp", environment["WANDRUN_BROWSER_CDP"], "get", "title",
+                    env=environment, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                output, _ = await asyncio.wait_for(process.communicate(), 20)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertIn("Chrome 不可达", output.decode())
+                self.assertIn('python3 "$WANDRUN_BROWSER_START"', output.decode())
+                self.assertNotIn("CDP response channel closed", output.decode())
+            finally:
+                closing = await asyncio.create_subprocess_exec(
+                    "agent-browser", "close", env=environment,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(closing.wait(), 10)
+                await browser.aclose()
+
+    async def test_discovery_accepts_only_loopback_authorities_before_any_chrome_io(self):
+        transport = TaskBrowserTransport("http://127.0.0.1:1")
+        transport.forbid_cdp = True
+        browser = BrowserLeases(BrowserDefinition("http://127.0.0.1:9222"), transport=transport)
+        browser.register("host", "root", "agent", "entry")
+        try:
+            env = await browser.command_environment("host")
+            async with httpx.AsyncClient(trust_env=False) as http:
+                for host in ("localhost:1234", "127.0.0.2:4321", "[::1]:9222"):
+                    response = await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/wandrun/status",
+                                              headers={"Host": host})
+                    self.assertEqual(response.status_code, 200, host)
+                for host in ("example.com", "192.168.1.2:9222", "localhost.evil:80",
+                             "localhost@127.0.0.1:80", "127.0.0.1:0", "127.0.0.1/path",
+                             "127.0.0.999:42", "127.0.0.1:65536", "127.0.0.1:"):
+                    response = await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version",
+                                              headers={"Host": host})
+                    self.assertEqual(response.status_code, 400, host)
+        finally:
+            await browser.aclose()
+
+    async def test_unconfirmed_remote_close_retains_ownership_until_confirmed(self):
+        transport = TaskBrowserTransport("http://127.0.0.1:1")
+        browser = BrowserLeases(BrowserDefinition("http://127.0.0.1:9222"), transport=transport)
+        browser.register("debt", "root", "agent", "entry")
+        try:
+            env = await browser.command_environment("debt")
+            transport.reject_close = True
+            with self.assertRaises(BrowserRejected):
+                await browser.close_task("debt")
+            self.assertEqual(browser.pending_tasks("agent"), ["debt"])
+            transport.reject_close = False
+            await browser.close_task("debt")
+            self.assertEqual(browser.pending_tasks("agent"), [])
+            async with httpx.AsyncClient(trust_env=False) as http:
+                with self.assertRaises(httpx.TransportError):
+                    await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")
+        finally:
+            transport.reject_close = False
+            await browser.aclose()
+
+    async def test_disconnect_during_mapping_closes_late_relay_without_publishing_old_access(self):
+        transport = TaskBrowserTransport("http://127.0.0.1:1")
+        transport.mapping_entered, transport.mapping_release = asyncio.Event(), asyncio.Event()
+        browser = BrowserLeases(BrowserDefinition("http://127.0.0.1:9222"), transport=transport)
+        browser.register("late", "root", "agent", "entry")
+        preparing = asyncio.create_task(browser.command_environment("late"))
+        try:
+            await asyncio.wait_for(transport.mapping_entered.wait(), 3)
+            await browser.connection_lost("浏览器连接中断")
+            transport.mapping_release.set()
+            with self.assertRaises(BrowserRejected):
+                await preparing
+            self.assertEqual(browser.pending_tasks("agent"), [])
+            self.assertEqual(transport.relays, {})
+        finally:
+            transport.mapping_release.set()
+            await asyncio.gather(preparing, return_exceptions=True)
+            await browser.aclose()
+
+    async def test_recovery_barrier_exception_retires_revoked_endpoint_before_next_use(self):
+        class RecoveringTransport(TaskBrowserTransport):
+            def __init__(self):
+                super().__init__("http://127.0.0.1:1")
+                self.forbid_cdp = True
+                self.revoked = set()
+                self.first = True
+
+            async def browser_command_environment(self, env):
+                if self.first:
+                    self.first = False
+                    await browser.connection_lost("平台恢复")
+                    raise BrowserEnvironmentError("执行环境刚恢复；本次环境操作未提交。")
+                if env["WANDRUN_BROWSER_CDP"] in self.revoked:
+                    raise ConnectionError("cannot restore a revoked endpoint")
+                return await super().browser_command_environment(env)
+
+            async def close_browser_endpoint(self, url):
+                self.revoked.add(url)
+                await super().close_browser_endpoint(url)
+
+        transport = RecoveringTransport()
+        browser = BrowserLeases(BrowserDefinition("http://127.0.0.1:9222"), transport=transport)
+        browser.register("recover", "root", "agent", "entry")
+        try:
+            with self.assertRaises(BrowserEnvironmentError):
+                await browser.command_environment("recover")
+            environment = await browser.command_environment("recover")
+            async with httpx.AsyncClient(trust_env=False) as http:
+                response = await http.get(environment["WANDRUN_BROWSER_CDP"] + "/json/wandrun/status")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["state"], "unallocated")
+            self.assertIsNone(browser.lease_for_task("recover"))
+        finally:
+            await browser.aclose()
+
+
+class BrowserStatusReadOnlyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unallocated_status_never_connects_or_admits_and_rejects_old_endpoint(self):
+        browser = BrowserLeases(BrowserDefinition("http://127.0.0.1:1", max_pages=3))
+        browser.register("status", "root", "agent", "entry")
+        owner = browser._tasks["status"]
+        endpoint = await browser._serve("status", "status-lease", 1)
+        owner.endpoint = endpoint
+        try:
+            with patch.object(browser, "_ensure_chrome", side_effect=AssertionError("Chrome I/O")), \
+                    patch.object(browser, "_fetch", side_effect=AssertionError("Chrome I/O")):
+                async with httpx.AsyncClient() as http:
+                    url = f"http://127.0.0.1:{endpoint.port}/json/wandrun/status"
+                    response = await http.get(url)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json(), {
+                        "state": "unallocated", "pages_used": 0,
+                        "environment_id": "local", "environment_name": "Local",
+                        "capacity": {"pages_used": 0, "pages_limit": 3, "pages_registered": 0,
+                                     "pages_creating": 0, "pages_pending_cleanup": 0},
+                        "reason": None,
+                    })
+                    self.assertIsNone(owner.lease)
+                    self.assertIsNone(endpoint.acquiring)
+                    self.assertIsNone(browser._chrome)
+                    self.assertFalse(endpoint.notice_seen)
+                    owner.endpoint = None
+                    stale = await http.get(url)
+                    self.assertEqual(stale.status_code, 409)
+                    self.assertNotIn("capacity", stale.json())
+                    owner.endpoint = endpoint
+                    owner.registered = False
+                    revoked = await http.get(url)
+                    self.assertEqual(revoked.status_code, 409)
+                    self.assertNotIn("capacity", revoked.json())
+        finally:
+            await browser.aclose()
 
 
 class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
@@ -83,8 +450,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.tick = [0.0]
         self.notices = []
         self.events = []
-        self.config = BrowserDefinition(self.chrome.cdp_url, slots=2, max_pages=3,
-                                        idle_timeout=100, queue_timeout=.25)
+        self.config = BrowserDefinition(self.chrome.cdp_url, max_pages=3, idle_timeout=100)
         await self.open_browser()
         self.clients = []
 
@@ -112,6 +478,195 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("result", reply, reply)
         await until(lambda: self.browser.lease_for_task(task) is not None)
         return client, self.browser.lease_for_task(task), env
+
+    async def test_created_page_survives_response_headers_delayed_over_ten_seconds(self):
+        client, ident, _ = await self.client("slow-navigation")
+        async with delayed_navigation_page() as (url, requested, release, _):
+            response = await asyncio.wait_for(client.call("Target.createTarget", {"url": url}), 3)
+            target = response["result"]["targetId"]
+            await asyncio.wait_for(requested.wait(), 3)
+            # Chrome runs outside Python: hold real response headers past its
+            # former ten-second deadline; a fake clock cannot exercise that path.
+            await asyncio.sleep(11)
+            self.assertIn(target, {page["id"] for page in self.browser.detail(ident)["pages"]})
+            self.assertEqual(self.browser.capacity()["pages_registered"], 2)
+            info = (await client.call("Target.getTargetInfo", {"targetId": target}))["result"]["targetInfo"]
+            self.assertEqual(info["targetId"], target)
+            release.set()
+            await until(lambda: any(page["id"] == target and page["title"] == "slow initial navigation"
+                                    for page in self.browser.detail(ident)["pages"]), timeout=5)
+            value = await self.browser.page_call(ident, target, "Runtime.evaluate", {
+                "expression": "6 * 7", "returnByValue": True})
+            self.assertEqual(value["result"]["value"], 42)
+
+    async def test_explicit_navigation_failure_keeps_created_owned_chrome_error_page(self):
+        client, ident, _ = await self.client("failed-navigation")
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            # Keep the port reserved but not listening until Chrome reports its
+            # failure; another process cannot turn this into a successful request.
+            url = f"http://127.0.0.1:{port}/"
+            response = await asyncio.wait_for(client.call("Target.createTarget", {"url": url}), 3)
+            target = response["result"]["targetId"]
+            session = (await client.call("Target.attachToTarget", {
+                "targetId": target, "flatten": True}))["result"]["sessionId"]
+            async with asyncio.timeout(5):
+                while True:
+                    tree = (await client.call("Page.getFrameTree", session=session))["result"]
+                    if tree["frameTree"]["frame"].get("unreachableUrl") == url:
+                        break
+                    await asyncio.sleep(.025)
+        self.assertIn(target, {page["id"] for page in self.browser.detail(ident)["pages"]})
+        targets = (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]
+        self.assertIn(target, {page["targetId"] for page in targets})
+        self.assertEqual(self.browser.capacity()["pages_registered"], 2)
+        self.assertFalse(self.browser._get(ident).uncertain_creations)
+
+    async def test_immediate_close_of_created_page_aborts_pending_navigation_without_resurrection(self):
+        client, ident, _ = await self.client("close-loading-page")
+        for close_via in ("gateway", "cdp"):
+            with self.subTest(close_via=close_via):
+                async with delayed_navigation_page() as (url, requested, release, responded):
+                    response = await asyncio.wait_for(client.call("Target.createTarget", {"url": url}), 3)
+                    target = response["result"]["targetId"]
+                    await asyncio.wait_for(requested.wait(), 3)
+                    if close_via == "gateway":
+                        await asyncio.wait_for(self.browser.close_page(ident, target), 8)
+                    else:
+                        closed = await client.call("Target.closeTarget", {"targetId": target})
+                        self.assertTrue(closed["result"]["success"])
+                    release.set()
+                    await asyncio.wait_for(responded.wait(), 3)
+                    await until(lambda: not self.browser._get(ident).creating)
+                    self.assertNotIn(target, {page["id"] for page in self.browser.detail(ident)["pages"]})
+                    targets = (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]
+                    self.assertNotIn(target, {page["targetId"] for page in targets})
+                    self.assertEqual(self.browser.capacity()["pages_used"], 1)
+                    self.assertEqual(self.browser.capacity()["pages_pending_cleanup"], 0)
+
+    async def test_immediate_close_of_registered_blank_page_confirms_removal(self):
+        client, ident, _ = await self.client("close-blank-page")
+        for close_via in ("gateway", "cdp"):
+            with self.subTest(close_via=close_via):
+                created = await client.call("Target.createTarget", {"url": "about:blank"})
+                target = created["result"]["targetId"]
+                if close_via == "gateway":
+                    await asyncio.wait_for(self.browser.close_page(ident, target), 8)
+                else:
+                    closed = await client.call("Target.closeTarget", {"targetId": target})
+                    self.assertTrue(closed["result"]["success"])
+                    await until(lambda: target not in {
+                        page["id"] for page in self.browser.detail(ident)["pages"]})
+                await until(lambda: not self.browser._get(ident).creating)
+                targets = (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]
+                self.assertNotIn(target, {page["targetId"] for page in targets})
+                self.assertEqual(self.browser.capacity()["pages_used"], 1)
+
+    async def test_failed_first_connect_without_waiters_is_retried_on_next_use(self):
+        transport = TaskBrowserTransport("http://127.0.0.1:1")
+        browser = BrowserLeases(self.config, transport=transport)
+        browser.register("late-chrome", "root", "agent", "entry")
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def paused_url():
+            entered.set()
+            await release.wait()
+            return transport.cdp_url
+
+        try:
+            with patch.object(transport, "browser_cdp_url", paused_url):
+                waiter = asyncio.create_task(browser._ensure_chrome())
+                await entered.wait()
+                initialization = browser._initialization
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+                release.set()
+                failure, = await asyncio.gather(initialization, return_exceptions=True)
+                self.assertIsInstance(failure, BrowserRejected)
+            transport.cdp_url = self.chrome.cdp_url
+            environment = await browser.command_environment("late-chrome")
+            async with connect(await discovery(environment)) as websocket:
+                response = await Client(websocket).call(
+                    "Target.createTarget", {"url": "data:text/html,<title>fresh connection</title>"})
+                target = response["result"]["targetId"]
+                lease = browser.detail(browser.lease_for_task("late-chrome"))
+                self.assertIn(target, {page["id"] for page in lease["pages"]})
+                self.assertEqual(lease["state"], "agent")
+        finally:
+            release.set()
+            await browser.aclose()
+
+    async def test_cdp_recovery_barrier_stops_command_setup_then_census_releases_old_lease(self):
+        class RecoveringTransport(TaskBrowserTransport):
+            recovering = False
+
+            async def browser_cdp_url(self):
+                if self.recovering:
+                    self.recovering = False
+                    raise BrowserEnvironmentError("执行环境刚恢复；本次环境操作未提交。")
+                return await super().browser_cdp_url()
+
+        transport = RecoveringTransport(self.chrome.cdp_url)
+        browser = BrowserLeases(self.config, transport=transport)
+        browser.register("recover-cdp", "root", "agent", "entry")
+        try:
+            environment = await browser.command_environment("recover-cdp")
+            async with connect(await discovery(environment)) as socket:
+                response = await Client(socket).call("Target.createTarget", {"url": "about:blank"})
+                old_target = response["result"]["targetId"]
+            old_id = browser.lease_for_task("recover-cdp")
+            await browser.connection_lost("浏览器连接中断")
+            transport.recovering = True
+            with self.assertRaises(BrowserEnvironmentError):
+                await browser.command_environment("recover-cdp")
+            self.assertEqual(browser.detail(old_id)["state"], "stopping")
+            environment = await browser.command_environment("recover-cdp")
+            self.assertEqual(browser.detail(old_id)["state"], "released")
+            targets = (await browser._chrome.call("Target.getTargets"))["targetInfos"]
+            self.assertNotIn(old_target, {target["targetId"] for target in targets})
+            async with connect(await discovery(environment)) as socket:
+                notice = await Client(socket).call("Browser.getVersion")
+                self.assertIn("上次浏览器租约已结束", notice["error"]["message"])
+            environment = await browser.command_environment("recover-cdp")
+            async with connect(await discovery(environment)) as socket:
+                reopened = await Client(socket).call("Target.createTarget", {"url": "about:blank"})
+                new_id = browser.lease_for_task("recover-cdp")
+                self.assertNotEqual(new_id, old_id)
+                self.assertIn(reopened["result"]["targetId"], {
+                    page["id"] for page in browser.detail(new_id)["pages"]})
+        finally:
+            await browser.aclose()
+
+    async def test_seen_end_notice_survives_cleanup_of_its_remote_endpoint(self):
+        transport = TaskBrowserTransport(self.chrome.cdp_url)
+        browser = BrowserLeases(self.config, transport=transport)
+        browser.register("reopen", "root", "agent", "entry")
+
+        async def call(environment, method, params=None):
+            async with connect(await discovery(environment)) as websocket:
+                return await Client(websocket).call(method, params)
+
+        try:
+            environment = await browser.command_environment("reopen")
+            await call(environment, "Browser.getVersion")
+            old_id = browser.lease_for_task("reopen")
+            await browser.connection_lost("浏览器连接中断")
+            transport.cdp_url = "http://127.0.0.1:1"
+            environment = await browser.command_environment("reopen")
+            notice = await call(environment, "Browser.getVersion")
+            self.assertIn("上次浏览器租约已结束", notice["error"]["message"])
+            transport.cdp_url = self.chrome.cdp_url
+            environment = await browser.command_environment("reopen")
+            response = await call(environment, "Target.createTarget", {
+                "url": "data:text/html,<title>explicit reopen</title>"})
+            target = response["result"]["targetId"]
+            new_id = browser.lease_for_task("reopen")
+            self.assertNotEqual(new_id, old_id)
+            self.assertEqual(browser.detail(old_id)["state"], "released")
+            self.assertIn(target, {page["id"] for page in browser.detail(new_id)["pages"]})
+        finally:
+            await browser.aclose()
 
     async def test_scoped_discovery_rejects_foreign_targets_and_global_mutation(self):
         a, aid, aenv = await self.client("alpha")
@@ -194,6 +749,32 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(item["webSocketDebuggerUrl"].startswith(
                 env["WANDRUN_BROWSER_CDP"].replace("http://", "ws://") + "/devtools/"))
 
+    async def test_status_counts_registered_pages_without_touching_idle_time(self):
+        _, ident, env = await self.client("status-owner")
+        _, other, _ = await self.client("status-other")
+        lease = self.browser._get(ident)
+        before = lease.last_activity
+        self.tick[0] += 10
+        async with httpx.AsyncClient() as http:
+            url = env["WANDRUN_BROWSER_CDP"] + "/json/wandrun/status"
+            with patch.object(self.browser, "_fetch", side_effect=AssertionError("Chrome I/O")):
+                response = await http.get(url)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {
+                "state": "agent", "pages_used": 1,
+                "environment_id": "local", "environment_name": "Local",
+                "capacity": {"pages_used": 2, "pages_limit": 3, "pages_registered": 2,
+                             "pages_creating": 0, "pages_pending_cleanup": 0},
+                "reason": None,
+            })
+            self.assertEqual(lease.last_activity, before)
+            self.assertNotIn(self.browser.detail(other)["current"], response.text)
+            await self.browser.takeover(ident)
+            response = await http.get(url)
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.json()["state"], "human")
+            self.assertIn("error", response.json())
+
     async def test_http_final_page_close_obeys_scope_and_epoch(self):
         _, aid, aenv = await self.client("http-owner")
         _, bid, _ = await self.client("http-other")
@@ -215,11 +796,13 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.browser.lease_for_task("http-owner"))
         with self.assertRaises(BrowserRejected):
             await self.browser.new_page(aid, self.browser.detail(aid)["epoch"])
-        self.assertEqual(self.browser.capacity()["slots_used"], 1)
+        self.assertEqual(self.browser.capacity()["pages_used"], 1)
         self.assertEqual(self.browser.detail(aid)["reason"], "Agent 关闭")
         self.assertEqual(self.browser.detail(bid)["state"], "agent")
 
     async def test_popup_claims_opener_and_enforces_page_limit(self):
+        from dataclasses import replace
+        self.browser.config = replace(self.config, max_pages=4)
         a, aid, _ = await self.client("alpha")
         b, bid, _ = await self.client("beta")
         page = self.browser.detail(aid)["current"]
@@ -235,7 +818,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                              {p["targetId"] for p in visible})
             self.assertEqual(len((await b.call("Target.getTargets"))["result"]["targetInfos"]), 1)
         rejected = await a.call("Target.createTarget", {"url": "about:blank"})
-        self.assertIn("页面数已达上限", rejected["error"]["message"])
+        self.assertIn("页面总数已达上限", rejected["error"]["message"])
         second, third = [p["id"] for p in self.browser.detail(aid)["pages"] if p["id"] != page]
         self.assertIn("result", await a.call("Target.activateTarget", {"targetId": second}))
         await until(lambda: self.browser.detail(aid)["current"] == second)
@@ -243,6 +826,116 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         await until(lambda: self.browser.detail(aid)["current"] == third)
         await self.browser.close_page(aid, third)
         self.assertEqual(self.browser.detail(aid)["current"], second)
+
+    async def test_stale_popup_info_does_not_reattach_a_closed_page(self):
+        client, ident, _ = await self.client("popup-stale")
+        lease = self.browser._get(ident)
+        await client.close()
+        await until(lambda: not lease.relays and not lease.creating)
+        async with controlled_popup_discovery(self.browser, lease) as deliver:
+            opener = lease.current
+            await self.browser.page_call(ident, opener, "Runtime.evaluate", {
+                "expression": "window.open('about:blank','_blank')", "userGesture": True})
+            infos = (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]
+            info, = [item for item in infos if item.get("openerId") == opener]
+            target = info["targetId"]
+            await deliver("Target.targetCreated", info)
+            self.assertIn(target, lease.pages)
+            await self.browser.close_page(ident, target)
+            self.assertNotIn(target, lease.pages)
+            self.assertIn(target, lease.targets)
+            self.assertNotIn(target, {
+                item["targetId"] for item in
+                (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]})
+            with patch.object(CDPSocket, "open",
+                              side_effect=CDPError("reattached closed popup")) as opened:
+                for method in ("Target.targetCreated", "Target.targetInfoChanged"):
+                    await deliver(method, info)
+                opened.assert_not_awaited()
+                opened.assert_not_called()
+            self.assertFalse(lease.creating)
+            self.assertNotIn(target, lease.pages)
+            self.assertEqual(lease.state, "agent")
+
+    async def test_rejected_popup_close_failure_is_cleaned_on_next_discovery(self):
+        client, ident, _ = await self.client("popup-over-limit")
+        lease = self.browser._get(ident)
+        await client.close()
+        await until(lambda: not lease.relays and not lease.creating)
+        epoch = (await self.browser.takeover(ident))["epoch"]
+        while len(lease.pages) < self.config.max_pages:
+            await self.browser.new_page(ident, epoch)
+        await self.browser.handback(ident)
+        await until(lambda: not lease.creating)
+        async with controlled_popup_discovery(self.browser, lease) as deliver:
+            opener = lease.current
+            await self.browser.page_call(ident, opener, "Runtime.evaluate", {
+                "expression": "window.open('about:blank','_blank')", "userGesture": True})
+            infos = (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]
+            info, = [item for item in infos if item.get("openerId") == opener]
+            target = info["targetId"]
+            call = self.browser._chrome.call
+            attempts = []
+
+            async def fail_first_close(method, params=None, **kwargs):
+                if method == "Target.closeTarget" and params["targetId"] == target:
+                    attempts.append(target)
+                    if len(attempts) == 1:
+                        return {"success": False}
+                return await call(method, params, **kwargs)
+
+            with patch.object(self.browser._chrome, "call", side_effect=fail_first_close), \
+                    patch.object(CDPSocket, "open",
+                                 side_effect=CDPError("initialized rejected popup")) as opened:
+                await deliver("Target.targetCreated", info)
+                self.assertEqual(attempts, [target])
+                self.assertIn(target, lease.targets)
+                self.assertNotIn(target, lease.pages)
+                self.assertEqual(len(lease.pages), self.config.max_pages)
+                self.assertIn(target, {
+                    item["targetId"] for item in (await call("Target.getTargets"))["targetInfos"]})
+                # A freed slot must not turn outstanding cleanup into attachment.
+                await self.browser.close_page(ident, next(iter(lease.pages)))
+                await deliver("Target.targetInfoChanged", info)
+                self.assertEqual(attempts, [target, target])
+                self.assertNotIn(target, {
+                    item["targetId"] for item in (await call("Target.getTargets"))["targetInfos"]})
+                await deliver("Target.targetCreated", info)
+                self.assertEqual(attempts, [target, target])
+                opened.assert_not_awaited()
+                opened.assert_not_called()
+            self.assertFalse(lease.creating)
+            self.assertNotIn(target, lease.pages)
+            self.assertEqual(lease.state, "agent")
+
+    async def test_concurrent_popup_info_does_not_repeat_failed_initialization(self):
+        _, ident, _ = await self.client("popup-failed")
+        lease = self.browser._get(ident)
+        target = (await self.browser._chrome.call(
+            "Target.createTarget", {"url": "about:blank"}))["targetId"]
+        # Deliver discovery explicitly so attachment and duplicate arrival order
+        # are deterministic, without depending on Chrome's event timing.
+        info = {"targetId": target, "openerId": lease.current, "type": "page", "url": "about:blank"}
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def fail_open():
+            entered.set()
+            await release.wait()
+            raise CDPError("injected popup handshake failure")
+        with patch.object(CDPSocket, "open", side_effect=fail_open) as opened:
+            claiming = asyncio.create_task(self.browser._claim_popup(info))
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                await self.browser._claim_popup(info)
+            finally:
+                release.set()
+            with self.assertRaisesRegex(CDPError, "injected popup handshake failure"):
+                await claiming
+            self.assertNotIn(target, lease.pages)
+            self.assertIn(target, lease.targets)
+            self.assertNotIn(target, {item["id"] for item in await self.browser._fetch("/json/list")})
+            await self.browser._chrome_event({
+                "method": "Target.targetInfoChanged", "params": {"targetInfo": info}})
+            self.assertEqual(opened.await_count, 1)
 
     async def test_document_revision_and_title_poll_track_actual_page(self):
         _, ident, _ = await self.client("titles")
@@ -257,42 +950,8 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         await until(lambda: self.browser.detail(ident)["pages"][0]["revision"] > initial)
         self.assertIn("data:text/html", self.browser.detail(ident)["pages"][0]["url"])
 
-    async def test_fifo_queue_timeout_cancellation_and_final_page_release(self):
-        await self.browser.aclose()
-        self.config = BrowserDefinition(self.chrome.cdp_url, slots=1, max_pages=3,
-                                        idle_timeout=100, queue_timeout=.25)
-        await self.open_browser()
-        a, aid, _ = await self.client("occupant", "occupied-root")
-        self.browser.register("waiting", "waiting-root", "waiting-agent", "entry")
-        env = await self.browser.command_environment("waiting")
-        url = await discovery(env)
-        waiting = Client(await connect(url))
-        self.clients.append(waiting)
-        rejected = await waiting.call("Browser.getVersion")
-        self.assertIn("occupied-root", rejected["error"]["message"])
-        self.assertIn("浏览器槽位已满", rejected["error"]["message"])
-        self.assertIsNone(self.browser.lease_for_task("waiting"))
-        self.browser.register("cancelled", "cancel-root", "cancel-agent", "entry")
-        env = await self.browser.command_environment("cancelled")
-        url = await discovery(env)
-        queued = Client(await connect(url))
-        self.clients.append(queued)
-        await until(lambda: bool(self.browser._waiters))
-        await self.browser.close_task("cancelled", "任务结束")
-        self.assertIsNone(self.browser.lease_for_task("cancelled"))
-        await until(lambda: not self.browser._waiters)
-        await asyncio.wait_for(queued.ws.wait_closed(), 3)
-        async with httpx.AsyncClient() as http:
-            with self.assertRaises(httpx.ConnectError):
-                await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")
-        page = self.browser.detail(aid)["current"]
-        await a.call("Target.closeTarget", {"targetId": page})
-        await until(lambda: self.browser.detail(aid)["state"] == "released")
-        self.assertEqual(self.browser.detail(aid)["reason"], "最后一张页面已关闭")
-        b, bid, _ = await self.client("new-owner")
-        self.assertEqual(self.browser.detail(bid)["state"], "agent")
 
-    async def test_human_last_page_close_preserves_slot_and_reopens(self):
+    async def test_human_last_page_close_preserves_owner_without_reserving_capacity(self):
         _, ident, _ = await self.client("human-last-page")
         target = self.browser.detail(ident)["current"]
         epoch = (await self.browser.takeover(ident))["epoch"]
@@ -300,12 +959,12 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((empty["state"], empty["pages"], empty["current"]),
                          ("human", [], None))
         self.assertIsNone(empty["reason"])
-        self.assertEqual(self.browser.capacity()["slots_used"], 1)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
         self.assertEqual([kind for kind, _ in self.events if kind == "takeover.ended"], [])
         created = await self.browser.new_page(ident, epoch)
         self.assertEqual(self.browser.detail(ident)["current"], created)
         self.assertEqual(self.browser.detail(ident)["state"], "human")
-        self.assertEqual(self.browser.capacity()["slots_used"], 1)
+        self.assertEqual(self.browser.capacity()["pages_used"], 1)
         self.assertEqual((await self.browser.handback(ident))["state"], "agent")
         self.assertEqual(self.browser.detail(ident)["pages"][0]["id"], created)
 
@@ -316,7 +975,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         await self.browser._chrome.call("Target.closeTarget", {"targetId": target})
         await until(lambda: self.browser.detail(ident)["pages"] == [])
         self.assertEqual(self.browser.detail(ident)["state"], "human")
-        self.assertEqual(self.browser.capacity()["slots_used"], 1)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
         replacement = await self.browser.new_page(ident, epoch)
         self.assertEqual(self.browser.detail(ident)["current"], replacement)
         await self.browser.close_page(ident, replacement)
@@ -324,7 +983,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         ended = await self.browser.handback(ident)
         self.assertEqual((ended["state"], ended["reason"], ended["pages"]),
                          ("released", "用户关闭", []))
-        self.assertEqual(self.browser.capacity()["slots_used"], 0)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
         self.assertIsNone(self.browser.lease_for_task("target-destroyed"))
         self.assertEqual(self.notices[-1],
                          ("target-destroyed", "接管结束，页面已关闭；如需继续请重新打开浏览器。", False))
@@ -350,44 +1009,15 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.tick[0] += self.config.idle_timeout
         await self.browser.expire_idle()
         self.assertEqual(self.browser.detail(ident)["reason"], "浏览器空闲超时")
-        self.assertEqual(self.browser.capacity()["slots_used"], 0)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
         _, other, _ = await self.client("empty-owner")
         page = self.browser.detail(other)["current"]
         await self.browser.takeover(other)
         await self.browser.close_page(other, page)
         await self.browser.close_task("empty-owner", "任务结束")
         self.assertEqual(self.browser.detail(other)["reason"], "任务结束")
-        self.assertEqual(self.browser.capacity()["slots_used"], 0)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
 
-    async def test_fifo_admits_oldest_waiter_before_later_connection(self):
-        await self.browser.aclose()
-        self.config = BrowserDefinition(self.chrome.cdp_url, slots=1, max_pages=3,
-                                        idle_timeout=100, queue_timeout=4)
-        await self.open_browser()
-        _, aid, _ = await self.client("first")
-        self.browser.register("left-queue", "gone-root", "left-agent", "entry")
-        abandoned = await self.browser.command_environment("left-queue")
-        disconnected = Client(await connect(await discovery(abandoned)))
-        await until(lambda: len(self.browser._waiters) == 1)
-        await disconnected.close()
-        await until(lambda: not self.browser._waiters)
-        self.assertIsNone(self.browser.lease_for_task("left-queue"))
-        pending = []
-        for task in ("second", "third"):
-            self.browser.register(task, task + "-root", task + "-agent", "entry")
-            env = await self.browser.command_environment(task)
-            client = Client(await connect(await discovery(env)))
-            self.clients.append(client)
-            pending.append(asyncio.create_task(client.call("Browser.getVersion")))
-            await until(lambda: len(self.browser._waiters) == len(pending))
-        await self.browser.close(aid)
-        second = await pending[0]
-        self.assertIn("result", second)
-        self.assertIsNotNone(self.browser.lease_for_task("second"))
-        self.assertIsNone(self.browser.lease_for_task("third"))
-        await self.browser.close(self.browser.lease_for_task("second"))
-        self.assertIn("result", await pending[1])
-        self.assertIsNotNone(self.browser.lease_for_task("third"))
 
     async def test_request_takeover_keeps_agent_writes_and_close_reason_is_next_use(self):
         client, ident, old_env = await self.client("requesting")
@@ -414,7 +1044,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(ident, replacement)
         self.assertIn("result", await fresh.call("Browser.getVersion"))
 
-    async def test_unconfirmed_cleanup_keeps_slot_until_retry_confirms_pages_gone(self):
+    async def test_unconfirmed_cleanup_keeps_capacity_until_retry_confirms_pages_gone(self):
         from unittest.mock import patch
 
         _, ident, _ = await self.client("failed-close")
@@ -422,10 +1052,10 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(BrowserRejected, "关闭未确认"):
                 await self.browser.close(ident)
         self.assertEqual(self.browser.detail(ident)["state"], "stopping")
-        self.assertEqual(self.browser._reserved, 1)
+        self.assertEqual(self.browser.capacity()["pages_pending_cleanup"], 1)
         result = await self.browser.close(ident)
         self.assertEqual(result["state"], "released")
-        self.assertEqual(self.browser._reserved, 0)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
     async def test_late_target_destroyed_completes_original_failed_close(self):
         _, ident, _ = await self.client("late-close")
         target = self.browser.detail(ident)["current"]
@@ -433,10 +1063,10 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.browser, "_close_target", side_effect=CDPError("still open")):
             with self.assertRaisesRegex(BrowserRejected, "关闭未确认"):
                 await self.browser.close(ident, "用户关闭")
-        self.assertEqual(self.browser._reserved, 1)
+        self.assertEqual(self.browser.capacity()["pages_used"], 1)
         await self.browser._chrome.call("Target.closeTarget", {"targetId": target})
         await until(lambda: self.browser.detail(ident)["state"] == "released")
-        self.assertEqual(self.browser._reserved, 0)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
         self.assertEqual(self.browser.detail(ident)["reason"], "用户关闭")
         self.assertIn("接管结束，页面已关闭", self.notices[-1][1])
         self.assertFalse(self.notices[-1][2])
@@ -450,7 +1080,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                 await self.browser.close(ident, "用户关闭")
         env = await self.browser.command_environment("retry-close")
         self.assertEqual(self.browser.detail(ident)["state"], "released")
-        self.assertEqual(self.browser._reserved, 0)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
         notice = Client(await connect(await discovery(env)))
         self.clients.append(notice)
         self.assertIn("用户关闭", (await notice.call("Browser.getVersion"))["error"]["message"])
@@ -467,7 +1097,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
             reply = await failed.call("Browser.getVersion")
             self.assertIn("injected create failure", reply["error"]["message"])
         await failed.close()
-        self.assertEqual(self.browser._reserved, 0)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
         recovered = Client(await connect(endpoint))
         self.clients.append(recovered)
         self.assertIn("result", await recovered.call("Browser.getVersion"))
@@ -531,7 +1161,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(.01)
         await asyncio.wait_for(self.browser.close_task("never-settles"), 12)
         self.assertEqual(self.browser.detail(ident)["state"], "released")
-        self.assertEqual(self.browser.capacity()["slots_used"], 0)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
         targets = (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]
         self.assertNotIn(target, {info["targetId"] for info in targets})
 
@@ -566,10 +1196,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                         with self.assertRaisesRegex(BrowserRejected, "关闭未确认"):
                             await asyncio.wait_for(closing, 12)
                         self.assertEqual(self.browser.detail(ident)["state"], "stopping")
-                        self.assertEqual(self.browser.capacity()["slots_used"], 1)
-                        self.assertIn(created[0], {
-                            info["targetId"] for info in
-                            (await call("Target.getTargets"))["targetInfos"]})
+                        self.assertEqual(self.browser.capacity()["pages_creating"], 1)
                 finally:
                     release.set()
                 await until(lambda: not self.browser._get(ident).creating)
@@ -578,13 +1205,13 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     await asyncio.wait_for(self.browser.close(ident), 12)
                 self.assertEqual(self.browser.detail(ident)["state"], "released")
-                self.assertEqual(self.browser.capacity()["slots_used"], 0)
+                self.assertEqual(self.browser.capacity()["pages_used"], 0)
                 self.assertNotIn(created[0], {
                     info["targetId"] for info in
                     (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]})
 
     async def test_agent_create_reply_after_disconnect_remains_lease_owned(self):
-        client, ident, _ = await self.client("agent-delayed-create")
+        client, ident, env = await self.client("agent-delayed-create")
         call = self.browser._chrome.call
         entered, release = asyncio.Event(), asyncio.Event()
         created = []
@@ -603,13 +1230,20 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                 await client.close()
                 with self.assertRaisesRegex(BrowserRejected, "关闭未确认"):
                     await asyncio.wait_for(self.browser.close(ident), 12)
-                self.assertEqual(self.browser.capacity()["slots_used"], 1)
+                self.assertEqual(self.browser.capacity()["pages_creating"], 1)
                 self.assertEqual(self.browser.detail(ident)["state"], "stopping")
+                async with httpx.AsyncClient() as http:
+                    response = await http.get(
+                        env["WANDRUN_BROWSER_CDP"] + "/json/wandrun/status")
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.json()["state"], "stopping")
+                self.assertEqual(response.json()["reason"], "用户关闭")
+                self.assertEqual(response.json()["capacity"], self.browser.capacity())
         finally:
             release.set()
         await until(lambda: not self.browser._get(ident).creating)
         await asyncio.wait_for(self.browser.close(ident), 12)
-        self.assertEqual(self.browser.capacity()["slots_used"], 0)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
         self.assertNotIn(created[0], {
             info["targetId"] for info in
             (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]})
@@ -637,14 +1271,14 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLogs("wandrun.runtime.browser.leases", level="WARNING") as reported:
             await until(lambda: self.browser.detail(second)["state"] == "released", timeout=8)
             self.assertEqual(self.browser.detail(first)["state"], "stopping")
-            self.assertEqual(self.browser.capacity()["slots_used"], 1)
+            self.assertEqual(self.browser.capacity()["pages_pending_cleanup"], 1)
             self.assertFalse(self.browser._idle_worker.done())
             _, later, _ = await self.client("idle-later")
             self.tick[0] += 101
             await until(lambda: self.browser.detail(later)["state"] == "released", timeout=8)
         self.assertTrue(any(first in line for line in reported.output))
         self.assertFalse(self.browser._idle_worker.done())
-        self.assertEqual(self.browser.capacity()["slots_used"], 1)
+        self.assertEqual(self.browser.capacity()["pages_pending_cleanup"], 1)
         await self.browser.close(first)
 
     async def test_idle_does_not_hide_cancellation_or_unexpected_errors(self):
@@ -754,7 +1388,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                 reply = await client.call("Target.createTarget", {"url": "about:blank"})
             self.assertIn("lost createTarget reply", reply["error"]["message"])
             await until(lambda: not lease.creating)
-            self.assertTrue(lease.create_uncertain)
+            self.assertTrue(lease.uncertain_creations)
             for _ in range(2):
                 with self.assertRaisesRegex(BrowserRejected, "收回未确认.*建页结果尚未确认"):
                     await self.browser.takeover(ident)
@@ -765,7 +1399,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
             # confirm its removal and clear uncertainty for normal teardown.
             for target in created:
                 await self.browser._close_target(target)
-            lease.create_uncertain = False
+            lease.uncertain_creations.clear()
 
     async def test_takeover_settles_inflight_chrome_input_before_human(self):
         ident, target = await self._queued_input(1200)
@@ -796,7 +1430,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["result"]["value"], "OLD")
         self.assertIn("WANDRUN_BROWSER_CDP", fresh)
 
-    async def test_handback_key_release_failure_preserves_retry_state(self):
+    async def test_handback_release_failure_reports_unknown_without_locking_or_replaying(self):
         _, ident, _ = await self.client("release-keys")
         human = await self.browser.takeover(ident)
         lease = self.browser._get(ident)
@@ -811,22 +1445,20 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         keys = [{"key": "Control", "code": "ControlLeft", "windowsVirtualKeyCode": 17},
                 {"key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16}]
         with patch.object(page.cdp, "call", side_effect=fail_shift_release):
-            with self.assertRaisesRegex(CDPError, "key-up transport failure"):
+            with self.assertRaises(CDPError):
                 await self.browser.human_batch(ident, page.id, human["epoch"], [
                     ("Input.dispatchKeyEvent", {**params, "type": kind})
                     for kind in ("rawKeyDown", "keyUp") for params in keys
                 ])
-            expected = {"ShiftLeft": {"target": page.id, **keys[1], "type": "rawKeyDown"}}
-            self.assertEqual(lease.keys, expected)
-            with self.assertRaisesRegex(CDPError, "key-up transport failure"):
-                await self.browser.handback(ident)
-            self.assertEqual(lease.keys, expected)
-            self.assertEqual(lease.state, "human")
-        self.assertEqual((await self.browser.handback(ident))["state"], "agent")
+            self.assertEqual(set(lease.keys), {"ShiftLeft"})
+            returned = await self.browser.handback(ident)
+            self.assertEqual(returned["state"], "agent")
+            self.assertEqual(lease.inputs.unknown, 1)
         self.assertEqual(lease.keys, {})
+        self.assertIn("1 条输入结果未确认", self.notices[-1][1])
         result = await self.browser.page_call(ident, page.id, "Runtime.evaluate", {
             "expression": "released", "returnByValue": True})
-        self.assertEqual(result["result"]["value"], ["ControlLeft", "ShiftLeft"])
+        self.assertEqual(result["result"]["value"], ["ControlLeft"])
 
     async def test_last_viewer_stops_stream_during_failed_takeover_and_close(self):
         for operation in ("takeover", "close"):
@@ -849,6 +1481,8 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(entered.wait(), 3)
                     try:
                         await stop()
+                        stopped_at = time.time()
+                        frames_at_stop = len(frames)
                         self.assertFalse(page.streaming)
                         self.assertEqual(page.viewers, set())
                     finally:
@@ -861,7 +1495,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                 on_event = page.cdp.on_event
                 async def observe(message):
                     if message.get("method") == "Page.screencastFrame":
-                        received.append(message)
+                        received.append(message["params"]["metadata"]["timestamp"])
                     await on_event(message)
                 with patch.object(page.cdp, "on_event", side_effect=observe):
                     for color in ("red", "green", "blue"):
@@ -869,9 +1503,58 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                             "expression": f"document.body.style.background='{color}';"
                                           "new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))",
                             "awaitPromise": True})
-                    self.assertEqual(received, [])
+                    # Chrome may finish encoding a pre-stop capture after the
+                    # stop reply. It must not capture any of these new paints
+                    # or deliver even a late old frame to the departed viewer.
+                    for captured_at in received:
+                        self.assertLessEqual(captured_at, stopped_at)
+                    self.assertEqual(len(frames), frames_at_stop)
                 await self.browser.close(ident)
 
+
+    async def test_last_viewer_unsubscribe_confirms_target_removed_during_stream_stop(self):
+        _, ident, _ = await self.client("viewer-close-race")
+        page = self.browser._get(ident).pages[self.browser.detail(ident)["current"]]
+        frames = []
+        stop = await self.browser.subscribe_frames(ident, page.id, frames.append)
+        await until(lambda: bool(frames))
+        closing_entered, allow_close, target_gone = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        stopping_entered, allow_stop = asyncio.Event(), asyncio.Event()
+        close_target, call = self.browser._close_target, page.cdp.call
+
+        async def held_close(target):
+            closing_entered.set()
+            await allow_close.wait()
+            await close_target(target)
+            target_gone.set()
+
+        async def held_stop(method, *args, **kwargs):
+            if method == "Page.stopScreencast":
+                stopping_entered.set()
+                await allow_stop.wait()
+            return await call(method, *args, **kwargs)
+
+        with patch.object(self.browser, "_close_target", held_close), patch.object(page.cdp, "call", held_stop):
+            closing = asyncio.create_task(self.browser.close(ident))
+            stopping = None
+            try:
+                await asyncio.wait_for(closing_entered.wait(), 3)
+                stopping = asyncio.create_task(stop())
+                await asyncio.wait_for(stopping_entered.wait(), 3)
+                allow_close.set()
+                await asyncio.wait_for(target_gone.wait(), 3)
+                allow_stop.set()
+                await asyncio.wait_for(stopping, 3)
+                self.assertFalse(page.streaming)
+                self.assertEqual(page.viewers, set())
+                self.assertEqual((await closing)["state"], "released")
+                targets = (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]
+                self.assertNotIn(page.id, {target["targetId"] for target in targets})
+            finally:
+                allow_close.set()
+                allow_stop.set()
+                await asyncio.gather(closing, *([stopping] if stopping is not None else []),
+                                     return_exceptions=True)
 
     async def test_task_cancellation_closes_active_lease_and_next_use_reports_reason(self):
         _, ident, _ = await self.client("cancel-owner")
@@ -991,6 +1674,137 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.browser.detail(ident)["state"], "released")
         self.assertIn("空闲超时", self.browser.detail(ident)["reason"])
 
+    async def test_cached_version_and_page_discovery_use_request_host(self):
+        _, ident, env = await self.client("host-version")
+        target = self.browser.detail(ident)["current"]
+        fetch = self.browser._fetch
+
+        async def no_version(path, **kwargs):
+            if path == "/json/version":
+                raise AssertionError("cached discovery queried Chrome")
+            return await fetch(path, **kwargs)
+
+        with patch.object(self.browser, "_fetch", no_version):
+            async with httpx.AsyncClient(trust_env=False) as http:
+                for host in ("127.0.0.1:34567", "localhost:34568", "[::1]:34569"):
+                    response = await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version",
+                                              headers={"Host": host})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["webSocketDebuggerUrl"],
+                                     f"ws://{host}/devtools/browser/{ident}")
+                    pages = (await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/list",
+                                            headers={"Host": host})).json()
+                    self.assertEqual({page["id"] for page in pages}, {target})
+                    self.assertEqual(pages[0]["webSocketDebuggerUrl"],
+                                     f"ws://{host}/devtools/page/{target}")
+
+    async def test_remote_authority_mapping_takeover_and_lease_close_retire_task_relay(self):
+        await self.browser.aclose()
+        transport = TaskBrowserTransport(self.config.cdp_url)
+        self.browser = BrowserLeases(self.config, transport=transport)
+        await self.browser.start()
+        fetch = self.browser._fetch
+
+        async def sandbox_version(path, **kwargs):
+            value = await fetch(path, **kwargs)
+            if path == "/json/version":
+                from urllib.parse import urlsplit
+                value["webSocketDebuggerUrl"] = urlsplit(value["webSocketDebuggerUrl"])._replace(
+                    netloc="127.0.0.1:1").geturl()
+            return value
+
+        with patch.object(self.browser, "_fetch", sandbox_version):
+            client, ident, env = await self.client("remote-map")
+        target = self.browser.detail(ident)["current"]
+        session = (await client.call("Target.attachToTarget", {
+            "targetId": target, "flatten": True}))["result"]["sessionId"]
+        value = await client.call("Runtime.evaluate", {
+            "expression": "6*7", "returnByValue": True}, session=session)
+        self.assertEqual(value["result"]["result"]["value"], 42)
+        await self.browser.takeover(ident)
+        async with httpx.AsyncClient(trust_env=False) as http:
+            with self.assertRaises(httpx.TransportError):
+                await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")
+        await self.browser.handback(ident)
+        fresh_client, same, fresh = await self.client("remote-map")
+        self.assertEqual(same, ident)
+        await self.browser.close(ident, "页面已结束")
+        self.assertEqual(self.browser.detail(ident)["state"], "released")
+        self.assertEqual(fresh_client.ws.close_code, 1008)
+        async with httpx.AsyncClient(trust_env=False) as http:
+            with self.assertRaises(httpx.TransportError):
+                await http.get(fresh["WANDRUN_BROWSER_CDP"] + "/json/version")
+
+    async def test_provider_connection_loss_preserves_fact_and_cleans_before_new_scene(self):
+        await self.browser.aclose()
+        transport = TaskBrowserTransport(self.config.cdp_url)
+        self.browser = BrowserLeases(self.config, transport=transport)
+        await self.browser.start()
+        for index, reason in enumerate(("浏览器连接中断", "平台恢复")):
+            task = f"provider-drop-{index}"
+            _, ident, env = await self.client(task)
+            target = self.browser.detail(ident)["current"]
+            await self.browser.connection_lost(reason)
+            stopped = self.browser.detail(ident)
+            self.assertEqual((stopped["state"], stopped["reason"], stopped["pages"]),
+                             ("stopping", reason, []))
+            self.assertEqual(self.browser.capacity()["pages_pending_cleanup"], 1)
+            async with httpx.AsyncClient(trust_env=False) as http:
+                inherited = (await http.get(self.config.cdp_url + "/json/list")).json()
+                self.assertIn(target, {page["id"] for page in inherited})
+                with self.assertRaises(httpx.TransportError):
+                    await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")
+            notice = await self.browser.command_environment(task)
+            stale = Client(await connect(await discovery(notice)))
+            self.clients.append(stale)
+            self.assertIn(reason, (await stale.call("Browser.getVersion"))["error"]["message"])
+            self.assertEqual(self.browser.detail(ident)["state"], "released")
+            self.assertEqual(self.browser.capacity()["pages_used"], 0)
+            _, replacement, _ = await self.client(task)
+            self.assertNotEqual(ident, replacement)
+            self.assertNotEqual(target, self.browser.detail(replacement)["current"])
+            await self.browser.close_task(task)
+
+    async def test_disconnect_during_first_inherited_cleanup_does_not_publish_ready_scene(self):
+        from websockets.exceptions import InvalidHandshake
+        await self.browser.aclose()
+        transport = TaskBrowserTransport(self.config.cdp_url)
+        self.browser = BrowserLeases(self.config, transport=transport)
+        await self.browser.start()
+        self.browser.register("initial-drop", "root", "agent", "entry")
+        env = await self.browser.command_environment("initial-drop")
+        entered, release = asyncio.Event(), asyncio.Event()
+        call = CDPSocket.call
+
+        async def paused_census(socket, method, *args, **kwargs):
+            if method == "Target.getTargets" and not entered.is_set():
+                entered.set()
+                await release.wait()
+            return await call(socket, method, *args, **kwargs)
+
+        async def open_client():
+            return await connect(await discovery(env))
+        with patch.object(CDPSocket, "call", paused_census):
+            opening = asyncio.create_task(open_client())
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                await self.browser.connection_lost("浏览器连接中断")
+                release.set()
+                with self.assertRaises((OSError, InvalidHandshake)):
+                    await opening
+            finally:
+                release.set()
+                await asyncio.gather(opening, return_exceptions=True)
+        self.assertIsNone(self.browser.lease_for_task("initial-drop"))
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
+        fresh = await self.browser.command_environment("initial-drop")
+        client = Client(await connect(await discovery(fresh)))
+        self.clients.append(client)
+        reply = await client.call("Browser.getVersion")
+        self.assertIn("Chrome", reply["result"]["product"])
+        ident = self.browser.lease_for_task("initial-drop")
+        self.assertEqual(self.browser.detail(ident)["state"], "agent")
+
     async def test_chrome_transport_restart_invalidates_lease_and_reaps_old_pages(self):
         _, ident, _ = await self.client("chrome-drop")
         target = self.browser.detail(ident)["current"]
@@ -998,7 +1812,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         await old.ws.close()
         await until(lambda: self.browser._chrome is None)
         self.assertEqual(self.browser.detail(ident)["state"], "stopping")
-        self.assertEqual(self.browser._reserved, 1)
+        self.assertEqual(self.browser.capacity()["pages_pending_cleanup"], 1)
         self.assertTrue(all(worker.done() for worker in
                             (old._reader, old._send_worker, old._event_worker)))
         # The process is still present: reconnect must clean its orphaned
@@ -1011,7 +1825,7 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
         stale = Client(await connect(await discovery(env)))
         self.clients.append(stale)
         error = await stale.call("Browser.getVersion")
-        self.assertIn("Chrome 重启", error["error"]["message"])
+        self.assertIn("Chrome 连接中断", error["error"]["message"])
 
     async def test_restart_closes_orphans_and_retains_previous_reason(self):
         _, ident, _ = await self.client("restart-task")
@@ -1089,13 +1903,13 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                 await self.browser.aclose()
         self.assertEqual(self.browser.detail(ident)["state"], "stopping")
         self.assertEqual(self.browser.detail(other)["state"], "released")
-        self.assertEqual(self.browser._reserved, 1)
+        self.assertEqual(self.browser.capacity()["pages_pending_cleanup"], 1)
         self.assertFalse(self.browser._tasks["revoked"].registered)
         listed = await self.browser._fetch("/json/list")
         self.assertIn(target, {item["id"] for item in listed})
         await self.browser.aclose()
         self.assertEqual(self.browser.detail(ident)["state"], "released")
-        self.assertEqual(self.browser._reserved, 0)
+        self.assertEqual(self.browser.capacity()["pages_used"], 0)
         self.assertNotIn(target, {item["id"] for item in await self.browser._fetch("/json/list")})
         self.assertTrue(all(task.done() for task in
                             (page.cdp._reader, page.cdp._send_worker, page.cdp._event_worker)))
@@ -1147,9 +1961,10 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                                 agent_workers={"entry": ("worker",), "worker": ()},
                                 on_task=gateway.on_task, notify_human_of_roots=False)
         self.addAsyncCleanup(manager.close)
-        runtime = SimpleNamespace(browser=self.browser, memory=None, files=None, mcp=None)
+        runtime = SimpleNamespace(browsers={"local": self.browser}, memory=None, files=None, mcp=None,
+                                  file_transfers_pending=lambda agent: False)
         gateway.attach(manager, Checkpointer(), runtime=runtime)
-        root = gateway.create_conversation("保留", "entry")["id"]
+        root = gateway.create_conversation("保留", "entry", client_id=uuid4().hex)[0]["id"]
         manager.start("root", root)
         await manager.wait(root)
         child = manager.start("child", sender_id=root, agent_name="worker")["task_id"]
@@ -1172,22 +1987,6 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(httpx.ConnectError):
                 await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")
 
-    async def test_close_agent_cancels_queue_without_touching_other_owner(self):
-        await self.browser.aclose()
-        self.config = BrowserDefinition(self.chrome.cdp_url, slots=1, queue_timeout=5)
-        await self.open_browser()
-        _, ident, _ = await self.client("occupant")
-        self.browser.register("queued-worker", "root", "worker", "entry")
-        env = await self.browser.command_environment("queued-worker")
-        client = Client(await connect(await discovery(env)))
-        self.clients.append(client)
-        await until(lambda: bool(self.browser._waiters))
-        await self.browser.close_agent("worker")
-        await asyncio.wait_for(client.ws.wait_closed(), 3)
-        self.assertEqual(self.browser.detail(ident)["state"], "agent")
-        self.assertEqual(self.browser._reserved, 1)
-        self.assertIsNone(self.browser.lease_for_task("queued-worker"))
-        self.assertEqual(list(self.browser._waiters), [])
 
     async def test_cancelled_or_unconfirmed_stream_start_stops_actual_chrome_source(self):
         _, ident, _ = await self.client("stream-start")
@@ -1259,12 +2058,18 @@ class BrowserLeaseTests(unittest.IsolatedAsyncioTestCase):
                                 with self.assertRaises(BrowserRejected):
                                     await self.browser.close(ident)
                             self.assertEqual(lease.state, "stopping")
-                            self.assertEqual(self.browser._reserved, 1)
+                            remaining = {
+                                info["targetId"] for info in
+                                (await self.browser._chrome.call("Target.getTargets"))["targetInfos"]
+                                if info["targetId"] in lease.targets
+                            }
+                            self.assertIn(popup[0], remaining)
+                            self.assertEqual(self.browser.capacity()["pages_pending_cleanup"], len(remaining))
                         await self.browser.close(ident)
                         listed = {item["id"] for item in await self.browser._fetch("/json/list")}
                         self.assertNotIn(target, listed)
                         self.assertNotIn(popup[0], listed)
                         self.assertEqual(lease.state, "released")
-                        self.assertEqual(self.browser._reserved, 0)
+                        self.assertEqual(self.browser.capacity()["pages_used"], 0)
                 finally:
                     release.set()

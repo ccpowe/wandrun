@@ -86,9 +86,9 @@ CODEX_HOME=~/.local/share/wandrun/codex-home \
 install -d -m 700 ~/wandrun-workspace
 ```
 
-- **Agent 和 MCP 服务**只在首次启动时从 TOML 导入网关数据库，之后请在 App 里修改（设置 → Agent / 连接器）。
-- **执行环境**（`environments.toml`）每次启动都会读取。
-- **技能**放在 `.wandrun/skills/<名字>/SKILL.md`，也可以从 App 导入。
+- **Agent 和 MCP 服务**仅在数据库尚无导入标记时从 TOML 导入；之后在 App 修改，删空列表也不会重新导入。
+- **执行环境**每次启动读取并校验 TOML，但已持久化的环境定义优先；修改 TOML 不会覆盖已有绑定或浏览器参数。下面的参数应在首次启动前设置。
+- **技能**放在 `.wandrun/skills/<名字>/SKILL.md`，可让 Agent 按 `skill-installer` 导入，再在 App 勾选。新建 Agent 不自动继承默认技能或 MCP。
 
 默认内容：
 
@@ -110,11 +110,12 @@ command_timeout = 120
 
 [environments.local.browser]
 cdp_url = "http://127.0.0.1:9222"
-slots = 1          # 同时进行的浏览器任务数
-max_pages = 3      # 每个任务最多页面数
-idle_timeout = 900 # 空闲多少秒后释放
-queue_timeout = 30
+max_pages = 3      # 这个 Chrome 的总页面数，所有任务共用
+idle_timeout = 900 # 浏览器租约空闲释放期限；不是云机器暂停期限，0 禁用
 ```
+
+`max_pages` 是该执行环境 Chrome 的共享总预算，包含创建中与未确认关闭的页面；超限立即拒绝，不排队。人工接管或有观看连接的租约不按上述空闲规则释放。
+空工作区只复制两个默认技能；仓库自带 workspace 另附未勾选的 `news-brief` 示例，其 Reader 等依赖需自行接入。`wandrun-ui` 是网关自动提供的协议技能，不写入该技能目录。
 
 之后新建的 Agent 如果要操作网页，在 App 里勾选 `browser` 技能。
 
@@ -239,32 +240,149 @@ journalctl --user -u wandrun-gateway -n 100 --no-pager
 
 ```bash
 cd ~/wandrun
-.venv/bin/python -m wandrun.gateway pair --workspace ~/wandrun-workspace \
+uv run --locked --no-dev python -m wandrun.gateway pair --workspace ~/wandrun-workspace \
   --url https://wandrun.example.com --name "我的手机"
 ```
 
 `--url` 换成手机实际访问的地址（第 6 节的域名或私有网络地址）。在 App 中扫码，或手动输入地址和配对码。配对码只能用一次，五分钟内有效。
 `--list` 列出已配对设备，`--revoke <设备 ID>` 撤销设备。
 
+## 可选 Instabox 云执行环境
+
+不使用云沙箱时跳过本节；本机运行和截图不依赖 Instabox 或 LiveKit。
+Wandrun 仅绑定**已有** [Instabox](https://instabox.sh) 机器，不负责创建、删除或主动暂停机器。云环境中的文件、命令与浏览器数据位于你的 Instabox 账号下，不再只留在网关主机。
+
+在网关的 `EnvironmentFile` 中设置 `INSTABOX_API_KEY=<你的 Key>`，权限 `0600`，重启网关。
+这是 systemd 的显式加载约定，Wandrun 不自动读取 `instabox.env` 或 `.env`。
+App 的 Agent 编辑器可选择已有机器；服务器页显示运行中 / 启动中 / 已暂停等平台状态、Agent 引用与页面数，并可打开完整列表。列表读取不会唤醒机器，平台状态不代表 SSH、Chrome 或视频已就绪。
+
+也可在**首次导入前**显式添加 `.wandrun/environments.toml` 定义（保留原有 local 表）：
+
+```toml
+[environments.cloud]
+type = "instabox"
+machine_id = "<已有机器 ID>"
+api_key_env = "INSTABOX_API_KEY" # 变量名，不是 Key 值
+workdir = "/data/home/wandrun"
+
+[environments.cloud.browser]
+```
+
+空 `browser` 表启用默认云浏览器：CDP 9222、profile `/data/home/wandrun-browser/profile`、总页面数 8、租约空闲期限 7200 秒；省略该表则不启用浏览器。仍需在 App 中将 Agent 的执行环境改为该机器。仅支持 `local` 与 `instabox`；旧 `type="ssh"` 不再支持。
+
+云机器需已有 Python 3.13、npm、uv 与 Chrome / Chromium，并能访问 npm / Python 包源。
+Agent 按 browser 技能运行 `start_browser.py` 时，在持久目录安装固定版本 `agent-browser@0.38.1`，以及视频 venv 的 `livekit==1.2.0`、`pillow==13.0.0`、`websockets==17.4`。推流 venv 位于 `/data/home/wandrun-browser/video-publisher/venv/`；网关只运行它，不在推流时安装依赖。云浏览器启动脚本使用 headless Chrome 与普通 Chrome UA；本机仍按第 5 节使用 Xvfb。
+
+实际执行 I/O 时才连接机器；`suspended` 会恢复，`stopped` 不自动启动。`/data` 中的文件可持久保存，但不保证进程、页面跨暂停继续；恢复后不自动重放结果未知的命令。云磁盘不能替代网关 `.wandrun/state` 备份。
+
+## 可选 LiveKit 浏览器视频
+
+视频需要 **Instabox 执行环境 + LiveKit SFU + 含原生 LiveKit 模块和项目补丁的 Android APK / 开发构建**；Expo Go 不具备该播放器能力。没有 `[stream.video]`、使用本机环境或 App 不支持时，自动使用截图，不影响接管输入。视频无音频。
+已选视频的连接失败时显示错误并允许显式重试，**不会自动降级为截图**；配置非法或密钥文件不可用会阻止网关启动。
+
+### 部署 SFU
+
+本项目现有部署使用 [LiveKit Server 1.13.11](https://github.com/livekit/livekit/releases/tag/v1.13.11)；按[官方自托管指南](https://docs.livekit.io/home/self-hosting/deployment/)安装该二进制到 `~/.local/bin/livekit-server`。以下为单节点、同机网关 / Caddy、无 TURN 示例，不是任意网络的连通保证。
+
+生成自己的 API key / secret 映射文件，供 SFU 和网关共同使用；不要把值写入仓库或日志。`generate-keys` 输出带标签的字段，需转换为 YAML 映射：
+
+```bash
+install -d -m 700 ~/.config/wandrun
+(umask 077; ~/.local/bin/livekit-server generate-keys |
+  uv run --no-project python -c 'import sys; fields = dict(line.split(":", 1) for line in sys.stdin if ":" in line); print(fields["API Key"].strip() + ": " + fields["API Secret"].strip())' \
+  > ~/.config/wandrun/livekit-keys.yaml)
+```
+
+创建 `~/.config/wandrun/livekit.yaml`，把用户路径、公网 IP 和网卡名替换为自己的实际值：
+
+```yaml
+port: 7880
+bind_addresses: ["127.0.0.1"]
+key_file: /home/<用户>/.config/wandrun/livekit-keys.yaml
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  node_ip: <SFU 公网 IP>
+  use_external_ip: false
+  interfaces:
+    includes: [<公网网卡名>]
+turn:
+  enabled: false
+```
+
+按 [LiveKit 端口说明](https://docs.livekit.io/home/self-hosting/ports-firewall/)放行 **TCP 7881、UDP 7882**；信令 7880 仅回环，不开放公网。媒体直接连接这些端口，不经 Caddy。App 与云机器都必须能访问 SFU；受限网络可能需额外部署 TURN（本例未配置）。多网桥主机应明确指定公网网卡。
+
+`~/.config/systemd/user/wandrun-livekit.service`：
+
+```ini
+[Unit]
+Description=Wandrun LiveKit SFU
+
+[Service]
+ExecStart=%h/.local/bin/livekit-server --config %h/.config/wandrun/livekit.yaml
+UMask=0077
+Restart=on-failure
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+重新加载并启动 `systemctl --user daemon-reload && systemctl --user enable --now wandrun-livekit`。
+将第 6 节 Caddy 站点替换为下面的同站点路由；保留 `/rtc` 前缀：
+
+```caddyfile
+wandrun.example.com {
+    handle /rtc* {
+        reverse_proxy 127.0.0.1:7880
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8765 {
+            flush_interval -1
+        }
+    }
+}
+```
+
+校验配置后重新加载 Caddy。SFU 与网关独立运行；SFU 不替代网关的鉴权和输入通道。
+
+### 网关视频配置
+
+创建 `~/.config/wandrun/stream.toml`：
+
+```toml
+[stream.video]
+url = "wss://wandrun.example.com" # 站点根地址，不加 /rtc
+api_url = "http://127.0.0.1:7880"
+key_file = "~/.config/wandrun/livekit-keys.yaml"
+```
+
+在网关 unit 的 `ExecStart` 后追加 `--stream-config %h/.config/wandrun/stream.toml`，重新加载 unit 并重启。
+`url` 必须为 App 与推流端可达的 WSS 地址；管理 API 必须为回环 HTTP；密钥文件必须为非空 YAML 映射且权限不宽于 `0600`。不自动查找配置文件。
+当前协议自动选择画面并使用流式状态输入，没有画面 / 输入方式切换；旧 `default_transport`、`default_input_mode`、`mode_switch_timeout_s` 会被拒绝，勿从旧实验配置复制。
+
+检查网关未认证请求仍返回 401、7880 仅回环监听、媒体端口放行；让云环境 Agent 打开网页，再用新 APK 观看并接管。此链路把该页面的画面经你部署的 SFU 发给 App；网关仍签发最小权限、短期房间令牌。不启用视频可移除 `[stream.video]` 后重启网关。
+
 ## 构建 Android App
 
-App 在 `mobile/`（Expo SDK 57、React Native）。Expo Go 适合快速预览界面；日常使用请装 APK 或开发构建，
-其中的原生模块和原生补丁只在这两种方式下生效。
+App 在 `mobile/`（Expo SDK 57、React Native）。v0.3.0 附件为从 `95bf9fc` 新构建的签名 APK，内部版本仍是 **0.2.0 / versionCode 3**。
+视频需要 APK / 开发构建中的原生 LiveKit 模块及两份项目补丁；Expo Go 自动使用截图。键盘 / 聊天顶置应在项目锁定的 keyboard-controller 1.22.9 原生构建上验证，不能以 Expo Go 的不同内置版本替代。
 
 ```bash
 cd mobile
-npm ci
-npx eas-cli login
-npx eas-cli init                                        # 关联到你自己的 Expo 账号
-npx eas-cli build --platform android --profile preview  # 生成可安装的 APK
+corepack enable pnpm
+pnpm install --frozen-lockfile  # packageManager 固定 pnpm 10.34.9
+pnpm dlx eas-cli login
+pnpm dlx eas-cli init                                        # 关联到你自己的 Expo 账号
+pnpm dlx eas-cli build --platform android --profile preview  # 生成可安装的 APK
 ```
 
-本地开发可用 `npx expo run:android`，在连接的设备上构建并安装调试版。
+本地开发可用 `pnpm exec expo run:android`，在连接的设备上构建并安装调试版。
 
 ## Fast 支持
 
-v0.2.1 网关发布支持已有 App 中每个 Agent 模型旁的独立闪电开关与离散档位推理强度滑条。
-随发布提供的是已有签名 APK（App 版本 **0.2.0**、Android versionCode **3**），不重新构建。
+v0.3.0 支持每个 Agent 模型旁的独立闪电开关与离散档位推理强度滑条。
 Fast 默认关闭，作用于该 Agent 的主模型与压缩模型请求，不改变推理强度。
 开启时发送 `service_tier=priority` 和 `x-codex-routing-hint`，关闭时两者均不发送。
 上游拒绝请求时，客户端不会自动关闭 Fast 降级重试。
@@ -298,86 +416,10 @@ LANGSMITH_PROJECT=wandrun
 1. 阅读发布说明，停止服务：`systemctl --user stop wandrun-gateway wandrun-chrome wandrun-xvfb`。
 2. 停服备份 `~/wandrun-workspace` 和 `~/wandrun-chrome`，包括 SQLite 附属文件；凭据备份保密，回滚限制见下文。
 3. 切换到新 tag，执行 `uv sync --locked --no-dev`。
-4. 按下面的路径处理状态：按说明移走旧 state，或先将保留的网关数据库转换到结构版本 **24**，再启动服务。
-   按上面的方法等到 401。首次启动会创建全新结构版本 24 的状态；应用拒绝旧结构版本，不会自动迁移。
+4. v0.3.0 要求结构版本 **31**，**不兼容旧 state，不提供迁移**。停服后将
+   `~/wandrun-workspace/.wandrun/state` 移到备份位置，再启动服务并等待上述 401 检查。
 
-### 全新 state
-
-无需保留历史时，优先选择**全新 state**：停服后把
-`~/wandrun-workspace/.wandrun/state` 移到备份位置。对话、定时和设备配对重新开始；
-Agent 和连接器从 TOML 重新导入，不会恢复旧数据库中经 App 做的编辑；旧记忆不导入。
-
-### 从 v0.2.0 升级（网关结构 23 → 24）
-
-要保留 Agent、对话、定时和设备配对，安装支持 JSON 的 `sqlite3` 命令行工具，
-仅对**已停服、已备份的结构版本 23 数据库**执行以下一次性运维 SQL。
-它为现有 Agent 添加 `fast_mode=0`，并为每一条保存的原始 Agent 创建响应添加 JSON
-`fast_mode=false`，包括后来已编辑或删除的 Agent。不能从当前 Agent 重建这些回放快照：
-重试必须保留首次结果。这只是有界的离线转换，不是应用迁移，也不保证旧执行检查点兼容；
-升级后新建对话，不继续旧检查点。
-
-```bash
-sqlite3 -bail "$HOME/wandrun-workspace/.wandrun/state/gateway.sqlite" <<'SQL'
-.bail on
-PRAGMA foreign_keys = ON;
-BEGIN IMMEDIATE;
-CREATE TEMP TABLE upgrade_guard (version INTEGER CHECK (version = 23));
-INSERT INTO upgrade_guard SELECT user_version FROM pragma_user_version;
-CREATE TEMP TABLE upgrade_assert (ok INTEGER NOT NULL CHECK (ok = 1));
-INSERT INTO upgrade_assert
-    SELECT count(*) = 0 FROM created_agent_results WHERE NOT json_valid(detail);
-INSERT INTO upgrade_assert
-    SELECT count(*) = 0 FROM created_agent_results
-    WHERE json_type(detail) != 'object' OR json_type(detail, '$.fast_mode') IS NOT NULL;
-ALTER TABLE agents ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0 CHECK (fast_mode IN (0, 1));
-UPDATE created_agent_results SET detail = json_set(detail, '$.fast_mode', json('false'));
-CREATE TEMP TABLE upgrade_integrity (result TEXT NOT NULL CHECK (result = 'ok'));
-INSERT INTO upgrade_integrity SELECT integrity_check FROM pragma_integrity_check;
-INSERT INTO upgrade_assert SELECT count(*) = 0 FROM pragma_foreign_key_check;
-PRAGMA user_version = 24;
-COMMIT;
-PRAGMA user_version;
-PRAGMA integrity_check;
-PRAGMA foreign_key_check;
-SQL
-```
-
-预期输出 `24` 和 `ok`，且没有外键检查结果行。任何错误都应保持停服；`.bail on` 会退出，
-未提交的事务随之回滚。基于备份排查，不绕过守卫，也不要只改 `user_version`。
-列的 SQL 默认值只用于初始化旧 Agent，不会开启 Fast。命令不可重复执行，也不能用于结构版本 22 或 24。
-
-### 从 v0.1.x 升级（网关结构 22 → 23 → 24）
-
-也可保留网关数据库：先仅对**已停服、已备份的结构版本 22 数据库**执行以下一次性 SQL。
-它丢弃记忆修改者元数据，重建 `memory_metadata` 并设版本 23。这只是中间步骤，**此时不要启动 v0.2.1**。
-旧记忆不转换为画像或工作记忆，需要的内容在 App 重新录入；升级后新建对话，不继续旧执行检查点。
-
-```bash
-sqlite3 "$HOME/wandrun-workspace/.wandrun/state/gateway.sqlite" <<'SQL'
-.bail on
-PRAGMA foreign_keys = ON;
-BEGIN IMMEDIATE;
-CREATE TEMP TABLE upgrade_guard (version INTEGER CHECK (version = 22));
-INSERT INTO upgrade_guard SELECT user_version FROM pragma_user_version;
-DROP TABLE memory_metadata;
-CREATE TABLE memory_metadata (
-    scope TEXT NOT NULL CHECK (scope IN ('profile', 'work')),
-    agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,
-    version TEXT NOT NULL,
-    updated_by TEXT NOT NULL CHECK (updated_by IN ('user', 'agent')),
-    CHECK ((scope = 'profile' AND agent_id IS NULL) OR (scope = 'work' AND agent_id IS NOT NULL))
-);
-CREATE UNIQUE INDEX memory_metadata_profile ON memory_metadata(scope) WHERE scope = 'profile';
-CREATE UNIQUE INDEX memory_metadata_work ON memory_metadata(agent_id) WHERE scope = 'work';
-PRAGMA user_version = 23;
-COMMIT;
-PRAGMA user_version;
-PRAGMA integrity_check;
-SQL
-```
-
-预期输出 `23` 和 `ok`，然后**保持停服，执行上方 23 → 24 SQL**，确认输出 `24`、`ok` 且无外键检查结果行后
-才可启动。出错时保持停服并核对备份，不绕过版本守卫；这段 SQL 不处理其他结构版本。
+新 state 会重新开始对话、定时、设备配对与数据库中的 Agent / 连接器设置；Agent 与连接器从 TOML 重新导入，不恢复旧数据库中经 App 做的编辑。升级前准备好要使用的 TOML 与技能，配对手机并重新授权连接器；不要只改 SQLite `user_version`，也不要套用旧版 22→24 运维 SQL。保留在 state 外的用户文件与浏览器 profile 不因移走 state 自动删除；仍需备份并人工核对。
 
 **回滚与 OAuth：** 验收可能使令牌轮换。不要把备份中的旧 Codex `auth.json` 或连接器 refresh token
 覆盖回当前凭据。回滚代码／状态不等于回滚凭据；无法一致保留当前凭据时，重新登录或授权，不重放旧 refresh token。
@@ -394,4 +436,7 @@ SQL
 | Chrome 端口被占用 / 用户目录被锁 | 另一个 Chrome 占用了端口或目录；使用自己的服务和用户目录 |
 | Google 登录提示浏览器不安全 | Chrome 在 headless 模式运行；按上文改为 Xvfb 上的有界面模式 |
 | 浏览器画面卡住、画面连接失败 | 多半是内存不足，Chrome 停止响应：`free -h` 查看；关闭占用大的页面或稍等即可恢复 |
-| 浏览器任务一直在排队 | 所有 `slots` 都被占用；关闭闲置页面，内存允许时调大 `slots` |
+| 新建浏览器页面被拒绝 | 本环境已达 `max_pages`；关闭闲置页面，内存允许时调大 `max_pages` |
+| 云机器显示已暂停但无法执行 | 平台 `stopped` 不会自动启动；先在 Instabox 恢复到支持的状态，页面状态不是 SSH 就绪检查 |
+| 视频失败 | 核对 SFU / `/rtc*` 反代、TCP 7881 / UDP 7882、App 原生播放器及云端推流 venv；显式重试，不自动切截图 |
+| 修改执行环境 TOML 不生效 | 已持久化定义优先；不要直接改 SQLite 重绑机器，使用新工作区重新配置 |

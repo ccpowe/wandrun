@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import av
 import httpx
@@ -125,7 +126,7 @@ class AttachmentPreviewTests(unittest.IsolatedAsyncioTestCase):
         self.gateway = Gateway(self.store)
         self.gateway.workspace_root = self.root
         self.gateway.manager = SimpleNamespace(root_of=lambda sender: sender, agent_name=lambda sender: "main")
-        self.conversation = self.store.create_conversation("Preview", "main")[0]["id"]
+        self.conversation = self.store.create_conversation("Preview", "main", client_id=uuid4().hex)[0]["id"]
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=create_app(self.gateway, "secret")),
             base_url="http://gateway",

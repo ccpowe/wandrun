@@ -1,4 +1,5 @@
 import { cn } from '@/lib/utils';
+import { progressSpring } from '@/lib/motion.ts';
 import * as ProgressPrimitive from '@rn-primitives/progress';
 import { Platform, View } from 'react-native';
 import Animated, {
@@ -61,7 +62,7 @@ function NativeIndicator({ value, className }: IndicatorProps) {
     return {
       width: withSpring(
         `${interpolate(progress.value, [0, 100], [1, 100], Extrapolation.CLAMP)}%`,
-        { overshootClamping: true }
+        progressSpring
       ),
     };
   }, [value]);

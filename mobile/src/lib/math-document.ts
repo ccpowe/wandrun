@@ -9,6 +9,11 @@ export type MathPage = {
   readAccessUrl?: string;
   dispose?: () => void;
 };
+/* Page script. Math.source: a long press on one formula asks the host to offer that formula's source. The WebView
+ * owns the touch, so it is detected here (contextmenu where the platform fires it, otherwise a 500 ms still press)
+ * and only on a [data-tex] node; prose keeps the platform's own long press / selection. The node stays highlighted
+ * until the host posts {kind:'clear-press'}; its index (document order) lets the host copy exactly that TeX.
+ * Comments stay outside the string: every content page carries this script (size budget in math_budget). */
 const SCRIPT = `
 (function () {
   'use strict';
@@ -17,10 +22,10 @@ const SCRIPT = `
     if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(data);
     else window.parent.postMessage(data, '*');
   }
-  // A failed stylesheet must not be reported as a successfully rendered formula.
   if (window.mathResourceFailed || typeof katex === 'undefined' || !document.querySelector('#katex-styles').sheet) {
     send({ kind: 'error' }); return;
   }
+  var failed = 0;
   document.querySelectorAll('[data-tex]').forEach(function (node) {
     try {
       katex.render(node.getAttribute('data-tex'), node, {
@@ -29,22 +34,61 @@ const SCRIPT = `
       });
       node.classList.add('rendered');
     } catch {
+      failed++;
       node.classList.add('failed');
       node.textContent = node.getAttribute('data-tex');
     }
   });
   function measure() {
     var height = Math.ceil(document.querySelector('.content').getBoundingClientRect().height);
-    if (Number.isFinite(height) && height > 0) send({ kind: 'height', height: height });
+    if (Number.isFinite(height) && height > 0) send({ kind: 'height', height: height, failed: failed });
   }
+  var pressTimer = 0, pressStart = null, pressNode = null, pressed = false, active = null;
+  var formulas = Array.prototype.slice.call(document.querySelectorAll('[data-tex]'));
+  function formulaAt(target) { return target && target.closest ? target.closest('[data-tex]') : null; }
+  function clearActive() { if (active) { active.classList.remove('pressed'); active = null; } }
+  function cancelPress() { clearTimeout(pressTimer); pressTimer = 0; pressStart = null; pressNode = null; }
+  function longPress(node) {
+    cancelPress();
+    if (pressed || !node) return;
+    pressed = true;
+    clearActive();
+    active = node;
+    node.classList.add('pressed');
+    var rect = node.getBoundingClientRect();
+    send({ kind: 'longpress', index: formulas.indexOf(node), top: rect.top, bottom: rect.bottom });
+  }
+  document.addEventListener('contextmenu', function (event) {
+    var node = formulaAt(event.target);
+    if (node) { event.preventDefault(); longPress(node); }
+  });
+  document.addEventListener('touchstart', function (event) {
+    var node = formulaAt(event.target);
+    if (event.touches.length !== 1 || !node) { cancelPress(); return; }
+    pressed = false;
+    pressNode = node;
+    pressStart = { x: event.touches[0].clientX, y: event.touches[0].clientY };
+    pressTimer = setTimeout(function () { longPress(pressNode); }, 500);
+  }, { passive: true });
+  document.addEventListener('touchmove', function (event) {
+    var touch = event.touches[0];
+    if (pressStart && touch && Math.hypot(touch.clientX - pressStart.x, touch.clientY - pressStart.y) > 10) cancelPress();
+  }, { passive: true });
+  document.addEventListener('touchend', cancelPress, { passive: true });
+  document.addEventListener('touchcancel', cancelPress, { passive: true });
+  function receive(data) {
+    try { if (JSON.parse(data).kind === 'clear-press') clearActive(); } catch (error) {}
+  }
+  document.addEventListener('message', function (event) { receive(event.data); });
+  window.addEventListener('message', function (event) { receive(event.data); });
   document.addEventListener('click', function (event) {
     var link = event.target.closest('a[href]');
     if (link) {
       event.preventDefault();
       send({ kind: 'link', href: link.getAttribute('href') });
-    }
+    } else if (!pressed) { clearActive(); send({ kind: 'tap' }); }
+    pressed = false;
   });
-  // Trigger layout/font discovery before capturing the current ready promise.
   document.querySelector('.content').getBoundingClientRect();
   document.fonts.ready.then(function () {
     if (Array.from(document.fonts).some(function (font) { return font.status === 'error'; })) {
@@ -54,7 +98,7 @@ const SCRIPT = `
     new ResizeObserver(measure).observe(document.body);
     measure();
   }, function () { send({ kind: 'error' }); });
-})();`;
+})();`.replace(/\n\s+/g, '\n'); // Indentation is not shipped: every content page carries this script.
 
 const PAGE_STYLE = `
 *{box-sizing:border-box}html,body{margin:0;padding:0;background:transparent}
@@ -64,7 +108,7 @@ ul,ol{padding-left:24px;margin:6px 0}li{margin:3px 0}blockquote{border-left:3px 
 pre,code{background:var(--muted);font-family:monospace}pre{overflow-x:auto;padding:8px}code{white-space:pre-wrap}
 table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%}td,th{border:1px solid var(--border);padding:4px 6px}
 a{color:inherit;text-decoration:underline}.math-source{white-space:pre-wrap}.math-source.display{display:block;overflow-x:auto;overflow-y:hidden;padding:7px 0;text-align:center}
-.math-source.failed{font-family:monospace;color:var(--ink);background:var(--muted)}.katex-display{margin:0;overflow-x:auto;overflow-y:hidden}
+.math-source.failed{font-family:monospace;color:var(--ink);background:var(--muted)}[data-tex]{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;border-radius:6px}[data-tex].pressed{background:var(--muted)}.katex-display{margin:0;overflow-x:auto;overflow-y:hidden}
 `;
 
 /** Escaped Markdown projection only. Resource URLs come from the platform owner.

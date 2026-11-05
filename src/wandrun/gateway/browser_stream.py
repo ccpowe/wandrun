@@ -1,67 +1,8 @@
-"""Authenticated page viewing and human input for a browser lease.
+"""Authenticated browser viewing and lease-owned stateful streaming input.
 
-Protocol v1: each binary message is uint32 big-endian JSON-header length, the
-UTF-8 JSON header, then JPEG bytes. Header: t=frame, seq, connection_id,
-page, epoch, vp, css, dpr, scroll, pageScale, offsetTop, dropped_frames,
-ack_wait_ms, applied_input_id, quality_tier and quality_reason; also
-max_in_flight, in_flight (including this frame), frame_age_ms (Chrome swap
-to send), credit_wait_ms (continuous pending-slot wait for credit),
-send_lock_ms (previous send_bytes duration), ack_baseline_ms, ack_smoothed_ms
-and queue_delay_ms. in_flight_bytes reserves JPEG bytes plus 2048 bytes per
-wire header, including invalidated generations until ACK; byte_budget is the
-current reservation ceiling, delivery_rate_bps is estimated bytes/second,
-and stop_reason is the last pause before this frame:
-none/frame-credit/byte-credit/pacing/oldest-frame. ACK turnaround is not
-network RTT. Unavailable timings are null; durations are nonnegative ms.
-Chrome/gateway wall clocks must agree for frame age; all intervals use a
-monotonic clock. The input marker denotes dispatch before swap, not proof of
-visual effect. JSON messages carry hello/pages (including max_pages),
-input_pending, input_done, page_done, reject {id, why}, and ping/pong {id}.
-input_done includes input_lock_wait_ms (receive to view lock), input_cdp_ms
-(view lock to CDP completion), input_dispatch_ms (receive to CDP completion).
-hello advertises connection_id, ping_supported, fps_limit (default 24;
-?fps=12..30), window_mode (adaptive or fixed), max_in_flight (initial window),
-and max_in_flight_limit (32). Omitted ?max_in_flight selects adaptive 2..32;
-?max_in_flight=1..32 fixes the frame window and disables learned pacing/BDP and
-oldest-frame gates for comparisons; the 1 MiB hard byte ceiling still applies.
-Frames start no more
-often than the chosen rate; only the newest pending frame is retained when
-credits are exhausted. Clients ACK each received seq exactly once with
-{t:"ack",seq,displayed:boolean}; an ACK returns its credit even when display
-was skipped. A skipped ACK revokes that seq as an input credential; previously
-sent frames retain bounded input history. Missing ACKs stop delivery at the
-window limit. new_page {id, epoch} creates an about:blank page only under
-human control and below the lease page limit, including when all pages have
-been closed; page_done includes its target, epoch and vp.
-
-Each connection lowers its native Chrome encoder only with sustained rising
-turnaround plus a rate deficit, or a severe, sustained qualified delivery deficit.
-Stable jitter, high turnaround and a large JPEG alone do not lower quality.
-Higher-tier trials use delivery saturation without treating the jitter floor
-as congestion. The window retains BDP credits, bounded rate max filter, pacing
-and an oldest-frame guard. A 10s rolling minimum detects drift; it cannot raise
-the baseline. Only a drift-triggered two-credit probe, drained and sampled for
-a baseline turnaround, can raise it. Cuts never manufacture credits.
-Encoding changes preserve CSS coordinates and vp; document, viewport and
-control changes still invalidate input. After visually distinct frames stop,
-a reduced-tier connection sends one sharp screenshot through the same window.
-Identical source frames are ignored so screenshot-induced repaint events cannot
-cancel that refresh or overwrite it with a blurry duplicate. A sharp refresh
-is not an ACK training sample and does not claim input-latency attribution.
-ACK timing cannot independently distinguish transport queue from receiver or
-network scheduling jitter; queue/rate signals are not a capacity measurement.
-
-Inputs carry id, epoch, vp and frame (the displayed seq). Coordinates are remote
-CSS pixels, never device pixels. A view-mode socket cannot mutate pages even
-while another socket controls the lease. Switching the viewed page is local to
-this socket; it never steals another viewer's page. Mouse down/up and touch
-start/end/cancel are assembled locally: start (and intermediate moves) replies
-input_pending without sending to Chrome, so there is no live drag feedback.
-A repeated start replaces the unfinished gesture; at most 256 commands may be
-assembled. The starting frame is retained for that gesture even after the
-32-frame input history evicts it. A gesture is validated once before sending;
-known document/viewport/control changes reject the whole group. Concurrent
-navigation is best-effort and never splits an accepted down/up pair.
+Wire contract (v3, including the retained JPEG rules):
+docs/engineering/browser-stream-protocol.md. Each connection owns its selected
+page, transport and viewport generation; BrowserLeases owns all write barriers.
 """
 
 import asyncio
@@ -78,6 +19,9 @@ from uuid import uuid4
 from starlette.responses import JSONResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from wandrun.gateway.stream_config import StreamConfig
+from wandrun.gateway.video_stream import VideoFailure, VideoStreams
+
 
 MAX_TEXT = 4096
 INPUT_MARKER_HISTORY = 256
@@ -85,7 +29,6 @@ DEFAULT_FPS = 24
 IDLE_REFRESH_SECONDS = .45
 QUALITY_CONFIRM_DOWN = 2
 QUALITY_CONFIRM_UP = 6
-BUTTONS = {"left": 1, "right": 2, "middle": 4}
 MAX_IN_FLIGHT = 32
 BASELINE_SECONDS = 10
 # Limits already-accepted JPEG plus header reservation; not compressed TCP bytes.
@@ -96,6 +39,12 @@ logger = logging.getLogger(__name__)
 
 class StreamRejected(ValueError):
     """A client request was not applied; the message is a protocol rejection code."""
+
+
+def _is_input_message(message):
+    """Only physical/text input is subject to asynchronous credential invalidation."""
+    return message is not None and message.get("t") in (
+        "pointer", "wheel", "touch", "key", "text")
 
 
 def _number(message, key, default=None):
@@ -227,6 +176,7 @@ class _FrameWindow:
         return slope > 100 and slope * (points[-1][0] - origin) > 300
 
     def delivered(self, now, started, jpeg_size, tier):
+        """Keep sender-limited pairs as upward evidence, not capacity drops."""
         if self._cycle_started is None:
             # The first ACK completes the first send's phase, rather than
             # starting another full RTT of probing at ACK arrival.
@@ -251,11 +201,25 @@ class _FrameWindow:
             else:
                 rate = min(self.fps * self._last_size,
                            charged / max(send_gap, ack_gap))
-                while self._rates and self._rates[-1][1] <= rate:
-                    self._rates.pop()
-                self._rates.append((now, rate))
-                self._last_qualified_at = now
-                self._sample_counts["qualified"] += 1
+                # A previous ACK already returned before this send proves an
+                # idle gap, even if receiver jitter stretches the next ACK.
+                # Otherwise, spacing that follows our pacing/source cadence
+                # measures offered load; allow 1% scheduling noise. Stretched
+                # ACK gaps between overlapping sends still reveal bottlenecks.
+                app_limited = (self.delivery_rate is not None and (
+                    started >= previous[0] or ack_gap <= 1.01 * send_gap))
+                if app_limited and math.isclose(rate, self.delivery_rate, rel_tol=1e-9):
+                    rate = self.delivery_rate
+                if app_limited and rate < self.delivery_rate:
+                    # Do not leave a low sample in the max filter: it would
+                    # silently pull B down when older capacity evidence expires.
+                    self._sample_counts["app-limited"] += 1
+                else:
+                    while self._rates and self._rates[-1][1] <= rate:
+                        self._rates.pop()
+                    self._rates.append((now, rate))
+                    self._last_qualified_at = now
+                    self._sample_counts["qualified"] += 1
         self._expire_rates(now)
 
     def _expire_rates(self, now):
@@ -403,6 +367,9 @@ _BROWSER_REJECTION_CODES = {
     "浏览器控制权已转交，旧代际不能关闭页面": "stale-epoch",
     "页面不可关闭或不属于本租约": "no-such-page",
     "人的输入方法不允许": "invalid-input",
+    "not-human": "not-human",
+    "stale-viewport": "stale-viewport",
+    "no-such-page": "no-such-page",
 }
 
 
@@ -411,18 +378,21 @@ def _safe_rejection(error):
     reason = str(error)
     if isinstance(error, StreamRejected):
         return reason
+    if reason.startswith("环境 ") and "浏览器页面总数已达上限" in reason:
+        return "page-limit"
     return _BROWSER_REJECTION_CODES.get(reason, "browser-operation-failed")
 
 
 class BrowserStream:
     """One viewer: a latest-frame slot, bounded sent-frame history and input guard.
 
-    Lease ownership and control barriers stay in BrowserLeases. This class owns
-    only socket-specific view selection, viewport generations and wire encoding.
+    Lease ownership and write barriers stay in BrowserLeases. This class owns
+    socket views/credentials, the input FIFO/coalescing and reply delivery.
     Unacknowledged frames occupy credits until ACK or view invalidation.
     """
 
-    def __init__(self, websocket, browser, lease_id, *, control=False, max_in_flight=None, fps=DEFAULT_FPS):
+    def __init__(self, websocket, browser, lease_id, *, control=False, max_in_flight=None, fps=DEFAULT_FPS,
+                 video_player=False, video_streams=None):
         if max_in_flight is not None and (type(max_in_flight) is not int or not 1 <= max_in_flight <= MAX_IN_FLIGHT):
             raise ValueError(f"max_in_flight must be an integer from 1 to {MAX_IN_FLIGHT}")
         if type(fps) is not int or not 12 <= fps <= 30:
@@ -431,6 +401,19 @@ class BrowserStream:
         self.window = _FrameWindow(fps, max_in_flight)
         self.ws, self.browser, self.lease_id = websocket, browser, lease_id
         self.connection_id = uuid4().hex
+        self.video_streams = video_streams or VideoStreams(StreamConfig())
+        self.video_support = self.video_streams.support(browser)
+        if self.video_support["available"] and not video_player:
+            self.video_support = {"available": False, "reason": "player-unavailable"}
+        self.transport = "video" if self.video_support["available"] else "jpeg"
+        self._timestamp_offset = None
+        self._input_replies = set()
+        self._active_message = None
+        self._stop_video = None
+        self._video_generation = 0
+        self._video_messages = asyncio.Queue()
+        self._video_failed = False
+        self.close_code = 1000
         self._interval_wall_start = time.time()
         self._interval_mono_start = time.perf_counter()
         self._adjustment_batches = 0
@@ -481,8 +464,19 @@ class BrowserStream:
         self._send_lock = asyncio.Lock()
         self._view_lock = asyncio.Lock()
         self._tasks = []
-        self._gesture = None
+        self._cleanup_task = None
+        self._commands_pending = deque()
+        self._input_counts = dict.fromkeys(("wheel", "pointer", "key", "touch", "other"), 0)
+        self._wheel_merge_batches = 0
+        self._wheel_merged_inputs = 0
+        self._move_merge_batches = 0
+        self._move_merged_inputs = 0
+        self._command_queue_max = 0
+        self._command_wake = asyncio.Event()
+        self._quality_wake = asyncio.Event()
+        self._quality_request = None
         self._closed = False
+        self._reader_disconnected = False
         self._credit_wait_started = None
         self._credit_wait_ms = 0.0
         self.send_lock_ms = None
@@ -584,9 +578,10 @@ class BrowserStream:
             return turnarounds[max(0, math.ceil(fraction * len(turnarounds)) - 1)]
         elapsed = max(0, end_mono - self._interval_mono_start)
         # Preserve an ongoing pause across periodic flush boundaries.
-        logger.info("[stream-stats] %s", json.dumps({
+        values = {
             "connection": self.connection_id, "connection_id": self.connection_id,
             "lease": self.lease_id, "final": final,
+            "transport": self.transport,
             "wall_start_s": self._interval_wall_start, "wall_end_s": end_wall,
             "monotonic_start_s": self._interval_mono_start, "monotonic_end_s": end_mono,
             "elapsed_s": elapsed, "seq_first": self._interval_first_seq,
@@ -617,9 +612,16 @@ class BrowserStream:
             "ack_baseline_ms": self.window.baseline_ms,
             "ack_smoothed_ms": self.window.smoothed_ms, "queue_delay_ms": self.window.queue_ms,
             "quality_tier": self.quality_tier, "dropped_frames": self.dropped_frames,
+            "input_counts": self._input_counts,
+            "wheel_merge_batches": self._wheel_merge_batches,
+            "wheel_merged_inputs": self._wheel_merged_inputs,
+            "move_merge_batches": self._move_merge_batches,
+            "move_merged_inputs": self._move_merged_inputs,
+            "command_queue_max": self._command_queue_max,
             "segments": {name: {"n": n, "mean_ms": total / n, "max_ms": peak}
                          for name, (n, total, peak) in self._segments.items()},
-        }, separators=(",", ":")))
+        }
+        logger.info("[stream-stats] %s", json.dumps(values, separators=(",", ":")))
         self._interval_wall_start, self._interval_mono_start = end_wall, end_mono
         self._interval_first_seq = self._interval_last_seq = None
         self._interval_ack_first_seq = self._interval_ack_last_seq = None
@@ -628,6 +630,11 @@ class BrowserStream:
         self._acked_reserved_bytes = self._acked_packet_bytes = 0
         self._ack_turnarounds.clear()
         self._ack_turnaround_count = 0
+        for kind in self._input_counts:
+            self._input_counts[kind] = 0
+        self._wheel_merge_batches = self._wheel_merged_inputs = 0
+        self._move_merge_batches = self._move_merged_inputs = 0
+        self._command_queue_max = len(self._commands_pending)
         self.window._sample_counts.clear()
         self.window._adjustment_count = 0
         self._adjustment_batches = 0
@@ -644,12 +651,86 @@ class BrowserStream:
             await asyncio.sleep(5)
             self._log_stats()
 
+    def _observe_input(self, message, event, **values):
+        if event == "dispatch" and not values.get("release"):
+            message["_attempted"] = True
+        elif event == "release" and values.get("sequence") is None:
+            if _is_input_message(self._active_message):
+                self._active_message["_reject_why"] = (
+                    "not-human" if values["trigger"] == "handback" else "stale-viewport")
+
+
+    def _settle_input(self, trigger, *, timeout=None, sequence=None):
+        inputs = self.browser.human_inputs(self.lease_id)
+        return inputs.settle(trigger, connection=self.connection_id, timeout=timeout, sequence=sequence)
+
+    def _failed_input(self, message, why):
+        sequence = message.get("_sequence")
+        if sequence is not None:
+            self._settle_input("sequence-rejected", sequence=sequence)
+        if message.get("_attempted"):
+            return {"t": "input_done", "epoch": message["epoch"], "vp": message["vp"],
+                    "outcome": "unknown"}
+        return {"t": "reject", "why": why}
+
+
+    async def _stop_source(self):
+        self._video_generation += 1
+        if self._stop_frames:
+            stop, self._stop_frames = self._stop_frames, None
+            await stop()
+        if self._stop_video:
+            stop, self._stop_video = self._stop_video, None
+            await stop()
+
+    async def _start_source(self):
+        if self.page is None or self._closed:
+            return
+        if self.transport == "jpeg":
+            self._stop_frames = await self.browser.subscribe_frames(
+                self.lease_id, self.page, lambda params, page=self.page: self._offer(page, params),
+                **({"quality_tier": self.quality_tier} if self.quality_tier != "high" else {}),
+            )
+        else:
+            try:
+                self._stop_video = self.video_streams.watch(self)
+            except VideoFailure as error:
+                self._video_event(self.page, {"t": "video_failed", "reason": str(error), "retryable": True})
+
+    def _video_event(self, page, message):
+        if not self._closed:
+            self._video_messages.put_nowait((self._video_generation, page, message))
+
+    async def _videos(self):
+        while not self._closed:
+            generation, page, message = await self._video_messages.get()
+            async with self._view_lock:
+                if (generation != self._video_generation or self.transport != "video"
+                        or page != self.page or self._video_failed):
+                    continue
+                if message["t"] == "view":
+                    css, dpr = tuple(message["css"]), message["dpr"]
+                    if css != self.css or dpr != self.dpr:
+                        self.css, self.dpr = css, dpr
+                        self._invalidate()
+                        await self._sync_pages()
+                else:
+                    if message["t"] == "video_failed":
+                        self._video_failed = True
+                        await self._stop_source()
+                    await self.send({**message, **({"vp": self.vp} if message.get("state") == "ready" else {})})
+
+
     async def send(self, message):
         async with self._send_lock:
             await self.ws.send_json(message)
 
     def _invalidate(self):
         self._pause(None, time.perf_counter())
+        if self.control and self.page is not None:
+            self._settle_input("vp")
+        if _is_input_message(self._active_message):
+            self._active_message["_reject_why"] = "stale-viewport"
         self.vp += 1
         self.pending = None
         self.sent.clear()
@@ -688,8 +769,9 @@ class BrowserStream:
     async def run(self):
         unsubscribe = self.browser.subscribe(self.lease_id, self._changed)
         try:
-            await self.send({"t": "hello", "protocol": 1, "mode": "control" if self.control else "view",
+            await self.send({"t": "hello", "protocol": 3, "mode": "control" if self.control else "view",
                              "connection_id": self.connection_id,
+                             "transport": self.transport, "video_support": self.video_support,
                              "binary": "uint32be-header-length+json+jpeg", "fps_limit": self.fps,
                              "max_in_flight": self.max_in_flight, "ping_supported": True,
                              "window_mode": "adaptive" if self.window.fixed is None else "fixed",
@@ -699,7 +781,8 @@ class BrowserStream:
             if self._closed:
                 return
             self._tasks = [asyncio.create_task(self._frames()), asyncio.create_task(self._states()),
-                           asyncio.create_task(self._receive()), asyncio.create_task(self._stats())]
+                           asyncio.create_task(self._receive()), asyncio.create_task(self._stats()),
+                           asyncio.create_task(self._videos())]
             done, _ = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
@@ -713,14 +796,10 @@ class BrowserStream:
             # Keep accounting alive until cancelled send_bytes has recorded its
             # finally sample; final flush also runs if source teardown fails.
             unsubscribe()
-            # Revocation can arrive after a normal disconnect has begun cleanup.
-            # Keep teardown owned here, even if that first cancellation arrives now.
-            cleanup = asyncio.create_task(self._cleanup())
+            # Repeated stops join one owner, including while nested worker
+            # teardown is already releasing a source. This is not input settlement.
             try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                await cleanup
-                raise
+                await self._cleanup()
             finally:
                 self._log_stats(final=True)
                 self.outstanding.clear()
@@ -728,23 +807,51 @@ class BrowserStream:
                 self._packet_sizes.clear()
                 self.sent.clear()
 
+    @staticmethod
+    async def _await_cleanup(operation):
+        """Keep ownership through repeated cancellation, then propagate it."""
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    pass
+            operation.result()
+            raise
+
     async def _cleanup(self):
-        if self._idle_task is not None:
-            self._idle_task.cancel()
-        for task in self._tasks:
-            task.cancel()
-        await asyncio.gather(*self._tasks, *(x for x in (self._idle_task,) if x is not None),
-                             return_exceptions=True)
-        if self._stop_frames:
-            await self._stop_frames()
-            self._stop_frames = None
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._close_resources())
+        await self._await_cleanup(self._cleanup_task)
+
+    async def _close_resources(self):
+        tasks = [*self._tasks, *(x for x in (self._idle_task,) if x is not None)]
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if self.control:
+            self.browser.human_inputs(self.lease_id).set_pending_work(self.connection_id, False)
+            await asyncio.shield(self._settle_input("disconnect"))
+        if self._input_replies:
+            await asyncio.gather(*tuple(self._input_replies), return_exceptions=True)
+        if self.control:
+            self.browser.human_inputs(self.lease_id).observers.pop(self.connection_id, None)
+            self.browser.human_inputs(self.lease_id).forget_connection(self.connection_id)
+        await self._stop_source()
+        self.video_streams.disconnect(self.connection_id)
+
     async def _sync_pages(self, requested=None):
         snapshot = self.browser.detail(self.lease_id)
         signature = self._view_signature(snapshot)
         if signature != self._signature:
             self._signature = signature
             self._invalidate()
-        if snapshot["state"] == "released":
+        if snapshot["state"] in ("released", "stopping"):
+            # The old scene is revoked even while its target cleanup is unconfirmed.
+            # Ending viewing must not claim that the lease's cleanup debt was released.
             await self.send({"t": "ended", "reason": snapshot.get("reason"), "epoch": snapshot["epoch"]})
             # Publish closure before close() yields; the receiver must not begin
             # another receive after Starlette has already disconnected the socket.
@@ -752,11 +859,14 @@ class BrowserStream:
             await self.ws.close(code=1000)
             return
         ids = {p["id"] for p in snapshot["pages"]}
-        if snapshot["state"] in ("stopping", "revoking"):
-            # The lease owns teardown/revocation. Keep its existing source; do
-            # not attach a fallback page while targets are being removed.
+        if snapshot["state"] == "revoking":
+            # Takeover revocation is not lease termination. Keep its existing
+            # source rather than attaching a fallback while control settles.
             await self.send({"t": "pages", "current": self.page if self.page in ids else None,
-                             "pages": snapshot["pages"], "max_pages": snapshot["max_pages"],
+                             "pages": snapshot["pages"], "capacity": snapshot["capacity"],
+                             "environment_id": snapshot["environment_id"],
+                             "environment_name": snapshot["environment_name"],
+                             "capacity_rejection": snapshot["capacity_rejection"],
                              "epoch": snapshot["epoch"], "state": snapshot["state"],
                              "vp": self.vp, "css": list(self.css), "dpr": self.dpr})
             return
@@ -766,26 +876,28 @@ class BrowserStream:
         if target not in ids:
             target = next((p for p in reversed(self.history) if p in ids), snapshot.get("current"))
         if target != self.page:
-            if self._stop_frames:
-                await self._stop_frames()
-                self._stop_frames = None
+            if self._pages is not None:
+                self._log_stats()
+            await self._stop_source()
             self.page = target
             self._invalidate()
             self.css = (0, 0)
             if target:
                 self.history = [p for p in self.history if p in ids and p != target] + [target]
-                result = await self.browser.page_call(self.lease_id, target, "Runtime.evaluate", {
-                    "expression": "[innerWidth,innerHeight,devicePixelRatio]", "returnByValue": True,
-                })
-                width, height, self.dpr = result["result"]["value"]
-                self.css = (width, height)
-                self._stop_frames = await self.browser.subscribe_frames(
-                    self.lease_id, target, lambda params: self._offer(target, params),
-                    **({"quality_tier": self.quality_tier} if self.quality_tier != "high" else {}),
-                )
+                if self.transport == "jpeg":
+                    result = await self.browser.page_call(self.lease_id, target, "Runtime.evaluate", {
+                        "expression": "[innerWidth,innerHeight,devicePixelRatio]", "returnByValue": True,
+                    })
+                    width, height, self.dpr = result["result"]["value"]
+                    self.css = (width, height)
+            self._video_failed = False
+            await self._start_source()
             self._signature = self._view_signature(snapshot)
         pages = {"t": "pages", "current": self.page, "pages": snapshot["pages"],
-                 "max_pages": snapshot["max_pages"], "epoch": snapshot["epoch"],
+                 "capacity": snapshot["capacity"], "epoch": snapshot["epoch"],
+                 "environment_id": snapshot["environment_id"],
+                 "environment_name": snapshot["environment_name"],
+                 "capacity_rejection": snapshot["capacity_rejection"],
                  "state": snapshot["state"], "vp": self.vp,
                  "css": list(self.css), "dpr": self.dpr}
         if pages != self._pages:
@@ -793,7 +905,7 @@ class BrowserStream:
             await self.send(pages)
 
     def _offer(self, target, params):
-        if self._closed or target != self.page:
+        if self._closed or self.transport != "jpeg" or target != self.page:
             return
         snapshot = self.browser.detail(self.lease_id)
         if snapshot["state"] == "released":
@@ -838,10 +950,12 @@ class BrowserStream:
 
     async def _switch_quality(self, tier, reason):
         """Replace only this socket's source; never relabel another viewer's JPEG."""
-        self.window.quality_changed(time.perf_counter(), tier)
+        # Encoder replacement shares the input/frame view barrier, but ACK
+        # reception must never wait for that barrier or a CDP round-trip.
         async with self._view_lock:
-            if self._closed or self.page is None:
+            if self._closed or self.transport != "jpeg" or self.page is None:
                 return
+            self.window.quality_changed(time.perf_counter(), tier)
             self._quality_candidate, self._quality_samples = None, 0
             if self._idle_task is not None:
                 self._idle_task.cancel()
@@ -1018,6 +1132,74 @@ class BrowserStream:
                         self._measure("send_lock_ms", self.send_lock_ms)
 
     async def _receive(self):
+        """Own and reap both socket reading and serial mutation workers."""
+        tasks = [asyncio.create_task(self._read_messages()),
+                 asyncio.create_task(self._commands()),
+                 asyncio.create_task(self._qualities())]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            reader, commands, _ = tasks
+            if reader in done:
+                try:
+                    reader.result()
+                except (WebSocketDisconnect, ConnectionError, TimeoutError):
+                    if self.control:
+                        await asyncio.shield(self._settle_input("disconnect"))
+                    await commands
+                    raise
+            for task in done:
+                task.result()
+        finally:
+            cleanup = asyncio.create_task(self._reap_workers(tasks))
+            await self._await_cleanup(cleanup)
+
+    async def _reap_workers(self, tasks):
+        # This owner receives no cancellation from its waiters. In particular,
+        # encoder-start cancellation cleanup must not be interrupted a second time.
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        replies = tuple(self._input_replies)
+        for reply in replies:
+            reply.cancel()
+        await asyncio.gather(*replies, return_exceptions=True)
+        inputs = self.browser.human_inputs(self.lease_id) if self.control else None
+        if inputs is not None and not self._reader_disconnected:
+            for command in tuple(inputs.commands):
+                if command.connection == self.connection_id:
+                    inputs.cancel(command)
+        self._commands_pending.clear()
+        if inputs is not None:
+            inputs.set_pending_work(self.connection_id, False)
+        self._quality_request = None
+
+    async def _qualities(self):
+        while not self._closed:
+            await self._quality_wake.wait()
+            self._quality_wake.clear()
+            tier, reason = self._quality_request
+            try:
+                await self._switch_quality(tier, reason)
+            finally:
+                self._quality_request = None
+
+    async def _read_messages(self):
+        """Publish any reader disconnect before the supervisor drains commands."""
+        try:
+            await self._read_messages_loop()
+        except (WebSocketDisconnect, ConnectionError, TimeoutError):
+            # Both receive_text and pong/reject sends can disconnect. Publish
+            # synchronously so no queued write can start after either failure.
+            self._reader_disconnected = True
+            self._commands_pending.clear()
+            if self.control:
+                self.browser.human_inputs(self.lease_id).set_pending_work(self.connection_id, False)
+                self._settle_input("disconnect")
+            self._command_wake.set()
+            raise
+
+    async def _read_messages_loop(self):
         while not self._closed:
             raw = await self.ws.receive_text()
             received_at = time.perf_counter()
@@ -1081,9 +1263,11 @@ class BrowserStream:
                                                          if candidate == self._quality_candidate else 1)
                                 self._quality_candidate = candidate
                                 threshold = QUALITY_CONFIRM_UP if why == "recovered" else QUALITY_CONFIRM_DOWN
-                                if self._quality_samples >= threshold:
+                                if self._quality_samples >= threshold and self._quality_request is None:
                                     # Only displayed current-tier ACKs confirm quality.
-                                    await self._switch_quality(candidate, why)
+                                    # Replacement may wait on input/CDP, never the reader.
+                                    self._quality_request = (candidate, why)
+                                    self._quality_wake.set()
                         if self.window.blocked(time.perf_counter(), self.outstanding, self._pending_size(),
                                                in_flight_bytes=self.in_flight_bytes) == "none":
                             self._end_credit_wait(time.perf_counter())
@@ -1100,16 +1284,225 @@ class BrowserStream:
                 else:
                     await self.send({"t": "pong", "id": ping_id})
                 continue
+            # Server-owned receipt metadata cannot be supplied by a client.
+            for field in tuple(message):
+                if field.startswith("_"):
+                    message.pop(field)
+            message["_wall_received"] = time.time()
+            message["_received_at"] = received_at
+            self._commands_pending.append((message, received_at))
+            if self.control:
+                self.browser.human_inputs(self.lease_id).set_pending_work(self.connection_id, True)
+            kind = message.get("t")
+            category = kind if isinstance(kind, str) and kind in self._input_counts else "other"
+            self._input_counts[category] += 1
+            self._command_queue_max = max(self._command_queue_max, len(self._commands_pending))
+            self._command_wake.set()
+            if _is_input_message(message) and self.control:
+                self.video_streams.input(self)
+                self.browser.human_inputs(self.lease_id).event(self.connection_id)
+
+    def _input_timestamp(self, message):
+        ts = _number(message, "ts")
+        offset = message.get("_wall_received", time.time()) * 1000 - ts
+        self._timestamp_offset = offset if self._timestamp_offset is None else min(
+            self._timestamp_offset, offset)
+        return (ts + self._timestamp_offset) / 1000
+
+    def _pointer_position(self, message):
+        x, y = _number(message, "x"), _number(message, "y")
+        if not (0 <= x < self.css[0] and 0 <= y < self.css[1]):
+            raise StreamRejected("out-of-bounds")
+        return x, y
+
+    def _wheel_values(self, message):
+        """Validate each original wheel at the CDP send boundary, not on receipt."""
+        if not self.control:
+            raise StreamRejected("read-only")
+        position = self._pointer_position(message)
+        dx, dy = _number(message, "dx", 0), _number(message, "dy")
+        self._validate_input(message)
+        self._input_timestamp(message)
+        return position, dx, dy
+
+    def _coalesce_wheels(self, message, receipts, *, limit=None):
+        """Merge valid same-anchor, same-direction wheels across frame credentials.
+
+        Failures stay queued as boundaries. Keep the common anchor and use the
+        last original's frame/id, summing deltas only. Different coordinates
+        can hit different scroll containers, even within one valid frame. Called
+        synchronously by the dispatch validator under the lease and CDP send
+        locks: no frame can expire between validation and serialization.
+        """
+        anchor, dx, dy = self._wheel_values(message)
+        merged = 0
+        while self._commands_pending and (limit is None or merged < limit):
+            following, received_at = self._commands_pending[0]
+            if following.get("t") != "wheel":
+                break
+            try:
+                following_anchor, wheel_dx, wheel_dy = self._wheel_values(following)
+                if following_anchor != anchor:
+                    break
+                # Clamping at a scroll edge makes reversal non-additive.
+                # Each accumulated axis keeps its nonzero sign; zero is neutral.
+                if (dx < 0 < wheel_dx or wheel_dx < 0 < dx
+                        or dy < 0 < wheel_dy or wheel_dy < 0 < dy):
+                    break
+                next_dx = dx + wheel_dx
+                next_dy = dy + wheel_dy
+                if not math.isfinite(next_dx) or not math.isfinite(next_dy):
+                    break
+            except StreamRejected:
+                break
+            self._commands_pending.popleft()
+            receipts.append((following.get("id"), received_at))
+            dx, dy = next_dx, next_dy
+            message = following
+            merged += 1
+        if merged:
+            self._wheel_merge_batches += 1
+            # Count eliminated commands, excluding the surviving original.
+            self._wheel_merged_inputs += merged
+        return {**message, "dx": dx, "dy": dy}
+
+    def _touch_points(self, message):
+        if "phase" in message:
+            raise StreamRejected("invalid-touch")
+        touches = message.get("touches")
+        if not isinstance(touches, list) or len(touches) > 10:
+            raise StreamRejected("invalid-touches")
+        points, ids = [], set()
+        for point in touches:
+            if not isinstance(point, dict):
+                raise StreamRejected("invalid-touches")
+            identity = _integer(point, "id", 0, 2**31 - 1)
+            if identity in ids:
+                raise StreamRejected("invalid-touches")
+            ids.add(identity)
+            x, y = self._pointer_position(point)
+            points.append({"id": identity, "x": x, "y": y})
+        return points
+
+    def _coalesce_states(self, message, receipts, *, limit=None):
+        """Only motion with identical physical state can skip intermediate points."""
+        kind = message["t"]
+        signature = (message["buttons"] if kind == "pointer" else
+                     {point["id"] for point in self._touch_points(message)})
+        merged = 0
+        while self._commands_pending and (limit is None or merged < limit):
+            following, received_at = self._commands_pending[0]
+            if following.get("t") != kind:
+                break
+            try:
+                self._validate_input(following)
+                self._input_timestamp(following)
+                if kind == "pointer":
+                    self._pointer_position(following)
+                    state = _integer(following, "buttons", 0, 31)
+                else:
+                    state = {point["id"] for point in self._touch_points(following)}
+                if state != signature:
+                    break
+            except StreamRejected:
+                break
+            self._commands_pending.popleft()
+            receipts.append((following.get("id"), received_at))
+            message = following
+            merged += 1
+        if merged:
+            self._move_merge_batches += 1
+            self._move_merged_inputs += merged
+        return message
+
+    def _reply_finished(self, task):
+        self._input_replies.discard(task)
+        if task.cancelled() or task.exception() is None:
+            return
+        logger.warning("Stream reply delivery failed (%s)", type(task.exception()).__name__)
+        # A failed result write is a disconnect just like a failed pong write.
+        self._reader_disconnected = True
+        self._commands_pending.clear()
+        self._command_wake.set()
+        if self.control:
+            self.browser.human_inputs(self.lease_id).set_pending_work(self.connection_id, False)
+            self._settle_input("disconnect")
+
+    async def _deliver_input(self, message, receipts, locked_at, result):
+        try:
+            reply = await result if hasattr(result, "__await__") else result
+        except (ValueError, LookupError, RuntimeError, TimeoutError, ConnectionError) as error:
+            logger.warning("Browser stream rejected input (connection=%s, id=%r): %s",
+                           self.connection_id, message.get("id"), error)
+            reply = self._failed_input(message, _safe_rejection(error))
+        except (NameError, AttributeError, TypeError, AssertionError):
+            logger.exception("Stream input completion programming error")
+            reply = self._failed_input(message, "internal-error")
+        completed_at = time.perf_counter()
+        for input_id, received_at in receipts:
+            response = {"id": input_id, **reply}
+            if reply["t"] == "input_done":
+                response.setdefault("outcome", "sent")
+                # Coalesced inputs can arrive after this batch acquired the view
+                # lock; they did not wait for it and must report zero, not debt.
+                response.update(input_lock_wait_ms=max(0.0, locked_at - received_at) * 1000,
+                                input_cdp_ms=max(0.0, completed_at - locked_at) * 1000,
+                                input_dispatch_ms=max(0.0, completed_at - received_at) * 1000)
+                for name in ("input_lock_wait_ms", "input_cdp_ms", "input_dispatch_ms"):
+                    self._measure(name, response[name])
+            if not self._reader_disconnected and not self._closed:
+                await self.send(response)
+
+    def _command_finished(self):
+        self._active_message = None
+        if self.control:
+            self.browser.human_inputs(self.lease_id).set_pending_work(
+                self.connection_id, bool(self._commands_pending))
+
+    async def _commands(self):
+        """FIFO ordered sends; reply delivery never holds the next input."""
+        while not self._closed and not self._reader_disconnected:
+            await self._command_wake.wait()
+            if self._reader_disconnected:
+                return
+            if not self._commands_pending:
+                self._command_wake.clear()
+                continue
+            message, received_at = self._commands_pending.popleft()
+            message.setdefault("_received_at", received_at)
+            receipts = [(message.get("id"), received_at)]
             async with self._view_lock:
+                if self._reader_disconnected:
+                    return
                 locked_at = time.perf_counter()
+                self._active_message = message
                 try:
+                    merge_limit = None
                     await self._sync_pages()
                     if self._closed:
                         return
-                    if message.get("t") == "switch_page":
+                    if _is_input_message(message) and message.get("_reject_why"):
+                        self._validate_input(message)
+                    if message.get("t") == "video_retry":
+                        command_id = message.get("id")
+                        if not isinstance(command_id, str) or not command_id or len(command_id.encode()) > 64:
+                            raise StreamRejected("invalid-id")
+                        if self.transport != "video":
+                            raise StreamRejected("not-video-failed")
+                        self._video_failed = False
+                        self._video_generation += 1
+                        if not self.video_streams.retry(self):
+                            await self._stop_source()
+                            await self._start_source()
+                        reply = None
+                        if reply is None:
+                            self._command_finished()
+                            continue
+                    elif message.get("t") == "switch_page":
                         target = message.get("target")
                         if not isinstance(target, str) or not target:
                             raise StreamRejected("invalid-target")
+                        await asyncio.shield(self._settle_input("page"))
                         await self._sync_pages(target)
                         reply = {"t": "page_done", "vp": self.vp}
                     elif message.get("t") == "new_page":
@@ -1120,53 +1513,69 @@ class BrowserStream:
                         await self._sync_pages(target)
                         reply = {"t": "page_done", "target": target, "epoch": epoch, "vp": self.vp}
                     else:
-                        reply = await self._input(message)
-                        if reply["t"] == "input_done":
-                            completed_at = time.perf_counter()
-                            reply.update(input_lock_wait_ms=(locked_at - received_at) * 1000,
-                                         input_cdp_ms=(completed_at - locked_at) * 1000,
-                                         input_dispatch_ms=(completed_at - received_at) * 1000)
-                            for name in ("input_lock_wait_ms", "input_cdp_ms", "input_dispatch_ms"):
-                                self._measure(name, reply[name])
+                        reply = await self._input(message, receipts=receipts,
+                                                  merge_limit=merge_limit, defer=True)
                 except (ValueError, LookupError, RuntimeError, TimeoutError, ConnectionError) as error:
                     logger.warning("Browser stream rejected input (connection=%s, id=%r): %s",
                                    self.connection_id, message.get("id"), error)
-                    reply = {"t": "reject", "why": _safe_rejection(error)}
-                except (NameError, AttributeError, TypeError, AssertionError) as error:
-                    # A defective command must not kill an otherwise usable
-                    # viewer. Do not catch cancellation, transport failures or
-                    # resource exhaustion under a blanket Exception handler.
-                    logger.exception("Stream input programming error (%s)", type(error).__name__)
-                    self._gesture = None
-                    reply = {"t": "reject", "why": "internal-error"}
-                await self.send({"id": message.get("id"), **reply})
+                    reply = self._failed_input(message, _safe_rejection(error))
+                except (NameError, AttributeError, TypeError, AssertionError):
+                    logger.exception("Stream input programming error")
+                    reply = self._failed_input(message, "internal-error")
+                self._command_finished()
+                if hasattr(reply, "__await__"):
+                    delivery = asyncio.create_task(
+                        self._deliver_input(message, receipts, locked_at, reply))
+                    self._input_replies.add(delivery)
+                    delivery.add_done_callback(self._reply_finished)
+                else:
+                    await self._deliver_input(message, receipts, locked_at, reply)
 
-    def _validate_input(self, message, retained_frame=None):
+    def _validate_input(self, message):
+        if self._closed or self._reader_disconnected:
+            raise StreamRejected("not-human")
         snapshot = self.browser.detail(self.lease_id)
         if snapshot["state"] != "human":
             raise StreamRejected("not-human")
         epoch = _integer(message, "epoch", 0, 2**53)
         if epoch != snapshot["epoch"]:
             raise StreamRejected("stale-epoch")
+        if _is_input_message(message) and message.get("_reject_why"):
+            raise StreamRejected(message["_reject_why"])
         if _integer(message, "vp", 0, 2**53) != self.vp:
             raise StreamRejected("stale-viewport")
-        frame = _integer(message, "frame", 1, 2**53)
-        credential = self.sent.get(frame) if retained_frame is None else retained_frame
-        if credential != (epoch, self.vp, self.page):
-            raise StreamRejected("stale-frame")
+        if self.transport == "jpeg":
+            frame = _integer(message, "frame", 1, 2**53)
+            credential = self.sent.get(frame)
+            if credential != (epoch, self.vp, self.page):
+                raise StreamRejected("stale-frame")
         if self.page is None:
             raise StreamRejected("no-page")
+        if _is_input_message(message) and message.get("page") != self.page:
+            raise StreamRejected("invalid-page")
         return epoch
 
-    async def _input(self, message):
+    async def _input(self, message, *, receipts=None, merge_limit=None, defer=False):
+        """Send one complete state in order; the caller owns the reply awaiter."""
+        kind = message.get("t")
+        if kind not in ("pointer", "touch", "wheel", "key", "text", "navigate", "back", "forward", "reload"):
+            raise StreamRejected("unsupported-message")
         if not self.control:
             raise StreamRejected("read-only")
         if self.page is None:
             raise StreamRejected("no-page")
-        epoch = _integer(message, "epoch", 0, 2**53)
-        kind = message.get("t")
-        input_id = message.get("id")  # Completion id, not a staged gesture's start id.
+        inputs = self.browser.human_inputs(self.lease_id)
+        limits = self.video_streams.config.input
+        inputs.configure(window=limits.window, reply_timeout=limits.reply_timeout_s,
+                         held_idle=limits.held_idle_release_s)
+        state = inputs.state(self.connection_id, self.page, kind) if kind in ("pointer", "touch") else None
+        if state is not None:
+            message["_sequence"] = state.sequence
+        epoch = self._validate_input(message) if _is_input_message(message) else _integer(message, "epoch", 0, 2**53)
+        input_id = message.get("id")
         commands = []
+        snapshot = None
+        generation = state.generation if state is not None else None
         if kind == "text":
             text = message.get("text")
             if not isinstance(text, str) or not text or len(text.encode("utf-16-le")) // 2 > MAX_TEXT:
@@ -1199,90 +1608,117 @@ class BrowserStream:
                 if not 0 <= index < len(history["entries"]):
                     raise StreamRejected("no-history")
                 commands = [("Page.navigateToHistoryEntry", {"entryId": history["entries"][index]["id"]})]
-        elif kind in ("move", "down", "up", "click", "wheel", "touch"):
-            x, y = _number(message, "x"), _number(message, "y")
-            if not (0 <= x < self.css[0] and 0 <= y < self.css[1]):
-                raise StreamRejected("out-of-bounds")
-            params = {"x": x, "y": y}
-            if kind == "wheel":
-                params.update(type="mouseWheel", deltaX=_number(message, "dx", 0), deltaY=_number(message, "dy"))
-            elif kind == "touch":
-                phase = message.get("phase")
-                if phase not in ("start", "move", "end", "cancel"):
-                    raise StreamRejected("invalid-touch-phase")
-                commands = [("Input.dispatchTouchEvent", {"type": "touch" + phase.title(),
-                             "touchPoints": [] if phase in ("end", "cancel") else [{"x": x, "y": y, "id": 0}]})]
-            elif kind == "move":
-                buttons = _integer(message, "buttons", 0, 7, 0)
-                params.update(type="mouseMoved", buttons=buttons, button="left" if buttons & 1 else "none")
-            else:
-                button = message.get("button", "left")
-                if not isinstance(button, str) or button not in BUTTONS:
-                    raise StreamRejected("invalid-button")
-                count = _integer(message, "count", 1, 3, 1)
-                params.update(button=button, clickCount=count)
-                if kind == "click":
-                    commands = [("Input.dispatchMouseEvent", {**params, "type": "mousePressed", "buttons": BUTTONS[button]}),
-                                ("Input.dispatchMouseEvent", {**params, "type": "mouseReleased", "buttons": 0})]
-                else:
-                    params.update(type="mousePressed" if kind == "down" else "mouseReleased",
-                                  buttons=BUTTONS[button] if kind == "down" else 0)
-            if not commands:
-                commands = [("Input.dispatchMouseEvent", params)]
-        else:
-            raise StreamRejected("unknown-input")
-        # Raw mouse/touch phases are assembled locally, never left pressed in
-        # Chrome between messages. Retain the validated starting frame even if
-        # newer frames evict it from the socket's bounded sent history.
-        starts = kind == "down" or kind == "touch" and message["phase"] == "start"
-        ends = kind == "up" or kind == "touch" and message["phase"] in ("end", "cancel")
-        family = "touch" if kind == "touch" else "mouse"
-        retained_frame = None
-        if starts:
+        elif kind == "pointer":
+            x, y = self._pointer_position(message)
+            commands, snapshot = state.pointer(x, y, _integer(message, "buttons", 0, 31),
+                                                _integer(message, "count", 1, 2**31 - 1, 1))
+        elif kind == "touch":
+            commands, snapshot = state.touch(self._touch_points(message))
+        elif kind == "wheel":
+            x, y = self._pointer_position(message)
+            commands = [("Input.dispatchMouseEvent", {
+                "type": "mouseWheel", "x": x, "y": y,
+                "deltaX": _number(message, "dx", 0), "deltaY": _number(message, "dy")})]
+        if kind in ("pointer", "touch", "wheel", "key"):
+            timestamp = self._input_timestamp(message)
+            for _, values in commands:
+                values["timestamp"] = timestamp
+        active = state is not None and (snapshot[2] if kind == "pointer" else bool(snapshot))
+        starting = active and not (state.buttons if kind == "pointer" else state.touches)
+        ending = state is not None and not active and bool(state.buttons if kind == "pointer" else state.touches)
+        if starting:
+            # Retain the previous interval's token while neutral: a final up
+            # whose reply is unknown must still reset that baseline's gate.
+            state.sequence = object()
+        if state is not None:
+            message["_sequence"] = state.sequence
+        elif kind == "key":
+            message["_sequence"] = object()
+        sequence = message.get("_sequence")
+        dispatch_view = self.page, epoch, self.vp
+        # An ending state waits for the whole drag, including earlier in-flight
+        # motion. Completed earlier messages already own their own final outcome.
+        handles = [command for command in inputs.commands if sequence is not None
+                   and command.connection == self.connection_id and command.sequence is sequence] if (
+                       ending) else []
+        merged_once = False
+
+        def check_admission():
             self._validate_input(message)
-            self._gesture = (family, message, commands, self.sent[message["frame"]])
-            return {"t": "input_pending"}
-        if self._gesture is not None and (ends or kind in ("move", "touch")):
-            expected, initial, accumulated, retained_frame = self._gesture
-            if (family != expected or len(accumulated) >= 256
-                    or kind == "up" and message.get("button", "left") != initial.get("button", "left")):
-                self._gesture = None
-                raise StreamRejected("invalid-gesture")
-            accumulated.extend(commands)
-            if not ends:
-                return {"t": "input_pending"}
-            self._gesture = None
-            commands, message = accumulated, initial
-            epoch = _integer(message, "epoch", 0, 2**53)
-        elif ends or kind == "touch":
-            raise StreamRejected("incomplete-gesture")
-        dispatch_view = (self.page, epoch, self.vp)
-        dispatched_at = None
+            if state is not None and state.generation != generation:
+                raise StreamRejected("sequence-rejected")
 
-        def mark_dispatched():
-            nonlocal dispatched_at
-            dispatched_at = time.time()
+        def validate_dispatch():
+            nonlocal input_id, snapshot, merged_once
+            check_admission()
+            if merged_once:
+                return
+            merged_once = True
+            if receipts is None:
+                return
+            if kind == "wheel":
+                merged = self._coalesce_wheels(message, receipts, limit=merge_limit)
+                commands[0][1].update(deltaX=merged["dx"], deltaY=merged["dy"],
+                                      timestamp=self._input_timestamp(merged))
+            elif (state is not None and len(commands) == 1
+                  and commands[0][1]["type"] in ("mouseMoved", "touchMove")):
+                merged = self._coalesce_states(message, receipts, limit=merge_limit)
+                if kind == "pointer":
+                    x, y = self._pointer_position(merged)
+                    snapshot = x, y, snapshot[2]
+                    commands[0][1].update(x=x, y=y)
+                else:
+                    points = self._touch_points(merged)
+                    snapshot = {point["id"]: point for point in points
+                                if point["id"] not in state.blocked_touches}
+                    commands[0][1]["touchPoints"] = list(snapshot.values())
+                commands[0][1]["timestamp"] = self._input_timestamp(merged)
+            else:
+                return
+            input_id = merged.get("id")
 
-        await self.browser.human_batch(
-            self.lease_id, self.page, epoch, commands,
-            validate=lambda: self._validate_input(message, retained_frame),
-            on_dispatch=mark_dispatched,
-        )
-        if kind in ("navigate", "reload", "back", "forward"):
-            self._invalidate()
-            dispatch_view = (dispatch_view[0], epoch, self.vp)
-        if (dispatched_at is not None and type(input_id) is int and 0 <= input_id <= 2**53
-                and dispatch_view == (self.page, epoch, self.vp)):
-            self._applied_dispatches.append((input_id, dispatched_at))
-            # Very late frames older than this history remain unattributed.
-            if len(self._applied_dispatches) > INPUT_MARKER_HISTORY:
+        def observer(event, **values):
+            self._observe_input(message, event, **values)
+
+        inputs.observers[self.connection_id] = observer
+        marked = False
+
+        def dispatched():
+            nonlocal marked
+            if (not marked and type(input_id) is int and 0 <= input_id <= 2**53
+                    and dispatch_view == (self.page, epoch, self.vp)):
+                marked = True
+                self._applied_dispatches.append((input_id, time.time()))
                 del self._applied_dispatches[:-INPUT_MARKER_HISTORY]
-            # _receive owns the view lock: a frame offered during the CDP
-            # round-trip is still in the slot, so reconcile it before send.
-            if self.pending is not None and self.pending[1:3] == (epoch, self.vp):
-                params, pending_epoch, pending_vp, _ = self.pending
-                self.pending = (params, pending_epoch, pending_vp, self._applied_id(params["metadata"]))
-        return {"t": "input_done", "epoch": epoch, "vp": self.vp}
+                if self.pending is not None and self.pending[1:3] == (epoch, self.vp):
+                    metadata, pending_epoch, pending_vp, _ = self.pending
+                    self.pending = (metadata, pending_epoch, pending_vp,
+                                    self._applied_id(metadata["metadata"]))
+
+        if starting:
+            await inputs.before_state_press(self.connection_id, dispatch_view[0], kind, check_admission)
+        for index, (method, values) in enumerate(commands):
+            handles.append(await self.browser.human_send(
+                self.lease_id, dispatch_view[0], epoch, method, values,
+                connection=self.connection_id,
+                validate=validate_dispatch if index == 0 else check_admission,
+                observer=observer, on_dispatch=dispatched,
+                check_admission=check_admission if _is_input_message(message) else None,
+                sequence=sequence))
+        if state is not None:
+            state.commit(generation, snapshot)
+
+        async def complete():
+            await asyncio.gather(*(handle.wait() for handle in handles))
+            unknown = any(handle.outcome == "unknown" for handle in handles)
+            if unknown and sequence is not None:
+                self._settle_input("sequence-rejected", sequence=sequence)
+            if kind in ("navigate", "reload", "back", "forward"):
+                self._invalidate()
+            return {"t": "input_done", "epoch": epoch, "vp": dispatch_view[2],
+                    "outcome": "unknown" if unknown else "sent"}
+
+        return complete() if defer else await complete()
 
 
 async def browser_stream(websocket: WebSocket):
@@ -1300,6 +1736,14 @@ async def browser_stream(websocket: WebSocket):
         await websocket.close(code=4400)
         return
     query = websocket.query_params
+    video_streams = getattr(websocket.app.state.gateway, "video_streams", None) or VideoStreams(StreamConfig())
+    player_values = query.getlist("video_player") if hasattr(query, "getlist") else (
+        [query["video_player"]] if "video_player" in query else [])
+    video_player = player_values[0] if player_values else "0"
+    if ("transport" in query or "input_mode" in query or len(player_values) > 1
+            or video_player not in ("0", "1")):
+        await websocket.close(code=4400)
+        return
     window_values = query.getlist("max_in_flight") if hasattr(query, "getlist") else (
         [query["max_in_flight"]] if "max_in_flight" in query else [])
     window = window_values[0] if window_values else None
@@ -1311,12 +1755,11 @@ async def browser_stream(websocket: WebSocket):
         await websocket.close(code=4400)
         return
     runtime = websocket.app.state.gateway.runtime
-    browser = runtime.browser if runtime else None
-    if browser is None:
-        await websocket.close(code=4404)
-        return
     ident = websocket.path_params["browser_task_id"]
     try:
+        if runtime is None:
+            raise LookupError(ident)
+        browser = runtime.browser_for_lease(ident)
         browser.detail(ident)
     except LookupError:
         await websocket.close(code=4404)
@@ -1324,6 +1767,9 @@ async def browser_stream(websocket: WebSocket):
     await websocket.accept()
     revoked = asyncio.Event()
     stream_task = None
+    stream = BrowserStream(websocket, browser, ident, control=mode == "control",
+                           max_in_flight=int(window) if window is not None else None, fps=int(fps),
+                           video_player=video_player == "1", video_streams=video_streams)
 
     def cancel_stream() -> None:
         if stream_task is not None and not stream_task.done() and not stream_task.cancelling():
@@ -1331,6 +1777,12 @@ async def browser_stream(websocket: WebSocket):
 
     def stop() -> None:
         revoked.set()
+        stream.close_code = 4401
+        stream._closed = True
+        if stream.control:
+            browser.human_inputs(ident).set_pending_work(stream.connection_id, False)
+            stream._settle_input("disconnect")
+        video_streams.disconnect(stream.connection_id)
         cancel_stream()
 
     unsubscribe = auth.register(identity["device_id"], stop)
@@ -1339,8 +1791,7 @@ async def browser_stream(websocket: WebSocket):
         return
     try:
         stream_task = asyncio.create_task(
-            BrowserStream(websocket, browser, ident, control=mode == "control",
-                          max_in_flight=int(window) if window is not None else None, fps=int(fps)).run()
+            stream.run()
         )
         revoke_wait = asyncio.create_task(revoked.wait())
         try:

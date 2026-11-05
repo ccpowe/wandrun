@@ -33,7 +33,7 @@ export const MOUSE_OPTIONS: MouseOptions = { slop: 10, longPressMs: 500, moveInt
 type Point = { x: number; y: number };
 type State =
   | { kind: "idle" }
-  | { kind: "pending"; id: string; x0: number; y0: number; t0: number; x: number; y: number; moved: boolean }
+  | { kind: "pending"; id: string; x0: number; y0: number; t0: number; x: number; y: number; moved: boolean; canTap: boolean }
   | { kind: "drag"; id: string; lastX: number; lastY: number }
   | { kind: "two"; a: string; b: string; active: boolean; d0: number; m0: Point; d: number; m: Point }
   | { kind: "dead" }; // 第二指之后的收尾 / 取消：全部手指抬起前不产生动作
@@ -65,7 +65,8 @@ export class MouseModeRecognizer {
     return this.leftId !== null;
   }
 
-  handle(event: TouchEvent): MouseAction[] {
+  /** canTap is sampled only on the initial contact; black touchpad space moves but never clicks. */
+  handle(event: TouchEvent, canTap = true): MouseAction[] {
     const state = this.state;
     switch (event.type) {
       case "start":
@@ -81,7 +82,7 @@ export class MouseModeRecognizer {
         if (state.kind === "idle" && event.touches.length === 1) {
           const { id, x, y } = event.touches[0];
           // 左键按住时画面区滑动立即就是拖动，不设死区（选文字、拖滑块要精细）。
-          this.state = this.leftHeld ? { kind: "drag", id, lastX: x, lastY: y } : { kind: "pending", id, x0: x, y0: y, t0: event.t, x, y, moved: false };
+          this.state = this.leftHeld ? { kind: "drag", id, lastX: x, lastY: y } : { kind: "pending", id, x0: x, y0: y, t0: event.t, x, y, moved: false, canTap };
         }
         return [];
       case "move":
@@ -93,7 +94,7 @@ export class MouseModeRecognizer {
           this.leftPressed = false;
           out.push({ kind: "release", button: "left", count: this.leftCount });
         }
-        if (state.kind === "pending" && event.touches.length === 0 && !state.moved && event.t - state.t0 < this.options.longPressMs && !this.leftHeld) {
+        if (state.kind === "pending" && state.canTap && event.touches.length === 0 && !state.moved && event.t - state.t0 < this.options.longPressMs && !this.leftHeld) {
           out.push({ kind: "click", button: "left", count: this.commit("left", state.t0, event.t) });
         }
         if (event.touches.length === 0) this.state = { kind: "idle" };

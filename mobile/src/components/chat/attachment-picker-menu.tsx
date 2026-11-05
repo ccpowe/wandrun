@@ -1,5 +1,5 @@
 import { Camera, CirclePlay, FileText, Images, Plus } from "lucide-react-native";
-import { useEffect, useRef, useState } from "react";
+import { useEffectEvent, useRef, useState } from "react";
 import { Keyboard } from "react-native";
 import type { TriggerRef } from "@rn-primitives/dropdown-menu";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -15,6 +15,7 @@ import { Icon } from "@/components/ui/icon.tsx";
 import { Text } from "@/components/ui/text.tsx";
 import type { AttachmentSource } from "@/lib/pick-upload.ts";
 import { useTranslation } from "@/lib/i18n.ts";
+import { useMountEffect } from "@/lib/use-mount-effect.ts";
 
 const OPTIONS = [
   { source: "camera", label: "相机", icon: Camera, testID: "attachment-picker-camera" },
@@ -23,40 +24,27 @@ const OPTIONS = [
   { source: "file", label: "文件", icon: FileText, testID: "attachment-picker-file" },
 ] as const;
 
-export function AttachmentPickerMenu({ onPick }: {
-  onPick(source: AttachmentSource): void;
+export function AttachmentPickerMenu({ onPick, disabled = false }: {
+  onPick(source: AttachmentSource): void; disabled?: boolean;
 }) {
   const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const trigger = useRef<TriggerRef>(null);
-  const open = useRef(false);
-  const [pendingPick, setPendingPick] = useState<AttachmentSource | null>(null);
-
-  useEffect(() => {
-    // The primitive measures on opening; refresh after the keyboard moves the composer.
-    const remeasure = () => {
-      if (open.current) trigger.current?.open?.();
-    };
+  const [open, setOpen] = useState(false);
+  const remeasure = useEffectEvent(() => {
+    if (open) trigger.current?.open?.();
+  });
+  useMountEffect(() => {
+    // The primitive remeasures after the keyboard moves the composer.
     const shown = Keyboard.addListener("keyboardDidShow", remeasure);
     const hidden = Keyboard.addListener("keyboardDidHide", remeasure);
     return () => { shown.remove(); hidden.remove(); };
-  }, []);
-
-  useEffect(() => {
-    if (!pendingPick) return;
-    // Item closes the portal first. Present the system picker after that commit.
-    // No native Modal remains, so iOS no longer needs an onDismiss callback.
-    const frame = requestAnimationFrame(() => {
-      setPendingPick(null);
-      onPick(pendingPick);
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [pendingPick, onPick]);
+  });
 
   return (
-    <DropdownMenu onOpenChange={(value) => { open.current = value; }}>
-      <DropdownMenuTrigger ref={trigger} asChild>
-        <Button testID="composer-add" variant="ghost" size="icon" className="size-10 bg-transparent" aria-label={t("添加附件")}>
+    <DropdownMenu onOpenChange={setOpen}>
+      <DropdownMenuTrigger ref={trigger} asChild disabled={disabled}>
+        <Button testID="composer-add" disabled={disabled} intent="quiet" size="icon-sm" className="mb-1" aria-label={t("添加附件")}>
           <Icon as={Plus} size={22} className="text-foreground" style={{ width: 22, height: 22 }} />
         </Button>
       </DropdownMenuTrigger>
@@ -67,14 +55,13 @@ export function AttachmentPickerMenu({ onPick }: {
         sideOffset={8}
         insets={insets}
         overlayTestID="attachment-picker-dismiss"
-        className="min-w-[176px] rounded-[18px] p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.18)] shadow-black/18"
+        className="min-w-[176px]"
       >
         {OPTIONS.map(({ source, label, icon, testID }) => (
-          <DropdownMenuItem key={source} testID={testID} accessibilityLabel={t(label)}
-            onPress={() => setPendingPick(source)}
-            className="min-h-12 gap-3.5 rounded-xl px-3.5">
-            <Icon as={icon} className="size-[22px] text-foreground" strokeWidth={1.75} />
-            <Text className="text-base">{t(label)}</Text>
+          <DropdownMenuItem key={source} testID={testID} accessibilityLabel={t(label)} icon={icon}
+            // rn-primitives closes its portal before invoking this user event.
+            onPress={() => onPick(source)}>
+            <Text variant="body">{t(label)}</Text>
           </DropdownMenuItem>
         ))}
       </DropdownMenuContent>

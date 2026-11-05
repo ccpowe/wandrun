@@ -1,6 +1,6 @@
 """Controlled, in-process OAuth 2.0 + Streamable HTTP MCP peer for gateway protocol tests.
 
-Standalone smoke peer: .venv/bin/python tests/oauth_server.py --port 18888
+Standalone smoke peer: uv run python tests/oauth_server.py --port 18888
 The authorization endpoint deliberately redirects rather than pretending to be a browser;
 follow the Location from a local HTTP client or paste it into the gateway callback API.
 """
@@ -47,16 +47,30 @@ class ProtocolState:
         self.refresh_release: asyncio.Event | None = None
         self.refresh_rotated = asyncio.Event()
         self.refresh_response_release: asyncio.Event | None = None
+        self.auth_mode = "oauth"
+        self.unauthorized_status = 401
+        self.challenge_metadata = True
+        self.prm_available = True
+        self.server_info = {"name": "controlled-oauth-mcp", "version": "1.0"}
+        self.instructions = None
+        self.tools = None
+        self.received_headers = []
+        self.received_urls = []
+        self.mcp_requests = []
 
 
 def create_app(state: ProtocolState) -> Starlette:
     async def prm(request: Request):
+        if not state.prm_available or state.auth_mode != "oauth":
+            return Response(status_code=404)
         return JSONResponse({
             "resource": state.resource, "authorization_servers": [state.origin],
             **({"scopes_supported": ["read"]} if state.prm_scope else {}),
         })
 
     async def as_metadata(request: Request):
+        if state.auth_mode != "oauth":
+            return Response(status_code=404)
         if state.metadata_unavailable:
             return JSONResponse({"error": "temporarily_unavailable"}, status_code=503)
         state.metadata_reads += 1
@@ -154,15 +168,29 @@ def create_app(state: ProtocolState) -> Starlette:
 
     async def mcp(request: Request):
         bearer = request.headers.get("authorization", "")
-        if not bearer.startswith("Bearer ") or bearer[7:] not in state.access:
+        state.received_headers.append(dict(request.headers))
+        state.received_urls.append(str(request.url))
+        method = (await request.json()).get("method") if request.method == "POST" else None
+        state.mcp_requests.append((request.method, method))
+        if state.auth_mode == "failed":
+            return Response(status_code=503)
+        authorized = state.auth_mode == "none" or (
+            state.auth_mode == "key" and bearer == "Bearer fixture-key"
+        ) or (
+            state.auth_mode == "query-key" and request.query_params.get("key") == "fixture-key"
+        ) or (bearer.startswith("Bearer ") and bearer[7:] in state.access)
+        if not authorized and state.auth_mode == "query-key":
+            # Shape of AMap's rejection (2026-11-02 probe): HTTP 200 with a non-JSON-RPC body.
+            return JSONResponse({"status": "0", "info": "INVALID_USER_KEY", "infocode": "10001"})
+        if not authorized:
             if request.method == "POST":
                 body = await request.json()
                 if body.get("method") == "tools/call":
                     state.denied_calls += 1
             challenge = f'Bearer resource_metadata="{state.origin}/.well-known/oauth-protected-resource/mcp"'
-            return Response(status_code=401, headers={
+            return Response(status_code=state.unauthorized_status, headers={
                 "WWW-Authenticate": challenge + (', scope="read"' if state.challenge_scope else ""),
-            })
+            } if state.auth_mode == "oauth" and state.challenge_metadata else {})
         if request.method == "GET" and state.stream_get:
             async def events():
                 state.get_stream_started.set()
@@ -178,9 +206,10 @@ def create_app(state: ProtocolState) -> Starlette:
         method = body.get("method")
         if method == "initialize":
             result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
-                      "serverInfo": {"name": "controlled-oauth-mcp", "version": "1.0"}}
+                      "serverInfo": state.server_info,
+                      **({"instructions": state.instructions} if state.instructions is not None else {})}
         elif method == "tools/list":
-            result = {"tools": [
+            result = {"tools": state.tools if state.tools is not None else [
                 {"name": "read_note", "description": "Read a controlled fixture note",
                  "inputSchema": {"type": "object", "properties": {}},
                  "annotations": {"readOnlyHint": True}},

@@ -8,10 +8,11 @@ type Bounds = { x: number; y: number; width: number; height: number; right: numb
 type LayoutResult = {
   kind: 'metrics' | 'labels' | 'extreme' | 'heading' | 'tabs' | 'tabs-scroll' | 'source-grid' | 'source-nested' | 'chat-code' | 'link-grid' | 'link-card' | 'link-stack' | 'link-mixed' | 'link-list' | 'link-titles' | 'link-thumbnails'; width: number; fontScale?: number;
   measuredWidth?: number; text?: string; cells?: Bounds[];
+  adaptiveCells?: Bounds[];
   headingBottom?: number; plotTop?: number; sectionsTop?: number;
-  tabs?: { trigger: Bounds; pill: Bounds; label: Bounds; text: string; scrollWidth: number; lineHeight: number }[];
+  tabs?: { trigger: Bounds; label: Bounds; text: string; scrollWidth: number; lineHeight: number }[];
   cell?: Bounds; toggle?: Bounds; label?: Bounds; arrow?: Bounds; lineHeight?: number;
-  charts?: { bounds: Bounds; legend?: Bounds; plot?: Bounds; circles?: Bounds[]; yLabels?: string[];
+  charts?: { bounds: Bounds; readout?: Bounds; plot?: Bounds; circles?: Bounds[]; yLabels?: string[];
     labels?: { text: string; bounds: Bounds; scrollHeight: number }[] }[];
   lines?: number; viewportWidth?: number; scrollWidth?: number; scrollLeft?: number; codeHeight?: number;
   expectedHeight?: number; frameScrollWidth?: number; inlineOutsideScroll?: boolean; fontFamily?: string;
@@ -48,7 +49,7 @@ test('browser layout preserves charts, tabs, Source summaries and unwrapped chat
       for (const title of result.titles!) {
         assert.equal(title.text, `${title.caption}\u2060\u00a0↗\ufe0e`, where);
         assert.equal(title.embeddedViews, 0, `${where}: title must not use embedded-view baseline layout`);
-        assert.equal(title.underlinedText, title.caption, `${where}: underline must cover the complete title only`);
+        assert.equal(title.underlinedText, '', `${where}: titles are not underlined (ADR-0081)`);
         assert.equal(title.arrowUnderline, 'none', `${where}: arrow must not be underlined`);
         assert.ok(Math.abs(title.last.y - title.arrow.y) <= 1, `${where}: last character and arrow separated vertically`);
         assert.ok(title.arrow.x >= title.last.right - 1, `${where}: arrow must follow the final character`);
@@ -62,8 +63,8 @@ test('browser layout preserves charts, tabs, Source summaries and unwrapped chat
         assert.ok(link.text.right <= link.bounds.right + 1, `${where}: text escaped the row`);
         assert.ok(link.scrollWidth <= link.bounds.width + 1, `${where}: row overflow`);
         if (link.thumbnail) {
-          assert.equal(link.thumbnail.width, 64, where);
-          assert.equal(link.thumbnail.height, 64, where);
+          assert.equal(link.thumbnail.width, 40, where); // richGeometry.linkMarkSize (ADR-0081 confirmation 6)
+          assert.equal(link.thumbnail.height, 40, where);
         } else {
           assert.ok(Math.abs(link.text.width - link.bounds.width) <= 1, `${where}: narrow rows must give text the full width`);
         }
@@ -86,8 +87,7 @@ test('browser layout preserves charts, tabs, Source summaries and unwrapped chat
       for (const [index, tab] of tabs.entries()) {
         assert.equal(tab.text, `选项${index + 1}二零二六年第一季度第一阶段统计结果`);
         assert.ok(tab.trigger.height >= 44, where);
-        assert.ok(tab.pill.x >= tab.trigger.x && tab.pill.right <= tab.trigger.right + 1, `${where}: pill overlaps adjacent target`);
-        assert.ok(tab.label.x >= tab.pill.x && tab.label.right <= tab.pill.right + 1, `${where}: text escapes pill`);
+        assert.ok(tab.label.x >= tab.trigger.x && tab.label.right <= tab.trigger.right + 1, `${where}: text escapes its segment`);
         assert.ok(tab.label.height <= tab.lineHeight + 1, `${where}: label wraps`);
       }
       if (result.kind === 'tabs') {
@@ -112,10 +112,15 @@ test('browser layout preserves charts, tabs, Source summaries and unwrapped chat
       assert.match(result.text!, /12.*已完成.*1.*失败/, where);
       assert.equal(result.cells!.length, 2, where);
       assert.ok(result.cells!.every((cell) => cell.width >= 140 && cell.height > 0), where);
+      assert.equal(result.adaptiveCells!.length, 2, where);
+      for (const [index, expected] of [result.width, result.width / 2].entries()) {
+        const cell = result.adaptiveCells![index];
+        assert.ok(Math.abs(cell.width - expected) < 1 && cell.height > 0, `${where}: auto/fraction Metrics collapsed`);
+      }
       continue;
     }
     if (result.kind === 'heading') {
-      assert.ok(result.sectionsTop! >= result.headingBottom!, `${where}: gifted background covers data button`);
+      assert.ok(result.sectionsTop! >= result.headingBottom!, `${where}: plot background covers current readings`);
       assert.ok(result.plotTop! <= result.sectionsTop!, where);
       continue;
     }
@@ -136,13 +141,13 @@ test('browser layout preserves charts, tabs, Source summaries and unwrapped chat
     for (const chart of result.charts!) {
       assert.equal(chart.bounds.width, result.width, where);
       for (const label of chart.labels!) {
-        assert.ok(label.bounds.bottom <= chart.legend!.y, `${where}: label overlaps legend`);
+        assert.ok(label.bounds.y >= chart.readout!.bottom, `${where}: category labels overlap current readings`);
         assert.ok(label.scrollHeight <= label.bounds.height + 1, `${where}: text clipped`);
         assert.ok(label.bounds.x >= chart.bounds.x && label.bounds.right <= chart.bounds.right + 1, where);
       }
     }
     assert.ok(Math.abs(long.bounds.height - short.bounds.height) < 1, `${where}: unequal row heights`);
-    assert.ok(Math.abs(long.legend!.y - short.legend!.y) < 1, `${where}: unaligned legends`);
+    assert.ok(Math.abs(long.readout!.y - short.readout!.y) < 1, `${where}: unaligned current readings`);
     if (result.width === 320 && result.fontScale === 2) {
       assert.ok(long.labels![0].bounds.height > 120, `fixture must exceed the former height limit: ${JSON.stringify(long.labels![0])}`);
     }

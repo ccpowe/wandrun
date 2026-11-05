@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { selectConnector, validateConnectorSelection } from "../src/lib/agent-connectors.ts";
-import { blankAgentDraft, changedAgentFields, prepareCreateCommand } from "../src/lib/agent-editor.ts";
+import { blankAgentDraft, changedAgentFields } from "../src/lib/agent-editor.ts";
 
 const catalog = [{ id: "docs", name: "资料", description: "查询文档" }, { id: "empty", name: "无说明", description: " " }];
 
@@ -22,14 +22,9 @@ test("Search rejects missing descriptions, deleted references and overlap withou
   assert.match(validateConnectorSelection({ mcp_servers: ["docs"], searchable_mcp_servers: ["docs"] }, catalog)!, /不能同时/);
 });
 
-test("Reference mode change PATCH removes prior mode and unknown creation retries keep their references", () => {
+test("agent-editor.E3 Reference mode PATCH removes the prior mode without touching unrelated references", () => {
   const before = { ...blankAgentDraft({ default_model: null, default_reasoning_effort: null }, []), mcp_servers: ["docs"] };
   const after = { ...before, ...selectConnector(before, "docs", "search") };
   assert.deepEqual(changedAgentFields(before, after), { mcp_servers: [], searchable_mcp_servers: ["docs"] });
   assert.deepEqual(changedAgentFields(before, { ...before, name: "新名字" }), { name: "新名字" });
-  const command = prepareCreateCommand(after, "once", null);
-  after.searchable_mcp_servers.push("empty");
-  const replay = prepareCreateCommand(after, "again", command);
-  assert.equal(replay.clientId, "once");
-  assert.deepEqual(replay.fields.searchable_mcp_servers, ["docs"]);
 });

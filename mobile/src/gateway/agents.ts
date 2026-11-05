@@ -1,18 +1,14 @@
-// 首页与“全部 Agent”共用的 Agent 列表：网关 GET /agents 的本地副本，随事件重新拉取。
-//
-// 列表（顺序、home、最近对话、未读）最终由网关派生；确认改名 / 删除时先修正已知摘要，再重拉其余字段。
-// 重拉不重叠、不丢最后一次（短时间触发合并，在途又有触发则结束后补拉）；失败保留旧列表并退避重试；
-// 已确认的资源变化不会被更早开始的旧快照盖回去。
+// Session-owned Agent directory in gateway order; UI ranking is a pure consumer projection.
+// Reads are coalesced, generation-guarded and retried.
 
-import type { AgentSummary, GatewayApi, GatewayEvent } from "./api.ts";
+import { type AgentListSnapshot, type AgentSummary, type GatewayApi, type GatewayEvent } from "./api.ts";
 
-/** 会改变首页某一行（或 home 分组）的持久事件；浏览器只在进入待接管时计入活动。 */
+/** Events that invalidate definitions, order, or retained conversation summaries. */
 export function affectsAgentList(event: Pick<GatewayEvent, "type" | "conversation_id" | "data">): boolean {
-  if (event.type === "resource.changed") return event.data.kind === "agent";
-  if ((event.type === "message.user" || event.type === "message.agent") && event.data.timeline_ids) return false;
+  if (event.type === "resource.changed") return event.data.kind === "agent" || event.data.kind === "agent_order";
+  // 用户在协作子对话里的插话也推进根的排序活动（conversation-drawer.P10）；成员的 Agent 回复不影响根摘要。
+  if (event.type === "message.agent" && event.data.timeline_ids) return false;
   switch (event.type) {
-    case "browser_task.updated":
-      return event.data.entered_requested === true;
     case "conversation.created":
     case "conversation.updated":
     case "conversation.deleted":
@@ -28,7 +24,7 @@ export function affectsAgentList(event: Pick<GatewayEvent, "type" | "conversatio
   }
 }
 
-type ListApi = Pick<GatewayApi, "listAgents" | "hideAgent" | "unhideAgent">;
+type ListApi = Pick<GatewayApi, "listAgents">;
 
 export type AgentListOptions = {
   /** 触发后等多久才发请求，合并这段时间内的多次触发。 */
@@ -47,6 +43,21 @@ export class AgentList {
   definitionVersion = 0;
   /** 已确认删除的不可变 id；让打开的页面退出，而不把“尚未加载”误当删除。 */
   readonly deletedIds = new Set<string>();
+  orderRevision = 0;
+  /** Accept only monotonic order snapshots; summary freshness still uses the existing request generation. */
+  private accept({ agents, as_of_seq, order_revision }: AgentListSnapshot): void {
+    const previousOrder = this.agents.map((agent) => agent.id);
+    const present = new Set(agents.map(agent => agent.id));
+    for (const id of previousOrder) {
+      if (!present.has(id)) this.deletedIds.add(id);
+    }
+    this.agents = agents;
+    this.asOfSeq = as_of_seq;
+    this.orderRevision = order_revision;
+    this.loaded = true;
+    this.error = null;
+    this.failures = 0;
+  }
 
   private readonly api: ListApi;
   private readonly onChange: () => void;
@@ -60,7 +71,7 @@ export class AgentList {
   private closed = false;
   private readGeneration = 0;
   /**
-   * 请求代际：每个列表请求开始时、每个资源事件 / hide / unhide 响应到达时以及 resync 时各取一个递增编号。
+   * 请求代际：每个列表请求开始时、资源事件或摘要更新到达时以及 resync 时各取一个递增编号。
    * 列表响应只有在最近一次确认或失效之后开始时才写入，避免旧快照覆盖命令结果、带回已删除 Agent 或旧库摘要。
    * 被丢弃的响应会安排一次补拉。
    */
@@ -80,6 +91,14 @@ export class AgentList {
   /** 资源事件分别推进列表副本和详情失效；列表快照已包含事件也不能证明资料页已重拉。 */
   observe(event: GatewayEvent): void {
     if (this.closed) return;
+    if (event.type === "resource.changed" && event.data.kind === "agent_order") {
+      if (event.seq > this.asOfSeq) {
+        this.confirmedAt = ++this.clock;
+        this.refresh();
+        this.onChange();
+      }
+      return;
+    }
     if (event.type === "resource.changed" && event.data.kind === "agent") {
       const id = event.data.id as string;
       if (event.seq <= (this.resourceSeq.get(id) ?? 0)) return;
@@ -131,8 +150,8 @@ export class AgentList {
   }
 
   /**
-   * 请求重拉（合并短时间内的多次请求）。事件流（重新）连上、用户点“重试”时也调用它：
-   * 此时本地副本可能已过期。正在等待退避重试时，它让重试提前到现在。
+   * 请求重拉（合并短时间内的多次请求）。重连 / 聚焦也调用它。
+   * 正在等待退避重试时，它让重试提前到现在。
    */
   refresh(): void {
     if (this.closed) return;
@@ -167,6 +186,7 @@ export class AgentList {
     this.definitionVersion++;
     this.asOfSeq = 0;
     this.resourceSeq.clear();
+    this.orderRevision = 0;
     this.deletedIds.clear();
     this.confirmedAt = ++this.clock;
     this.agents = this.agents.map((agent) => ({ ...agent, latest_conversation: null, unread: false }));
@@ -174,14 +194,6 @@ export class AgentList {
     this.onChange();
   }
 
-  /** 失败时抛出（调用方提示用户）。成功后以返回的这一行为准，直到更新的快照到达。 */
-  async hide(id: string): Promise<void> {
-    this.confirm(await this.api.hideAgent(id));
-  }
-
-  async unhide(id: string): Promise<void> {
-    this.confirm(await this.api.unhideAgent(id));
-  }
 
   /**
    * Drop this computer's cached list and timers. The API owner aborts in-flight requests;
@@ -206,13 +218,6 @@ export class AgentList {
     this.dirty = false;
   }
 
-  private confirm(updated: AgentSummary): void {
-    if (this.closed) return;
-    this.confirmedAt = ++this.clock;
-    this.agents = this.agents.map((agent) => (agent.id === updated.id ? updated : agent));
-    this.onChange();
-    this.refresh(); // 取得包含这次命令的新排序；在途的旧请求结束后会被丢弃并补拉
-  }
 
   private async load(): Promise<void> {
     this.loading = true;
@@ -220,20 +225,12 @@ export class AgentList {
     const generation = this.readGeneration;
     let failed = false;
     try {
-      const { agents, as_of_seq } = await this.api.listAgents();
+      const snapshot = await this.api.listAgents();
       if (this.closed || generation !== this.readGeneration) return;
-      if (startedAt > this.confirmedAt) {
-        const present = new Set(agents.map((agent) => agent.id));
-        for (const previous of this.agents) {
-          if (!present.has(previous.id)) this.deletedIds.add(previous.id);
-        }
-        this.agents = agents;
-        this.asOfSeq = as_of_seq;
-        this.loaded = true;
-        this.error = null;
-        this.failures = 0;
+      if (startedAt > this.confirmedAt && snapshot.order_revision >= this.orderRevision) {
+        this.accept(snapshot);
       } else {
-        this.dirty = true; // 旧快照：丢弃，补拉
+        this.dirty = true; // Old snapshot: discard and read again.
       }
     } catch (error) {
       if (this.closed || generation !== this.readGeneration) return;

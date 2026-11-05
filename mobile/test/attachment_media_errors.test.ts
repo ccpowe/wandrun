@@ -16,10 +16,12 @@ const hosts: Record<string, string> = {
     export const PixelRatio={get:()=>1};`,
   'expo-image': `export function Image(props) { return globalThis.__attachmentReact.createElement('ExpoImage',props); }`,
   'expo-router': `export const router={push:()=>{}};`,
-  'lucide-react-native': `export const ChevronRight='ChevronRight';`,
+  'lucide-react-native': `export const ChevronRight='ChevronRight', ImageOff='ImageOff';`,
+  'uniwind': `export const useCSSVariable=(names)=>names.map(()=> '#666666');`,
   '@/components/file-type-icon.tsx': `export const FileTypeIcon='FileTypeIcon';`,
   '@/components/ui/icon.tsx': `export const Icon='Icon';`,
   '@/components/ui/text.tsx': `export const Text='Text';`,
+  '@/components/ui/surface-pressable.tsx': `export const SurfacePressable='Pressable';`,
   '@/lib/local-image.ts': `export const loadLocalImage=(_api,path)=>path.includes('/thumbnail?')?globalThis.__attachmentThumbnailLoad(path):globalThis.__attachmentOriginalLoad(path);`,
 };
 Object.assign(globalThis, {
@@ -48,8 +50,10 @@ const { ThumbnailImage, PdfCard } = await import('../src/components/chat/attachm
 const { GatewayApi } = await import('../src/gateway/api.ts');
 const { applyLanguage } = await import('../src/lib/locale-store.ts');
 const file = (id: string) => ({ id, name: `${id}.png`, size: 42, media_type: 'image/png' });
+let resourceIdentity = 0;
 const api = (computerId: string, load: (id: string) => Promise<Lease>) => ({
   config: { computerId }, signal: new AbortController().signal,
+  resourceIdentity: ++resourceIdentity,
   loadFileThumbnail: (id: string) => load(id),
 }) as unknown as GatewayApiType;
 const cachedApi = () => new GatewayApi({ baseUrl: 'https://images.test', token: 'test', computerId: 'computer-a' });
@@ -58,7 +62,6 @@ const render = (root: Root, gateway: GatewayApiType, id = 'one') => createElemen
 });
 const image = (root: Root) => root.container.queryAll(node => node.type === 'ExpoImage')[0];
 const failure = (root: Root) => root.container.queryAll(node => node.props.testID === 'attachment-image-error')[0];
-const retry = (root: Root) => root.container.queryAll(node => node.props.testID === 'attachment-image-retry')[0];
 const lease = (uri: string, dispose: () => void = () => {}): Lease => ({ uri, dispose });
 const nextTurn = async () => {
   const { promise, resolve } = Promise.withResolvers<void>();
@@ -66,7 +69,7 @@ const nextTurn = async () => {
   await promise;
 };
 
-test('thumbnail and original fetch failures show a retry; retry downloads the thumbnail again', async () => {
+test('chat.F2 failed image uses a tappable icon placeholder that reloads the thumbnail', async () => {
   const root = createRoot({ textComponentTypes: ['Text'] });
   let originalAttempts = 0;
   let thumbnailAttempts = 0;
@@ -76,9 +79,8 @@ test('thumbnail and original fetch failures show a retry; retry downloads the th
   try {
     await act(async () => { root.render(render(root, gateway)); });
     assert.ok(failure(root), 'failed content should replace the spinner');
-    assert.equal(retry(root)?.props.accessibilityLabel, '重试加载图片');
     assert.equal(root.container.queryAll(node => node.type === 'ActivityIndicator').length, 0);
-    await act(async () => { retry(root).props.onPress(); });
+    await act(async () => { failure(root).props.onPress(); });
     assert.equal(image(root)?.props.source.uri, 'thumbnail-ok');
     assert.equal(originalAttempts, 1);
     assert.equal(thumbnailAttempts, 2);
@@ -98,7 +100,7 @@ test('thumbnail decoder failure invalidates the cached URI before retry', async 
     assert.equal(image(root)?.props.source.uri, 'original-corrupt');
     await act(async () => image(root).props.onError({ error: 'decode' }));
     assert.ok(failure(root));
-    await act(async () => retry(root).props.onPress());
+    await act(async () => failure(root).props.onPress());
     assert.equal(image(root)?.props.source.uri, 'thumbnail-fixed');
     assert.equal(thumbnailAttempts, 2);
   } finally { await act(async () => root.unmount()); gateway.close(); }
@@ -305,5 +307,26 @@ test('unmount disposes an original image lease that completes late', async () =>
   await act(async () => root.unmount());
   await act(async () => gate.resolve(lease('late', () => { disposed = true; })));
   assert.equal(disposed, true);
+});
+
+test('chat.F2 reconnect or visibility return reloads failure without polling successful images', async () => {
+  const root = createRoot({ textComponentTypes: ['Text'] });
+  const gateway = cachedApi();
+  let attempts = 0;
+  thumbnailLoad = async () => {
+    if (++attempts === 1) throw new Error('offline');
+    return lease('recovered');
+  };
+  originalLoad = async () => { throw new Error('offline'); };
+  const props = { file: file('one'), api: gateway, width: 120, height: 90, onOpen: () => {} };
+  try {
+    await act(async () => root.render(createElement(ThumbnailImage, { ...props, reloadOnActive: false })));
+    assert.ok(failure(root));
+    await act(async () => root.render(createElement(ThumbnailImage, { ...props, reloadOnActive: true })));
+    assert.equal(image(root)?.props.source.uri, 'recovered');
+    await act(async () => root.render(createElement(ThumbnailImage, { ...props, reloadOnActive: false })));
+    await act(async () => root.render(createElement(ThumbnailImage, { ...props, reloadOnActive: true })));
+    assert.equal(attempts, 2, 'successful pixels are not re-downloaded on every activation');
+  } finally { await act(async () => root.unmount()); gateway.close(); }
 });
 

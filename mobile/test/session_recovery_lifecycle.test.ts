@@ -23,11 +23,12 @@ declare global {
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const platform: Record<string, string> = {
   "react-native": "export const View='View'; export const AppState=globalThis.__recoveryNative.app; export const Platform={OS:'android'};",
-  "expo-network": "export const NetworkStateType={NONE:'NONE'}; export const addNetworkStateListener=globalThis.__recoveryNative.network;",
+  "react-native-safe-area-context": "export const SafeAreaView='SafeAreaView';",
+  "expo-network": "export const NetworkStateType={NONE:'NONE'}; export const addNetworkStateListener=globalThis.__recoveryNative.network; export const getNetworkStateAsync=async()=>({type:'WIFI',isConnected:true});",
   "expo": "export const requireOptionalNativeModule=()=>globalThis.__recoveryNative.transport;",
   "expo-secure-store": "export async function getItemAsync(){return null} export async function setItemAsync(){} export async function deleteItemAsync(){}",
   "@/components/ui/text.tsx": "export const Text='Text';",
-  "@/lib/upload-drafts.ts": "export const discardConversationDraft=()=>{},pruneConversationDrafts=()=>{},suspendComputerUploads=async()=>{};",
+  "@/lib/upload-drafts.ts": "export const acknowledgeFirstSendDraft=()=>{},discardConversationDraft=()=>{},reconcileConversationDrafts=()=>{},suspendComputerUploads=async()=>{};",
 };
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -68,11 +69,8 @@ test("short inactive period is untouched; long background resets before recovery
   let sendHeartbeat = true;
   t.mock.method(globalThis, "fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = new URL(String(input)).pathname;
-    if (path === "/conversations") return Response.json({ conversations: [{
-      id: "c", agent_id: "main", title, created_at: 1, updated_at: 1, status: "idle", read_seq: 0, last_agent_seq: 0,
-      unread: false, last_text: null, source: "user", schedule_origin: null,
-    }], as_of_seq: seq });
-    if (path === "/agents") return Response.json({ agents: [], as_of_seq: seq });
+    if (path === "/conversations") return Response.json({ conversations: [{ id: "c", agent_id: "main", title, created_at: 1, updated_at: 1, status: "idle", read_seq: 0, last_agent_seq: 0, unread: false, last_text: null, last_activity_seq: null, last_activity_at: null, source: "user", schedule_origin: null, }], as_of_seq: seq });
+    if (path === "/agents") return Response.json({ agents: [], as_of_seq: seq, order_revision: 1 });
     if (path === "/browser-tasks") return Response.json({ browser_tasks: [], as_of_seq: seq });
     assert.equal(path, "/events");
     const cursor = Number(new Headers(init?.headers).get("Last-Event-ID"));

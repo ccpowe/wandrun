@@ -1,41 +1,17 @@
-import { useFocusEffect, useIsFocused } from "expo-router";
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { skipToken } from "@tanstack/react-query";
 
-import type { AgentCapability } from "../gateway/api.ts";
 import type { ChatSession } from "../gateway/session.ts";
-import { t } from "./i18n.ts";
+import { agentCapabilityOptions } from "./gateway-queries.ts";
+import { useGatewayQuery } from "./use-gateway-query.ts";
+import { userErrorMessage } from "./user-error.ts";
 
-/** Fetch committed capabilities on focus, Agent changes and reconnect, without changing editor drafts. */
-export function useAgentCapabilities(session: ChatSession, id?: string): {
-  capabilities: AgentCapability[] | null; error: string; refresh: () => void;
-} {
-  const revision = useSyncExternalStore(session.subscribe, () => session.agents.definitionVersion);
-  const connection = useSyncExternalStore(session.subscribe, () => session.connection);
-  const focused = useIsFocused();
-  const [retry, setRetry] = useState(0);
-  const [state, setState] = useState<{ session: ChatSession; id?: string; capabilities: AgentCapability[] | null; error: string }>(
-    { session, id, capabilities: null, error: "" },
-  );
-  const refresh = useCallback(() => setRetry((value) => value + 1), []);
-  useFocusEffect(useCallback(() => { refresh(); }, [refresh]));
-  useEffect(() => {
-    if (!focused || !id) return;
-    let active = true;
-    void session.api.getAgentCapabilities(id).then(
-      ({ capabilities }) => {
-        if (active) setState({ session, id, capabilities, error: "" });
-      },
-      (reason: unknown) => {
-        if (active) setState((current) => ({
-          session, id,
-          capabilities: current.session === session && current.id === id ? current.capabilities : null,
-          error: t("无法加载系统能力：{error}", { error: t(reason instanceof Error ? reason.message : String(reason)) }),
-        }));
-      },
-    );
-    return () => { active = false; };
-  }, [session, id, focused, revision, connection, retry]);
-  return state.session === session && state.id === id
-    ? { capabilities: state.capabilities, error: state.error, refresh }
-    : { capabilities: null, error: "", refresh };
+/** Both consumers read one committed snapshot; editor drafts never feed this resource. */
+export function useAgentCapabilities(session: ChatSession, id?: string) {
+  const read = useGatewayQuery(id ? agentCapabilityOptions(session, id) : skipToken);
+  return {
+    capabilities: read.data?.capabilities ?? null,
+    error: read.error ? userErrorMessage(read.error, "无法加载系统能力") : "",
+    fetchStatus: read.fetchStatus,
+    refresh: read.refresh,
+  };
 }

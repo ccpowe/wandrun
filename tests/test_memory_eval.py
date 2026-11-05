@@ -265,14 +265,14 @@ class GatewayReplayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         root = await replay.create("c", "collaboration")
         await replay.turn(root, "delegate")
         task = await replay.child(root, "a")
+        root_messages = [event for event in self.store.history(root, limit=200) if "text" in event.data]
         result = await replay.turn(root, "member feedback", task_id=task["task_id"])
         self.assertEqual(result["outputs"], ["member reply\ncomplete second line"])
         self.assertEqual(result["terminal_status"], "waiting")
         self.assertGreater(len(result["events"]), 200)
         root_events = self.store.history(root, limit=200)
         self.assertFalse(any(event.type == "message.agent" for event in root_events))
-        preview = next(event for event in root_events if event.type == "message.task_preview")
-        self.assertEqual(preview.data["text"], "member reply")
+        self.assertEqual([event for event in root_events if "text" in event.data], root_messages)
         member_messages = [event for event in self.store.task_history(task["task_id"], limit=300)
                            if event.type == "message.agent"]
         self.assertEqual(member_messages[0].data["text"], result["outputs"][0])

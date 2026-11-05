@@ -50,9 +50,11 @@ const hosts: Record<string, string> = {
     const state = globalThis.__imageFixture;
     export async function isAvailableAsync() { return state.available; }
     export async function shareAsync(uri, options) { state.shares.push({ uri, options }); state.shareStarted(); await state.sharing; }`,
-  'expo-router': `export function useIsFocused() { return globalThis.__imageFixture.focus; }`,
+  'expo-router': `export function useIsFocused() { return globalThis.__imageFixture.focus; }
+    export function useFocusEffect(effect) { const React = globalThis.__imageReact; const focus = globalThis.__imageFixture.focus; React.useEffect(() => focus ? effect() : undefined, [focus, effect]); }`,
   'react-native': `export const View='View', ActivityIndicator='ActivityIndicator', Platform={OS:'android'};`,
   'lucide-react-native': `export const Download='Download', Share2='Share2';`,
+  'uniwind': `export const useCSSVariable=(names)=>names.map(()=> '#666666');`,
   '@/components/rich-message/media.tsx': `export function mediaErrorMessage(error) { return '图片源站或网关暂不可用'; }`,
   '@/components/ui/button.tsx': `export function Button(props) { return globalThis.__imageReact.createElement('Button',props); }`,
   '@/components/ui/icon.tsx': `export const Icon='Icon';`,
@@ -78,13 +80,18 @@ registerHooks({
   },
 });
 // The hooks must be registered before importing the real component/native boundary.
-const { GatewayApi } = await import('../src/gateway/api.ts');
+const { ChatSession } = await import('../src/gateway/session.ts');
+const { attachSessionQueries } = await import('../src/lib/gateway-queries.ts');
 const { deliverImage } = await import('../src/lib/image-delivery.ts');
 const { ImageActions } = await import('../src/components/image-actions.tsx');
 const image = { conversationId: 'conversation/1', messageSeq: 8, block: 'markdown' as const, element: 'image', index: 2 };
 const file = { id: 'file/1', name: '真实附件.png', media_type: 'image/png', available: true };
-const gateway = (answer: (path: string) => Promise<Response> | Response) => new GatewayApi({ baseUrl: 'https://gateway.test', token: 'secret', computerId: 'computer-a' },
-  async (input) => answer(new URL(String(input)).pathname));
+const gateway = (answer: (path: string) => Promise<Response> | Response) => {
+  const session = new ChatSession({ baseUrl: 'https://gateway.test', token: 'secret', computerId: 'computer-a' },
+    async input => answer(new URL(String(input)).pathname));
+  attachSessionQueries(session);
+  return session.api;
+};
 function reset() {
   fixture.files.clear(); fixture.transfers.length = 0; fixture.shares.length = 0; fixture.created.length = 0;
   fixture.picker = Promise.resolve(); fixture.transfer = Promise.resolve(); fixture.sharing = Promise.resolve();

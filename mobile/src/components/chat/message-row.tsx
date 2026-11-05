@@ -1,6 +1,8 @@
+import { useState, type ReactNode } from "react";
 import { router } from "expo-router";
-import { Brain, Check, ChevronRight, CircleAlert, Clock, Hand, RefreshCw, Square } from "lucide-react-native";
-import { Alert, Pressable, ScrollView, View, useWindowDimensions } from "react-native";
+import { Check, ChevronRight, CircleAlert, Square } from "lucide-react-native";
+import { Pressable, ScrollView, View, useWindowDimensions } from "react-native";
+import { ActivityIndicator } from "@/components/ui/activity-indicator.tsx";
 
 import { BrowserCard } from "@/components/chat/browser-card.tsx";
 import { AgentMessageContent } from "@/components/chat/agent-message-content.tsx";
@@ -9,8 +11,8 @@ import { AgentMemoryMarkdown } from "@/components/agent-memory-markdown.tsx";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog.tsx";
 import { Icon } from "@/components/ui/icon.tsx";
 import { Text } from "@/components/ui/text.tsx";
-import { TASK_STATUS_LABEL, type Item } from "@/lib/chat-timeline.ts";
-import { agentDisplayName } from "@/lib/agent-display-name.ts";
+import { TASK_STATUS_LABEL, type ChatRow } from "@/lib/chat-timeline.ts";
+import { chatLocation } from "@/lib/chat-route.ts";
 import type { ContextCompactedData, ContextCompactionFailedData, FileRecord } from "@/gateway/api.ts";
 import type { ChatSession } from "@/gateway/session.ts";
 import { WandrunAvatar } from "@/components/wandrun-avatar.tsx";
@@ -18,20 +20,33 @@ import { TypingDots } from "./typing-dots.tsx";
 import { AttachmentPreview, type AttachmentOwner } from "@/components/chat/attachment-preview.tsx";
 import { ProgressRow } from "./progress-row.tsx";
 import { useTranslation } from "@/lib/i18n.ts";
-import { messagePreview } from "@/lib/message-preview.ts";
+import { userErrorMessage } from "@/lib/user-error.ts";
+import { deferLoadingIndicator } from "@/lib/load-state.ts";
+import { useMountEffect } from "@/lib/use-mount-effect.ts";
+
+/** Feedback only; the network deadline and retry identity remain session-owned. */
+const sendingIndicatorDelayMs = 500;
+function SendingIndicator({ clientId }: { clientId: string }) {
+  const { t } = useTranslation();
+  const [visible, setVisible] = useState(false);
+  useMountEffect(() => deferLoadingIndicator(() => setVisible(true), sendingIndicatorDelayMs));
+  return visible ? <ActivityIndicator testID={`message-sending-${clientId}`} accessibilityLabel={t("发送中")} size="small" /> : null;
+}
 type CardFile = Pick<FileRecord, "id" | "name" | "size" | "media_type"> & Partial<Pick<FileRecord, "remote_environment">>;
 
 
 /** My text bubble and the same attachment preview used by Agent messages. */
-function MineBubble({ text, attachments = [], session, owner }: {
-  text: string; attachments?: CardFile[]; session: ChatSession; owner?: AttachmentOwner;
+function MineBubble({ text, attachments = [], session, owner, active = true, status }: {
+  text: string; attachments?: CardFile[]; session: ChatSession; owner?: AttachmentOwner; active?: boolean; status?: ReactNode;
 }) {
   return (
     <View className={attachments.length ? "w-[240px] max-w-[78%] self-end" : "max-w-[78%] self-end"}>
-      {text ? <View className="self-end rounded-[20px] rounded-br-[6px] bg-primary px-3.5 py-2.5">
-        <Text selectable className="text-base text-primary-foreground">{text}</Text>
+      {/* The status never participates in bubble sizing, including attachment-only messages. */}
+      {status && <View className="absolute -left-7 top-0 bottom-0 w-5 items-center justify-center">{status}</View>}
+      {text ? <View className="self-end rounded-[20px] rounded-br-[6px] bg-muted px-3.5 py-2.5">
+        <Text className="text-base text-foreground">{text}</Text>
       </View> : null}
-      <AttachmentPreview files={attachments} session={session} owner={owner} mine />
+      <AttachmentPreview files={attachments} session={session} owner={owner} mine active={active} />
     </View>
   );
 }
@@ -44,9 +59,8 @@ function CompactedRow({ data, seq, agentName }: { data: ContextCompactedData; se
       <DialogTrigger asChild>
         <Pressable testID={`context-compacted-${seq}`} accessibilityRole="button"
           accessibilityLabel={t("已压缩上下文（{agent}），查看工作摘要", { agent: agentName })}
-          className="max-w-[300px] flex-row items-center gap-1.5 self-center rounded-2xl bg-muted px-3 py-1.5">
-          <Icon as={RefreshCw} className="size-3.5 text-muted-foreground" />
-          <Text className="shrink text-[13px] text-muted-foreground">{t("已压缩上下文（{agent}）", { agent: agentName })}</Text>
+          className="self-center">
+          <Text className="text-center text-xs text-muted-foreground">{t("已压缩上下文（{agent}）", { agent: agentName })}</Text>
         </Pressable>
       </DialogTrigger>
       {/* Keep dialog taps out of the backdrop; the ScrollView child claims body taps so Android can intercept drags. */}
@@ -66,27 +80,25 @@ function CompactedRow({ data, seq, agentName }: { data: ContextCompactedData; se
 }
 
 /** The current timeline already identifies its Agent; only a different sender needs a name. */
-function AgentSender({ session, timelineId, agentId, snapshotName }: {
-  session: ChatSession; timelineId: string; agentId?: string; snapshotName?: string;
-}) {
-  if (!agentId || agentId === session.chat(timelineId)?.agent_id) return null;
-  const name = agentDisplayName(session.agents, agentId, snapshotName);
-  return <Text className="mb-0.5 text-xs text-muted-foreground">{name}</Text>;
+function AgentSender({ name }: { name?: string }) {
+  return name ? <Text className="mb-0.5 text-xs text-muted-foreground">{name}</Text> : null;
 }
 
 /** 时间线上的一行：我的消息 / Agent 消息 / 停止、失败事件，以及还没确认的本地消息。 */
-export function MessageRow({ item, session, visible = false, timelineId, onUiSubmitted }: {
-  item: Item; session: ChatSession; visible?: boolean; timelineId?: string;
+export function MessageRow({ item, session, visible = false, timelineId, onUiSubmitted, onRetryPending }: {
+  item: ChatRow; session: ChatSession; visible?: boolean; timelineId?: string;
+  /** Before real identity, retry belongs to the first-intent owner, not session.retry. */
+  onRetryPending?: (clientId: string) => void;
   /** Local form acceptance only; validation/rejection and other senders do not take over reading. */
   onUiSubmitted?: () => void;
 }) {
   const { t } = useTranslation();
   if (item.delegation) {
-    const { taskId, agentId, status } = item.delegation;
-    const name = agentDisplayName(session.agents, agentId, item.event?.data.agent_name);
+    const { taskId, status } = item.delegation;
+    const name = item.agentName!;
     return <ProgressRow testID={`delegation-${taskId}`}
       accessibilityLabel={t("委派 {agent} · {status}", { agent: name, status: t(TASK_STATUS_LABEL[status]) })}
-      onPress={() => router.push({ pathname: "/c/[id]", params: { id: taskId } })}>
+      onPress={() => router.push(chatLocation(taskId))}>
       {status === "running" || status === "waiting" ? <TypingDots />
         : <Icon as={status === "completed" ? Check : status === "failed" || status === "unavailable" ? CircleAlert : Square} className="size-4 text-muted-foreground" />}
       <Text numberOfLines={1} className="shrink text-sm">{t("委派 {agent} · {status}", { agent: name, status: t(TASK_STATUS_LABEL[status]) })}</Text>
@@ -94,33 +106,33 @@ export function MessageRow({ item, session, visible = false, timelineId, onUiSub
     </ProgressRow>;
   }
   if (item.browser) {
-    const agentId = item.browser.agent_id;
-    const name = agentDisplayName(session.agents, agentId, item.browser.agent_name);
-    return <BrowserCard task={item.browser} active={visible} agentName={name} />;
+    return <BrowserCard session={session} task={item.browser} active={visible} agentName={item.agentName!} />;
   }
   if (item.draft) return <View className="px-0.5" testID={`draft-${item.draft.draft_id}`}>
-    <AgentSender session={session} timelineId={timelineId ?? item.draft.task_id ?? item.draft.conversation_id} agentId={item.draft.agent} />
+    <AgentSender name={item.senderName} />
     <DraftMessageContent text={item.draft.text} />
-    <Text className="mt-1 text-xs text-muted-foreground">{t("生成中 · 尚未发送")}</Text>
   </View>;
-  if (item.pending) {
+  if (item.kind === "user" && item.pending) {
     const pending = item.pending;
+    const retry = () => { if (onRetryPending) onRetryPending(pending.clientId); else void session.retry(pending.clientId); };
     return (
-      <View className="flex-row items-center justify-end gap-2">
-        {pending.status === "failed" && <Pressable
-          testID={`message-failed-${pending.clientId}`}
-          accessibilityRole="button"
-          accessibilityLabel={t("消息发送失败，查看详情")}
-          accessibilityHint={pending.retryable ? t("查看失败原因，并重试或删除消息") : t("查看失败原因或删除消息")}
-          className="size-11 items-center justify-center"
-          onPress={() => Alert.alert(t("发送失败"), pending.error ? t(pending.error) : t("消息未能发送。"), [
-            { text: t("取消"), style: "cancel" },
-            { text: t("删除消息"), style: "destructive", onPress: () => session.discard(pending.clientId) },
-            ...(pending.retryable ? [{ text: t("重试"), onPress: () => { void session.retry(pending.clientId); } }] : []),
-          ])}>
-          <Icon as={CircleAlert} className="size-5 text-destructive" />
-        </Pressable>}
-        <MineBubble text={pending.text} attachments={pending.attachments} session={session} />
+      <View className="items-end gap-1">
+        <MineBubble text={pending.text} attachments={pending.attachments} session={session} active={visible}
+          status={item.delivery === "sending"
+            ? <SendingIndicator key={pending.clientId} clientId={pending.clientId} />
+            : item.retryable
+              ? <Pressable testID={`message-retry-icon-${pending.clientId}`} accessibilityRole="button"
+                  accessibilityLabel={t("消息发送失败")} hitSlop={4} className="size-5"
+                  onPress={retry}>
+                  <Icon as={CircleAlert} className="size-5 text-destructive" />
+                </Pressable>
+              : <View accessible accessibilityRole="image" accessibilityLabel={t("消息发送失败")}><Icon as={CircleAlert} className="size-5 text-destructive" /></View>} />
+        {item.delivery !== "sending" && (item.retryable
+          ? <Pressable accessibilityRole="button" testID={`message-retry-${pending.clientId}`} hitSlop={2}
+              onPress={retry}>
+              <Text className="text-xs text-destructive">{t(item.delivery === "unconfirmed" ? "结果未确认，点按重试" : "点按重试")}</Text>
+            </Pressable>
+          : <Text className="text-xs text-destructive">{t("发送失败")}</Text>)}
       </View>
     );
   }
@@ -128,51 +140,25 @@ export function MessageRow({ item, session, visible = false, timelineId, onUiSub
   const ownerId = timelineId ?? event.data.task_id ?? event.conversation_id!;
   switch (event.type) {
     case "message.user": {
-      const task = event.data.task_id ? session.tasks.get(ownerId) : undefined;
-      const creatorName = task && agentDisplayName(session.agents, task.creator_agent_id);
       return <View className="gap-3">
         <MineBubble text={event.data.text} attachments={event.data.attachments} session={session}
-          owner={{ timelineId: ownerId, messageSeq: event.seq }} />
-        {task && <Text testID={`interjection-${event.seq}`} className="self-center text-[13px] text-muted-foreground">
-          {t("已打断这一轮 · 已告知 {agent}", { agent: creatorName ?? "" })}
+          owner={{ timelineId: ownerId, messageSeq: event.seq }} active={visible} />
+        {item.creatorName !== undefined && <Text testID={`interjection-${event.seq}`} className="self-center text-[13px] text-muted-foreground">
+          {t("已打断这一轮 · 已告知 {agent}", { agent: item.creatorName })}
         </Text>}
       </View>;
     }
-    case "message.task_preview": {
-      const agent = session.agents.agents.find((entry) => entry.id === event.data.agent_id);
-      const name = agentDisplayName(session.agents, event.data.agent_id, event.data.agent_name);
-      const attachments = Array.isArray(event.data.attachments) ? event.data.attachments : [];
-      return <View testID={`task-preview-${event.seq}`}>
-        <Pressable accessibilityRole="button" accessibilityLabel={t("查看 {agent} 给你的消息", { agent: name })}
-          onPress={() => router.push({ pathname: "/c/[id]", params: { id: event.data.task_id, message_seq: String(event.data.message_seq) } })}
-          className="flex-row items-center gap-2.5 rounded-2xl border border-border px-3 py-2.5">
-          <WandrunAvatar index={agent?.avatar ?? 0} alt={name} size={28} className="border border-border" />
-          <View className="min-w-0 flex-1 gap-0.5">
-            <Text numberOfLines={1} className="text-xs text-muted-foreground">{t("{agent} 给你发了消息", { agent: name })}</Text>
-            <Text numberOfLines={1} className="text-sm">{messagePreview(event.data.text)}</Text>
-          </View>
-          <View className="h-8 justify-center rounded-full border-[1.5px] border-foreground px-3">
-            <Text className="text-[13px] font-semibold">{t("查看")}</Text>
-          </View>
-        </Pressable>
-        {attachments.length ? <AttachmentPreview files={attachments} session={session}
-          owner={{ timelineId: event.data.task_id, messageSeq: event.data.message_seq }} /> : null}
-      </View>;
-    }
     case "message.task": {
-      const incoming = event.data.recipient_task_id === ownerId;
-      const counterpart = incoming ? event.data.sender_agent_id : event.data.recipient_agent_id;
-      const agent = session.agents.agents.find((entry) => entry.id === counterpart);
-      const name = agentDisplayName(session.agents, counterpart);
+      const { incoming, name, avatar } = item.counterpart!;
       return <View testID={`task-message-${event.seq}`} className={incoming ? "max-w-[86%] self-start gap-1.5" : "gap-1.5 px-0.5"}>
         <View className="flex-row items-center gap-1.5">
-          {incoming && <WandrunAvatar index={agent?.avatar ?? 0} alt={name} size={18} className="border border-border" />}
+          {incoming && <WandrunAvatar index={avatar} alt={name} size={18} className="border border-border" />}
           <Text className="text-xs text-muted-foreground">{incoming ? name : t("交给 {agent}", { agent: name })}</Text>
         </View>
         <View className={incoming ? "rounded-[20px] rounded-tl-[4px] border border-border px-3.5 py-2.5" : undefined}>
           <AgentMemoryMarkdown content={event.data.text} selectable scrollCodeBlocks />
           <AttachmentPreview files={event.data.attachments ?? []} session={session}
-            owner={{ timelineId: ownerId, messageSeq: event.seq }} />
+            owner={{ timelineId: ownerId, messageSeq: event.seq }} active={visible} />
         </View>
       </View>;
     }
@@ -180,74 +166,70 @@ export function MessageRow({ item, session, visible = false, timelineId, onUiSub
       // Agent 的消息不加底色，直接排在背景上。
       return (
         <View className="px-0.5">
-          <AgentSender session={session} timelineId={ownerId} agentId={event.data.agent} snapshotName={event.data.agent_name} />
-          {typeof event.data.text === "string" && (event.data.status === "interrupted"
+          <AgentSender name={item.senderName} />
+          {typeof event.data.text === "string" && (item.kind === "agent" && item.phase === "interrupted"
             ? <DraftMessageContent text={event.data.text} interrupted />
             : <AgentMessageContent
               text={event.data.text}
               ui={Array.isArray(event.data.ui) ? event.data.ui : undefined}
               attachments={Array.isArray(event.data.attachments) ? event.data.attachments : undefined}
-              submissions={session.submissionsFor(ownerId, event.seq)}
+              submissions={item.submissions}
               draftOwner={{ session, conversationId: event.conversation_id!, timelineId: ownerId, messageSeq: event.seq }}
-              onSubmit={async (block, values, clientId) => {
-                await session.submitUi(ownerId, event.seq, block, values, clientId);
+              onSubmit={async (block, values, clientId, actionId) => {
+                await session.submitUi(ownerId, event.seq, block, values, clientId, actionId);
                 onUiSubmitted?.();
               }}
             />)}
-          {event.data.status === "interrupted"
+          {item.kind === "agent" && item.phase === "interrupted"
             ? <Text className="mt-1 text-xs text-muted-foreground">{t("已中断 · 内容未完成")}</Text>
             : Array.isArray(event.data.attachments) && <AttachmentPreview files={event.data.attachments} session={session}
-              owner={{ timelineId: ownerId, messageSeq: event.seq }} />}
+              owner={{ timelineId: ownerId, messageSeq: event.seq }} active={visible} />}
         </View>
       );
     case "context.compacted":
       return <CompactedRow seq={event.seq} data={event.data as ContextCompactedData}
-        agentName={agentDisplayName(session.agents, event.data.agent_id, event.data.agent_name)} />;
+        agentName={item.agentName!} />;
     case "context.compaction_failed": {
       const data = event.data as ContextCompactionFailedData;
       return (
-        <View testID={`context-compaction-failed-${event.seq}`} className="max-w-[300px] flex-row items-center gap-1.5 self-center rounded-2xl bg-muted px-3 py-1.5">
-          <Icon as={CircleAlert} className="size-3.5 text-muted-foreground" />
-          <Text className="shrink text-[13px] text-muted-foreground">{t("压缩未完成（{agent}）：{error}", { agent: agentDisplayName(session.agents, data.agent_id, data.agent_name), error: t(data.message || data.error) })}</Text>
+        <View testID={`context-compaction-failed-${event.seq}`} className="self-center">
+          <Text className="text-center text-xs text-muted-foreground">{t("压缩未完成（{agent}）：{error}", { agent: item.agentName!, error: t(data.message || data.error) })}</Text>
         </View>
       );
     }
     case "takeover.ended":
       return (
-        <View testID={`takeover-ended-${event.seq}`} className="max-w-[300px] flex-row items-center gap-1.5 self-center rounded-2xl bg-muted px-3 py-1.5">
-          <Icon as={Hand} className="size-3.5 text-muted-foreground" />
-          <Text className="shrink text-[13px] text-muted-foreground">{t(event.data.text)}</Text>
+        <View testID={`takeover-ended-${event.seq}`} className="self-center">
+          <Text className="text-center text-xs text-muted-foreground">{t(event.data.text)}</Text>
         </View>
       );
     case "schedule.triggered":
       return (
-        <View testID={`schedule-triggered-${event.seq}`} className="flex-row items-center gap-1.5 self-center rounded-full bg-muted px-3 py-1.5">
-          <Icon as={Clock} className="size-3.5 text-muted-foreground" />
-          <Text className="text-[13px] text-muted-foreground">{t("定时 · {name}", { name: event.data.name })}</Text>
+        <View testID={`schedule-triggered-${event.seq}`} className="self-center">
+          <Text className="text-center text-xs text-muted-foreground">{t("定时 · {name}", { name: event.data.name })}</Text>
         </View>
       );
     case "memory.updated":
       return (
         <Pressable testID={`memory-updated-${event.seq}`} accessibilityRole="button"
-          accessibilityLabel={event.data.scope === "profile" ? t("查看关于你") : t("查看{agent}的工作记忆", { agent: agentDisplayName(session.agents, event.data.agent_id, event.data.agent_name) })}
+          accessibilityLabel={event.data.scope === "profile" ? t("查看关于你") : t("查看{agent}的工作记忆", { agent: item.agentName! })}
           onPress={() => event.data.scope === "profile" ? router.push("/settings-about-you") : router.push({ pathname: "/agents/[id]", params: { id: event.data.agent_id, tab: "memory" } })}
-          className="flex-row items-center gap-1.5 self-center rounded-full border border-border bg-card px-3 py-1.5">
-          <Icon as={Brain} className="size-3.5 text-muted-foreground" />
-          <Text className="text-[13px] text-muted-foreground">{t(event.data.summary || "已记住")} · {event.data.scope === "profile" ? t("查看关于你") : t("查看工作记忆")}</Text>
+          className="self-center">
+          <Text className="text-center text-xs text-muted-foreground">{t(event.data.summary || "已记住")} · {event.data.scope === "profile" ? t("查看关于你") : t("查看工作记忆")}</Text>
         </Pressable>
       );
     case "turn.stopped":
       return (
-        <View className="flex-row items-center gap-1.5 self-center">
-          <Icon as={Square} className="size-3 text-muted-foreground" fill="currentColor" />
-          <Text className="text-[13px] leading-[18px] text-muted-foreground">{t("你停止了这一轮及其下属工作")}</Text>
+        <View className="self-center">
+          <Text className="text-center text-xs text-muted-foreground">{t("你停止了这一轮及其下属工作")}</Text>
         </View>
       );
     case "turn.failed":
       return (
-        <View className="rounded-lg bg-destructive/10 px-4 py-3.5">
-          <Text className="text-[15px] text-destructive">{t("这一轮没有完成：{error}", { error: t(event.data.error) })}</Text>
-          <Text className="mt-1 text-[13px] text-muted-foreground">{t("可以直接再发一条继续，已完成的内容会保留。")}</Text>
+        <View testID={`turn-failed-${event.seq}`} className="self-center">
+          <Text className="text-center text-xs text-muted-foreground">{t("这一轮未完成：{error}", {
+            error: t(userErrorMessage(event.data.error, "原因未知")),
+          })}</Text>
         </View>
       );
     default:

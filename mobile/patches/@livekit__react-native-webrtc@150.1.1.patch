@@ -1,0 +1,546 @@
+diff --git a/android/src/main/java/com/oney/WebRTCModule/PeerConnectionObserver.java b/android/src/main/java/com/oney/WebRTCModule/PeerConnectionObserver.java
+index 81075cbb6ef2b6353801e61428a6ff804d7c664b..64817fc6cb6507842df973d207391f329571ca0f 100644
+--- a/android/src/main/java/com/oney/WebRTCModule/PeerConnectionObserver.java
++++ b/android/src/main/java/com/oney/WebRTCModule/PeerConnectionObserver.java
+@@ -17,6 +17,7 @@ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.UUID;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import livekit.org.webrtc.AudioTrack;
+ import livekit.org.webrtc.DataChannel;
+@@ -45,6 +46,12 @@ class PeerConnectionObserver implements PeerConnection.Observer {
+     private final VideoTrackAdapter videoTrackAdapters;
+     private final WebRTCModule webRTCModule;
+ 
++    // Wandrun: control executor owns these flags; video callbacks only read them.
++    // Disable before native black-frame generation; invalidate before native disposal.
++    // Remove with the retained-surface extension when upstream supports it.
++    private Map<String, AtomicBoolean> remoteTrackRenderStates;
++    private boolean trackRenderingClosed;
++
+     PeerConnectionObserver(WebRTCModule webRTCModule, int id) {
+         this.webRTCModule = webRTCModule;
+         this.id = id;
+@@ -55,6 +62,32 @@ class PeerConnectionObserver implements PeerConnection.Observer {
+         this.videoTrackAdapters = new VideoTrackAdapter(webRTCModule, id);
+     }
+ 
++    AtomicBoolean getTrackRenderState(VideoTrack track) {
++        if (trackRenderingClosed) return null;
++        if (remoteTrackRenderStates == null) remoteTrackRenderStates = new HashMap<>();
++        String trackId = track.id();
++        AtomicBoolean state = remoteTrackRenderStates.get(trackId);
++        if (state == null) {
++            state = new AtomicBoolean(track.enabled());
++            remoteTrackRenderStates.put(trackId, state);
++        }
++        return state;
++    }
++
++    void setTrackRenderingEnabled(String trackId, boolean enabled) {
++        if (remoteTrackRenderStates == null) return;
++        AtomicBoolean state = remoteTrackRenderStates.get(trackId);
++        if (state != null) state.set(enabled);
++    }
++
++    private void invalidateTrackRendering() {
++        trackRenderingClosed = true;
++        if (remoteTrackRenderStates != null) {
++            for (AtomicBoolean state : remoteTrackRenderStates.values()) state.set(false);
++            remoteTrackRenderStates = null;
++        }
++    }
++
+     PeerConnection getPeerConnection() {
+         return peerConnection;
+     }
+@@ -65,12 +98,14 @@ class PeerConnectionObserver implements PeerConnection.Observer {
+ 
+     void close() {
+         Log.d(TAG, "PeerConnection.close() for " + id);
++        invalidateTrackRendering();
+ 
+         peerConnection.close();
+     }
+ 
+     void dispose() {
+         Log.d(TAG, "PeerConnection.dispose() for " + id);
++        invalidateTrackRendering();
+ 
+         // Remove video track adapters
+         for (MediaStreamTrack track : this.remoteTracks.values()) {
+diff --git a/android/src/main/java/com/oney/WebRTCModule/RTCVideoViewManager.java b/android/src/main/java/com/oney/WebRTCModule/RTCVideoViewManager.java
+index 55560942ef80a4801e64854c5a5df3f39efc7fb4..fecb1cab07a089b2d715b6afcb148ce5f2844ff8 100644
+--- a/android/src/main/java/com/oney/WebRTCModule/RTCVideoViewManager.java
++++ b/android/src/main/java/com/oney/WebRTCModule/RTCVideoViewManager.java
+@@ -87,12 +87,24 @@ public class RTCVideoViewManager extends SimpleViewManager<WebRTCView> {
+         view.setOnDimensionsChange(onDimensionsChange);
+     }
+ 
++    @ReactProp(name = "retainLastFrame")
++    public void setRetainLastFrame(WebRTCView view, boolean enabled) { view.setRetainLastFrame(enabled); }
++
++    @ReactProp(name = "frameContext")
++    public void setFrameContext(WebRTCView view, String context) { view.setFrameContext(context); }
++
++    @ReactProp(name = "onFrameRendered")
++    public void setOnFrameRendered(WebRTCView view, boolean enabled) { view.setOnFrameRendered(enabled); }
++
+     @Override
+     public Map<String, Object> getExportedCustomDirectEventTypeConstants() {
+         Map<String, Object> eventTypeConstants = new HashMap<>();
+         Map<String, String> dimensionsChangeEvent = new HashMap<>();
+         dimensionsChangeEvent.put("registrationName", "onDimensionsChange");
+         eventTypeConstants.put("onDimensionsChange", dimensionsChangeEvent);
++        Map<String, String> rendered = new HashMap<>();
++        rendered.put("registrationName", "onFrameRendered");
++        eventTypeConstants.put("onFrameRendered", rendered);
+         return eventTypeConstants;
+     }
+ }
+diff --git a/android/src/main/java/com/oney/WebRTCModule/WebRTCModule.java b/android/src/main/java/com/oney/WebRTCModule/WebRTCModule.java
+index 04b46b5394fc0dcc3254dbb6bb5bd5507f4fcbf8..a3f5ff0ed29d3e5412afa7835acf5d59c253f33d 100644
+--- a/android/src/main/java/com/oney/WebRTCModule/WebRTCModule.java
++++ b/android/src/main/java/com/oney/WebRTCModule/WebRTCModule.java
+@@ -31,6 +31,7 @@ import java.util.Map;
+ import java.util.Objects;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutionException;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import livekit.org.webrtc.AddIceObserver;
+ import livekit.org.webrtc.AudioProcessingFactory;
+@@ -447,23 +448,26 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
+         }
+     }
+ 
+-    // Must be called in the executor.
+-    MediaStream getStreamForReactTag(String streamReactTag) {
++    // Must be called in the executor. The callback also runs there.
++    // A null render state denotes a local track; closed remote owners resolve no track.
++    void getVideoTrackForReactTag(String streamReactTag,
++            java.util.function.BiConsumer<VideoTrack, AtomicBoolean> callback) {
+         MediaStream stream = localStreams.get(streamReactTag);
+-
+-        if (stream != null) {
+-            return stream;
+-        }
+-
+-        for (int i = 0, size = mPeerConnectionObservers.size(); i < size; i++) {
+-            PeerConnectionObserver pco = mPeerConnectionObservers.valueAt(i);
+-            stream = pco.remoteStreams.get(streamReactTag);
+-            if (stream != null) {
+-                return stream;
++        PeerConnectionObserver owner = null;
++        if (stream == null) {
++            for (int i = 0, size = mPeerConnectionObservers.size(); i < size; i++) {
++                PeerConnectionObserver pco = mPeerConnectionObservers.valueAt(i);
++                stream = pco.remoteStreams.get(streamReactTag);
++                if (stream != null) {
++                    owner = pco;
++                    break;
++                }
+             }
+         }
+-
+-        return null;
++        VideoTrack track = stream == null || stream.videoTracks.isEmpty() ? null : stream.videoTracks.get(0);
++        AtomicBoolean renderState = track != null && owner != null ? owner.getTrackRenderState(track) : null;
++        if (owner != null && renderState == null) track = null;
++        callback.accept(track, renderState);
+     }
+ 
+     public MediaStreamTrack getTrack(int pcId, String trackId) {
+@@ -919,16 +923,22 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
+     @ReactMethod
+     public void mediaStreamTrackSetEnabled(int pcId, String id, boolean enabled) {
+         ThreadUtils.runOnExecutor(() -> {
+-            MediaStreamTrack track = getTrack(pcId, id);
++            PeerConnectionObserver owner = pcId == -1 ? null : mPeerConnectionObservers.get(pcId);
++            MediaStreamTrack track = pcId == -1 ? getLocalTrack(id) : owner == null ? null : owner.remoteTracks.get(id);
+             if (track == null) {
+                 Log.d(TAG, "mediaStreamTrackSetEnabled() could not find track " + id);
+                 return;
+             }
+ 
++            // Disabled tracks emit black video. Stop retained sinks before the JNI call;
++            // only re-enable them after native has applied the transition.
++            if (!enabled && owner != null) owner.setTrackRenderingEnabled(id, false);
+             if (track.enabled() == enabled) {
++                if (enabled && owner != null) owner.setTrackRenderingEnabled(id, true);
+                 return;
+             }
+-            track.setEnabled(enabled);
++            boolean applied = track.setEnabled(enabled);
++            if (enabled && applied && owner != null) owner.setTrackRenderingEnabled(id, true);
+             getUserMediaImpl.mediaStreamTrackSetEnabled(id, enabled);
+         });
+     }
+diff --git a/android/src/main/java/com/oney/WebRTCModule/WebRTCView.java b/android/src/main/java/com/oney/WebRTCModule/WebRTCView.java
+index e3008faf97f0ce2bb1f89fa6e4eebda8521cabef..2d0b97e0c20b407a4c5e5b5df695af4a5770e6ca 100644
+--- a/android/src/main/java/com/oney/WebRTCModule/WebRTCView.java
++++ b/android/src/main/java/com/oney/WebRTCModule/WebRTCView.java
+@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
+ import android.content.Context;
+ import android.graphics.Color;
+ import android.graphics.Point;
++import android.os.SystemClock;
+ import android.util.Log;
+ import android.view.View;
+ import android.view.ViewGroup;
+@@ -15,14 +16,20 @@ import com.facebook.react.bridge.Callback;
+ import com.facebook.react.bridge.ReactContext;
+ import com.facebook.react.bridge.ReadableMap;
+ import com.facebook.react.bridge.WritableMap;
++import com.facebook.react.uimanager.UIManagerHelper;
++import com.facebook.react.uimanager.events.Event;
++import com.facebook.react.uimanager.events.EventDispatcher;
+ import com.facebook.react.uimanager.events.RCTEventEmitter;
+ 
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+-import java.util.List;
+ import java.util.Objects;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import livekit.org.webrtc.EglBase;
++import livekit.org.webrtc.EglRenderer;
++import livekit.org.webrtc.VideoFrame;
++import livekit.org.webrtc.VideoSink;
+ import livekit.org.webrtc.Logging;
+ import livekit.org.webrtc.MediaStream;
+ import livekit.org.webrtc.RendererCommon;
+@@ -96,6 +103,15 @@ public class WebRTCView extends ViewGroup {
+      */
+     private boolean rendererAttached;
+ 
++    // Wandrun: remove when upstream offers retained-surface swaps and rendered-frame events.
++    private boolean rendererInitialized;
++    private volatile boolean retainLastFrame;
++    private volatile boolean onFrameRenderedEnabled;
++    private volatile String frameContext = "";
++    private long streamRequest;
++    private FrameSink frameSink;
++    private AtomicBoolean remoteTrackRenderState;
++
+     /**
+      * The {@code RendererEvents} which listens to rendering events reported by
+      * {@link #surfaceViewRenderer}.
+@@ -154,6 +170,87 @@ public class WebRTCView extends ViewGroup {
+      */
+     private boolean onDimensionsChangeEnabled = false;
+ 
++    private static final class FrameRenderedEvent extends Event<FrameRenderedEvent> {
++        private final WritableMap data;
++
++        FrameRenderedEvent(int surfaceId, int viewId, WritableMap data) {
++            super(surfaceId, viewId);
++            this.data = data;
++        }
++
++        @Override public String getEventName() { return "onFrameRendered"; }
++        @Override public WritableMap getEventData() { return data; }
++        @Override public boolean canCoalesce() { return false; }
++    }
++
++    /** One source's sink. Only the EGL draw callback reports display, never receipt/decoding.
++     * Zero-scale frame listeners do not allocate/copy a Bitmap. Re-registering a listener
++     * fences source/context/dimension changes behind already queued renderer work. */
++    private final class FrameSink implements VideoSink {
++        final String source;
++        final AtomicBoolean renderState;
++        volatile boolean active = true;
++        volatile EglRenderer.FrameListener listener;
++        String context;
++        int width;
++        int height;
++
++        FrameSink(String source, AtomicBoolean renderState) {
++            this.source = source;
++            this.renderState = renderState;
++        }
++
++        @Override
++        public void onFrame(VideoFrame frame) {
++            if (!active || (retainLastFrame && renderState != null && !renderState.get())) return;
++            String nextContext = frameContext;
++            if (onFrameRenderedEnabled && (listener == null || !Objects.equals(context, nextContext)
++                    || width != frame.getRotatedWidth() || height != frame.getRotatedHeight())) {
++                removeListener();
++                context = nextContext;
++                width = frame.getRotatedWidth();
++                height = frame.getRotatedHeight();
++                final String capturedContext = context;
++                final int capturedWidth = width, capturedHeight = height;
++                EglRenderer.FrameListener next = new EglRenderer.FrameListener() {
++                    @Override
++                    public void onFrame(android.graphics.Bitmap unused) {
++                        if (!active || listener != this) return;
++                        final double at = SystemClock.elapsedRealtimeNanos() / 1000000.0;
++                        post(() -> {
++                            if (!active || listener != this || !onFrameRenderedEnabled) return;
++                            EventDispatcher dispatcher = UIManagerHelper.getEventDispatcher((ReactContext) getContext());
++                            if (dispatcher == null) return;
++                            WritableMap params = Arguments.createMap();
++                            params.putString("source", source);
++                            params.putString("context", capturedContext);
++                            params.putInt("width", capturedWidth);
++                            params.putInt("height", capturedHeight);
++                            params.putDouble("at_ms", at);
++                            dispatcher.dispatchEvent(new FrameRenderedEvent(
++                                    UIManagerHelper.getSurfaceId(WebRTCView.this), getId(), params));
++                        });
++                        if (active && listener == this) surfaceViewRenderer.addFrameListener(this, 0);
++                    }
++                };
++                listener = next;
++                surfaceViewRenderer.addFrameListener(next, 0);
++            }
++            if (active) surfaceViewRenderer.onFrame(frame);
++        }
++
++        void removeListener() {
++            EglRenderer.FrameListener previous = listener;
++            listener = null;
++            if (previous != null) surfaceViewRenderer.removeFrameListener(previous);
++        }
++
++        void stop() {
++            active = false;
++            removeListener();
++        }
++    }
++
+     public WebRTCView(Context context) {
+         super(context);
+ 
+@@ -179,45 +276,26 @@ public class WebRTCView extends ViewGroup {
+      * on the WebRTC executor thread and posting the result back to the UI thread.
+      *
+      * @param streamURL The stream URL to lookup
+-     * @param callback Callback invoked on UI thread with the VideoTrack (or null if not found)
++     * @param callback Callback invoked on UI thread with the track and its remote lifecycle flag
+      */
+-    private void getVideoTrackForStreamURL(String streamURL, java.util.function.Consumer<VideoTrack> callback) {
++    private void getVideoTrackForStreamURL(String streamURL,
++            java.util.function.BiConsumer<VideoTrack, AtomicBoolean> callback) {
+         if (streamURL == null) {
+-            callback.accept(null);
++            callback.accept(null, null);
+             return;
+         }
+ 
+         ReactContext reactContext = (ReactContext) getContext();
+         WebRTCModule module = reactContext.getNativeModule(WebRTCModule.class);
+ 
+-        // Submit lookup to executor thread to avoid blocking UI thread
++        // Resolve both the track and its control-owned flag off the UI/video threads.
+         ThreadUtils.runOnExecutor(() -> {
+             try {
+-                MediaStream stream = module.getStreamForReactTag(streamURL);
+-                if (stream == null) {
+-                    Log.w(TAG, "Stream not found for URL: " + streamURL);
+-                    post(() -> callback.accept(null));
+-                    return;
+-                }
+-
+-                VideoTrack videoTrack = null;
+-                List<VideoTrack> videoTracks = stream.videoTracks;
+-                if (!videoTracks.isEmpty()) {
+-                    videoTrack = videoTracks.get(0);
+-                }
+-
+-                if (videoTrack == null) {
+-                    Log.w(TAG, "No video stream for react tag: " + streamURL);
+-                    post(() -> callback.accept(null));
+-                    return;
+-                }
+-
+-                // Post result back to UI thread
+-                final VideoTrack result = videoTrack;
+-                post(() -> callback.accept(result));
++                module.getVideoTrackForReactTag(streamURL,
++                        (track, state) -> post(() -> callback.accept(track, state)));
+             } catch (Throwable tr) {
+                 Log.e(TAG, "Error getting video track for stream URL: " + streamURL, tr);
+-                post(() -> callback.accept(null));
++                post(() -> callback.accept(null, null));
+             }
+         });
+     }
+@@ -244,7 +322,7 @@ public class WebRTCView extends ViewGroup {
+             // infrastructure hooked up while this View is not attached to a
+             // window. Additionally, a memory leak was solved in a similar way
+             // on iOS.
+-            removeRendererFromVideoTrack();
++            removeRendererFromVideoTrack(true);
+         } finally {
+             super.onDetachedFromWindow();
+         }
+@@ -373,26 +451,23 @@ public class WebRTCView extends ViewGroup {
+      * Stops rendering {@link #videoTrack} and releases the associated acquired
+      * resources (if rendering is in progress).
+      */
+-    private void removeRendererFromVideoTrack() {
+-        if (rendererAttached) {
+-            if (videoTrack != null) {
+-                ThreadUtils.runOnExecutor(() -> {
+-                    try {
+-                        videoTrack.removeSink(surfaceViewRenderer);
+-                    } catch (Throwable tr) {
+-                        // XXX If WebRTCModule#mediaStreamTrackRelease has already been
+-                        // invoked on videoTrack, then it is no longer safe to call removeSink
+-                        // on the instance, it will throw IllegalStateException.
+-                    }
+-                });
+-            }
+-
++    private void removeRendererFromVideoTrack(boolean release) {
++        final VideoTrack oldTrack = videoTrack;
++        final FrameSink oldSink = frameSink;
++        if (oldSink != null) {
++            oldSink.stop();
++            if (oldTrack != null) ThreadUtils.runOnExecutor(() -> {
++                try { oldTrack.removeSink(oldSink); } catch (Throwable disposedTrack) {
++                    // The SDK may already have disposed this remote track.
++                }
++            });
++        }
++        frameSink = null;
++        rendererAttached = false;
++        if (release && rendererInitialized) {
+             surfaceViewRenderer.release();
+             surfaceViewRendererInstances--;
+-            rendererAttached = false;
+-
+-            // Since this WebRTCView is no longer rendering anything, make sure
+-            // surfaceViewRenderer displays nothing as well.
++            rendererInitialized = false;
+             synchronized (layoutSyncRoot) {
+                 frameHeight = 0;
+                 frameRotation = 0;
+@@ -481,6 +556,7 @@ public class WebRTCView extends ViewGroup {
+         if (Objects.equals(streamURL, this.streamURL)) {
+             return;
+         }
++        final long request = ++streamRequest;
+ 
+         // The value of this.streamURL is really changing. Before
+         // realizing/applying the change, let go of the old videoTrack. Of
+@@ -492,13 +568,15 @@ public class WebRTCView extends ViewGroup {
+         // VideoTracks (the old and the new) may start rendering and, most
+         // importantly the videoRender may eventually crash when the old
+         // videoTrack is disposed.
+-        getVideoTrackForStreamURL(streamURL, videoTrack -> {
++        getVideoTrackForStreamURL(streamURL, (videoTrack, renderState) -> {
++            if (request != streamRequest) return;
+             Log.d(TAG, "Got video track for stream URL " + streamURL + " -> " + videoTrack);
+             if (this.videoTrack != videoTrack) {
+                 setVideoTrack(null);
+             }
+ 
+             this.streamURL = streamURL;
++            this.remoteTrackRenderState = renderState;
+ 
+             // After realizing/applying the change in the value of
+             // this.streamURL, reflect it on the value of videoTrack.
+@@ -517,19 +595,19 @@ public class WebRTCView extends ViewGroup {
+ 
+         if (oldVideoTrack != videoTrack) {
+             if (oldVideoTrack != null) {
+-                if (videoTrack == null) {
++                if (videoTrack == null && !retainLastFrame) {
+                     // If we are not going to render any stream, clean the
+                     // surface.
+                     cleanSurfaceViewRenderer();
+                 }
+-                removeRendererFromVideoTrack();
++                removeRendererFromVideoTrack(!retainLastFrame);
+             }
+ 
+             this.videoTrack = videoTrack;
+ 
+             if (videoTrack != null) {
+                 tryAddRendererToVideoTrack();
+-                if (oldVideoTrack == null) {
++                if (oldVideoTrack == null && !retainLastFrame) {
+                     // If there was no old track, clean the surface so we start
+                     // with black.
+                     cleanSurfaceViewRenderer();
+@@ -575,18 +653,23 @@ public class WebRTCView extends ViewGroup {
+                 return;
+             }
+ 
+-            try {
+-                surfaceViewRenderer.init(sharedContext, rendererEvents);
+-                surfaceViewRendererInstances++;
+-            } catch (Exception e) {
+-                Logging.e(
+-                        TAG, "Failed to initialize surfaceViewRenderer on instance " + surfaceViewRendererInstances, e);
+-                return;
++            if (!rendererInitialized) {
++                try {
++                    surfaceViewRenderer.init(sharedContext, rendererEvents);
++                    surfaceViewRendererInstances++;
++                    rendererInitialized = true;
++                } catch (Exception e) {
++                    Logging.e(TAG, "Failed to initialize surfaceViewRenderer", e);
++                    return;
++                }
+             }
+ 
++            final VideoTrack attachedTrack = videoTrack;
++            final FrameSink attachedSink = new FrameSink(streamURL, remoteTrackRenderState);
++            frameSink = attachedSink;
+             ThreadUtils.runOnExecutor(() -> {
+                 try {
+-                    videoTrack.addSink(surfaceViewRenderer);
++                    if (attachedSink.active) attachedTrack.addSink(attachedSink);
+                 } catch (Throwable tr) {
+                     // XXX If WebRTCModule#mediaStreamTrackRelease has already been
+                     // invoked on videoTrack, then it is no longer safe to call addSink
+@@ -608,4 +691,8 @@ public class WebRTCView extends ViewGroup {
+     public void setOnDimensionsChange(boolean enabled) {
+         this.onDimensionsChangeEnabled = enabled;
+     }
++
++    public void setRetainLastFrame(boolean enabled) { retainLastFrame = enabled; }
++    public void setFrameContext(String context) { frameContext = context == null ? "" : context; }
++    public void setOnFrameRendered(boolean enabled) { onFrameRenderedEnabled = enabled; }
+ }
+diff --git a/lib/typescript/RTCView.d.ts b/lib/typescript/RTCView.d.ts
+index e316524d7b9ee2e3315c83de5527dad372be4010..d3bf2860b3db7f172e5be5a95480d97364ef7c18 100644
+--- a/lib/typescript/RTCView.d.ts
++++ b/lib/typescript/RTCView.d.ts
+@@ -80,6 +80,12 @@ export interface RTCVideoViewProps extends ViewProps {
+             height: number;
+         };
+     }) => void;
++    /** Wandrun Android extension; remove after upstream supports retained rendering/events. */
++    retainLastFrame?: boolean;
++    frameContext?: string;
++    onFrameRendered?: (event: { nativeEvent: {
++        source: string; context: string; width: number; height: number; at_ms: number;
++    } }) => void;
+ }
+ export interface RTCIOSPIPOptions {
+     /**
+diff --git a/src/RTCView.ts b/src/RTCView.ts
+index ea97a430f15963b23aa78bd66485aaabf85292c5..17cd5af125385b265ebe099227af8029b84b53f2 100644
+--- a/src/RTCView.ts
++++ b/src/RTCView.ts
+@@ -81,6 +81,12 @@ export interface RTCVideoViewProps extends ViewProps {
+    * @param {number} event.nativeEvent.height - The height of the video.
+    */
+   onDimensionsChange?: (event: { nativeEvent: { width: number; height: number } }) => void;
++  /** Wandrun Android extension; remove after upstream adopts retained rendering/events. */
++  retainLastFrame?: boolean;
++  frameContext?: string;
++  onFrameRendered?: (event: { nativeEvent: {
++    source: string; context: string; width: number; height: number; at_ms: number;
++  } }) => void;
+ }
+ 
+ export interface RTCIOSPIPOptions {

@@ -1,43 +1,26 @@
-import type { AgentUsage, GatewayApi, SubscriptionAuth, SubscriptionStatus, SubscriptionUsage } from "../gateway/api.ts";
+import type { AgentUsage, SubscriptionAuth, SubscriptionStatus, SubscriptionUsage } from "../gateway/api.ts";
 import { getLanguage, getLocale, t } from "./i18n.ts";
 
-/** A transport error clears current authentication evidence without discarding historical quota. */
+/** Unavailable current evidence never discards the last observed quota. */
 export type SubscriptionView = { auth: SubscriptionAuth | null; usage: SubscriptionUsage | null; networkError: boolean };
-const subscriptions = new WeakMap<GatewayApi, SubscriptionView>();
-const requests = new WeakMap<GatewayApi, number>();
-
-export function lastSubscriptionUsage(api: GatewayApi): SubscriptionView {
-  return subscriptions.get(api) ?? { auth: null, usage: null, networkError: false };
+/** Transport failure, offline session and paused Query all revoke current authentication evidence. */
+export function subscriptionView(status: SubscriptionStatus | undefined, unavailable: boolean): SubscriptionView {
+  return { auth: unavailable ? null : status?.auth ?? null, usage: status?.usage ?? null, networkError: unavailable };
 }
 
-export async function loadSubscriptionUsage(api: GatewayApi, refresh: boolean): Promise<SubscriptionView> {
-  const request = (requests.get(api) ?? 0) + 1;
-  requests.set(api, request);
-  try {
-    const response: SubscriptionStatus = await api.getSubscriptionUsage(refresh);
-    const previous = lastSubscriptionUsage(api);
-    const latest = request === requests.get(api);
-    const auth = (latest || !previous.networkError) &&
-      (!previous.auth || response.auth.checked_at > previous.auth.checked_at)
-      ? response.auth : previous.auth;
-    const usage = response.usage && (!previous.usage || response.usage.fetched_at > previous.usage.fetched_at)
-      ? response.usage : previous.usage;
-    const value = { auth, usage, networkError: latest ? false : previous.networkError };
-    subscriptions.set(api, value);
-    return value;
-  } catch {
-    if (request !== requests.get(api)) return lastSubscriptionUsage(api);
-    const value = { auth: null, usage: lastSubscriptionUsage(api).usage, networkError: true };
-    subscriptions.set(api, value);
-    return value;
-  }
+/** Authentication and historical quota have independent upstream timestamps. Empty quota never erases history. */
+export function mergeSubscriptionStatus(previous: SubscriptionStatus | undefined, next: SubscriptionStatus): SubscriptionStatus {
+  if (!previous) return next;
+  const auth = previous.auth.checked_at > next.auth.checked_at ? previous.auth : next.auth;
+  const usage = previous.usage && (!next.usage || previous.usage.fetched_at > next.usage.fetched_at) ? previous.usage : next.usage;
+  return auth === next.auth && usage === next.usage ? next : { auth, usage };
 }
 
 export function subscriptionSummary(view: SubscriptionView): string {
   if (view.networkError) return t("登录状态暂不可检查");
   switch (view.auth?.status) {
     case "reauth_required": return t("需要重新登录");
-    case "relogin_required": return t("凭据轮换结果不确定，需停止网关并重新登录");
+    case "relogin_required": return t("凭据轮换结果不确定，需停止服务器并重新登录");
     case "login_required": return t("尚未登录");
     case "temporarily_unavailable": return t("登录暂时不可用");
     case "refresh_due": return t("即将续期");

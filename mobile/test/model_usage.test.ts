@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { GatewayApi, GatewayError, type SubscriptionAuth, type SubscriptionStatus, type SubscriptionUsage } from "../src/gateway/api.ts";
-import { agentTokens, formatTokens, lastSubscriptionUsage, loadSubscriptionUsage, quotaSummary, quotaWarning, resetLabel, subscriptionSummary, usedPercent, windowTitle } from "../src/lib/model-usage.ts";
+import { agentTokens, formatTokens, mergeSubscriptionStatus, subscriptionView, quotaSummary, quotaWarning, resetLabel, subscriptionSummary, usedPercent, windowTitle } from "../src/lib/model-usage.ts";
 
 const reset = new Date(2099, 9, 13, 9, 5).getTime() / 1000;
 const weekly = { name: "secondary", used_percent: 35, window_seconds: 7 * 86400, reset_at: reset };
@@ -48,68 +48,26 @@ test("Agent token 总数只含 input 与 output，cached/reasoning 不重复累�
   assert.equal(formatTokens(999_950), "1M");
 });
 
-test("网络失败保留历史额度但清除登录证据，不显示重新登录", async () => {
-  const calls: string[] = [];
-  let available = true;
-  const fetcher: typeof fetch = async (input) => {
-    calls.push(String(input));
-    if (!available) throw new Error("offline");
-    return Response.json(envelope("ready", 100));
-  };
-  const api = new GatewayApi({ baseUrl: "http://gateway-one", token: "one" }, fetcher);
-  const other = new GatewayApi({ baseUrl: "http://gateway-two", token: "two" }, fetcher);
-  assert.deepEqual(await loadSubscriptionUsage(api, true), { auth, usage, networkError: false });
-  available = false;
-  assert.deepEqual(await loadSubscriptionUsage(api, true), { auth: null, usage, networkError: true });
-  assert.equal(subscriptionSummary(lastSubscriptionUsage(api)), "登录状态暂不可检查");
-  assert.deepEqual(await loadSubscriptionUsage(other, true), { auth: null, usage: null, networkError: true });
-  assert.deepEqual(calls, [
-    "http://gateway-one/usage/subscription?refresh=true",
-    "http://gateway-one/usage/subscription?refresh=true",
-    "http://gateway-two/usage/subscription?refresh=true",
-  ]);
+test("settings-models.A2 网络失败保留历史额度但撤销登录证据，不冒充重新登录", () => {
+  const current = envelope("ready", 100);
+  assert.deepEqual(subscriptionView(current, false), { auth, usage, networkError: false });
+  const offline = subscriptionView(current, true);
+  assert.deepEqual(offline, { auth: null, usage, networkError: true });
+  assert.equal(subscriptionSummary(offline), "登录状态暂不可检查");
+  assert.deepEqual(subscriptionView(undefined, true), { auth: null, usage: null, networkError: true });
 });
 
-test("认证状态按 checked_at、历史额度按 fetched_at 各自排序", async () => {
-  const pending: ((response: Response) => void)[] = [];
-  const api = new GatewayApi({ baseUrl: "http://gateway", token: "dev" },
-    () => new Promise<Response>((resolve) => pending.push(resolve)));
-  const oldRequest = loadSubscriptionUsage(api, false);
-  const refreshRequest = loadSubscriptionUsage(api, true);
-  const newestAuth = envelope("reauth_required", 300, { ...usage, fetched_at: 100 });
-  pending[1](Response.json(newestAuth));
-  assert.equal((await refreshRequest).auth?.status, "reauth_required");
-  pending[0](Response.json(envelope("ready", 200, { ...usage, fetched_at: 200, allowed: false })));
-  const lateResult = await oldRequest;
-  assert.equal(lateResult.auth?.status, "reauth_required");
-  assert.equal(lateResult.usage?.allowed, false);
-  assert.equal(lateResult.usage?.fetched_at, 200);
-  assert.equal(lastSubscriptionUsage(api).auth?.checked_at, 300);
-  assert.equal(subscriptionSummary(lateResult), "需要重新登录");
-});
-
-test("较早的成功响应不能抹除较新的网络失败", async () => {
-  const pending: { resolve: (response: Response) => void; reject: (error: Error) => void }[] = [];
-  const api = new GatewayApi({ baseUrl: "http://gateway", token: "dev" },
-    () => new Promise<Response>((resolve, reject) => { pending.push({ resolve, reject }); }));
-  const first = loadSubscriptionUsage(api, false);
-  const second = loadSubscriptionUsage(api, true);
-  pending[1].reject(new Error("offline"));
-  assert.equal((await second).networkError, true);
-  pending[0].resolve(Response.json(envelope("ready", 100)));
-  assert.equal((await first).auth, null);
-  assert.equal(lastSubscriptionUsage(api).auth, null);
-});
-
-test("较旧的额度不隐藏较新的临时失败；重新检查后可恢复", async () => {
-  const replies = [envelope("ready", 100, { ...usage, fetched_at: 500 }), envelope("temporarily_unavailable", 200, { ...usage, fetched_at: 10 }), envelope("ready", 300, null)];
-  const api = new GatewayApi({ baseUrl: "http://gateway", token: "dev" }, async () => Response.json(replies.shift()));
-  await loadSubscriptionUsage(api, false);
-  const failed = await loadSubscriptionUsage(api, true);
-  assert.equal(failed.auth?.status, "temporarily_unavailable");
-  assert.equal(failed.usage?.fetched_at, 500);
-  assert.equal(subscriptionSummary(failed), "登录暂时不可用");
-  assert.equal((await loadSubscriptionUsage(api, true)).auth?.status, "ready");
+test("settings-models.A3 A5 登录与额度独立排序，临时失败和空额度不抹掉历史", () => {
+  const original = envelope("reauth_required", 300, { ...usage, fetched_at: 100 });
+  const incoming = envelope("ready", 200, { ...usage, fetched_at: 200, allowed: false });
+  const merged = mergeSubscriptionStatus(original, incoming);
+  assert.equal(merged.auth.status, "reauth_required");
+  assert.equal(merged.usage?.fetched_at, 200);
+  assert.equal(merged.usage?.allowed, false);
+  const temporary = mergeSubscriptionStatus(merged, envelope("temporarily_unavailable", 400, { ...usage, fetched_at: 10 }));
+  assert.equal(temporary.auth.status, "temporarily_unavailable");
+  assert.equal(temporary.usage?.fetched_at, 200);
+  assert.equal(mergeSubscriptionStatus(temporary, envelope("ready", 500, null)).usage?.fetched_at, 200);
 });
 
 test("订阅响应严格解析 auth 与可空额度，拒绝旧扁平协议", async () => {

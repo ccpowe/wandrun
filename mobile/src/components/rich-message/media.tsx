@@ -2,14 +2,18 @@ import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, FlatList, Platform, Pressable, View } from 'react-native';
 import { Image as ExpoImage } from 'expo-image';
 import { router } from 'expo-router';
+import { ChevronLeft, ChevronRight, ImageOff } from 'lucide-react-native';
 import { DrawerHorizontalGesture } from '@/components/chat/drawer-horizontal-gesture.tsx';
 
+import { Button } from '@/components/ui/button.tsx';
+import { Icon } from '@/components/ui/icon.tsx';
 import { Text } from '@/components/ui/text.tsx';
 import { RichText } from '@/components/rich-message/math.tsx';
 import { richGeometry, richRadius, richSpace, richType } from '@/components/rich-message/tokens.ts';
 import { GatewayError, type GatewayApi } from '@/gateway/api.ts';
 import { loadLocalImage } from '@/lib/local-image.ts';
 import { t, useTranslation } from '@/lib/i18n.ts';
+import { thumbnailFade } from '@/lib/motion.ts';
 
 export type MediaLocation = { conversationId: string; messageSeq: number; block: number | 'markdown'; element: string; index: number };
 export type ImageItem = { attachment?: string; url?: string; alt: string; caption?: string };
@@ -87,24 +91,35 @@ export function MediaPicture({ api, location, fileId, alt, height = richGeometry
   }, [api, path, key, onErrorMessage]);
   const source = loaded?.key === key && loaded.path === path ? { uri: loaded.uri } : null;
   const dimensions = result?.key === key ? result.dimensions : null;
-  const frame = !full && height === 'auto' && dimensions
+  const preview = __DEV__ && !api && (fileId === 'rich-preview-image' || fileId?.startsWith('attachment-preview-image-'));
+  // `RichImage.error`: a failed or unavailable standalone image collapses to a 96px placeholder;
+  // fixed-height gallery / media-card tiles keep their size so rows stay aligned.
+  // Same condition as the content branch below: without a requestable file or message location the
+  // picture is unavailable even when an API exists (e.g. an attachment the message did not authorize).
+  const requestable = !!api && (!!location || !!fileId);
+  const unavailable = !!error || (!requestable && !preview);
+  const compactError = !full && unavailable && (height === 'auto' || height === richGeometry.imageHeight);
+  const frame = compactError ? { height: 96 } : !full && height === 'auto' && dimensions
     ? { width: '100%' as const, aspectRatio: dimensions.width / dimensions.height }
     : { height: full ? '100%' as const : height === 'auto' ? richGeometry.imageHeight : height };
-  const preview = __DEV__ && !api && (fileId === 'rich-preview-image' || fileId?.startsWith('attachment-preview-image-'));
   const open = full ? undefined : onOpen ?? (location ? () => router.push({ pathname: '/media-viewer', params: {
     id: location.conversationId, seq: String(location.messageSeq), block: String(location.block),
     element: location.element, index: String(location.index), alt,
   } }) : fileId ? () => router.push({ pathname: '/files/[id]', params: { id: fileId } }) : undefined);
   // Full-screen sits on the viewer's black stage: no card fill or corners there.
   return <View className={full ? 'items-center justify-center overflow-hidden' : 'bg-muted items-center justify-center overflow-hidden'}
-    style={{ ...frame, ...(full && radius === undefined ? {} : { borderRadius: radius ?? richRadius.small }) }} testID="media-image">
+    style={{ ...frame, gap: richSpace.xs, ...(full && radius === undefined ? {} : { borderRadius: radius ?? richRadius.medium }) }} testID="media-image">
     {source || preview ? <Pressable onPress={open} disabled={!open} accessibilityRole="button" accessibilityLabel={t('查看图片 {alt}', { alt })} testID="media-image-open" className="h-full w-full">
       <ExpoImage source={preview ? require('../../../assets/empty-together.png') : source!} alt={alt} contentFit={contentFit} cachePolicy="none" allowDownscaling={!full} style={{ width: '100%', height: '100%' }}
         onLoad={fileId && onDimensions && !api?.signal.aborted ? ({ source: image }) => onDimensions(image.width, image.height) : undefined}
         onError={() => { if (!api?.signal.aborted) { const message = t('图片内容暂不可用'); setResult({ key, error: message, dimensions: null }); onErrorMessage?.(message); } }} />
-    </Pressable> : error ? <Text className="text-center text-destructive" style={{ ...richType.subtle, paddingHorizontal: richSpace.md }} testID="media-image-error">{t(error)}</Text>
-      : api && (location || fileId) ? <ActivityIndicator /> : <Text className="text-center text-muted-foreground" style={{ ...richType.subtle, paddingHorizontal: richSpace.md }}>{t('图片附件不可用')}</Text>}
-    {error && alt ? <Text className="text-center text-muted-foreground" style={{ ...richType.subtle, paddingHorizontal: richSpace.md }}>{alt}</Text> : null}
+    </Pressable> : error ? <>
+      <Icon as={ImageOff} size={20} className="text-muted-foreground" />
+      <Text numberOfLines={2} className="text-center text-muted-foreground" style={{ ...richType.subtle, paddingHorizontal: richSpace.md }} testID="media-image-error">{t(error)}</Text>
+    </> : api && (location || fileId) ? <ActivityIndicator /> : <>
+      <Icon as={ImageOff} size={20} className="text-muted-foreground" />
+      <Text className="text-center text-muted-foreground" style={{ ...richType.subtle, paddingHorizontal: richSpace.md }}>{t('图片附件不可用')}</Text>
+    </>}
   </View>;
 }
 
@@ -142,14 +157,14 @@ export function LinkThumbnail({ api, location, letter, color }: {
     };
   }, [api, key, conversationId, messageSeq, block, element, index, opacity]);
   return <View testID="rich-link-thumbnail" accessible={false} aria-hidden accessibilityElementsHidden
-    importantForAccessibility="no-hide-descendants" className="items-center justify-center overflow-hidden border-border border"
-    style={{ width: 64, height: 64, flexShrink: 0, borderRadius: 14, backgroundColor: color }}>
-    <Text allowFontScaling={false} className="text-white" style={{ fontSize: 26, fontWeight: '600' }}>{letter}</Text>
+    importantForAccessibility="no-hide-descendants" className="items-center justify-center overflow-hidden"
+    style={{ width: richGeometry.linkMarkSize, height: richGeometry.linkMarkSize, flexShrink: 0, borderRadius: richRadius.small, backgroundColor: color }}>
+    <Text allowFontScaling={false} className="text-source-foreground" style={{ fontSize: 18, fontWeight: '600' }}>{letter}</Text>
     {loaded && loaded.api === api && loaded.key === key && key ? <Animated.View pointerEvents="none"
       style={{ position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, opacity, backgroundColor: color }}>
       <ExpoImage source={{ uri: loaded.uri }} cachePolicy="none" contentFit="cover"
         style={{ width: '100%', height: '100%' }}
-        onLoad={() => Animated.timing(opacity, { toValue: 1, duration: 180, useNativeDriver: true }).start()}
+        onLoad={() => Animated.timing(opacity, { toValue: 1, duration: thumbnailFade, useNativeDriver: true }).start()}
         onError={() => {
           if (lease.current?.key === key) { lease.current.dispose(); lease.current = null; }
           setLoaded(null);
@@ -163,11 +178,11 @@ export function MediaCard({ item, title, description, tags, direction, api, loca
   api?: GatewayApi; location?: MediaLocation; fileId?: string;
 }) {
   const horizontal = direction === 'horizontal';
-  return <View className={`border-border overflow-hidden border bg-card ${horizontal ? 'flex-row' : ''}`}
-    style={{ borderRadius: richRadius.medium }} testID="rich-media-card">
-    <View style={horizontal ? { width: '42%' } : undefined}><MediaPicture api={api} location={location} fileId={fileId} alt={item.alt}
+  // `MediaCard.horizontal` / `.vertical`: no frame; the image fills its slot (cover).
+  return <View className={horizontal ? 'flex-row items-start' : ''} style={{ gap: richSpace.md }} testID="rich-media-card">
+    <View style={horizontal ? { width: '42%' } : undefined}><MediaPicture api={api} location={location} fileId={fileId} alt={item.alt} contentFit="cover"
       height={horizontal ? richGeometry.horizontalImageHeight : richGeometry.imageHeight} /></View>
-    <View className="min-w-0 flex-1" style={{ gap: richSpace.sm, padding: richSpace.md }}><RichText style={richType.title}>{title}</RichText>
+    <View className="min-w-0 flex-1" style={{ gap: richSpace.xs }}><RichText style={richType.title}>{title}</RichText>
       {description ? <RichText className="text-muted-foreground" style={richType.subtle}>{description}</RichText> : null}
       {tags?.length ? <View className="flex-row flex-wrap" style={{ gap: richSpace.xs }}>{tags.map((tag, i) => <View key={i} className="bg-muted"
         style={{ borderRadius: richRadius.full, paddingHorizontal: richSpace.sm, paddingVertical: richSpace.xs }}>
@@ -208,8 +223,9 @@ export function MediaGallery({ items, api, locate, fileFor }: {
       <MediaPicture api={api} location={locate(index)} fileId={fileFor(item)} alt={item.alt} height={richGeometry.galleryHeight} />
       {!scrollable && item.caption ? <RichText className="text-muted-foreground" style={{ ...richType.subtle, marginTop: richSpace.sm }}>{item.caption}</RichText> : null}
     </View>;
-  return <View className="border-border border bg-card" style={{ gap: richSpace.sm, borderRadius: richRadius.medium, padding: richSpace.sm }}
-    onLayout={(event) => setWidth(event.nativeEvent.layout.width - 2 * richSpace.sm - 2)} testID="rich-gallery">
+  // `Gallery.single` / `.pair` / `.scroll`: no frame; tiles sit directly in the message.
+  return <View style={{ gap: richSpace.sm }}
+    onLayout={(event) => setWidth(event.nativeEvent.layout.width)} testID="rich-gallery">
     {width > 0 ? scrollable
       ? <DrawerHorizontalGesture><FlatList ref={list} horizontal data={items} keyExtractor={(_, index) => String(index)}
         style={{ height: richGeometry.galleryHeight, ...(Platform.OS === 'web' ? { scrollSnapType: 'x mandatory' as const } : {}) }}
@@ -224,18 +240,21 @@ export function MediaGallery({ items, api, locate, fileFor }: {
       : <View className="flex-row" style={{ gap }}>{items.map(picture)}</View> : null}
     {scrollable && items[page]?.caption ? <RichText testID="rich-gallery-caption" className="text-muted-foreground"
       style={{ ...richType.subtle, paddingHorizontal: richSpace.xs }}>{items[page].caption}</RichText> : null}
-    {scrollable ? <View className="flex-row items-center justify-between"><Text style={richType.subtle}>{page + 1} / {items.length}</Text>
-      <View className="flex-row" style={{ gap: richSpace.md }}>{[-1, 1].map((step) => <Pressable key={step} accessibilityRole="button" accessibilityLabel={step < 0 ? t('上一张图片') : t('下一张图片')}
-        disabled={page + step < 0 || page + step >= items.length} onPress={() => {
-          const next = page + step;
-          if (next >= 0 && next < items.length) {
+    {scrollable ? <View className="flex-row items-center justify-between">
+      <Text className="text-muted-foreground" style={richType.subtle}>{page + 1} / {items.length}</Text>
+      {/* Icon buttons keep a 48 target (F3); the previous 16px glyphs had no minimum size. */}
+      <View className="flex-row">{[-1, 1].map((step) => {
+        const next = page + step;
+        const disabled = next < 0 || next >= items.length;
+        return <Button key={step} intent="quiet" size="icon" accessibilityLabel={step < 0 ? t('上一张图片') : t('下一张图片')}
+          disabled={disabled} onPress={() => {
             selectedPage.current = next;
             setPage(next);
             list.current?.scrollToIndex({ index: next, animated: false });
-          }
-        }}>
-        <Text className={page + step < 0 || page + step >= items.length ? 'text-muted-foreground' : 'text-foreground'}
-          style={richType.body}>{step < 0 ? '‹' : '›'}</Text>
-      </Pressable>)}</View></View> : null}
+          }}>
+          <Icon as={step < 0 ? ChevronLeft : ChevronRight} size={22} />
+        </Button>;
+      })}</View>
+    </View> : null}
   </View>;
 }

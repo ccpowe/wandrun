@@ -7,7 +7,7 @@ import { MouseModeRecognizer, WheelControl } from "../src/takeover-lab/mouse-ges
 
 const finger = (id: number, x: number, y: number) => ({ id, x, y });
 const event = (type: TouchEvent["type"], t: number, allTouches: { id: number; x: number; y: number }[], changedTouches = allTouches) =>
-  gestureTouches(type, { allTouches, changedTouches }, t);
+  ({ ...gestureTouches(type, { allTouches, changedTouches }), t });
 
 for (const firstUp of ["button", "surface"] as const) {
   test(`native cross-region drag releases on ${firstUp} lift and flushes sub-frame motion first`, () => {
@@ -81,3 +81,52 @@ test("native wheel release and cancel stop scrolling with the lifted pointer sti
     assert.equal(wheel.tick(50), 0);
   }
 });
+
+for (const [missing, payload] of [
+  ["allTouches", { changedTouches: [finger(1, 10, 10)] }],
+  ["changedTouches", { allTouches: [finger(1, 10, 10)] }],
+  ["both arrays", {}],
+] as const) {
+  test(`browser.B6 missing ${missing} cancels a held drag and stops the wheel without a click`, () => {
+    const mouse = new MouseModeRecognizer(), wheel = new WheelControl();
+    const button = finger(0, 30, 30), surface = finger(1, 10, 10);
+    mouse.handleButton("left", event("start", 0, [button]));
+    mouse.handle(event("start", 10, [surface]));
+    mouse.handle(event("move", 30, [finger(1, 20, 10)]));
+    wheel.handle(event("start", 0, [surface]));
+    wheel.handle(event("move", 10, [finger(1, 10, 50)]));
+    wheel.tick(10);
+    assert.ok(wheel.tick(30) > 0);
+
+    const cancelled = { ...gestureTouches("end", payload), t: 40 };
+    assert.equal(cancelled.type, "cancel");
+    assert.deepEqual(cancelled.touches, []);
+    assert.deepEqual(mouse.handle(cancelled), [{ kind: "release", button: "left", count: 1 }]);
+    assert.deepEqual(mouse.handleButton("left", cancelled), []);
+    wheel.handle(cancelled);
+    assert.equal(wheel.active, false);
+    assert.equal(wheel.offset, 0);
+    assert.equal(wheel.tick(60), 0);
+    assert.deepEqual(mouse.handle(cancelled), [], "duplicate cancellation cannot release twice");
+
+    mouse.handleButton("right", event("start", 100, [button]));
+    assert.deepEqual(mouse.handleButton("right", cancelled), [], "missing data cannot synthesize a right click");
+    mouse.handleButton("right", event("start", 200, [button]));
+    assert.deepEqual(mouse.handleButton("right", event("end", 240, [button])),
+      [{ kind: "click", button: "right", count: 1 }], "a later complete contact still works");
+  });
+}
+
+for (const type of ["start", "move"] as const) {
+  test(`browser.B6 ${type} without allTouches cancels a pending tap instead of inventing a click`, () => {
+    const mouse = new MouseModeRecognizer();
+    mouse.handle(event("start", 0, [finger(1, 10, 10)]));
+    const cancelled = { ...gestureTouches(type, {}), t: 10 };
+    assert.equal(cancelled.type, "cancel");
+    assert.deepEqual(mouse.handle(cancelled), []);
+    assert.deepEqual(mouse.handle(event("end", 20, [finger(1, 10, 10)])), []);
+    mouse.handle(event("start", 100, [finger(1, 10, 10)]));
+    assert.deepEqual(mouse.handle(event("end", 140, [finger(1, 10, 10)])),
+      [{ kind: "click", button: "left", count: 1 }]);
+  });
+}

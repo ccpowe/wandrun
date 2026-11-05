@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { AccessibilityInfo, Alert, Pressable, View, Platform } from 'react-native';
+import { AccessibilityInfo, Pressable, View, Platform } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import { ChevronDown, ChevronRight, File, FileCode2, Folder, FolderOpen, FolderTree } from 'lucide-react-native';
 import { Icon } from '@/components/ui/icon.tsx';
@@ -12,9 +12,17 @@ const INDENT = 18;
 const CODE_FILE = /\.(?:[cm]?[jt]sx?|json|ya?ml|toml|py|go|rs|java|kt|swift|css|scss|html|vue|sh|sql|md|xml|c|h|cpp|hpp)$/i;
 
 type RowProps = { node: FileTreeNode; depth: number; collapsed: ReadonlyMap<string, boolean>;
-  toggle: (path: string, current: boolean) => void };
+  toggle: (path: string, current: boolean) => void;
+  /** Path whose last copy attempt failed; shown inline under that row instead of a system alert. */
+  copyFailed: string | null; onCopyResult: (path: string, ok: boolean) => void };
 
-function TreeRow({ node, depth, collapsed, toggle }: RowProps) {
+/** Long names wrap at `-` `_` `.` `/` and camelCase boundaries before Android's simple strategy splits letters
+ * (zero-width spaces are display-only; labels and copied paths keep the original name). */
+export function breakableName(name: string): string {
+  return name.replace(/([-_./])(?=.)/g, '$1\u200B').replace(/([a-z0-9])(?=[A-Z])/g, '$1\u200B');
+}
+
+function TreeRow({ node, depth, collapsed, toggle, copyFailed, onCopyResult }: RowProps) {
   const { t } = useTranslation();
   const folder = node.kind === 'folder';
   const hasChildren = node.children.length > 0;
@@ -22,10 +30,12 @@ function TreeRow({ node, depth, collapsed, toggle }: RowProps) {
   const label = folder ? `${node.name}，${hasChildren ? closed ? t('已折叠') : t('展开') : t('空目录')}` : node.path;
   const copyPath = async () => {
     try {
-      if (!await Clipboard.setStringAsync(node.path)) throw new Error(t('剪贴板不可用，请稍后重试。'));
+      if (!await Clipboard.setStringAsync(node.path)) throw new Error('clipboard unavailable');
+      onCopyResult(node.path, true);
       AccessibilityInfo.announceForAccessibility(t('已复制路径'));
     } catch {
-      Alert.alert(t('无法复制路径'), t('剪贴板不可用，请稍后重试。'));
+      onCopyResult(node.path, false);
+      AccessibilityInfo.announceForAccessibility(t('无法复制路径'));
     }
   };
   const content = <>
@@ -41,7 +51,7 @@ function TreeRow({ node, depth, collapsed, toggle }: RowProps) {
     <Text textBreakStrategy="simple" className="text-foreground" style={{ flex: 1, minWidth: 0, fontSize: 14, lineHeight: 20,
       ...(Platform.OS === 'web' ? { overflowWrap: 'anywhere' as const } : {}) }}>
       <Text className="text-foreground" style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 13.5,
-        lineHeight: 20, fontWeight: folder ? '600' : '400' }}>{node.name}</Text>
+        lineHeight: 20, fontWeight: folder ? '600' : '400' }}>{breakableName(node.name)}</Text>
       {closed && hasChildren ? <Text className="text-muted-foreground" style={{ fontSize: 12, lineHeight: 20 }}>  {t('{count} 项', { count: node.children.length })}</Text> : null}
       {node.note ? <Text className="text-muted-foreground" style={{ fontSize: 13, lineHeight: 20 }}>  {node.note}</Text> : null}
     </Text>
@@ -60,7 +70,10 @@ function TreeRow({ node, depth, collapsed, toggle }: RowProps) {
       className="flex-row items-start" style={{ minHeight: 32, gap: 6, paddingLeft: 12 + INDENT * depth, paddingRight: richSpace.md, paddingVertical: 6 }}>
       {content}
     </View>}
-    {!closed && node.children.map(child => <TreeRow key={child.path} node={child} depth={depth + 1} collapsed={collapsed} toggle={toggle} />)}
+    {copyFailed === node.path ? <Text testID="rich-tree-copy-failed" className="text-muted-foreground"
+      style={{ fontSize: 12, lineHeight: 16, paddingLeft: 12 + INDENT * depth + 22, paddingBottom: 4 }}>{t('无法复制路径')}</Text> : null}
+    {!closed && node.children.map(child => <TreeRow key={child.path} node={child} depth={depth + 1} collapsed={collapsed} toggle={toggle}
+      copyFailed={copyFailed} onCopyResult={onCopyResult} />)}
   </>;
 }
 
@@ -88,6 +101,8 @@ export function FileTreeDisplay({ props }: { props: { title?: string; nodes: Fil
   const folders = [...initial.keys()];
   const allCollapsed = folders.length > 0 && folders.every(path => collapsed.get(path));
   const toggle = (path: string, current: boolean) => setManual(previous => new Map(previous).set(path, !current));
+  const [copyFailed, setCopyFailed] = useState<string | null>(null);
+  const onCopyResult = (path: string, ok: boolean) => setCopyFailed(ok ? null : path);
   const toggleAll = () => setManual(new Map(folders.map(path => [path, !allCollapsed])));
   return <View className="bg-muted" style={{ borderRadius: 14, paddingTop: 6, paddingBottom: 8 }} testID="rich-file-tree">
     <View className="flex-row items-center" style={{ gap: richSpace.sm, paddingLeft: 14, paddingRight: 8, paddingTop: 4, paddingBottom: 6 }}>
@@ -98,6 +113,7 @@ export function FileTreeDisplay({ props }: { props: { title?: string; nodes: Fil
         <Text className="text-foreground" style={{ fontSize: 13, lineHeight: 20 }}>{allCollapsed ? t('全部展开') : t('全部折叠')}</Text>
       </Pressable> : null}
     </View>
-    {roots.map(node => <TreeRow key={node.path} node={node} depth={0} collapsed={collapsed} toggle={toggle} />)}
+    {roots.map(node => <TreeRow key={node.path} node={node} depth={0} collapsed={collapsed} toggle={toggle}
+      copyFailed={copyFailed} onCopyResult={onCopyResult} />)}
   </View>;
 }

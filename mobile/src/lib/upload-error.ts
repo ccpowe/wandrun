@@ -16,7 +16,7 @@ export class LocalUploadError extends Error {
   }
 }
 
-const endpointMessage = "上传地址不安全，请检查电脑连接后重试";
+const endpointMessage = "上传地址不安全，请检查服务器连接后重试";
 
 /** Reject an upload URL before tus can attach a bearer header or open a transport. */
 export class UploadEndpointError extends Error {
@@ -68,13 +68,13 @@ export function uploadErrorMessage(error: unknown, localFailure?: LocalFailure):
     const status = detail.originalResponse?.getStatus();
     switch (status) {
       case 413: return "文件超过大小上限";
-      case 507: return "电脑磁盘空间不足";
+      case 507: return "服务器磁盘空间不足";
       case 404:
       case 410: return "上传已过期或不存在，需重新上传";
       case 401:
-      case 403: return "上传未获授权，请检查电脑连接";
+      case 403: return "上传未获授权，请检查服务器连接";
     }
-    if (detail.originalRequest && (status === undefined || status === 0)) return "连不上电脑";
+    if (detail.originalRequest && (status === undefined || status === 0)) return "连不上服务器";
   }
   return "上传失败，请重试";
 }

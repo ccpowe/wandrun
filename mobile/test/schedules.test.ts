@@ -3,8 +3,8 @@ import { test } from "node:test";
 
 import type { Schedule } from "../src/gateway/api.ts";
 import { ChatSession } from "../src/gateway/session.ts";
-import { buildItems } from "../src/lib/chat-timeline.ts";
-import { changedScheduleFields, editableSchedule } from "../src/lib/schedules.ts";
+import { projectChatRows } from "../src/lib/chat-timeline.ts";
+import { changedScheduleFields, editableSchedule, validateSchedule } from "../src/lib/schedules.ts";
 
 const schedule: Schedule = {
   id: "s/1", agent_id: "agent", name: "简报", content: "整理新闻", rule: { kind: "daily", time: "08:00" },
@@ -40,6 +40,21 @@ test("调度资源事件按序更新全局版本和墓碑；触发系统行与�
   const triggered = { seq: 9, type: "schedule.triggered", conversation_id: "c", at: 9,
     data: { schedule_id: "s", run_id: 7, name: "新闻", scheduled_at: 10 } };
   session["apply"](triggered);
-  assert.deepEqual(buildItems(session.timeline("c").events, []).map((item) => item.event?.type), ["schedule.triggered"]);
+  assert.deepEqual(projectChatRows({ events: session.timeline("c").events, pending: [] }).rows.map((item) => item.event?.type), ["schedule.triggered"]);
   void session.close();
+});
+
+test("schedule-editor.B4 本地校验报告所属字段，Unicode 边界与周几不留空", () => {
+  const draft = editableSchedule(schedule);
+  assert.equal(validateSchedule({ ...draft, name: "🙂".repeat(64) }), null);
+  assert.equal(validateSchedule({ ...draft, name: "🙂".repeat(65) })?.field, "name");
+  assert.equal(validateSchedule({ ...draft, name: "第一行\n第二行" })?.field, "name");
+  assert.equal(validateSchedule({ ...draft, content: "文".repeat(20_000) }), null);
+  assert.equal(validateSchedule({ ...draft, content: "文".repeat(20_001) })?.field, "content");
+  assert.equal(validateSchedule({ ...draft, timezone: " " })?.field, "timezone");
+  assert.equal(validateSchedule({ ...draft, rule: { kind: "daily", time: "24:00" } })?.field, "rule");
+  assert.equal(validateSchedule({ ...draft, rule: { kind: "weekly", time: "08:00", weekdays: [] } })?.field, "rule");
+  assert.equal(validateSchedule({ ...draft, rule: { kind: "once", local_at: "2026-10-30 08:00" } })?.field, "rule");
+  assert.equal(validateSchedule({ ...draft, rule: { kind: "cron", expression: " " } })?.field, "rule");
+  assert.equal(validateSchedule({ ...draft, rule: { kind: "cron", expression: "0 8 * * *" } }), null);
 });

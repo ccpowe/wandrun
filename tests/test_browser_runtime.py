@@ -26,9 +26,9 @@ from wandrun.integrations.browser_dev import ChromeDev
 from wandrun.integrations.local_processes import ProcessTable
 from wandrun.integrations.shell_backend import ManagedShellBackend
 from wandrun.runtime.browser.tools import BrowserTakeoverMiddleware
-from wandrun.runtime.browser.leases import BrowserLeases, BrowserRejected
+from wandrun.runtime.browser.leases import BrowserLeases, BrowserRejected, _Lease
 from wandrun.runtime.execution.code_mode import CodeModeCatalog, code_mode_tool
-from wandrun.runtime.execution.files import TaskBackend
+from wandrun.runtime.execution.files import TaskBackend, TaskFiles
 from wandrun.runtime.session import _browser_notify
 from wandrun.runtime.execution.process_tools import process_tools
 from wandrun.runtime.communication.workers import WorkerManager
@@ -53,6 +53,115 @@ with connect(ws_url, open_timeout=5) as socket:
                                     if target["type"] == "page")))
             break
 '''
+
+
+class BrowserSwitchInventoryTests(unittest.IsolatedAsyncioTestCase):
+    def browser(self):
+        # No start(): a Backend-switch query must not need a live Chrome.
+        return BrowserLeases(BrowserDefinition("http://127.0.0.1:1"))
+
+    async def test_registration_and_released_history_do_not_block_switch(self):
+        browser = self.browser()
+        browser.register("unused", "root", "agent", "entry")
+        browser.register("history", "root", "agent", "entry")
+        owner = browser._tasks["history"]
+        owner.lease = _Lease("old", "history", "root", "agent", "entry", state="released")
+        self.assertEqual(browser.pending_tasks("agent"), [])
+        self.assertEqual(browser.pending_tasks("other"), [])
+
+    async def test_active_and_unconfirmed_leases_block_only_their_agent(self):
+        browser = self.browser()
+        for state in ("agent", "human", "stopping", "revoking"):
+            task = "task-" + state
+            browser.register(task, "root", "agent", "entry")
+            owner = browser._tasks[task]
+            owner.lease = _Lease(task, task, "root", "agent", "entry", state=state)
+            owner.registered = False  # Revocation cannot erase cleanup ownership.
+        self.assertEqual(set(browser.pending_tasks("agent")),
+                         {"task-agent", "task-human", "task-stopping", "task-revoking"})
+        self.assertEqual(browser.pending_tasks("other"), [])
+
+    async def test_preparation_admission_and_close_hold_switch_until_settled(self):
+        browser = self.browser()
+        browser.register("task", "root", "agent", "entry")
+        owner = browser._tasks["task"]
+        for attribute in ("preparing", "closing"):
+            with self.subTest(operation=attribute):
+                operation = asyncio.get_running_loop().create_future()
+                setattr(owner, attribute, operation)
+                self.assertEqual(browser.pending_tasks("agent"), ["task"])
+                operation.set_result(None)
+                self.assertEqual(browser.pending_tasks("agent"), [])
+        owner.admitting = True
+        self.assertEqual(browser.pending_tasks("agent"), ["task"])
+        owner.admitting = False
+        self.assertEqual(browser.pending_tasks("agent"), [])
+
+    async def test_page_less_cli_endpoint_blocks_until_close_is_confirmed(self):
+        browser = self.browser()
+        browser.register("task", "root", "agent", "entry")
+        endpoint = await browser._serve("task", "unallocated", 1)
+        browser._tasks["task"].endpoint = endpoint
+        try:
+            self.assertIsNone(browser.lease_for_task("task"))
+            self.assertEqual(browser.pending_tasks("agent"), ["task"])
+            endpoint.server.close()
+            # Listener close alone does not confirm its connected clients ended.
+            self.assertEqual(browser.pending_tasks("agent"), ["task"])
+            await browser._close_endpoint(endpoint)
+            self.assertEqual(browser.pending_tasks("agent"), [])
+        finally:
+            if endpoint in browser._tasks["task"].endpoints:
+                await browser._close_endpoint(endpoint)
+
+    async def test_switch_retires_only_idle_access_without_revoking_registration(self):
+        browser = self.browser()
+        browser.register("idle", "root", "agent", "entry")
+        browser.register("active", "root", "agent", "entry")
+        browser.register("other", "root", "other-agent", "entry")
+        endpoints = {}
+        for task in ("idle", "active", "other"):
+            endpoint = await browser._serve(task, task + "-lease", 1)
+            browser._tasks[task].endpoint = endpoint
+            endpoints[task] = endpoint
+        active = browser._tasks["active"]
+        active.lease = _Lease("active-lease", "active", "root", "agent", "entry")
+        try:
+            await browser.revoke_idle_endpoints("agent")
+            self.assertEqual(browser.pending_tasks("agent"), ["active"])
+            self.assertTrue(browser._tasks["idle"].registered)
+            self.assertIsNone(browser._tasks["idle"].endpoint)
+            self.assertTrue(endpoints["active"].server.is_serving())
+            self.assertTrue(endpoints["other"].server.is_serving())
+            self.assertEqual(active.lease.state, "agent")
+        finally:
+            for task, endpoint in endpoints.items():
+                if endpoint in browser._tasks[task].endpoints:
+                    await browser._close_endpoint(endpoint)
+
+    async def test_waiting_or_acquiring_cli_access_cannot_be_retired(self):
+        browser = self.browser()
+        browser.register("task", "root", "agent", "entry")
+        endpoint = await browser._serve("task", "unallocated", 1)
+        browser._tasks["task"].endpoint = endpoint
+        operation = asyncio.get_running_loop().create_future()
+        try:
+            endpoint.waiting = 1
+            await browser.revoke_idle_endpoints("agent")
+            self.assertTrue(endpoint.server.is_serving())
+            endpoint.waiting = 0
+            endpoint.acquiring = operation
+            await browser.revoke_idle_endpoints("agent")
+            self.assertTrue(endpoint.server.is_serving())
+            self.assertEqual(browser.pending_tasks("agent"), ["task"])
+            operation.set_result(None)
+            await browser.revoke_idle_endpoints("agent")
+            self.assertEqual(browser.pending_tasks("agent"), [])
+        finally:
+            if not operation.done():
+                operation.cancel()
+            if endpoint in browser._tasks["task"].endpoints:
+                await browser._close_endpoint(endpoint)
 
 
 class BrowserToolRejectionTests(unittest.IsolatedAsyncioTestCase):
@@ -203,7 +312,7 @@ class BrowserCommandEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             script = root / "cdp_client.py"
             script.write_text(CLIENT, encoding="utf-8")
             command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
-            leases = BrowserLeases(BrowserDefinition(chrome.cdp_url, slots=2), state_path=root / "leases.json")
+            leases = BrowserLeases(BrowserDefinition(chrome.cdp_url), state_path=root / "leases.json")
             await leases.start()
             table = ProcessTable(cwd=root, log_dir=root / "logs", termination_grace=0.1)
             results = {}
@@ -232,10 +341,13 @@ class BrowserCommandEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
                 backend = ManagedShellBackend(root_dir=root, virtual_mode=False, inherit_env=True, timeout=10)
                 try:
+                    files = TaskFiles(
+                        root, manager, {"worker": ("local", str(root))}, conversation_workdirs=False,
+                    )
                     async with pm.AsyncMonty() as pool:
                         tool = code_mode_tool(
                             pool,
-                            TaskBackend(backend, lambda _: str(root), task_id="task-a", browser=leases),
+                            TaskBackend(backend, files, task_id="task-a", browser=leases),
                             CodeModeCatalog([], []),
                         )
                         result = await tool.ainvoke({

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { toASCII } from 'tr46';
 import iconNames from '../../../../src/wandrun/gateway/ui_icons.json' with { type: 'json' };
+import catalog from '../../../../src/wandrun/gateway/ui_catalog.json' with { type: 'json' };
 import { getLocale, t } from '../../lib/i18n.ts';
 
 function codepoints(value: string): number {
@@ -19,6 +20,19 @@ const key = z.string().refine((value) =>
 const optionValue = short.min(1);
 const tone = z.enum(['neutral', 'active', 'success', 'warning', 'error', 'info']);
 const iconName = z.enum(iconNames as [string, ...string[]]);
+const childWidth = z.enum(catalog.$defs.childWidth.enum as ['1/2', '1/3', '2/3', 'auto']);
+export type RichChildWidth = z.infer<typeof childWidth>;
+const stateBinding = z.strictObject({ $state: z.string().regex(/^\/[A-Za-z_][A-Za-z0-9_]{0,63}$/) });
+const boundShort = z.union([short, stateBinding]);
+const boundLong = z.union([long, stateBinding]);
+const sendAction = z.strictObject({ text: bounded(2000).min(1).refine(value => value.trim().length > 0) });
+const literal = z.union([z.string(), z.number().finite(), z.boolean(), z.null(), z.array(z.string())]);
+const conditionFields = { $state: stateBinding.shape.$state, not: z.literal(true).optional() };
+const conditionSchema = z.union([
+  z.strictObject(conditionFields),
+  z.strictObject({ ...conditionFields, eq: literal }),
+  z.strictObject({ ...conditionFields, neq: literal }),
+]);
 /** Syntax-only delivery validation; the gateway separately owns DNS and download policy. */
 const webUrl = z.string().min(1).refine((value) => {
   if (codepoints(value) > 2048 || !/^https?:\/\//.test(value) || /[\u0000-\u0020\u007f\\]/.test(value)) return false;
@@ -94,15 +108,19 @@ function validFileTree(nodes: z.infer<typeof fileTreeNode>[]): boolean {
 
 /** Defensive renderer validation; rich_catalog_validation.test.ts compares every constraint with the authoritative catalog. */
 export const componentSchemas = {
-  Stack: z.strictObject({ direction: z.enum(['vertical', 'horizontal']).optional(), gap: z.enum(['sm', 'md']).optional(), justify: z.enum(['start', 'between']).optional() }),
+  Stack: z.strictObject({ direction: z.enum(['vertical', 'horizontal']).optional(), gap: z.enum(['none', 'sm', 'md', 'lg']).optional(), justify: z.enum(['start', 'center', 'end', 'between']).optional(), align: z.enum(['start', 'center', 'end', 'stretch']).optional(), wrap: z.boolean().optional() }),
+  ScrollRow: z.strictObject({ gap: z.enum(['none', 'sm', 'md', 'lg']).optional() }),
   Card: z.strictObject({ title: short.optional() }),
   Divider: z.strictObject({}),
-  Heading: z.strictObject({ text: long }),
-  Text: z.strictObject({ text: long, tone: z.enum(['default', 'muted']).optional() }),
+  Heading: z.strictObject({ text: boundLong }),
+  Text: z.strictObject({ text: boundLong, tone: z.enum(['default', 'muted']).optional() }),
   Badge: z.strictObject({ text: long, tone: tone.optional() }),
   Status: z.strictObject({ title: short, badge: badge.optional(), progress: percent.optional(), caption: long.optional() }),
   Metrics: z.strictObject({ items: z.array(z.strictObject({ label: short, value: short, hint: long.optional() })).min(1).max(4) }),
-  KeyValue: z.strictObject({ items: z.array(z.strictObject({ label: short, value: short })).min(1).max(12) }),
+  StatCard: z.strictObject({ icon: iconName.optional(), badge: badge.optional(), label: short, value: boundShort, description: long.optional(), send: sendAction.optional() }),
+  Field: z.strictObject({ label: short, value: boundShort.optional() }),
+  ButtonRow: z.strictObject({}),
+  KeyValue: z.strictObject({ items: z.array(z.strictObject({ label: short, value: boundShort })).min(1).max(12) }),
   Steps: z.strictObject({ items: z.array(z.strictObject({ label: short, state: z.enum(['done', 'current', 'todo', 'failed']), note: long.optional() })).min(1).max(10) }),
   Progress: z.strictObject({ value: percent, caption: long.optional() }),
   Table: z.strictObject({ columns: z.array(short).min(1).max(5), rows: z.array(z.array(z.union([short, z.strictObject({ badge })]))).min(1).max(12) }),
@@ -114,10 +132,12 @@ export const componentSchemas = {
   Slider: z.strictObject({ stateKey: key, label: short, min: z.number().finite(), max: z.number().finite(), step: z.number().finite().positive() }),
   TextInput: z.strictObject({ stateKey: key, label: short, placeholder: long.optional(), multiline: z.boolean().optional() }),
   DateInput: z.strictObject({ stateKey: key, label: short }),
-  Submit: z.strictObject({ label: short }),
-  LineChart: z.strictObject({ title: chartTitle.optional(), xLabels: z.array(chartLabel).min(2).max(24), series: z.array(z.strictObject({ name: chartName, values: z.array(finite) })).min(1).max(3), unit: chartUnit.optional() }),
-  BarChart: z.strictObject({ title: chartTitle.optional(), labels: z.array(chartLabel).min(1).max(12), values: z.array(finite.nonnegative()), unit: chartUnit.optional() }),
-  PieChart: z.strictObject({ title: chartTitle.optional(), items: z.array(z.strictObject({ label: chartName, value: finite.positive() })).min(2).max(6), unit: chartUnit.optional() }),
+  Submit: z.strictObject({ label: short, send: sendAction.optional() }),
+  Copy: z.strictObject({ label: short, text: z.union([bounded(2000), stateBinding]) }),
+  FollowUps: z.strictObject({ items: z.array(z.strictObject({ label: short, text: sendAction.shape.text })).min(2).max(4) }),
+  LineChart: z.strictObject({ title: chartTitle.optional(), xLabels: z.array(chartLabel).max(24), series: z.array(z.strictObject({ name: chartName, values: z.array(finite) })).max(3), unit: chartUnit.optional() }),
+  BarChart: z.strictObject({ title: chartTitle.optional(), labels: z.array(chartLabel).max(12), series: z.array(z.strictObject({ name: chartName, values: z.array(finite) })).max(3), horizontal: z.boolean().optional(), unit: chartUnit.optional() }),
+  PieChart: z.strictObject({ title: chartTitle.optional(), items: z.array(z.strictObject({ label: chartName, value: finite.nonnegative() })).max(6), unit: chartUnit.optional() }),
   Tabs: z.strictObject({ tabs: z.array(z.strictObject({ label: chartLabel })).min(2).max(5) }),
   Accordion: z.strictObject({ title: chartTitle, defaultOpen: z.boolean().optional() }),
   Grid: z.strictObject({ columns: z.union([z.literal(2), z.literal(3)]) }),
@@ -137,9 +157,9 @@ export const componentSchemas = {
 } as const;
 
 export const richComponentNames = Object.keys(componentSchemas) as (keyof typeof componentSchemas)[];
-type Element = { type: keyof typeof componentSchemas; props: Record<string, any>; children: string[] };
+type Element = { type: keyof typeof componentSchemas; props: Record<string, any>; children: string[]; width?: RichChildWidth; visible?: z.infer<typeof conditionSchema> };
 export type RichSpec = { root: string; elements: Record<string, Element>; state: Record<string, unknown> };
-export type SubmissionFailure = { message: string; retryable: boolean; editable: boolean };
+export type SubmissionFailure = { message: string; retryable: boolean; editable: boolean; unknown?: boolean };
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -224,12 +244,16 @@ export function parseRichSpec(source: string): RichSpec | null {
       const element = elements[id];
       if (!object(element) || typeof element.type !== 'string' || !Object.hasOwn(componentSchemas, element.type) ||
           !object(element.props) || !Array.isArray(element.children) ||
-          Object.keys(element).some((name) => !['type', 'props', 'children'].includes(name)) ||
+          Object.keys(element).some((name) => !['type', 'props', 'children', 'width', 'visible'].includes(name)) ||
           !element.children.every((child) => typeof child === 'string')) return null;
       const type = element.type as Element['type'];
       const props = componentSchemas[type].safeParse(element.props);
       if (!props.success) return null;
-      if (!['Stack', 'Card', 'Grid', 'Tabs', 'Accordion'].includes(type) && element.children.length !== 0) return null;
+      if (Object.hasOwn(element, 'width') && !childWidth.safeParse(element.width).success) return null;
+      if (Object.hasOwn(element, 'visible') && (!conditionSchema.safeParse(element.visible).success ||
+          !object(element.visible) || !Object.hasOwn(state, String(element.visible.$state).slice(1)) ||
+          !key.safeParse(String(element.visible.$state).slice(1)).success)) return null;
+      if (!catalog.components[type].container && element.children.length !== 0) return null;
       if (type === 'ChoiceGroup' || type === 'Select' || type === 'Segmented' || type === 'MultiSelect') {
         const options = (props.data as z.infer<typeof componentSchemas.ChoiceGroup>).options;
         if (new Set(options.map((option) => option.value)).size !== options.length) return null;
@@ -244,7 +268,7 @@ export function parseRichSpec(source: string): RichSpec | null {
       }
       if (type === 'BarChart') {
         const chart = props.data as z.infer<typeof componentSchemas.BarChart>;
-        if (chart.values.length !== chart.labels.length) return null;
+        if (chart.series.some((series) => series.values.length !== chart.labels.length)) return null;
       }
       if (type === 'FileTree' && !validFileTree((props.data as z.infer<typeof componentSchemas.FileTree>).nodes)) return null;
       if (type === 'Tabs' && element.children.length !== (props.data as z.infer<typeof componentSchemas.Tabs>).tabs.length) return null;
@@ -252,21 +276,39 @@ export function parseRichSpec(source: string): RichSpec | null {
         const slider = props.data as z.infer<typeof componentSchemas.Slider>;
         if (slider.max < slider.min) return null;
       }
-      nodes[id] = { type, props: props.data, children: element.children as string[] };
+      nodes[id] = { type, props: props.data, children: element.children as string[],
+        ...(Object.hasOwn(element, 'width') ? { width: element.width as RichChildWidth } : {}),
+        ...(Object.hasOwn(element, 'visible') ? { visible: element.visible as Element['visible'] } : {}) };
     }
     const seen = new Set<string>();
-    const walk = (id: string, depth: number): boolean => {
+    const walk = (id: string, depth: number, parent?: Element['type']): boolean => {
       if (depth > 8 || seen.has(id) || !Object.hasOwn(nodes, id)) return false;
+      const node = nodes[id];
+      if (node.width !== undefined && (!parent || !catalog.widthContainers.includes(parent))) return false;
+      const definition = catalog.components[node.type] as { childCount?: number; childTypes?: string[] };
+      if (definition.childCount !== undefined && node.children.length !== definition.childCount ||
+          definition.childTypes && node.children.some((child) => !nodes[child] || !definition.childTypes!.includes(nodes[child].type))) return false;
+      if (node.type === 'ButtonRow' && node.children.filter(child => nodes[child]?.type === 'Submit').length !== 1) return false;
       seen.add(id);
-      return nodes[id].children.every((child) => walk(child, depth + 1));
+      return node.children.every((child) => walk(child, depth + 1, node.type));
     };
     if (!walk(root, 1) || seen.size !== ids.length) return null;
     const fields = Object.values(nodes).filter((node) => Object.hasOwn(inputTypes, node.type));
     const keys = fields.map((node) => node.props.stateKey as string);
+    const sendGroups = new Set(Object.entries(nodes).flatMap(([id, node]) =>
+      node.type === 'FollowUps' ? [id] : node.props.send ? [node.type === 'StatCard' ? '$statcards' : id] : []));
+    const submitCount = Object.values(nodes).filter(node => node.type === 'Submit' && !node.props.send).length;
     if (new Set(keys).size !== keys.length || Object.keys(state).length !== keys.length ||
         keys.some((name) => !Object.hasOwn(state, name)) ||
         fields.some((node) => !validValue(node, state[node.props.stateKey])) ||
-        Object.values(nodes).filter((node) => node.type === 'Submit').length !== (fields.length > 0 ? 1 : 0)) return null;
+        Object.values(nodes).some((node) => {
+          const values = node.type === 'KeyValue' ? node.props.items.map((item: { value: unknown }) => item.value) :
+            ['Text', 'Heading', 'Copy'].includes(node.type) ? [node.props.text] :
+              ['StatCard', 'Field'].includes(node.type) ? [node.props.value] : [];
+          return values.some((value: unknown) => object(value) && (!Object.hasOwn(state, String(value.$state).slice(1)) ||
+            !key.safeParse(String(value.$state).slice(1)).success));
+        }) ||
+        submitCount !== (fields.length > 0 ? 1 : 0) || submitCount + sendGroups.size > 1 || fields.length > 0 && sendGroups.size > 0) return null;
     return { root, elements: nodes, state: { ...state } };
   } catch {
     return null;
@@ -291,6 +333,11 @@ export function displayFieldValue(type: Element['type'], options: { value: strin
   return display || t('未填写');
 }
 
+/** A+ boundary (ADR-0081): any input or submit action frames the whole block; the model cannot opt in or out. */
+export function richBlockFramed(spec: Pick<RichSpec, 'elements'>): boolean {
+  return Object.values(spec.elements).some((node) => node.type === 'Submit' || node.type === 'FollowUps' || Object.hasOwn(inputTypes, node.type));
+}
+
 export function fieldSummaries(spec: RichSpec, values: Record<string, unknown>): { label: string; value: string }[] {
   return Object.values(spec.elements).filter((node) => Object.hasOwn(inputTypes, node.type)).map((node) => {
     const { props, type } = node;
@@ -299,10 +346,17 @@ export function fieldSummaries(spec: RichSpec, values: Record<string, unknown>):
   });
 }
 
-export function submissionError(error: unknown): SubmissionFailure {
+export function submissionError(error: unknown, sending = false): SubmissionFailure {
   const reason = object(error) ? error : {};
   const code = reason.code;
-  if (code === 'ui_already_submitted') return { message: t('这个界面已在其他设备提交。'), retryable: false, editable: false };
+  if (code === 'ui_already_submitted') return { message: t('这个界面已提交。'), retryable: false, editable: false };
+  if (sending && !['ui_block_not_found', 'collaboration_unavailable', 'collaboration_stopped'].includes(String(code))) {
+    const status = typeof reason.status === 'number' ? reason.status : 0;
+    if (status >= 400 && status < 500 && status !== 408) return {
+      message: status === 429 ? t('发送失败，请重试。') : t('发送失败'), retryable: status === 429, editable: false,
+    };
+    return { message: t('发送结果尚未确认，恢复连接后会核对。'), retryable: false, editable: false, unknown: true };
+  }
   if (code === 'ui_block_not_found') return { message: t('界面已失效或找不到，请刷新对话。'), retryable: false, editable: false };
   if (code === 'collaboration_unavailable') return { message: t('这个协作已无法继续'), retryable: false, editable: false };
   if (code === 'collaboration_stopped') return {

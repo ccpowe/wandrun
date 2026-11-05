@@ -12,7 +12,7 @@ Object.assign(globalThis, { __richTreeReact: React, __richTreeCopied: copied });
 const hosts: Record<string, string> = {
   'react-native': `export const View='View', Pressable='Pressable'; export const Platform={OS:'web'};
     export const AccessibilityInfo={announceForAccessibility:()=>{}}; export const Alert={alert:()=>{}};`,
-  'expo-clipboard': `export const setStringAsync=async path=>{globalThis.__richTreeCopied.push(path);return true;};`,
+  'expo-clipboard': `export const setStringAsync=async path=>{if(globalThis.__richTreeCopyFails)return false;globalThis.__richTreeCopied.push(path);return true;};`,
   'lucide-react-native': `export const ChevronDown='ChevronDown', ChevronRight='ChevronRight', File='File', FileCode2='FileCode2', Folder='Folder', FolderOpen='FolderOpen', FolderTree='FolderTree';`,
   '@/components/ui/icon.tsx': `export const Icon='Icon';`,
   '@/components/ui/text.tsx': `export const Text='Text';`,
@@ -32,7 +32,7 @@ registerHooks({
   },
 });
 // The native module hosts must be registered before importing the RN component under test.
-const { FileTreeDisplay } = await import('../src/components/rich-message/file-tree.tsx');
+const { FileTreeDisplay, breakableName } = await import('../src/components/rich-message/file-tree.tsx');
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const byId = (root: Root, id: string) => root.container.queryAll(node => node.props.testID === id)[0];
@@ -104,3 +104,29 @@ for (const path of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
     });
   }
 }
+
+test('FileTree.default long names get display-only break points after separators', () => {
+  assert.equal(breakableName('customer-profile_and.loyalty'), 'customer-\u200Bprofile_\u200Band.\u200Bloyalty');
+  assert.equal(breakableName('.env'), '.\u200Benv');
+  assert.equal(breakableName('README'), 'README');
+  assert.equal(breakableName('trailing-'), 'trailing-', 'no break point after the final character');
+  assert.equal(breakableName('useLoyaltyPoints.ts'), 'use\u200BLoyalty\u200BPoints.\u200Bts');
+  assert.equal(breakableName('URLParser'), 'URLParser', 'acronyms stay intact');
+});
+
+test('FileTree.copy-failed is shown inline under the row and cleared by a later successful copy', async () => {
+  const root = createRoot();
+  try {
+    await act(async () => { root.render(createElement(FileTreeDisplay, { props: { nodes: [{ path: 'a.ts' }, { path: 'b.ts' }] } })); });
+    Object.assign(globalThis, { __richTreeCopyFails: true });
+    await act(async () => { await byId(root, 'rich-tree-a.ts').props.onLongPress(); });
+    assert.ok(byId(root, 'rich-tree-copy-failed'), 'failure stays in the tree instead of a system alert');
+    Object.assign(globalThis, { __richTreeCopyFails: false });
+    await act(async () => { await byId(root, 'rich-tree-b.ts').props.onLongPress(); });
+    assert.equal(byId(root, 'rich-tree-copy-failed'), undefined);
+    assert.ok(copied.includes('b.ts'));
+  } finally {
+    Object.assign(globalThis, { __richTreeCopyFails: false });
+    await act(async () => root.unmount());
+  }
+});

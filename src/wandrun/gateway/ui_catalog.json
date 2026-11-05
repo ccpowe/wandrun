@@ -26,17 +26,33 @@
     {"title":"目录结构","chapter":"display.md","spec":{"root":"r","elements":{"r":{"type":"FileTree","props":{"title":"项目结构","nodes":[{"path":"src/components/","note":"界面组件"},{"path":"src/components/App.tsx","note":"应用入口"},{"path":"src/utils/format.ts","kind":"file"}]},"children":[]}},"state":{}}},
     {"title":"链接清单","chapter":"display.md","spec":{"root":"r","elements":{"r":{"type":"Stack","props":{},"children":["a","b"]},"a":{"type":"LinkCard","props":{"url":"https://example.org/guide","title":"入门指南","description":"基础用法与示例","tags":["文档"]},"children":[]},"b":{"type":"LinkCard","props":{"url":"https://example.org/api","title":"接口参考","description":"接口与参数说明"},"children":[]}},"state":{}}},
     {"title":"趋势","chapter":"charts.md","spec":{"root":"r","elements":{"r":{"type":"LineChart","props":{"title":"完成项","xLabels":["周一","周二","周三"],"series":[{"name":"项目","values":[2,3,5]}],"unit":"项"},"children":[]}},"state":{}}},
+    {"title":"分类比较","chapter":"charts.md","spec":{"root":"r","elements":{"r":{"type":"BarChart","props":{"title":"渠道净增长","labels":["官网","社群"],"series":[{"name":"本周","values":[45,-22]},{"name":"上周","values":[32,-15]}],"horizontal":true,"unit":"人"},"children":[]}},"state":{}}},
     {"title":"收集偏好","chapter":"forms.md","spec":{"root":"r","elements":{"r":{"type":"Stack","props":{},"children":["f","m","n","s"]},"f":{"type":"Segmented","props":{"stateKey":"frequency","label":"频率","options":[{"value":"week","label":"每周"},{"value":"month","label":"每月"}]},"children":[]},"m":{"type":"MultiSelect","props":{"stateKey":"topics","label":"内容","options":[{"value":"progress","label":"进度"},{"value":"risks","label":"风险"}]},"children":[]},"n":{"type":"Switch","props":{"stateKey":"notify","label":"提醒"},"children":[]},"s":{"type":"Submit","props":{"label":"提交偏好"},"children":[]}},"state":{"frequency":"week","topics":["progress"],"notify":true}}},
     {"title":"流程图","chapter":"media.md","spec":{"root":"r","elements":{"r":{"type":"Mermaid","props":{"source":"flowchart LR\n  A[开始] --> B{检查}\n  B -->|通过| C[完成]","title":"处理流程"},"children":[]}},"state":{}}}
   ],
   "$defs": {
     "identifier": {"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$","not":{"enum":["constructor","prototype","__proto__"]}},
-    "webUrl": {"type":"string","minLength":1,"maxLength":2048,"pattern":"^https?://"}
+    "webUrl": {"type":"string","minLength":1,"maxLength":2048,"pattern":"^https?://"},
+    "childWidth": {"enum":["1/2","1/3","2/3","auto"]},
+    "stateBinding": {"type":"object","properties":{"$state":{"type":"string","pattern":"^/[A-Za-z_][A-Za-z0-9_]{0,63}$"}},"required":["$state"],"additionalProperties":false},
+    "boundShort": {"oneOf":[{"type":"string","maxLength":80},{"$ref":"#/$defs/stateBinding"}]},
+    "boundLong": {"oneOf":[{"type":"string","maxLength":500},{"$ref":"#/$defs/stateBinding"}]},
+    "send": {"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":2000}},"required":["text"],"additionalProperties":false},
+    "condition": {"oneOf":[
+      {"type":"object","properties":{"$state":{"type":"string","pattern":"^/[A-Za-z_][A-Za-z0-9_]{0,63}$"},"not":{"enum":[true]}},"required":["$state"],"additionalProperties":false},
+      {"type":"object","properties":{"$state":{"type":"string","pattern":"^/[A-Za-z_][A-Za-z0-9_]{0,63}$"},"eq":{"type":["string","number","boolean","null","array"],"items":{"type":"string"}},"not":{"enum":[true]}},"required":["$state","eq"],"additionalProperties":false},
+      {"type":"object","properties":{"$state":{"type":"string","pattern":"^/[A-Za-z_][A-Za-z0-9_]{0,63}$"},"neq":{"type":["string","number","boolean","null","array"],"items":{"type":"string"}},"not":{"enum":[true]}},"required":["$state","neq"],"additionalProperties":false}
+    ]}
   },
+  "widthContainers": ["Stack", "Grid", "ScrollRow"],
   "components": {
     "Stack": {
-      "description": "横排或竖排组合内容；justify 仅横排生效，默认 start，between 将多余水平空间分配到子项之间。", "container": true,
-      "props": {"type":"object","properties":{"direction":{"enum":["vertical","horizontal"]},"gap":{"enum":["sm","md"]},"justify":{"enum":["start","between"]}},"additionalProperties":false}
+      "description": "横排或竖排组合内容；gap 默认 md，justify 默认 start；align 横排默认 center、竖排默认 stretch；横排默认换行，wrap=false 不换行；子项 width=auto 视同未声明，保留原生排布。", "container": true,
+      "props": {"type":"object","properties":{"direction":{"enum":["vertical","horizontal"]},"gap":{"enum":["none","sm","md","lg"]},"justify":{"enum":["start","center","end","between"]},"align":{"enum":["start","center","end","stretch"]},"wrap":{"type":"boolean"}},"additionalProperties":false}
+    },
+    "ScrollRow": {
+      "description": "任意子块横向滑动；gap 默认 sm；子项缺省/auto 约 4/5 容器宽，分数宽先扣除右侧 16 预览宽及其前方间距，再按剩余内容宽计算；无滚动条，露出下一项提示可滑，末项可完全显示。", "container": true,
+      "props": {"type":"object","properties":{"gap":{"enum":["none","sm","md","lg"]}},"additionalProperties":false}
     },
     "Card": {
       "description": "分组展示方案或表单。", "container": true,
@@ -48,11 +64,11 @@
     },
     "Heading": {
       "description": "简短标题。", "container": false,
-      "props": {"type":"object","properties":{"text":{"type":"string","maxLength":500}},"required":["text"],"additionalProperties":false}
+      "props": {"type":"object","properties":{"text":{"$ref":"#/$defs/boundLong"}},"required":["text"],"additionalProperties":false}
     },
     "Text": {
       "description": "说明文字；text 支持 **粗体**、*斜体*、`行内代码` 和 $公式$／$$公式$$，未闭合标记按原文显示。", "container": false,
-      "props": {"type":"object","properties":{"text":{"type":"string","maxLength":500},"tone":{"enum":["default","muted"]}},"required":["text"],"additionalProperties":false}
+      "props": {"type":"object","properties":{"text":{"$ref":"#/$defs/boundLong"},"tone":{"enum":["default","muted"]}},"required":["text"],"additionalProperties":false}
     },
     "Badge": {
       "description": "简短状态标记。", "container": false,
@@ -66,9 +82,23 @@
       "description": "并列展示 1～4 个指标。", "container": false,
       "props": {"type":"object","properties":{"items":{"type":"array","minItems":1,"maxItems":4,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":80},"value":{"type":"string","maxLength":80},"hint":{"type":"string","maxLength":500}},"required":["label","value"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}
     },
+    "StatCard": {
+      "description": "统计卡：受控图标、角标、标签、大数字与可选说明；可声明 send 固定文本，使整卡可点。同块多张可点卡算一组，只能成功发送一张，不与其他提交类动作混用。", "container": false,
+      "props": {"type":"object","properties":{"icon":{"type":"string"},"badge":{"type":"object","properties":{"text":{"type":"string","maxLength":500},"tone":{"enum":["neutral","active","success","warning","error","info"]}},"required":["text","tone"],"additionalProperties":false},"label":{"type":"string","maxLength":80},"value":{"$ref":"#/$defs/boundShort"},"description":{"type":"string","maxLength":500},"send":{"$ref":"#/$defs/send"}},"required":["label","value"],"additionalProperties":false}
+    },
+    "Field": {
+      "description": "标签左、当前值右（固定文本或 $state 绑定）、下方一个直接输入控件；子控件自身可见标签与当前值隐藏，无障碍标签保留。", "container": true,
+      "childCount": 1, "childTypes": ["ChoiceGroup","Select","Segmented","MultiSelect","Switch","Slider","TextInput","DateInput"],
+      "props": {"type":"object","properties":{"label":{"type":"string","maxLength":80},"value":{"$ref":"#/$defs/boundShort"}},"required":["label"],"additionalProperties":false}
+    },
+    "ButtonRow": {
+      "description": "动作横排；任意个 Copy 自适应宽居左，唯一 Submit 占满剩余宽度。", "container": true,
+      "childTypes": ["Submit","Copy"],
+      "props": {"type":"object","properties":{},"additionalProperties":false}
+    },
     "KeyValue": {
       "description": "展示 1～12 个标签与值。", "container": false,
-      "props": {"type":"object","properties":{"items":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":80},"value":{"type":"string","maxLength":80}},"required":["label","value"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}
+      "props": {"type":"object","properties":{"items":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":80},"value":{"$ref":"#/$defs/boundShort"}},"required":["label","value"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}
     },
     "Steps": {
       "description": "展示 1～10 个步骤的当前状态。", "container": false,
@@ -124,18 +154,18 @@
       "input":{"kind":"date","value":{"type":"string","pattern":"^$|^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}}
     },
     "LineChart": {
-      "description": "展示 2～24 个点、1～3 条序列的趋势。", "container": false,
-      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"xLabels":{"type":"array","minItems":2,"maxItems":24,"items":{"type":"string","maxLength":20}},"series":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":40},"values":{"type":"array","items":{"type":"number"}}},"required":["name","values"],"additionalProperties":false}},"unit":{"type":"string","maxLength":10}},"required":["xLabels","series"],"additionalProperties":false},
+      "description": "展示最多 24 个点、3 条序列的趋势；允许空数据与单点。", "container": false,
+      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"xLabels":{"type":"array","maxItems":24,"items":{"type":"string","maxLength":20}},"series":{"type":"array","maxItems":3,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":40},"values":{"type":"array","items":{"type":"number"}}},"required":["name","values"],"additionalProperties":false}},"unit":{"type":"string","maxLength":10}},"required":["xLabels","series"],"additionalProperties":false},
       "relations":[{"items":"series","member":"values","lengthEquals":"xLabels"}]
     },
     "BarChart": {
-      "description": "展示 1～12 个非负分类数值。", "container": false,
-      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"labels":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"string","maxLength":20}},"values":{"type":"array","items":{"type":"number","minimum":0}},"unit":{"type":"string","maxLength":10}},"required":["labels","values"],"additionalProperties":false},
-      "relations":[{"prop":"values","lengthEquals":"labels"}]
+      "description": "比较最多 12 类、3 条序列的数值，支持负值与 horizontal 横向柱；允许空数据。", "container": false,
+      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"labels":{"type":"array","maxItems":12,"items":{"type":"string","maxLength":20}},"series":{"type":"array","maxItems":3,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":40},"values":{"type":"array","items":{"type":"number"}}},"required":["name","values"],"additionalProperties":false}},"horizontal":{"type":"boolean"},"unit":{"type":"string","maxLength":10}},"required":["labels","series"],"additionalProperties":false},
+      "relations":[{"items":"series","member":"values","lengthEquals":"labels"}]
     },
     "PieChart": {
-      "description": "展示 2～6 项正值占比。", "container": false,
-      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"items":{"type":"array","minItems":2,"maxItems":6,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":40},"value":{"type":"number","exclusiveMinimum":0}},"required":["label","value"],"additionalProperties":false}},"unit":{"type":"string","maxLength":10}},"required":["items"],"additionalProperties":false}
+      "description": "展示最多 6 项非负占比；允许空数据、全零与单项。", "container": false,
+      "props": {"type":"object","properties":{"title":{"type":"string","maxLength":80},"items":{"type":"array","maxItems":6,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":40},"value":{"type":"number","minimum":0}},"required":["label","value"],"additionalProperties":false}},"unit":{"type":"string","maxLength":10}},"required":["items"],"additionalProperties":false}
     },
     "Tabs": {
       "description": "2～5 个本地切换的选项卡；每项对应一个子节点，不影响表单状态。", "container": true,
@@ -199,8 +229,16 @@
       "props": {"type":"object","properties":{"source":{"type":"string","minLength":1,"maxLength":10000},"title":{"type":"string","maxLength":80}},"required":["source"],"additionalProperties":false}
     },
     "Submit": {
-      "description": "提交本块全部表单字段；无表单字段时不可使用。", "container": false,
-      "props": {"type":"object","properties":{"label":{"type":"string","maxLength":80}},"required":["label"],"additionalProperties":false}
+      "description": "提交本块全部表单字段；无输入时可声明 send 固定文本，按发送动作处理，不接受客户端修改文本。", "container": false,
+      "props": {"type":"object","properties":{"label":{"type":"string","maxLength":80},"send":{"$ref":"#/$defs/send"}},"required":["label"],"additionalProperties":false}
+    },
+    "Copy": {
+      "description": "纯本地复制文本或 $state 的显示文本；不发消息，失败就地提示。", "container": false,
+      "props": {"type":"object","properties":{"label":{"type":"string","maxLength":80},"text":{"oneOf":[{"type":"string","maxLength":2000},{"$ref":"#/$defs/stateBinding"}]}},"required":["label","text"],"additionalProperties":false}
+    },
+    "FollowUps": {
+      "description": "2～4 条追问建议；点一条即发送该项固定文本，一组只能成功发送一条。", "container": false,
+      "props": {"type":"object","properties":{"items":{"type":"array","minItems":2,"maxItems":4,"items":{"type":"object","properties":{"label":{"type":"string","maxLength":80},"text":{"type":"string","minLength":1,"maxLength":2000}},"required":["label","text"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}
     }
   }
 }

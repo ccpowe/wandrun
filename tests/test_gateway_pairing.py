@@ -74,7 +74,9 @@ class EmptyBrowser:
         if identity != "lease":
             raise LookupError(identity)
         return {"id": identity, "state": "human", "epoch": 1, "pages": [],
-                "current": None, "max_pages": 3}
+                "current": None, "environment_id": "local", "environment_name": "Local", "capacity_rejection": None,
+                "capacity": {"pages_used": 0, "pages_registered": 0, "pages_creating": 0,
+                             "pages_pending_cleanup": 0, "pages_limit": 3}}
 
     def subscribe(self, identity, callback):
         self.detail(identity)
@@ -296,7 +298,7 @@ class PairingTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_revoke_closes_only_device_sse_and_browser_websocket(self):
         first, second = await self.paired(), await self.paired()
         browser = EmptyBrowser()
-        self.gateway.runtime = SimpleNamespace(browser=browser)
+        self.gateway.runtime = SimpleNamespace(browser_for_lease=lambda identity: browser)
         async with live_gateway(self.app) as origin:
             async with httpx.AsyncClient(base_url=origin, timeout=5) as client:
                 async with client.stream("GET", "/events", headers=bearer(first["token"])) as first_sse, client.stream(
@@ -403,7 +405,7 @@ class PairingTests(unittest.IsolatedAsyncioTestCase):
     async def test_revoke_aborts_websocket_blocked_sending_to_nonreading_tcp_peer(self):
         paired = await self.paired()
         browser = EmptyBrowser()
-        self.gateway.runtime = SimpleNamespace(browser=browser)
+        self.gateway.runtime = SimpleNamespace(browser_for_lease=lambda identity: browser)
         blocked = asyncio.Event()
         protocols = set()
         original_send = WSProtocol.send
@@ -480,7 +482,7 @@ class PairingTests(unittest.IsolatedAsyncioTestCase):
                     await agent.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
                     self.assertIn("result", json.loads(await agent.recv()))
                     identity = leases.lease_for_task("pairing-owner")
-                    self.gateway.runtime = SimpleNamespace(browser=leases)
+                    self.gateway.runtime = SimpleNamespace(browser_for_lease=lambda identity: leases)
                     async with live_gateway(self.app) as origin, httpx.AsyncClient(base_url=origin) as client:
                         async with connect(
                             origin.replace("http:", "ws:") + f"/browser-tasks/{identity}/stream",
@@ -521,12 +523,17 @@ class PairingTests(unittest.IsolatedAsyncioTestCase):
 class ListeningSocketTests(unittest.TestCase):
     @unittest.skipUnless(socket.has_ipv6, "IPv6 unavailable")
     def test_ipv6_wildcard_accepts_ipv6_and_refuses_ipv4(self):
-        with _listening_sockets("::", 8795) as listeners:
-            with socket.create_connection(("::1", 8795), timeout=1):
-                accepted, _ = listeners[0].accept()
-                accepted.close()
-            with self.assertRaises(ConnectionRefusedError):
-                socket.create_connection(("127.0.0.1", 8795), timeout=1)
+        # Reserve the IPv4 port without listening: an unrelated server must not
+        # satisfy the refusal probe while the IPv6 listener owns the same port.
+        with socket.socket() as ipv4:
+            ipv4.bind(("127.0.0.1", 0))
+            port = ipv4.getsockname()[1]
+            with _listening_sockets("::", port) as listeners:
+                with socket.create_connection(("::1", port), timeout=1):
+                    accepted, _ = listeners[0].accept()
+                    accepted.close()
+                with self.assertRaises(ConnectionRefusedError):
+                    socket.create_connection(("127.0.0.1", port), timeout=1)
 
 
 class ManagementCredentialTests(unittest.TestCase):

@@ -1,8 +1,8 @@
-"""Local image generation tool: bind task identity, save one completed PNG, return its path."""
+"""Gateway image requests with references and completed PNGs in the caller's execution environment."""
 
 
 import asyncio
-import os
+import asyncssh
 
 from langchain.tools import BaseTool, tool
 from langchain_core.runnables import RunnableConfig
@@ -11,23 +11,25 @@ from wandrun.integrations.image_generation import (
     DEFAULT_IMAGE_MODEL, MAX_REFERENCE_BYTES, MAX_REFERENCE_IMAGES, MAX_REFERENCE_PIXELS,
     ImageGenerationError, ImageSize, generate_image as request_image,
 )
-from wandrun.runtime.execution.files import TaskFiles
+from wandrun.runtime.execution.files import TaskDirectoryError, TaskFiles
 from wandrun.runtime.communication.workers import WorkerManager
 from wandrun.integrations.codex_credentials import CodexCredentials
+from wandrun.integrations.instabox import InstaboxError
+from wandrun.integrations.shell_backend import CleanupUnconfirmedError
 
 
 def image_tools(
     manager: WorkerManager, files: TaskFiles, *, model_name: str = DEFAULT_IMAGE_MODEL,
     credentials: CodexCredentials | None = None,
 ) -> list[BaseTool]:
-    """Expose image generation with optional conversation-local references to active local tasks."""
+    """Expose gateway image generation with conversation-confined references in every Backend."""
 
     @tool(description=f"""生成 PNG 并保存到当前对话目录；不会自动发送附件。
 
 用户上传的商品图应通过 reference_image_paths 作为原图传入，不要只用文字转述；
 列表顺序对应 prompt 中的第一张、第二张等参考图。最多 {MAX_REFERENCE_IMAGES} 张 PNG/JPEG/WebP，
 每张最多 {MAX_REFERENCE_BYTES // (1024 * 1024)} MiB、{MAX_REFERENCE_PIXELS} 像素。
-相对路径基于当前对话目录；只接受该目录内的普通文件，不接受 URL、符号链接或其他宿主路径。
+相对路径基于当前执行环境的对话目录；只接受该目录内的普通文件，不接受 URL、符号链接或目录之外的路径。
 size 支持 1024x1024、1024x1536（竖图）、1536x1024（横图）或 auto；
 小红书可选竖图并在 prompt 说明构图。尺寸和画质均 best-effort，以返回的
 width、height、quality 为准；quality 为 null 表示服务端未报告。
@@ -40,33 +42,41 @@ width、height、quality 为准；quality 为 null 表示服务端未报告。
         if not isinstance(task_id, str) or not task_id.strip():
             return {"error": {"code": "image_generation_failed", "detail": "生图需要调用方的 thread_id"}}
         manager.ensure_active(task_id)
+        request_completed = False
         try:
             if manager.get(task_id)["status"] != "running":
                 raise asyncio.CancelledError()
-            # Check local path and symlinks before incurring a billable network request.
-            _, directory_fd = files.open_local_conversation_directory(task_id)
-            os.close(directory_fd)
+            # Prepare the actual caller environment before a billable network request.
+            await files.prepare_file_output(task_id)
             paths = reference_image_paths or []
             if len(paths) > MAX_REFERENCE_IMAGES:
                 raise ValueError(f"参考图最多 {MAX_REFERENCE_IMAGES} 张")
             references = [
-                files.read_local_file(task_id, path, max_bytes=MAX_REFERENCE_BYTES)
+                await files.read_task_file(task_id, path, max_bytes=MAX_REFERENCE_BYTES)
                 for path in paths
             ]
             image = await request_image(
                 prompt, reference_images=references, size=size,
                 model_name=model_name, credentials=credentials,
             )
+            request_completed = True
             manager.ensure_active(task_id)
             if manager.get(task_id)["status"] != "running":
                 raise asyncio.CancelledError()
-            saved = files.save_local_file(task_id, "generated.png", image.data)
+            saved = await files.save_task_file(task_id, "generated.png", image.data)
         except ImageGenerationError as error:
             detail = {"code": error.code, "detail": error.detail}
             if error.resets_at is not None:
                 detail["resets_at"] = error.resets_at
             return {"error": detail}
-        except (OSError, ValueError, KeyError) as error:
+        except asyncssh.Error:
+            detail = (
+                "远端文件操作失败；生图请求已完成，但图片保存结果未确认。请检查目标文件，不要直接重复生图。"
+                if request_completed else
+                "远端文件操作失败；生图请求尚未发出，请检查执行环境后重试。"
+            )
+            return {"error": {"code": "image_generation_failed", "detail": detail}}
+        except (OSError, ValueError, KeyError, TaskDirectoryError, InstaboxError, CleanupUnconfirmedError) as error:
             return {"error": {"code": "image_generation_failed", "detail": str(error)}}
         return {
             "path": str(saved), "quality": image.quality,

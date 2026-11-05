@@ -8,14 +8,15 @@ import { ChatSession } from "../src/gateway/session.ts";
 const root: Conversation = {
   id: "root", agent_id: "writer", title: "Before", created_at: 1, updated_at: 1,
   read_seq: 0, last_agent_seq: 0, status: "working", unread: false, last_text: null, source: "user", schedule_origin: null,
+  last_activity_seq: null, last_activity_at: null,
 };
-const agent = (name: string): AgentSummary => ({
-  id: "writer", name, avatar: 1, description: "", workers: [], home: true, latest_conversation: null, unread: false,
-});
+const agent = (name: string): AgentSummary => ({ id: "writer", name, avatar: 1, description: "", workers: [], environment: "local", latest_conversation: null, unread: false, });
 const browserTask = (title: string): BrowserTask => ({
   id: "lease", task_id: "task", root_id: "root", agent_id: "writer", entry_agent_id: "writer",
   conversation_title: title, entry_agent_name: "Writer", state: "agent", epoch: 1,
-  pages: [], current: null, max_pages: 3, reason: null, requested_reason: null,
+  pages: [], current: null, environment_id: "local", environment_name: "Local",
+  capacity: { pages_used: 0, pages_registered: 0, pages_creating: 0, pages_pending_cleanup: 0, pages_limit: 3 },
+  capacity_rejection: null, reason: null, requested_reason: null,
 });
 const collaboration = (title: string): TaskConversation => ({
   id: "task", task_id: "task", kind: "task", root_id: "root", root_title: "Before",
@@ -55,8 +56,25 @@ test("finite JSON reads settle at the deadline through both headers and body", a
   assert.equal(unauthorized, 0);
 });
 
+for (const stalled of ["headers", "body"] as const) {
+  test(`create deadline releases an uncertain intent even when native ${stalled} ignores abort`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let signal: AbortSignal | undefined;
+    const api = new GatewayApi({ baseUrl: "http://gateway", token: "dev" }, async (_input, init) => {
+      signal = init!.signal!;
+      return stalled === "headers" ? new Promise<Response>(() => {}) : new Response(new ReadableStream({ start() {} }));
+    });
+    t.after(() => api.close());
+    const pending = api.createConversation("writer", undefined, `create-${stalled}`);
+    await setImmediate();
+    t.mock.timers.tick(15_000);
+    await assert.rejects(pending, (error: unknown) => error instanceof GatewayError && error.code === "timeout");
+    assert.equal(signal?.aborted, true);
+  });
+}
+
 for (const method of ["POST", "PATCH", "PUT", "DELETE"] as const) {
-  test(`${method} survives the read deadline and recovery but remains bound to the session`, async (t) => {
+  test(`${method} without a dedicated deadline survives read recovery but remains bound to the session`, async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const response = Promise.withResolvers<Response>();
     const signals: AbortSignal[] = [];
@@ -68,7 +86,7 @@ for (const method of ["POST", "PATCH", "PUT", "DELETE"] as const) {
     t.after(() => api.close());
     const command = () => {
       switch (method) {
-        case "POST": return api.createConversation("writer");
+        case "POST": return api.stop("root", "stop-intent");
         case "PATCH": return api.renameConversation("root", "Renamed");
         case "PUT": return api.updateMemory("work", "writer", "Remember this", "old-version");
         case "DELETE": return api.deleteConversation("root");
@@ -103,43 +121,41 @@ for (const method of ["POST", "PATCH", "PUT", "DELETE"] as const) {
 test("a reset generation marks an in-flight command unknown but leaves reads as network errors", async (t) => {
   const commandResponse = Promise.withResolvers<Response>();
   const readResponse = Promise.withResolvers<Response>();
-  let request = 0;
   const api = new GatewayApi({ baseUrl: "http://gateway", token: "dev" }, async (_input, init) => {
-    request++;
     return init?.method === "POST" ? commandResponse.promise : readResponse.promise;
   });
   t.after(() => api.close());
 
-  const command = api.createConversation("writer");
+  const command = api.createConversation("writer", undefined, globalThis.crypto.randomUUID());
   await setImmediate();
   api.resetConnections();
   commandResponse.reject(new Error("socket closed by reset"));
   await assert.rejects(command, (error: unknown) =>
-    error instanceof GatewayError && error.code === "timeout" && error.message === "操作结果未确认。请重新加载核对结果。");
+    error instanceof GatewayError && error.code === "timeout");
 
   const read = api.history("root");
   await setImmediate();
   api.resetConnections();
   readResponse.reject(new Error("socket closed by reset"));
   await assert.rejects(read, (error: unknown) =>
-    error instanceof GatewayError && error.code === "network" && error.message === "连不上电脑，请检查网络和网关连接");
+    error instanceof GatewayError && error.code === "network");
   const failedResponse = Promise.withResolvers<Response>();
   const failed = new GatewayApi({ baseUrl: "http://gateway", token: "dev" },
     async () => failedResponse.promise, undefined, () => { throw new Error("reset failed"); });
   t.after(() => failed.close());
-  const failedCommand = failed.createConversation("writer");
+  const failedCommand = failed.createConversation("writer", undefined, globalThis.crypto.randomUUID());
   await setImmediate();
   assert.throws(() => failed.resetConnections(), /reset failed/);
   failedResponse.reject(new Error("socket closed by failed reset"));
   await assert.rejects(failedCommand, (error: unknown) =>
-    error instanceof GatewayError && error.code === "timeout" && error.message === "操作结果未确认。请重新加载核对结果。");
+    error instanceof GatewayError && error.code === "timeout");
 
   const offline = new GatewayApi({ baseUrl: "http://gateway", token: "dev" }, async () => {
     throw new Error("offline");
   });
   t.after(() => offline.close());
-  await assert.rejects(offline.createConversation("writer"), (error: unknown) =>
-    error instanceof GatewayError && error.code === "network" && error.message === "连不上电脑，请检查网络和网关连接");
+  await assert.rejects(offline.createConversation("writer", undefined, globalThis.crypto.randomUUID()), (error: unknown) =>
+    error instanceof GatewayError && error.code === "network");
 });
 
 for (const first of ["no-headers", "body", "backoff"] as const) {
@@ -159,7 +175,7 @@ for (const first of ["no-headers", "body", "backoff"] as const) {
         return json({ conversations: [root], as_of_seq: 0 });
       }
       if (path === "/events") return new Response(new ReadableStream({ start() {} }));
-      if (path === "/agents") return json({ agents: [], as_of_seq: 0 });
+      if (path === "/agents") return json({ agents: [], as_of_seq: 0, order_revision: 1 });
       if (path === "/browser-tasks") return json({ browser_tasks: [], as_of_seq: 0 });
       throw Error(`unexpected ${path}`);
     });
@@ -191,7 +207,7 @@ test("fresh-but-dead SSE recovery preserves a visible preview and pending send w
       cursors.push(new Headers(init?.headers).get("Last-Event-ID")!);
       return new Response(new ReadableStream<Uint8Array>({ start(controller) { streams.push(controller); } }));
     }
-    if (path === "/agents") return json({ agents: [], as_of_seq: 0 });
+    if (path === "/agents") return json({ agents: [], as_of_seq: 0, order_revision: 1 });
     if (path === "/browser-tasks") return json({ browser_tasks: [], as_of_seq: 0 });
     if (path.endsWith("/messages")) { sends++; return new Promise<Response>(() => {}); }
     throw Error(`unexpected ${path}`);
@@ -241,8 +257,8 @@ test("SSE recovery detaches hung agents, browser and collaboration snapshots; la
     if (path === "/events") { sseReads++; return new Response(new ReadableStream({ start() {} })); }
     if (path === "/agents") {
       agentReads++;
-      return agentReads === 1 ? json({ agents: [agent("Before")], as_of_seq: 0 })
-        : agentReads === 2 ? oldAgents.promise : json({ agents: [agent("After")], as_of_seq: 1 });
+      return agentReads === 1 ? json({ agents: [agent("Before")], as_of_seq: 0, order_revision: 1 })
+        : agentReads === 2 ? oldAgents.promise : json({ agents: [agent("After")], as_of_seq: 1, order_revision: 1 });
     }
     if (path === "/browser-tasks") {
       browserReads++;
@@ -256,7 +272,7 @@ test("SSE recovery detaches hung agents, browser and collaboration snapshots; la
     if (path === "/agents/writer/collaborations") return json({ conversations: [], as_of_seq: 1 });
     throw Error(`unexpected ${path}`);
   });
-  t.after(() => { oldAgents.resolve(json({ agents: [], as_of_seq: 0 })); oldBrowser.resolve(json({ browser_tasks: [], as_of_seq: 0 })); oldScope.resolve(json({ conversations: [], as_of_seq: 0 })); return session.close(); });
+  t.after(() => { oldAgents.resolve(json({ agents: [], as_of_seq: 0, order_revision: 1 })); oldBrowser.resolve(json({ browser_tasks: [], as_of_seq: 0 })); oldScope.resolve(json({ conversations: [], as_of_seq: 0 })); return session.close(); });
   await session.start();
   await until(() => session.agents.loaded && session.browserTasks.has("lease"));
   session.agents.refresh();
@@ -266,7 +282,7 @@ test("SSE recovery detaches hung agents, browser and collaboration snapshots; la
   session.resume();
   await until(() => sseReads === 2 && session.agents.agents[0]?.name === "After" &&
     session.browserTasks.get("lease")?.conversation_title === "After" && session.tasks.get("task")?.title === "After");
-  oldAgents.resolve(json({ agents: [agent("Stale")], as_of_seq: 1 }));
+  oldAgents.resolve(json({ agents: [agent("Stale")], as_of_seq: 1, order_revision: 1 }));
   oldBrowser.resolve(json({ browser_tasks: [browserTask("Stale")], as_of_seq: 1 }));
   oldScope.resolve(json({ conversations: [collaboration("Stale")], as_of_seq: 1 }));
   await setImmediate();
@@ -288,7 +304,7 @@ test("a recovery hint during cooldown is delivered at the bound after an offline
       cursors.push(new Headers(init?.headers).get("Last-Event-ID")!);
       return offline ? new Response("down", { status: 503 }) : new Response(new ReadableStream({ start() {} }));
     }
-    if (path === "/agents") return json({ agents: [], as_of_seq: 0 });
+    if (path === "/agents") return json({ agents: [], as_of_seq: 0, order_revision: 1 });
     if (path === "/browser-tasks") return json({ browser_tasks: [], as_of_seq: 0 });
     throw Error(`unexpected ${path}`);
   }, { retryDelays: [60_000] });
@@ -327,7 +343,7 @@ test("rapid active and network hints coalesce once the replacement stream delive
     const path = new URL(String(input)).pathname;
     if (path === "/conversations") return json({ conversations: [root], as_of_seq: 0 });
     if (path === "/events") return new Response(new ReadableStream<Uint8Array>({ start(controller) { streams.push(controller); } }));
-    if (path === "/agents") return json({ agents: [], as_of_seq: 0 });
+    if (path === "/agents") return json({ agents: [], as_of_seq: 0, order_revision: 1 });
     if (path === "/browser-tasks") return json({ browser_tasks: [], as_of_seq: 0 });
     throw Error(`unexpected ${path}`);
   }, { retryDelays: [60_000] });

@@ -1,0 +1,67 @@
+# One PDF selection, real tus/read_file/write_file/SendMessage, original Markdown preview.
+appId: host.exp.exponent
+---
+# @phase attachment-native-upload
+# @attachments-open
+- tapOn:
+    id: composer-input
+# @attachments-keyboard
+- tapOn:
+    id: composer-add
+- extendedWaitUntil:
+    visible:
+      id: attachment-picker-menu
+    timeout: 10000
+# @attachments-menu
+- takeScreenshot: ${ARTIFACTS}/01-attachment-menu-keyboard.png
+# Dismiss the menu outside, then reopen it; DocumentsUI itself opens exactly once.
+# @tap-outside
+- assertNotVisible:
+    id: attachment-picker-file
+- tapOn:
+    id: composer-add
+- tapOn:
+    id: attachment-picker-file
+# @attachments-select
+- extendedWaitUntil:
+    visible:
+      id: upload-ready-${UPLOAD_NAME}
+    timeout: 30000
+- tapOn:
+    id: composer-input
+- inputText: ${UPLOAD_PROMPT}
+- tapOn:
+    id: composer-send
+# @attachments-sent
+# @phase attachment-real-model
+# @attachments-delivered
+- extendedWaitUntil:
+    visible:
+      id: attachment-markdown-${DELIVERY_FILE_ID}
+    timeout: 10000
+- takeScreenshot: ${ARTIFACTS}/02-attachment-original-card.png
+# @phase attachment-preview
+- tapOn:
+    id: attachment-markdown-${DELIVERY_FILE_ID}
+- extendedWaitUntil:
+    visible:
+      id: file-text-preview
+    timeout: 10000
+- assertVisible: PDF round trip
+- assertVisible: ${PDF_MARKER}
+- takeScreenshot: ${ARTIFACTS}/03-attachment-original-preview.png
+# @phase attachment-save-share
+# Manual details are exported as attachments.MANUAL_SAVE_SHARE for the runner prompt.
+# 保存：下载 → Download/下载中新建本次 wandrun-e2e-<run_id> 目录 → 允许访问 → Expo 出现“已保存到所选位置”。
+# 人工用系统文件应用实际打开 DELIVERY_NAME，核对 PDF_MARKER，再返回同一 Expo 预览。
+# 分享：分享 → OS 接收方选择 → 人工在实际接收应用打开文件，核对原文件名和 PDF_MARKER，再返回 Expo。
+# Agent 只操作 Expo；外部查看/返回由人工操作。明确回复保存及分享接收均通过，不能以按钮/面板存在算成功。
+# 无接收方、权限失败或外部查看触碰限制时明确报阻塞。人工清理仅本次保存目录/接收副本。
+# @manual attachment-save-share
+# @phase attachment-return
+- assertVisible:
+    id: file-text-preview
+- assertVisible: ${PDF_MARKER}
+- tapOn: 返回
+# @attachments-returned
+- takeScreenshot: ${ARTIFACTS}/04-attachment-returned-chat.png

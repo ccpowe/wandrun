@@ -75,11 +75,8 @@ function openSession() {
       connections.push(controller);
       onConnect();
     } }));
-    if (path === '/conversations') return Response.json({ as_of_seq: 0, conversations: [{
-      id: 'root', agent_id: 'writer', title: 'Chat', created_at: 1, updated_at: 1, read_seq: 0, last_agent_seq: 0,
-      status: 'working', unread: false, last_text: null, source: 'user', schedule_origin: null,
-    }] });
-    if (path === '/agents') return Response.json({ agents: [], as_of_seq: 0 });
+    if (path === '/conversations') return Response.json({ as_of_seq: 0, conversations: [{ id: 'root', agent_id: 'writer', title: 'Chat', created_at: 1, updated_at: 1, read_seq: 0, last_agent_seq: 0, status: 'working', unread: false, last_text: null, last_activity_seq: null, last_activity_at: null, source: 'user', schedule_origin: null, }] });
+    if (path === '/agents') return Response.json({ agents: [], as_of_seq: 0, order_revision: 1 });
     if (path === '/browser-tasks') return Response.json({ browser_tasks: [], as_of_seq: 0 });
     throw Error(`Unexpected request: ${path}`);
   }, { retryDelays: [0] });

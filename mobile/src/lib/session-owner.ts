@@ -1,5 +1,6 @@
 import { ChatSession } from "../gateway/session.ts";
 import type { SavedComputer } from "./credentials.ts";
+import { attachSessionQueries } from "./gateway-queries.ts";
 
 export type ActiveSession = { owner: SavedComputer; session: ChatSession; key: number };
 
@@ -47,6 +48,8 @@ export class SessionOwner {
     const selected = this.closing.then(() => {
       if (revision !== this.revision || !config) return;
       const session = this.create(config);
+      // Install before publication/start: no consumer can miss a revision or connection transition.
+      attachSessionQueries(session);
       const active = { owner: config, session, key: ++this.nextKey };
       this.publish(active);
       void session.start().then(() => { if (this.current === active) this.started(active); });

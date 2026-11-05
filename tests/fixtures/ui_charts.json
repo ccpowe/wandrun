@@ -1,0 +1,14 @@
+[
+  {"name":"empty line","type":"LineChart","props":{"xLabels":[],"series":[]},"valid":true},
+  {"name":"empty named line","type":"LineChart","props":{"xLabels":[],"series":[{"name":"完成","values":[]}]},"valid":true},
+  {"name":"single line point","type":"LineChart","props":{"xLabels":["今天"],"series":[{"name":"完成","values":[8]}]},"valid":true},
+  {"name":"line alignment","type":"LineChart","props":{"xLabels":["今天"],"series":[{"name":"完成","values":[]}]},"valid":false},
+  {"name":"empty bar","type":"BarChart","props":{"labels":[],"series":[]},"valid":true},
+  {"name":"signed grouped horizontal bar","type":"BarChart","props":{"labels":["官网","社群"],"series":[{"name":"本周","values":[4,-2]},{"name":"上周","values":[0,3]},{"name":"目标","values":[2,1]}],"horizontal":true},"valid":true},
+  {"name":"bar alignment","type":"BarChart","props":{"labels":["官网","社群"],"series":[{"name":"本周","values":[1]}]},"valid":false},
+  {"name":"old bar shape rejected","type":"BarChart","props":{"labels":["官网"],"values":[1]},"valid":false},
+  {"name":"empty pie","type":"PieChart","props":{"items":[]},"valid":true},
+  {"name":"single pie","type":"PieChart","props":{"items":[{"label":"住宿","value":1}]},"valid":true},
+  {"name":"zero pie","type":"PieChart","props":{"items":[{"label":"住宿","value":0},{"label":"交通","value":0}]},"valid":true},
+  {"name":"negative pie rejected","type":"PieChart","props":{"items":[{"label":"住宿","value":-1}]},"valid":false}
+]

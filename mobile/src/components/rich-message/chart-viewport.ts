@@ -23,18 +23,16 @@ export function chartYAxisLabelWidth(labels: readonly string[], fontScale: numbe
     Math.max(...labels.map((label) => label.length)) * richType.subtle.fontSize * 0.6 * fontScale + richSpace.sm);
 }
 
-const EDGE_SPACING = richSpace.md;
-
 /**
  * Fit every point without scrolling; thin only axis labels. Native label slots
  * stay within the viewport, including the first/last label, and can wrap.
  */
 export function lineLayout(plotWidth: number, labels: readonly string[], fontScale = 1) {
-  const textWidth = Math.max(...labels.map((label) => Array.from(label).length * richType.subtle.fontSize)) * fontScale;
+  const textWidth = Math.max(0, ...labels.map((label) => Array.from(label).length * richType.subtle.fontSize)) * fontScale;
   const labelWidth = Math.max(0, Math.min(Math.max(32 * fontScale, textWidth), 100 * fontScale, (plotWidth - richSpace.sm) / 2));
-  const initialSpacing = labelWidth / 2 + LINE_POINT_RADIUS;
-  const endSpacing = initialSpacing + LINE_POINT_RADIUS * 2;
-  const spacing = Math.max(0, (plotWidth - initialSpacing - endSpacing) / (labels.length - 1));
+  const initialSpacing = labels.length === 1 ? plotWidth / 2 : labelWidth / 2 + LINE_POINT_RADIUS;
+  const endSpacing = labels.length === 1 ? plotWidth / 2 : initialSpacing + LINE_POINT_RADIUS * 2;
+  const spacing = labels.length <= 1 ? 0 : Math.max(0, (plotWidth - initialSpacing - endSpacing) / (labels.length - 1));
   const stride = Math.max(1, Math.ceil((labels.length - 1) / 5), Math.ceil((labelWidth + richSpace.sm) / Math.max(1, spacing)));
   const ticks = labels.flatMap((label, index) =>
     index === 0 || index === labels.length - 1 || (index % stride === 0 && (labels.length - 1 - index) * spacing >= labelWidth + richSpace.sm)
@@ -43,9 +41,3 @@ export function lineLayout(plotWidth: number, labels: readonly string[], fontSca
   return { initialSpacing, endSpacing, spacing, labelWidth, ticks };
 }
 
-/** Give each bar an equal slot of the plot: half bar, half gap, within readable bounds. */
-export function barLayout(plotWidth: number, bars: number) {
-  const slot = (plotWidth - 2 * EDGE_SPACING) / Math.max(1, bars);
-  const barWidth = Math.min(48, Math.max(richSpace.lg, slot * 0.5));
-  return { barWidth, spacing: Math.max(richSpace.md, slot - barWidth) };
-}

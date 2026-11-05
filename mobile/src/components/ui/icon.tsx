@@ -43,16 +43,23 @@ const StyledIcon = withUniwind(IconImpl, {
  * @param {number} size - Icon size (overrides the size class).
  * @param {...LucideProps} ...props - Additional Lucide icon props passed to the "as" icon.
  */
+/**
+ * Set by a disabled quiet icon button: the muted colour must win over a caller's own colour class
+ * (e.g. immersive white), otherwise the disabled state would look identical to the enabled one.
+ */
+const IconDisabledContext = React.createContext(false);
+
 function Icon({ as: IconComponent, className, ...props }: IconProps) {
   const textClass = React.useContext(TextClassContext);
+  const disabled = React.useContext(IconDisabledContext);
   return (
     <StyledIcon
       as={IconComponent}
       strokeWidth={1.75}
-      className={cn('text-foreground size-5', textClass, className)}
+      className={cn('text-foreground size-5', textClass, className, disabled && 'text-muted-foreground/60')}
       {...props}
     />
   );
 }
 
-export { Icon };
+export { Icon, IconDisabledContext };

@@ -3,7 +3,13 @@
     "appVersionSource": "local"
   },
   "build": {
+    "development": {
+      "extends": "preview",
+      "developmentClient": true
+    },
     "preview": {
+      "pnpm": "10.34.9",
+      "corepack": true,
       "distribution": "internal",
       "android": {
         "buildType": "apk"

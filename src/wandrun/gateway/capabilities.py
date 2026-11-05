@@ -30,14 +30,15 @@ class ImageGenerationMiddleware(AgentMiddleware):
         self.tools = tools
 
 
+class UploadFetchMiddleware(AgentMiddleware):
+    """Gateway-only upload acquisition stays directly callable with or without Code Mode."""
+
+    def __init__(self, tools: list[BaseTool]):
+        self.tools = tools
+
+
 def _always(_agent, _environment):
     return "enabled", "所有 Agent 都有"
-
-
-def _local_image(_agent, environment):
-    if environment.type == "local":
-        return "enabled", "本机环境可用"
-    return "not_applicable", "需要本机环境"
 
 
 def _ui_middleware(_manager, _files, _environment_type):
@@ -57,7 +58,7 @@ UI_CAPABILITY = EntryCapabilityDefinition(
 
 
 def gateway_capabilities(gateway, *, image_generation_model=DEFAULT_IMAGE_MODEL):
-    """Register schedule, local image generation and UI for one Gateway instance.
+    """Register gateway tools, upload acquisition and UI for one Gateway instance.
 
     Tool closures are prepared once per configured environment type by the runtime;
     rebuilding graphs creates fresh middleware referencing those same tools. The UI
@@ -79,6 +80,15 @@ def gateway_capabilities(gateway, *, image_generation_model=DEFAULT_IMAGE_MODEL)
         )
         return lambda: ImageGenerationMiddleware(tools)
 
+    def upload_middleware(manager, files, _environment_type):
+        from wandrun.runtime.execution.file_tools import attachment_tools
+
+        files.bind_upload_resolver(
+            lambda task_id, upload_id: gateway.store.user_uploads(manager.root_of(task_id), [upload_id])[0],
+        )
+        tools = attachment_tools(files)
+        return lambda: UploadFetchMiddleware(tools)
+
     return (
         EntryCapabilityDefinition(
             id="schedule",
@@ -91,10 +101,18 @@ def gateway_capabilities(gateway, *, image_generation_model=DEFAULT_IMAGE_MODEL)
         EntryCapabilityDefinition(
             id="image_generation",
             display_name="生图",
-            condition=_local_image,
+            condition=_always,
             prepare_middleware=image_middleware,
             summary="生成图片",
             description="生成图片并保存到当前对话的目录。",
+        ),
+        EntryCapabilityDefinition(
+            id="uploads",
+            display_name="获取用户上传",
+            condition=_always,
+            prepare_middleware=upload_middleware,
+            summary="显式获取本对话的用户上传",
+            description="将本对话已完成的用户上传获取到当前执行环境；不会为上传提前唤醒 Sandbox。",
         ),
         replace(UI_CAPABILITY, validate_human=gateway.validate_human),
     )

@@ -3,7 +3,7 @@ import { test } from "node:test";
 
 import { exchangePairingCode, GatewayApi, GatewayError } from "../src/gateway/api.ts";
 import { Credentials } from "../src/lib/credentials.ts";
-import { PairingScanScope, normalizeGatewayAddress, normalizePairingCode, pairingErrorMessage, parsePairingQr } from "../src/lib/pairing.ts";
+import { PairingScanScope, normalizeGatewayAddress, normalizePairingCode, parsePairingQr } from "../src/lib/pairing.ts";
 
 function storage() {
   let saved: string | null = null;
@@ -28,7 +28,7 @@ test("QR encodes an address/code only; malformed and credential-bearing URLs can
   assert.throws(() => normalizePairingCode("AB12"));
 });
 
-test("exchange sends no existing credential and gives explicit challenge/network errors", async () => {
+test("exchange sends only the one-time code and never an existing credential", async () => {
   const requests: { url: string; init?: RequestInit }[] = [];
   const exchange = await exchangePairingCode("http://computer", "AB12CD34", "manual", undefined, async (url, init) => {
     requests.push({ url: String(url), init });
@@ -38,9 +38,6 @@ test("exchange sends no existing credential and gives explicit challenge/network
   assert.equal(requests[0].url, "http://computer/pairing/exchange");
   assert.deepEqual(JSON.parse(String(requests[0].init?.body)), { code: "AB12CD34", method: "manual" });
   assert.equal(JSON.stringify(requests[0].init?.headers).includes("Authorization"), false);
-  for (const [code, message] of [["pairing_expired", "已过期"], ["pairing_invalid", "不正确"], ["pairing_used", "已使用"], ["pairing_locked", "错误次数过多"], ["network", "连不上电脑"], ["timeout", "连接超时"]]) {
-    assert.match(pairingErrorMessage(new GatewayError(400, code, "secret")), new RegExp(message));
-  }
 });
 
 test("pairing deadline covers a hanging fetch and a hanging response body", async (t) => {
@@ -174,6 +171,61 @@ test("computer list persists selection, notes and distinct pairing identities; o
   assert.equal(restored.snapshot().config?.connectionId, a.connectionId);
   await assert.rejects(restored.switchComputer("missing"), /已移除/);
   await assert.rejects(restored.renameComputer(a.computerId, "two\nlines"), /单行/);
+});
+
+test("chat.J1 每台电脑保存自己的主对话；记录和重命名不改变连接身份", async () => {
+  const durable = storage();
+  const credentials = new Credentials(durable);
+  await credentials.install({ baseUrl: "http://a", token: "a", deviceId: "a" });
+  const a = credentials.snapshot().config!;
+  await Promise.all([
+    credentials.rememberConversation(a.connectionId, "root-a"),
+    credentials.renameComputer(a.computerId, "Work"),
+  ]);
+  await credentials.install({ baseUrl: "http://b", token: "b", deviceId: "b" });
+  const b = credentials.snapshot().config!;
+  await credentials.rememberConversation(b.connectionId, "root-b");
+  await credentials.switchComputer(a.computerId);
+  const restored = new Credentials(durable);
+  await restored.restore();
+  assert.equal(restored.snapshot().config?.lastConversationId, "root-a");
+  assert.equal(restored.snapshot().config?.connectionId, a.connectionId);
+  assert.equal(restored.snapshot().config?.localName, "Work");
+  await restored.switchComputer(b.computerId);
+  assert.equal(restored.snapshot().config?.lastConversationId, "root-b");
+});
+
+test("chat.J1 重新配对保留打开记录；旧连接的迟到记录不能覆盖它", async () => {
+  const credentials = new Credentials(storage());
+  await credentials.install({ baseUrl: "http://a", token: "old", deviceId: "a" });
+  const old = credentials.snapshot().config!;
+  await credentials.rememberConversation(old.connectionId, "root");
+  await credentials.install({ baseUrl: "http://a", token: "new", deviceId: "a" });
+  await credentials.rememberConversation(old.connectionId, "stale");
+  assert.notEqual(credentials.snapshot().config?.connectionId, old.connectionId);
+  assert.equal(credentials.snapshot().config?.lastConversationId, "root");
+});
+
+test("chat.J8 记录写入失败保留最后成功记录，后续凭据写入仍可使用", async () => {
+  const durable = storage();
+  let fail = false;
+  const credentials = new Credentials({ ...durable, async setItemAsync(key, value) {
+    if (fail) throw new Error("disk unavailable");
+    await durable.setItemAsync(key, value);
+  } });
+  await credentials.install({ baseUrl: "http://a", token: "a", deviceId: "a" });
+  const owner = credentials.snapshot().config!;
+  await credentials.rememberConversation(owner.connectionId, "saved");
+  fail = true;
+  await assert.rejects(credentials.rememberConversation(owner.connectionId, "not-saved"), /disk unavailable/);
+  assert.equal(credentials.snapshot().config?.lastConversationId, "saved");
+  fail = false;
+  await credentials.renameComputer(owner.computerId, "Work");
+  const restored = new Credentials(durable);
+  await restored.restore();
+  assert.equal(restored.snapshot().config?.lastConversationId, "saved");
+  assert.equal(restored.snapshot().config?.connectionId, owner.connectionId);
+  assert.equal(restored.snapshot().config?.localName, "Work");
 });
 
 test("only a proven repeated pairing deduplicates; a hostname, endpoint or fresh device does not", async () => {
@@ -321,7 +373,7 @@ test("explicit 4401 revocation removes only its saved installation", async () =>
   assert.deepEqual(restored.snapshot().computers.map((item) => item.computerId), [a.computerId]);
 });
 
-test("self-revoke racing with SSE refusal never marks the fallback revoked", async () => {
+test("local disconnect racing with SSE refusal never marks the fallback revoked", async () => {
   const credentials = new Credentials(storage());
   await credentials.install({ baseUrl: "http://a", token: "a" });
   const a = credentials.snapshot().config!;
@@ -455,14 +507,30 @@ test("a cancelled page probe cannot cancel request-level 401 confirmation", asyn
   assert.equal(credentials.snapshot().computers.length, 1);
 });
 
-test("hidden-status probe times out and aborts an unresponsive transport", async () => {
+test("hidden-status probe times out and aborts an unresponsive transport", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   let transportSignal: AbortSignal | undefined;
+  const transport = Promise.withResolvers<Response>();
   const api = new GatewayApi({ baseUrl: "http://computer", token: "old" }, async (_url, init) => {
     transportSignal = init?.signal ?? undefined;
-    return new Promise<Response>(() => {});
+    return transport.promise;
   });
-  await api.checkUnauthorized();
-  assert.equal(transportSignal?.aborted, true);
+  let ended = false;
+  const pending = api.checkUnauthorized().finally(() => { ended = true; });
+  try {
+    t.mock.timers.tick(4_999);
+    await Promise.resolve();
+    assert.equal(ended, false);
+    assert.equal(transportSignal?.aborted, false);
+    t.mock.timers.tick(1);
+    await pending;
+    assert.equal(ended, true);
+    assert.equal(transportSignal?.aborted, true);
+  } finally {
+    transport.resolve(new Response("", { status: 200 }));
+    t.mock.timers.tick(5_000);
+    await pending;
+  }
 });
 
 test("hidden-status probe marks a real 401 invalid without deleting the computer", async () => {
@@ -481,4 +549,44 @@ test("hidden-status probe marks a real 401 invalid without deleting the computer
   const restored = new Credentials(durable);
   await restored.restore();
   assert.equal(restored.snapshot().config?.authStatus, "invalid");
+});
+
+test("chat.J9 首次连接意图按连接归属消费，冷启与重复配对不重新开新对话", async () => {
+  const durable = storage();
+  const credentials = new Credentials(durable);
+  await credentials.install({ baseUrl: "http://a", token: "a", deviceId: "a" });
+  const a = credentials.snapshot().config!;
+  assert.equal(credentials.snapshot().newChatConnectionId, a.connectionId);
+  await credentials.install({ baseUrl: "http://b", token: "b", deviceId: "b" });
+  const b = credentials.snapshot().config!;
+  await credentials.rememberConversation(a.connectionId, "late-root-a");
+  assert.equal(credentials.snapshot().newChatConnectionId, b.connectionId);
+  await credentials.rememberConversation(b.connectionId, "root-b");
+  assert.equal(credentials.snapshot().newChatConnectionId, null);
+  const restored = new Credentials(durable);
+  await restored.restore();
+  assert.equal(restored.snapshot().newChatConnectionId, null);
+  assert.equal(restored.snapshot().config?.lastConversationId, "root-b");
+  await credentials.install({ baseUrl: "http://b", token: "replacement", deviceId: "b" });
+  assert.equal(credentials.snapshot().newChatConnectionId, null);
+  assert.equal(credentials.snapshot().config?.lastConversationId, "root-b");
+});
+
+test("chat.J8/J9 首次打开记录写失败也消费导航意图，不在下次入口自动重放", async () => {
+  const durable = storage();
+  let fail = false;
+  const credentials = new Credentials({ ...durable, async setItemAsync(key, value) {
+    if (fail) throw new Error("disk unavailable");
+    await durable.setItemAsync(key, value);
+  } });
+  await credentials.install({ baseUrl: "http://a", token: "a", deviceId: "a" });
+  const owner = credentials.snapshot().config!;
+  fail = true;
+  await assert.rejects(credentials.rememberConversation(owner.connectionId, "not-saved"), /disk unavailable/);
+  assert.equal(credentials.snapshot().newChatConnectionId, null);
+  assert.equal(credentials.snapshot().config?.lastConversationId, undefined);
+  const restored = new Credentials(durable);
+  await restored.restore();
+  assert.equal(restored.snapshot().newChatConnectionId, null);
+  assert.equal(restored.snapshot().config?.lastConversationId, undefined);
 });

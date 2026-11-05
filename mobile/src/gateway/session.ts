@@ -18,21 +18,23 @@ import {
   type TaskConversation,
   GatewayApi,
   GatewayError,
+  createResultUnknown,
 } from "./api.ts";
 import { AgentList } from "./agents.ts";
+import { EditorOperations } from "./editor-operation.ts";
 import { EventStream, type StreamOptions, type StreamState } from "./stream.ts";
 import { Drafts } from "./drafts.ts";
 import { uiSubmissionFromEvent, type UiDraft, type UiSubmission } from "../lib/agent-message.ts";
+import { uiDraftReducer } from "../lib/ui-draft.ts";
 import { eventTimelines } from "./timelines.ts";
 import { networkDiagnostic } from "./network-diagnostics.ts";
+import { retryDelay } from "../lib/load-state.ts";
 
 
 export type ConversationView = Omit<Conversation, "last_agent_seq"> & {
   /** 临时的“正在做什么”，状态离开 working 时清掉。 */
   activity: string | null;
   lastTextSeq: number;
-  /** 最近一条已确认产品活动的时间；对话列表不提供它，不能拿 updated_at 代替。 */
-  lastActivityAt: number | null;
   lastAgentSeq: number;
 };
 
@@ -51,10 +53,11 @@ export type Timeline = {
   loaded: boolean;
   complete: boolean;
   loading: boolean;
-  /** 本时间线最近一次历史请求失败；新尝试开始时清除，不依赖 SSE 连接状态。 */
+  /** 本时间线最近一次历史读取失败；保留至读取成功，后台重试期间不闪退横幅。 */
   historyError?: string;
 };
 
+export type PendingFailureReason = "timeout" | "offline" | "rejected" | "recovered" | "deferred";
 export type Pending = {
   clientId: string;
   conversationId: string;
@@ -64,14 +67,23 @@ export type Pending = {
   /** 失败后能否用同一个 client_id 重试（网关不会重复执行）。 */
   retryable: boolean;
   error: string | null;
+  reason?: PendingFailureReason;
 };
 
 const PAGE = 50;
 const DELETED_TIMELINE: Timeline = { events: [], submissions: new Map(), oldest: null, loaded: true, complete: true, loading: false };
 const EMPTY_SUBMISSIONS: ReadonlyMap<number, UiSubmission> = new Map();
 
+let nextQueryIdentity = 0;
+
 export class ChatSession {
   readonly api: GatewayApi;
+  /** Object-lifetime identity, allocated at construction, never from credentials or during React render. */
+  readonly queryIdentity = `session-${++nextQueryIdentity}`;
+  /** Store replacement revokes old commands, not just their navigation. */
+  private storeGeneration = 0;
+  get storeVersion(): number { return this.storeGeneration; }
+  private readonly creationConfirmations = new Map<string, { id: string; agentId: string; title: string }>();
   conversations = new Map<string, ConversationView>();
   timelines = new Map<string, Timeline>();
   tasks = new Map<string, TaskView>();
@@ -96,14 +108,17 @@ export class ChatSession {
   /** An unconfirmed failed stop retains its client identity until a receipt, terminal state or removal. */
   private stopRequests = new Map<string, { clientId: string; confirmed: boolean }>();
   version = 0;
-  /** 首页 / 全部 Agent 的数据；事件流（重新）连上和相关事件到达时自动重拉。 */
+  /** All Agents in confirmed manual order; shared by directory, carousel and entry navigation. */
   readonly agents: AgentList;
+  readonly editorOperations: EditorOperations;
   /** Connector metadata/status and used_by invalidation; screens keep editable drafts separate from this revision. */
   connectorRevision = 0;
   /** Skill directories are not watched; only gateway deletes emit events. Screens also refresh on focus. */
   skillRevision = 0;
   /** Global schedule revision; resources have no Agent metadata in their event. */
   scheduleRevision = 0;
+  /** A list predating a write/read-back cannot authorize another toggle. Ordinary SSE refreshes do not raise this barrier. */
+  scheduleReceiptRevision = 0;
   /** Live lease snapshots shared by chat, profile, settings and attention dots. */
   browserTasks = new Map<string, BrowserTask>();
   browserRevision = 0;
@@ -113,6 +128,8 @@ export class ChatSession {
   private browserRefresh: Promise<void> | null = null;
   private browserRefreshAgain = false;
   private browserGeneration = 0;
+  private browserRetry: ReturnType<typeof setTimeout> | undefined;
+  private browserReadFailures = 0;
   private collaborationGeneration = 0;
   private scheduleSeq = new Map<string, number>();
   readonly deletedScheduleIds = new Set<string>();
@@ -158,16 +175,33 @@ export class ChatSession {
 
   /** The native layer owns staged bytes; this callback disposes them on local or remote deletion. */
   onConversationDeleted?: (id: string) => void;
+  /** Native durable first-send receipts follow HTTP, SSE and paginated-history confirmation alike. */
+  onMessageConfirmed?: (id: string, clientId: string) => void;
   constructor(config: GatewayConfig, fetchImpl?: Fetch, streamOptions: StreamOptions = {}, onUnauthorized?: (reason: "invalid" | "revoked") => void, resetConnections?: () => void) {
     this.api = new GatewayApi(config, fetchImpl, onUnauthorized, resetConnections);
     this.streamOptions = streamOptions;
     this.resetConnections = resetConnections;
     this.agents = new AgentList(this.api, () => this.changed());
+    this.editorOperations = new EditorOperations(this.api, () => !this.closed && this.connection === "open", receipt => {
+      // A successful write/read-back can precede or have no SSE receipt. Invalidate
+      // through the session bridge, including when the initiating page has left.
+      if (receipt?.resource === "schedule") this.scheduleReceiptRevision = ++this.scheduleRevision;
+      if (receipt?.resource === "connector") this.connectorRevision++;
+      // Browser commands/read-back have no list watermark; refresh the canonical
+      // snapshot rather than publishing an unsequenced command response over SSE.
+      if (receipt?.resource === "browser") void this.refreshBrowserTasks();
+      this.changed();
+    });
   }
 
   // ---- 订阅（给 useSyncExternalStore） ----
 
+  /** Active subscribers receive one final stopped snapshot after teardown.
+   * Terminal callbacks are captured and detached before delivery, so self-unsubscribe is safe.
+   * Subscribe after stopping only reads the terminal snapshot; it retains no listener.
+   */
   subscribe = (listener: () => void): (() => void) => {
+    if (this.connection === "stopped") return () => {};
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   };
@@ -261,6 +295,8 @@ export class ChatSession {
             this.abandonSnapshotReads();
             this.notice = null;
             this.agents.refresh();
+            this.editorOperations.recover();
+            void this.recoverUiSubmissions();
             this.refreshConnectors();
             this.skillRevision++;
             this.memoryConnectionRevision++;
@@ -284,6 +320,8 @@ export class ChatSession {
     const stream = this.stream;
     this.stream = null;
     this.connection = "listing"; // 清空旧库状态前先标记，界面不能把临时空列表当成已删除
+    this.storeGeneration++;
+    this.creationConfirmations.clear();
     this.deleted.clear();
     this.lastTitleSeq.clear();
     this.beforeSnapshot.clear();
@@ -308,6 +346,7 @@ export class ChatSession {
     this.deletedScheduleIds.clear();
     this.scheduleRevision++;
     this.browserGeneration++;
+    clearTimeout(this.browserRetry); this.browserRetry = undefined; this.browserReadFailures = 0;
     this.browserTasks.clear();
     this.browserEventSeq.clear();
     this.browserSnapshotSeq = 0;
@@ -376,6 +415,7 @@ export class ChatSession {
     this.api.cancelReads();
     this.agents.abandonRead();
     this.browserGeneration++;
+    clearTimeout(this.browserRetry); this.browserRetry = undefined;
     this.browserRefresh = null;
     this.browserRefreshAgain = false;
     this.collaborationGeneration++;
@@ -386,17 +426,22 @@ export class ChatSession {
     return this.stream?.lastSeq ?? 0;
   }
 
-  /** Closing the API first interrupts requests and socket streams before a replacement can start. */
+  /** First reject new work and abort API/streams; then clear state and publish stopped once.
+   * The final version notification bypasses changed()'s closed guard so attached resources
+   * can stop retries. close() resolves after notification; repeated calls share that barrier.
+   */
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.closed = true;
     clearTimeout(this.pendingResume);
     this.pendingResume = undefined;
     clearTimeout(this.draftNotification);
+    clearTimeout(this.browserRetry); this.browserRetry = undefined;
     this.wakeList?.();
     this.draftNotification = undefined;
     this.api.close();
     this.agents.close();
+    this.editorOperations.close();
     this.stream = null;
     this.closing = Promise.all([...this.streams].map((stream) => stream.close()).concat(this.starting ? [this.starting] : [])).then(() => {
       this.streams.clear();
@@ -411,8 +456,7 @@ export class ChatSession {
       this.stopping.clear();
       this.viewing.clear();
       this.reading.clear();
-      this.listeners.clear();
-      this.creating.clear();
+      this.creationConfirmations.clear();
       this.beforeSnapshot.clear();
       this.createdBeforeSnapshot.clear();
       this.deleted.clear();
@@ -440,6 +484,11 @@ export class ChatSession {
       this.browserRevision = 0;
       this.memoryConnectionRevision = 0;
       this.onConversationDeleted = undefined;
+      this.onMessageConfirmed = undefined;
+      const listeners = [...this.listeners];
+      this.listeners.clear();
+      this.version++;
+      for (const listener of listeners) listener();
     });
     return this.closing;
   }
@@ -451,7 +500,7 @@ export class ChatSession {
     this.conversations = new Map(
       conversations.filter((c) => !this.deleted.has(c.id)).map(({ last_agent_seq, ...c }) => [
         c.id,
-        { ...c, activity: null, lastTextSeq: 0, lastActivityAt: null, lastAgentSeq: last_agent_seq },
+        { ...c, activity: null, lastTextSeq: 0, lastAgentSeq: last_agent_seq },
       ]),
     );
     for (const [id, conversation] of this.createdBeforeSnapshot) {
@@ -472,6 +521,7 @@ export class ChatSession {
       this.browserRefreshAgain = true;
       return this.browserRefresh;
     }
+    clearTimeout(this.browserRetry); this.browserRetry = undefined;
     const generation = this.browserGeneration;
     const request = this.api.listBrowserTasks().then(({ browser_tasks, as_of_seq }) => {
       if (this.closed || generation !== this.browserGeneration || as_of_seq < this.browserSnapshotSeq) return;
@@ -492,11 +542,13 @@ export class ChatSession {
       this.browserSnapshotSeq = as_of_seq;
       for (const [id, seq] of this.browserEventSeq) if (seq <= as_of_seq) this.browserEventSeq.delete(id);
       this.browserError = null;
+      this.browserReadFailures = 0;
       this.browserRevision++;
       this.changed();
     }, (error: unknown) => {
       if (this.closed || generation !== this.browserGeneration) return;
       this.browserError = describe(error);
+      if (this.connection === "open") this.browserRetry = setTimeout(() => void this.refreshBrowserTasks(), retryDelay(this.browserReadFailures++));
       this.changed();
     }).finally(() => {
       if (this.browserRefresh === request) {
@@ -703,6 +755,7 @@ export class ChatSession {
   /** 事件流或命令响应里的持久事件；各字段按自己的 seq 水位应用，与时间线是否已有该事件无关。 */
   private apply(event: GatewayEvent): void {
     if (this.closed) return;
+    this.editorOperations.observe(event);
     if (this.connection === "listing" && event.seq > this.snapshotSeq) this.beforeSnapshot.set(event.seq, event);
     if (event.type === "conversation.deleted") {
       const id = event.data.id;
@@ -776,6 +829,9 @@ export class ChatSession {
       }
     }
     this.agents.observe(event);
+    if (event.type === "conversation.created" && event.client_id && event.conversation_id) {
+      this.creationConfirmations.set(event.client_id, { id: event.conversation_id, agentId: event.data.agent_id, title: event.data.title });
+    }
     if (event.conversation_id === undefined) {
       // 全局资源事件使相关列表失效，但不进入对话时间线。
       this.changed();
@@ -789,15 +845,22 @@ export class ChatSession {
     }
     this.insert(event);
     this.observeTask(event);
-    if (event.client_id && (event.type === "message.user" || event.type === "message.agent")) {
-      this.pending.delete(event.client_id);
-    }
     if (event.seq <= this.snapshotSeq) {
       this.changed();
       return;
     }
     const conversation = eventTimelines(event).includes(event.conversation_id)
       ? this.conversations.get(event.conversation_id) : undefined;
+    // Snapshot and live activity share one projection (gateway _ROOT_ACTIVITY_FILTER): only the user's own
+    // sends — including interjections in a collaboration child, recorded under the root id — and schedule triggers
+    // move a root. AI replies, status, browser requests and member messages never do. Sequence owns its timestamp.
+    const ranked = this.conversations.get(event.conversation_id);
+    if (ranked && (event.type === "message.user" ||
+        event.type === "schedule.triggered" && event.data.timeline_ids == null) &&
+      event.seq > (ranked.last_activity_seq ?? 0)) {
+      ranked.last_activity_seq = event.seq;
+      ranked.last_activity_at = event.at;
+    }
     // context.* 压缩通知只留在时间线，不更新未读、last_text 或会话列表顺序。
     switch (event.type) {
       case "conversation.created":
@@ -814,9 +877,10 @@ export class ChatSession {
             status: "idle",
             unread: false,
             last_text: null,
+            last_activity_seq: null,
+            last_activity_at: null,
             activity: null,
             lastTextSeq: 0,
-            lastActivityAt: null,
             lastAgentSeq: 0,
           });
         }
@@ -849,7 +913,6 @@ export class ChatSession {
         if (conversation && event.seq > conversation.lastTextSeq && typeof event.data.text === "string") {
           conversation.last_text = event.data.text;
           conversation.lastTextSeq = event.seq;
-          conversation.lastActivityAt = event.at;
           conversation.updated_at = Math.max(conversation.updated_at, event.at);
         }
         if (conversation && event.type === "message.agent" && event.seq > conversation.lastAgentSeq) {
@@ -908,6 +971,10 @@ export class ChatSession {
       if (this.deleted.has(id)) continue;
       if (id !== event.conversation_id) this.timelineRoots.set(id, event.conversation_id);
       this.insertInto(id, event);
+      if (event.client_id && (event.type === "message.user" || event.type === "message.agent")) {
+        if (this.pending.get(event.client_id)?.conversationId === id) this.pending.delete(event.client_id);
+        this.onMessageConfirmed?.(id, event.client_id);
+      }
     }
   }
 
@@ -974,8 +1041,7 @@ export class ChatSession {
     const previous = blocks.get(block);
     blocks.set(block, draft);
     // The json-render store already updates the mounted field; don't rerender the entire chat per keystroke.
-    if (previous?.pending !== draft.pending || previous?.completed !== draft.completed ||
-      previous?.error !== draft.error || previous?.attempt !== draft.attempt) this.changed();
+    if (previous?.flow !== draft.flow) this.changed();
   }
 
   // ---- 聊天页 ----
@@ -998,8 +1064,6 @@ export class ChatSession {
     const timeline = this.timeline(id);
     if (timeline.loading || timeline.complete) return;
     timeline.loading = true;
-    timeline.historyError = undefined;
-    this.taskErrors.delete(id);
     this.changed();
     try {
       if (!this.chat(id)) await this.ensureTask(id);
@@ -1012,6 +1076,8 @@ export class ChatSession {
       if (events.length > 0) timeline.oldest = events[0].seq;
       timeline.complete = events.length < PAGE;
       timeline.loaded = true;
+      timeline.historyError = undefined;
+      this.taskErrors.delete(id);
       if (this.viewing.has(id)) void this.markRead(id);
     } catch (error) {
       if (!this.closed && !this.deleted.has(id) && this.timelines.get(id) === timeline) {
@@ -1057,23 +1123,39 @@ export class ChatSession {
 
   // ---- 命令 ----
 
-  async createConversation(agentId: string, title?: string): Promise<string> {
-    const conversation = await this.api.createConversation(agentId, title);
+  async createConversation(agentId: string, title: string | undefined, clientId: string): Promise<string> {
+    const generation = this.storeGeneration;
+    let conversation: Conversation;
+    try {
+      conversation = await this.api.createConversation(agentId, title, clientId);
+    } catch (error) {
+      const confirmed = this.creationConfirmations.get(clientId);
+      const unknown = createResultUnknown(error) || error instanceof GatewayError && error.status === 408;
+      if (unknown && !this.closed && generation === this.storeGeneration && confirmed &&
+        confirmed.agentId === agentId && confirmed.title === (title || "新对话").trim() && !this.deleted.has(confirmed.id)) return confirmed.id;
+      throw error;
+    }
     if (this.closed) throw new GatewayError(0, "cancelled", "连接已关闭");
+    // A receipt from a replaced store must not enter the new one.
+    if (generation !== this.storeGeneration) throw new GatewayError(0, "cancelled", "对话库已更换");
     if (this.deleted.has(conversation.id)) throw new GatewayError(404, "not_found", "对话已删除");
     if (!this.conversations.has(conversation.id)) {
-      this.conversations.set(conversation.id, { ...conversation, activity: null, lastTextSeq: 0, lastActivityAt: null, lastAgentSeq: 0 });
+      // Idempotent creation receipts are historical snapshots, not resurrection instructions.
+      // A cold session has no deletion tombstone: prove existence with one bounded resource read.
+      await this.api.history(conversation.id, undefined, 1);
+      if (this.closed || generation !== this.storeGeneration) throw new GatewayError(0, "cancelled", "连接已关闭");
+      if (this.deleted.has(conversation.id)) throw new GatewayError(404, "not_found", "对话已删除");
+    }
+    if (!this.conversations.has(conversation.id)) {
+      this.conversations.set(conversation.id, { ...conversation, activity: null, lastTextSeq: 0, lastAgentSeq: 0 });
       if (this.connection === "listing") this.createdBeforeSnapshot.set(conversation.id, this.conversations.get(conversation.id)!);
       this.changed();
     }
     return conversation.id;
   }
 
-  /**
-   * 进入最近有产品活动的对话：比较摘要和本地已确认的用户 / Agent 消息，不受状态、已读或空对话影响。
-   * 统一按活动 seq 比较，时间只用于展示；没有活动时复用最新创建的对话，都没有才新建。
-   */
-  conversationFor(agent: Pick<AgentSummary, "id" | "latest_conversation">): Promise<string> {
+  /** Member entry restores a real conversation; absence is a local new-chat destination, never a write. */
+  conversationFor(agent: Pick<AgentSummary, "id" | "latest_conversation">): string | undefined {
     // 换库后调用方可能还握着旧 Agent 行：优先用当前列表；尚未加载列表时，只信本地确实存在的摘要。
     const listed = this.agents.agents.find((item) => item.id === agent.id);
     const candidate = listed ? listed.latest_conversation : agent.latest_conversation;
@@ -1085,61 +1167,38 @@ export class ChatSession {
     for (const conversation of this.conversations.values()) {
       if (conversation.agent_id !== agent.id) continue;
       if (!newest || conversation.created_at > newest.created_at) newest = conversation;
-      if (conversation.lastTextSeq > 0 && (!active || conversation.lastTextSeq > active.lastTextSeq)) {
+      // Same ranking as the gateway summary: user sends and schedule triggers, never AI replies (conversation-drawer.P1).
+      if (conversation.last_activity_seq !== null && (!active || conversation.last_activity_seq > active.last_activity_seq!)) {
         active = conversation;
       }
     }
-    if (active && (summary?.last_activity_seq == null || active.lastTextSeq > summary.last_activity_seq)) {
-      return Promise.resolve(active.id);
+    if (active && (summary?.last_activity_seq == null || active.last_activity_seq! > summary.last_activity_seq)) {
+      return active.id;
     }
-    if (summary?.last_activity_seq != null) return Promise.resolve(summary.id);
+    if (summary?.last_activity_seq != null) return summary.id;
     // 空摘要缺少创建时间；只有本地同时知道两者的创建时间时，才用较新的空对话覆盖它。
     const summaryCreatedAt = summary ? this.conversations.get(summary.id)?.created_at : undefined;
     const known = summary && (!newest || summaryCreatedAt === undefined || newest.created_at <= summaryCreatedAt)
       ? summary.id
       : newest?.id;
-    return known !== undefined ? Promise.resolve(known) : this.createOnce(agent.id);
+    return known;
   }
 
-  /**
-   * “新对话”：已有一个空对话就直接用它，避免堆出一串空对话；否则新建。
-   * 空 = 当前字段和已加载历史都没有消息，且本地没有待发送 / 发送失败的消息。
-   */
-  blankConversation(agentId: string): Promise<string> {
-    const blank = this.conversationsOf(agentId).find((c) =>
-      c.last_text === null &&
-      this.pendingFor(c.id).length === 0 &&
-      !this.timelines.get(c.id)?.events.some((event) => event.type === "message.user" || event.type === "message.agent")
-    );
-    return blank ? Promise.resolve(blank.id) : this.createOnce(agentId);
-  }
 
   /** 某个入口 Agent 的对话，最近更新的在前。 */
   conversationsOf(agentId: string): ConversationView[] {
     return this.sortedConversations().filter((c) => c.agent_id === agentId);
   }
 
-  /** 同一 Agent 的新建请求进行中时共用它：重复点击不会建出两个对话。 */
-  private creating = new Map<string, Promise<string>>();
-
-  private createOnce(agentId: string): Promise<string> {
-    let creating = this.creating.get(agentId);
-    if (!creating) {
-      creating = this.createConversation(agentId).finally(() => this.creating.delete(agentId));
-      this.creating.set(agentId, creating);
-    }
-    return creating;
-  }
 
   /** 先在本地显示，再提交。client_id 在第一次提交前生成，重试沿用：网关保证同一个只执行一次。 */
-  send(conversationId: string, text: string, attachments: Pick<FileRecord, "id" | "name" | "media_type" | "size">[] = []): Promise<void> {
+  send(conversationId: string, text: string, attachments: Pick<FileRecord, "id" | "name" | "media_type" | "size">[] = [], clientId = newClientId()): Promise<void> {
     if (this.closed) return Promise.resolve();
     if (this.deleted.has(conversationId)) {
       this.notice = "对话已删除";
       this.changed();
       return Promise.resolve();
     }
-    const clientId = newClientId();
     this.pending.set(clientId, {
       clientId,
       conversationId,
@@ -1153,11 +1212,23 @@ export class ChatSession {
     return this.submit(clientId);
   }
 
+  /** Reload a durable first-send intent as a failed item; recovery never submits network writes. */
+  restoreFirstSend(conversationId: string, clientId: string, text: string, attachments: Pending["attachments"],
+    reason: "recovered" | "deferred" = "recovered"): void {
+    if (this.closed || this.deleted.has(conversationId) || this.pending.has(clientId)) return;
+    if (this.timelines.get(conversationId)?.events.some(event => event.client_id === clientId)) return;
+    this.pending.set(clientId, { conversationId, clientId, text, attachments, status: "failed", retryable: true, error: "结果未确认", reason });
+    this.changed();
+  }
+
   retry(clientId: string): Promise<void> {
     const pending = this.pending.get(clientId);
     if (this.closed || !pending || pending.status === "sending" || !pending.retryable) return Promise.resolve();
+    // O8 is known not submitted. Offline retry must leave its receipt untouched (Q7).
+    if (pending.reason === "deferred" && this.connection !== "open") return Promise.resolve();
     pending.status = "sending";
     pending.error = null;
+    pending.reason = undefined;
     this.changed();
     return this.submit(clientId);
   }
@@ -1171,31 +1242,41 @@ export class ChatSession {
 
   private async submit(clientId: string): Promise<void> {
     const pending = this.pending.get(clientId)!;
+    // chat.G3: failed sends are local user-owned items, never an offline command queue.
+    if (this.connection !== "open") {
+      pending.status = "failed";
+      pending.retryable = true;
+      pending.error = "连接已断开，请恢复连接后重试";
+      pending.reason = "offline";
+      this.changed();
+      return;
+    }
     try {
       const { event } = await (this.tasks.has(pending.conversationId)
         ? this.api.sendTaskMessage(pending.conversationId, clientId, pending.text)
         : this.api.sendMessage(pending.conversationId, clientId, pending.text, pending.attachments?.map((file) => file.id) ?? []));
       if (this.closed || this.pending.get(clientId) !== pending) return; // 流已确认、删除或换库时，不重放旧请求
-      this.pending.delete(clientId);
       if (!this.deleted.has(pending.conversationId)) this.apply(event);
     } catch (error) {
       if (this.closed || this.pending.get(clientId) !== pending) return; // 流已确认，或对话已被删除
       pending.status = "failed";
       pending.retryable = !(error instanceof GatewayError) || error.retryable;
-      pending.error = describe(error);
+      pending.error = error instanceof GatewayError && error.code === "timeout" ? "结果未确认" : describe(error);
+      pending.reason = error instanceof GatewayError && error.code === "timeout" ? "timeout" : "rejected";
       this.collaborationRefusal(pending.conversationId, error);
       this.changed();
     }
   }
 
   /** A UI submission is a normal user event; conflicts include the winning user event, even outside history pages. */
-  async submitUi(conversationId: string, messageSeq: number, block: number, values: Record<string, unknown>, clientId: string): Promise<void> {
+  async submitUi(conversationId: string, messageSeq: number, block: number, values: Record<string, unknown>, clientId: string, actionId?: string): Promise<void> {
     if (this.closed) throw new GatewayError(0, "cancelled", "连接已关闭");
     if (this.deleted.has(conversationId)) throw new GatewayError(404, "ui_block_not_found", "对话已删除");
+    if (this.connection !== "open") throw new GatewayError(0, "offline", "连接已断开，请恢复连接后重试");
     const timeline = this.timeline(conversationId);
     const rootId = this.rootId(conversationId);
     try {
-      const { event } = await this.api.submitUi(rootId, clientId, messageSeq, block, values);
+      const { event } = await this.api.submitUi(rootId, clientId, messageSeq, block, values, actionId);
       if (this.closed || this.deleted.has(conversationId) || this.timelines.get(conversationId) !== timeline) return;
       this.apply(event);
     } catch (error) {
@@ -1210,6 +1291,43 @@ export class ChatSession {
         }
       }
       throw error;
+    }
+  }
+
+  /** Recovery is read-only, automatic on reconnect or explicit for one visible block.
+   * Unknown sends never auto-replay; only confirmed absence permits the same POST identity. */
+  async recoverUiSubmissions(target?: { timelineId: string; messageSeq: number; block: number }): Promise<void> {
+    if (this.closed || this.connection !== "open") return;
+    const generation = this.storeGeneration;
+    for (const [id, messages] of this.uiDrafts) for (const [messageSeq, blocks] of messages) for (const [block, draft] of blocks) {
+      if (this.closed || this.connection !== "open" || this.storeGeneration !== generation) return;
+      if (target && (target.timelineId !== id || target.messageSeq !== messageSeq || target.block !== block)) continue;
+      if (draft.flow.status !== 'unknown') continue;
+      const clientId = draft.flow.attempt.clientId;
+      const timeline = this.timeline(id);
+      this.saveUiDraft(id, messageSeq, block, uiDraftReducer(draft, { type: 'check', clientId }));
+      try {
+        const { event } = await this.api.uiSubmissionResult(this.rootId(id), messageSeq, block);
+        if (this.closed || this.storeGeneration !== generation || this.deleted.has(id) || this.timelines.get(id) !== timeline) continue;
+        const current = this.uiDraftFor(id, messageSeq, block);
+        if (current?.flow.status !== 'checking' || current.flow.attempt.clientId !== clientId) continue;
+        if (event) {
+          const receipt = uiSubmissionFromEvent(event);
+          if (event.conversation_id === this.rootId(id) && receipt?.messageSeq === messageSeq && receipt.block === block) this.apply(event);
+        } else {
+          this.saveUiDraft(id, messageSeq, block, uiDraftReducer(current, {
+            type: 'checked', clientId, failure: { message: '尚未发送，可以重试。', retryable: true, editable: false },
+          }));
+        }
+      } catch {
+        // Failed reads do not prove absence. The user may check again without replaying POST.
+      } finally {
+        if (!this.closed && this.storeGeneration === generation && !this.deleted.has(id) && this.timelines.get(id) === timeline) {
+          const current = this.uiDraftFor(id, messageSeq, block);
+          if (current?.flow.status === 'checking' && current.flow.attempt.clientId === clientId)
+            this.saveUiDraft(id, messageSeq, block, uiDraftReducer(current, { type: 'check-failed', clientId }));
+        }
+      }
     }
   }
 
@@ -1342,7 +1460,9 @@ function describe(error: unknown): string {
   return String(error);
 }
 
-function newClientId(): string {
+
+
+export function newClientId(): string {
   // 只需在本机唯一；不依赖 crypto.randomUUID（Hermes 不一定有）。
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }

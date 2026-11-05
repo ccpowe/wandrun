@@ -106,10 +106,21 @@ class ChromeDev:
         finally:
             os.close(write_fd)
         try:
-            ready, _, _ = select.select([read_fd], [], [], 10)
-            if not ready:
-                raise RuntimeError("Xvfb 启动超时")
-            display = os.read(read_fd, 32).decode("ascii").strip()
+            # Xserver writes the digits and newline separately. Closing after
+            # the first write can break its second write and terminate Xvfb.
+            deadline = time.monotonic() + 10
+            message = bytearray()
+            while b"\n" not in message:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([read_fd], [], [], remaining)[0]:
+                    raise RuntimeError("Xvfb 启动超时")
+                chunk = os.read(read_fd, 32 - len(message))
+                if not chunk:
+                    raise RuntimeError("Xvfb 未能分配显示号")
+                message.extend(chunk)
+                if len(message) >= 32 and b"\n" not in message:
+                    raise RuntimeError("Xvfb 未能分配显示号")
+            display = message.decode("ascii").strip()
             if not display.isdecimal():
                 raise RuntimeError("Xvfb 未能分配显示号")
             self.display = f":{display}"

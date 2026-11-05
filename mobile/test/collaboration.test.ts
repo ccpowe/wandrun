@@ -1,8 +1,9 @@
+import { branchNeedsAttention, conversationChildren, rootBranches, subtreeNeedsAttention, taskNeedsAttention } from '../src/lib/chat-branches.ts';
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import { ChatSession } from "../src/gateway/session.ts";
 import { type GatewayEvent, type TaskConversation } from "../src/gateway/api.ts";
-import { buildItems } from "../src/lib/chat-timeline.ts";
+import { projectChatRows } from "../src/lib/chat-timeline.ts";
 import { searchDestination } from "../src/lib/file-delivery.ts";
 import { affectsAgentList } from "../src/gateway/agents.ts";
 import { collaborationEvents } from "./fixtures/collaboration-timeline.ts";
@@ -14,7 +15,7 @@ function setup(fetcher?: typeof fetch) {
   sessions.push(session);
   session.agents.close();
   session["reset"]([{ id: "root", agent_id: "planner", title: "Root", status: "idle", unread: false,
-    read_seq: 0, last_agent_seq: 0, created_at: 1, updated_at: 1, last_text: null, source: "user", schedule_origin: null }], 1);
+    read_seq: 0, last_agent_seq: 0, created_at: 1, updated_at: 1, last_text: null, last_activity_seq: null, last_activity_at: null, source: "user", schedule_origin: null }], 1);
   session.connection = "open";
   return session;
 }
@@ -39,14 +40,14 @@ test("root history excludes Agent-to-Agent bodies between delegations while memb
   for (const entry of collaborationEvents) session["apply"](entry);
   const history = session.timeline("root").events;
   assert.ok(history.some((entry) => entry.seq === 11), "transport retains the shared root endpoint event");
-  const rootItems = buildItems(history, [], undefined, [], undefined, "root", session.tasks);
+  const rootItems = projectChatRows({ events: history, pending: [], timelineId: "root", tasks: session.tasks }).rows;
   assert.deepEqual(rootItems.map((row) => [row.key, row.event?.seq, row.delegation?.status]), [
     ["tsearch-1", 10, "completed"], ["tsearch-2", 12, "running"],
   ], "invisible bodies, file notices and receipts must not create separator-bearing rows");
-  assert.deepEqual(buildItems(history, []).map((row) => row.key), ["tsearch-1", "tsearch-2"],
+  assert.deepEqual(projectChatRows({ events: history, pending: [] }).rows.map((row) => row.key), ["tsearch-1", "tsearch-2"],
     "omitting timelineId still means the envelope's root, not an arbitrary member");
 
-  const memberItems = buildItems(session.timeline("search-1").events, [], undefined, [], undefined, "search-1", session.tasks);
+  const memberItems = projectChatRows({ events: session.timeline("search-1").events, pending: [], timelineId: "search-1", tasks: session.tasks }).rows;
   assert.deepEqual(memberItems.map((row) => row.event?.seq), [11, 32, 37, 38, 39, 67, 81]);
   assert.equal(memberItems[0].event?.data.recipient_task_id, "search-1", "parent instructions remain incoming");
   assert.equal(memberItems.at(-1)?.event?.data.sender_task_id, "search-1", "results to the parent remain outgoing");
@@ -59,14 +60,14 @@ test("member-to-member messages remain visible only to their endpoints, not to t
     attachments: [], timeline_ids: ["child", "nested"],
   });
   for (const id of ["child", "nested"]) {
-    assert.deepEqual(buildItems([entry], [], undefined, [], undefined, id).map((row) => row.key), ["e90"]);
+    assert.deepEqual(projectChatRows({ events: [entry], pending: [], timelineId: id }).rows.map((row) => row.key), ["e90"]);
   }
   for (const id of ["root", "other-member"]) {
-    assert.deepEqual(buildItems([entry], [], undefined, [], undefined, id), []);
+    assert.deepEqual(projectChatRows({ events: [entry], pending: [], timelineId: id }).rows, []);
   }
 });
 
-test("nested delivery fans out once; interjections and member replies never become root messages or home activity", () => {
+test("nested delivery fans out once; member replies never become root messages or activity, a user interjection only moves the root (conversation-drawer.P1 P10)", () => {
   const session = setup();
   create(session);
   create(session, "nested", "child", 3);
@@ -77,8 +78,10 @@ test("nested delivery fans out once; interjections and member replies never beco
   for (const type of ["message.user", "message.agent"]) {
     const message = event(type === "message.user" ? 5 : 6, type, { task_id: "child", text: type, timeline_ids: ["child"] });
     session["apply"](message);
-    assert.equal(affectsAgentList(message), false);
+    // 成员 Agent 回复不影响根摘要；用户插话推进根的排序活动，需要重拉摘要。
+    assert.equal(affectsAgentList(message), type === "message.user");
   }
+  assert.equal(session.conversations.get("root")!.last_activity_seq, 5);
   assert.deepEqual(session.timeline("root").events.map((e) => e.seq), [2]);
   assert.deepEqual(session.timeline("nested").events.map((e) => e.seq), [3, 4]);
   assert.deepEqual(session.timeline("child").events.map((e) => e.seq), [2, 3, 4, 5, 6]);
@@ -88,8 +91,8 @@ test("nested delivery fans out once; interjections and member replies never beco
   session["apply"](event(7, "task.read", { task_id: "child", seq: 6, timeline_ids: ["child"] }));
   assert.equal(session.tasks.get("child")!.unread, false);
   assert.equal(session.tasks.get("nested")!.unread, true);
-  const rootItems = buildItems(session.timeline("root").events, [], undefined, [], undefined, "root", session.tasks);
-  const childItems = buildItems(session.timeline("child").events, [], undefined, [], undefined, "child", session.tasks);
+  const rootItems = projectChatRows({ events: session.timeline("root").events, pending: [], timelineId: "root", tasks: session.tasks }).rows;
+  const childItems = projectChatRows({ events: session.timeline("child").events, pending: [], timelineId: "child", tasks: session.tasks }).rows;
   assert.deepEqual(rootItems.map((row) => row.delegation?.taskId), ["child"]);
   assert.deepEqual(childItems.filter((row) => row.delegation).map((row) => row.delegation?.taskId), ["nested"]);
 });
@@ -154,7 +157,7 @@ test("draft ordering and terminal replacement are task-local; deleting root clea
   assert.deepEqual(session.draftsFor("root"), []);
   assert.deepEqual(session.draftsFor("child").map((d) => d.text), ["child"]);
   session["apply"](event(3, "message.agent", { task_id: "child", text: "complete", draft_id: "d-child", timeline_ids: ["child"] }));
-  const items = buildItems(session.timeline("child").events, [], undefined, session.draftsFor("child"), session.drafts.order, "child");
+  const items = projectChatRows({ events: session.timeline("child").events, pending: [], browserTasks: undefined, drafts: session.draftsFor("child"), draftOrder: session.drafts.order, timelineId: "child" }).rows;
   assert.deepEqual(items.map((row) => [row.key, row.event?.data.text]), [["dd-child", "complete"]]);
   session["apply"](event(4, "conversation.deleted", { id: "root" }));
   assert.deepEqual(session.draftsFor("preview-only"), []);
@@ -270,9 +273,9 @@ test("member receipt after a failed stop clears only its own unresolved failure"
   assert.equal(session["stopRequests"].has("child"), false);
 });
 
-test("search locates the member timeline rather than a root containing only its preview", () => {
+test("search locates the member timeline rather than the root conversation", () => {
   assert.deepEqual(searchDestination({ kind: "message", id: "8", title: "Result", text: "blue", conversation_id: "root", task_id: "child", agent_id: "search", seq: 8 }),
-    { pathname: "/c/[id]", params: { id: "child", message_seq: "8" } });
+    { pathname: "/chat", params: { id: "child", message_seq: "8" } });
 });
 
 test("a delayed unread snapshot cannot undo a later receipt whose read position is below its global watermark", async () => {
@@ -351,4 +354,30 @@ test("unavailable needs attention in both member timelines, but never changes ro
   assert.equal(session.conversations.get("root")!.unread, false);
   session["apply"](event(7, "task.read", { task_id: "child", seq: 6, timeline_ids: ["child"] }));
   assert.equal(session.tasks.get("child")!.unread, false);
+});
+
+test('chat.H1 I3 I8 attention follows creator ancestry, never unread or another root', () => {
+  const session = setup();
+  create(session);
+  create(session, 'nested', 'child', 3);
+  create(session, 'sibling', 'root', 4);
+  const nested = session.tasks.get('nested')!;
+  nested.unread = true;
+  assert.equal(taskNeedsAttention(session, nested), false);
+  assert.equal(subtreeNeedsAttention(session, 'root'), false);
+  nested.status = 'failed';
+  assert.equal(subtreeNeedsAttention(session, 'root'), true);
+  assert.equal(branchNeedsAttention(session, session.tasks.get('child')!), true);
+  assert.equal(subtreeNeedsAttention(session, 'sibling'), false);
+  assert.equal(subtreeNeedsAttention(session, 'another-root'), false);
+  assert.equal(conversationChildren(session, 'root')[0].id, 'child');
+  assert.deepEqual(rootBranches(session, 'root'), { count: 3, attention: true });
+  nested.status = 'unavailable';
+  assert.equal(branchNeedsAttention(session, session.tasks.get('child')!), true);
+  nested.status = 'completed';
+  assert.equal(subtreeNeedsAttention(session, 'root'), false);
+  session.browserTasks.set('request', { task_id: nested.id, state: 'requested' } as never);
+  assert.equal(branchNeedsAttention(session, session.tasks.get('child')!), true);
+  session.browserTasks.get('request')!.state = 'human';
+  assert.equal(subtreeNeedsAttention(session, 'root'), false);
 });

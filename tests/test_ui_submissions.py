@@ -4,6 +4,7 @@ from copy import deepcopy
 import asyncio
 import json
 import unittest
+from uuid import uuid4
 
 import httpx
 
@@ -69,7 +70,7 @@ class UISubmissionTests(unittest.IsolatedAsyncioTestCase):
             base_url="http://gateway", headers={"Authorization": "Bearer secret"},
         )
         self.addAsyncCleanup(self.client.aclose)
-        self.conversation = self.gateway.create_conversation("测试", "main")["id"]
+        self.conversation = self.gateway.create_conversation("测试", "main", client_id=uuid4().hex)[0]["id"]
         self.url = f"/conversations/{self.conversation}/ui-submissions"
 
     def source(self, spec=FORM, *, conversation=None):
@@ -81,6 +82,80 @@ class UISubmissionTests(unittest.IsolatedAsyncioTestCase):
         return {"client_id": "submit-1", "message_seq": seq, "block": 0,
                 "values": {"plan": "B", "note": "按期完成"}, **changes}
 
+
+    async def test_send_uses_spec_text_and_persists_one_group_winner_after_restart(self):
+        spec = {
+            "root": "cards", "state": {}, "elements": {
+                "cards": {"type": "Grid", "props": {"columns": 2}, "children": ["a", "b"]},
+                "a": {"type": "StatCard", "props": {"label": "方案甲", "value": "128", "send": {"text": "选择方案甲，保留原文。"}}, "children": []},
+                "b": {"type": "StatCard", "props": {"label": "方案乙", "value": "256", "send": {"text": "选择方案乙，保留原文！"}}, "children": []},
+            },
+        }
+        source = self.source(spec)
+        body = {"client_id": "send-card", "message_seq": source.seq, "block": 0, "values": {}, "action_id": "b"}
+        lookup = f"{self.url}?message_seq={source.seq}&block=0"
+        self.assertEqual((await self.client.get(lookup)).json(), {"event": None})
+        for extra in ({"text": "客户端改写"}, {"values": {"text": "客户端改写"}}, {"action_id": "missing"}):
+            rejected = await self.client.post(self.url, json={**body, **extra})
+            self.assertEqual(rejected.status_code, 400)
+        sent = await self.client.post(self.url, json=body)
+        self.assertEqual(sent.status_code, 200, sent.text)
+        event = sent.json()["event"]
+        self.assertEqual(event["data"]["text"], "选择方案乙，保留原文！")
+        self.assertEqual(event["data"]["ui_submission"], {
+            "message_seq": source.seq, "block": 0, "values": {}, "action_id": "b",
+        })
+        await self.manager.wait(self.conversation)
+        self.assertEqual(self.calls[-1][-1], "选择方案乙，保留原文！")
+        repeated = await self.client.post(self.url, json=body)
+        self.assertEqual(repeated.json(), {"event": event, "replayed": True})
+        changed = await self.client.post(self.url, json={**body, "action_id": "a"})
+        self.assertEqual((changed.status_code, changed.json()["error"]["code"]), (409, "client_id_reused"))
+        rival = await self.client.post(self.url, json={**body, "client_id": "other", "action_id": "a"})
+        self.assertEqual((rival.status_code, rival.json()["error"]["code"]), (409, "ui_already_submitted"))
+        self.assertEqual((await self.client.get(lookup)).json(), {"event": event})
+        restarted = GatewayStore(self.path)
+        self.addCleanup(restarted.close)
+        other = Gateway(restarted)
+        self.assertEqual(other.ui_submission_result(self.conversation, source.seq, 0).to_dict(), event)
+        replay, created = other.submit_ui(self.conversation, "send-card", source.seq, 0, {}, action_id="b")
+        self.assertFalse(created)
+        self.assertEqual(replay.to_dict(), event)
+
+    async def test_submit_send_uses_persisted_button_text_and_read_receipt(self):
+        source = self.source({"root": "go", "state": {}, "elements": {
+            "go": {"type": "Submit", "props": {"label": "继续", "send": {"text": "请继续，保留原文。"}}, "children": []},
+        }})
+        body = {"client_id": "send-button", "message_seq": source.seq, "block": 0, "values": {}, "action_id": "go"}
+        response = await self.client.post(self.url, json=body)
+        self.assertEqual(response.status_code, 200)
+        winner = response.json()["event"]
+        self.assertEqual(winner["data"]["text"], "请继续，保留原文。")
+        self.assertEqual(winner["data"]["ui_submission"]["action_id"], "go")
+        self.assertEqual((await self.client.get(f"{self.url}?message_seq={source.seq}&block=0")).json(), {"event": winner})
+        await self.manager.wait(self.conversation)
+
+    async def test_followups_send_once_and_concurrent_choices_share_one_submission(self):
+        spec = {"root": "follow", "state": {}, "elements": {
+            "follow": {"type": "FollowUps", "props": {"items": [
+                {"label": "展开", "text": "请展开上一条结论"},
+                {"label": "举例", "text": "请给出一个具体例子"},
+            ]}, "children": []},
+        }}
+        source = self.source(spec)
+        responses = await asyncio.gather(*[
+            self.client.post(self.url, json={
+                "client_id": f"follow-{index}", "message_seq": source.seq, "block": 0,
+                "values": {}, "action_id": f"follow/{index}",
+            }) for index in range(2)
+        ])
+        self.assertEqual(sorted(response.status_code for response in responses), [200, 409])
+        winner = next(response.json()["event"] for response in responses if response.status_code == 200)
+        loser = next(response for response in responses if response.status_code == 409)
+        self.assertEqual(loser.json()["error"]["details"], {"event": winner})
+        index = int(winner["data"]["ui_submission"]["action_id"].split("/")[1])
+        self.assertEqual(winner["data"]["text"], spec["elements"]["follow"]["props"]["items"][index]["text"])
+        await self.manager.wait(self.conversation)
     async def test_submission_interrupts_active_turn(self):
         source = self.source()
         self.block = True
@@ -134,7 +209,7 @@ class UISubmissionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_submission_validation_provenance_and_conflicts(self):
         source = self.source()
-        extra = self.gateway.create_conversation("别的", "main")["id"]
+        extra = self.gateway.create_conversation("别的", "main", client_id=uuid4().hex)[0]["id"]
         other_source = self.source(conversation=extra)
         invalid = self.source({**FORM, "elements": {"root": {"type": "Unknown", "props": {}, "children": []}}, "state": {}})
         display = self.source(DISPLAY)
@@ -145,6 +220,8 @@ class UISubmissionTests(unittest.IsolatedAsyncioTestCase):
             result = await self.client.post(self.url, json=self.payload(seq, block=block))
             self.assertEqual((result.status_code, result.json()["error"]["code"]), (404, "ui_block_not_found"))
         self.assertEqual(invalid.data["ui"][0]["valid"], False)
+        action_on_form = await self.client.post(self.url, json=self.payload(source.seq, action_id="submit"))
+        self.assertEqual((action_on_form.status_code, action_on_form.json()["error"]["code"]), (400, "ui_invalid_values"))
         for values, expected_key in (({"plan": "A"}, "note"),
                                      ({"plan": "A", "note": "", "unexpected": 1}, "unexpected"),
                                      ({"plan": 42, "note": ""}, "plan"),
@@ -338,8 +415,8 @@ class UISubmissionTests(unittest.IsolatedAsyncioTestCase):
             batch = AgentOutput(messages=[SendMessage(to=to, task_id=task_id, message=text)], next="wait")
             return self.manager.dispatch(batch, sender)[0]
 
-        second = self.gateway.create_conversation("第二任务", "main")["id"]
-        multiple = self.gateway.create_conversation("多块任务", "main")["id"]
+        second = self.gateway.create_conversation("第二任务", "main", client_id=uuid4().hex)[0]["id"]
+        multiple = self.gateway.create_conversation("多块任务", "main", client_id=uuid4().hex)[0]["id"]
         errors = deliver(multiple, text=bad + "\n" + bad)
         self.assertFalse(errors["accepted"])
         self.assertIn("界面块 0", errors["error"])

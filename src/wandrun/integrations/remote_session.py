@@ -3,10 +3,12 @@
 
     python3 remote_session.py <工作目录> <termination_grace>
 
-stdin/stdout 上每行一个 JSON 消息：宿主发 run / cancel / shutdown，服务发 ready / result / closed；日志写 stderr。
+stdin/stdout 上每行一个 JSON 消息：宿主发 run / managed / cancel / shutdown。
+run 提供完整等待的同步执行；managed 为命令工具发 output / log_error / finalizing / result，
+使用远端日志、未回收组长身份与完整进程组收尾。它不是跨暂停或断线常驻的监督服务。
 一个环境的所有活动调用都由这一个进程持有，取消就是修改内存中的调用状态。
 
-一次调用：先登记并开始计时，再派生 `sh -c`（独立进程组，stdin 为 /dev/null）。
+普通 run 调用：先登记并开始计时，再派生 `sh -c`（独立进程组，stdin 为 /dev/null）。
 - 正常结束：直接子进程退出，且 stdout、stderr 都读到 EOF。不占管道的后台进程保留。
 - 取消或到期：对整组 SIGTERM，宽限期后仍有成员则 SIGKILL，等整组消失；SIGKILL 后最多再等 SETTLE 秒，
   仍有成员则 cleanup=unconfirmed。一旦开始终止就做完，不因直接子进程或输出先结束而中止。
@@ -18,20 +20,24 @@ stdin/stdout 上每行一个 JSON 消息：宿主发 run / cancel / shutdown，�
 
 import asyncio
 import codecs
+import base64
 import hashlib
 import json
 import math
 import os
 import signal
+import subprocess
 import sys
 import time
 
-PROTOCOL = 1
+PROTOCOL = 2
 SETTLE = 5.0  # SIGKILL 后等待整组消失的上限（成员可能处于不可中断睡眠）
 POLL = 0.05
 READ_CHUNK = 65536
 MAX_PENDING_OUTPUT = 16 * 1024 * 1024  # 协议发送缓冲上限
 MAX_LINE = 16 * 1024 * 1024  # 单条请求（含命令）的长度上限
+LOG_LIMIT = 10 * 1024 * 1024
+OUTPUT_GRACE = 2.0
 
 
 def log(text):
@@ -83,11 +89,12 @@ class Output:
 
 
 class Call:
-    def __init__(self, session, call_id, command, timeout, max_output):
+    def __init__(self, session, call_id, command, timeout, max_output, env=None):
         self.session = session
         self.id = call_id
         self.command = command
         self.timeout = timeout
+        self.env = env or {}
         self.stdout = Output(max_output)
         self.stderr = Output(max_output)
         self.stop_reason = None  # "cancelled" 或 "timeout"
@@ -129,6 +136,7 @@ class Call:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.session.workdir,
+                env={**os.environ, **self.env},
                 start_new_session=True,  # 返回时子进程已 setsid 并完成 exec，进程组已存在
             )
         except OSError as error:
@@ -194,12 +202,206 @@ def exit_code(returncode):
     return 128 - returncode if returncode < 0 else returncode
 
 
+
+def live_members(pgid):
+    """只把 Linux /proc 中非僵尸组员算作存活；无法核验时返回 None。"""
+    try:
+        entries = os.listdir("/proc")
+        members = []
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "rb") as stream:
+                    fields = stream.read().rsplit(b")", 1)[1].split()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if int(fields[2]) == pgid and fields[0] not in (b"Z", b"X"):
+                members.append(int(entry))
+        return members
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class ManagedCall:
+    """后台工具的执行：保留未回收组长作为 PGID 身份，只清理这一组，不支持跨连接续接。
+
+    shell 退出也清理剩余后代。输出实时送到宿主并写远端轮换日志；日志失败不阻塞命令，
+    通过独立事件和终态报告。结算后未确认的资源继续持有，关闭时仍汇总报告。
+    """
+
+    def __init__(self, session, call_id, command, cwd, env, log_path):
+        self.session = session
+        self.id = call_id
+        self.command = command
+        self.cwd = cwd
+        self.env = env
+        self.log_path = log_path
+        self.stop_reason = None
+        self.process = None
+        self.observed = False
+        self.reaped = False
+        self.code = None
+        self.log_error = None
+        self.eof = False
+        self.log_file = None
+        self.log_size = 0
+        self.task = asyncio.create_task(self.run())
+
+    def stop(self, reason):
+        if self.stop_reason is None:
+            self.stop_reason = reason
+
+    def event(self, kind, **values):
+        self.session.send({"type": kind, "id": self.id, **values})
+
+    def observe(self):
+        if self.observed:
+            return True
+        try:
+            info = os.waitid(os.P_PID, self.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            self.observed = self.reaped = True
+            return True  # 身份已失效；不再向可能复用的 PGID 发信号
+        if info is not None:
+            self.code = info.si_status if info.si_code == os.CLD_EXITED else 128 + info.si_status
+            self.observed = True
+        return self.observed
+
+    def signal(self, sig):
+        if not self.reaped:
+            signal_group(self.process.pid, sig)
+
+    def fail_log(self, error):
+        if self.log_error is None:
+            self.log_error = f"{type(error).__name__}: {error}"
+            self.event("log_error", error=self.log_error)
+        if self.log_file is not None:
+            stream, self.log_file = self.log_file, None
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def write_log(self, chunk):
+        if self.log_file is None:
+            return
+        try:
+            if self.log_size and self.log_size + len(chunk) > LOG_LIMIT:
+                self.log_file.close()
+                os.replace(self.log_path, self.log_path + ".1")
+                self.log_file = open(self.log_path, "wb")
+                self.log_size = 0
+            self.log_file.write(chunk)
+            self.log_file.flush()
+            self.log_size += len(chunk)
+        except OSError as error:
+            self.fail_log(error)
+
+    async def read_output(self):
+        reader = asyncio.StreamReader()
+        transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(reader), self.process.stdout,
+        )
+        try:
+            while chunk := await reader.read(READ_CHUNK):
+                self.event("output", data=base64.b64encode(chunk).decode("ascii"))
+                self.write_log(chunk)
+            self.eof = True
+        finally:
+            transport.close()
+
+    async def terminate(self):
+        self.signal(signal.SIGTERM)
+        deadline = time.monotonic() + self.session.grace
+        while live_members(self.process.pid) != [] and time.monotonic() < deadline:
+            self.observe()
+            await asyncio.sleep(POLL)
+        # 一次空扫描可能漏过并发 fork，组长未回收时总是再发 KILL。
+        self.signal(signal.SIGKILL)
+        deadline = time.monotonic() + SETTLE
+        while True:
+            self.observe()
+            members = live_members(self.process.pid)
+            if members == [] and self.observed and not self.reaped:
+                return True
+            if members is None or self.reaped or time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(POLL)
+
+    def reap(self):
+        if self.observe() and not self.reaped:
+            os.waitpid(self.process.pid, 0)
+            self.reaped = True
+            self.process.returncode = self.code if self.code is not None else -signal.SIGKILL
+
+    async def run(self):
+        reader = None
+        confirmed = True
+        error_text = None
+        reason = "not_started"
+        try:
+            if self.stop_reason is None:
+                try:
+                    os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+                    self.log_file = open(self.log_path, "xb")
+                except OSError as error:
+                    self.fail_log(error)
+                self.process = subprocess.Popen(
+                    self.command, shell=True, cwd=self.cwd,
+                    env={**os.environ, **self.env} if self.env else None,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                reader = asyncio.create_task(self.read_output())
+                while not self.observe() and self.stop_reason is None:
+                    if reader.done() and not reader.cancelled() and reader.exception() is not None:
+                        raise reader.exception()
+                    await asyncio.sleep(POLL)
+                self.event("finalizing")
+                reason = self.stop_reason or "exited"
+                confirmed = await self.terminate()
+        except Exception as error:
+            error_text = f"{type(error).__name__}: {error}"
+            reason = "error" if self.process is not None else "not_started"
+            if self.process is not None:
+                try:
+                    confirmed = await self.terminate()
+                except Exception:
+                    confirmed = False
+        finally:
+            if reader is not None:
+                await asyncio.wait({reader}, timeout=OUTPUT_GRACE)
+                if not reader.done():
+                    reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+            if self.log_file is not None:
+                try:
+                    self.log_file.close()
+                except OSError as error:
+                    self.fail_log(error)
+                self.log_file = None
+            if self.process is not None:
+                self.reap()
+                confirmed = confirmed and self.reaped
+            self.session.finish(self.id, {
+                "type": "result", "id": self.id, "reason": reason,
+                "exit_code": self.code, "cleanup": "confirmed" if confirmed else "unconfirmed",
+                "output_complete": self.eof, "output_settled": True,
+                "log_error": self.log_error, "error": error_text,
+                "stdout": "", "stderr": "", "truncated": False,
+            })
+            if not confirmed and self.process is not None:
+                self.session.retained.append(self)
+
+
 class Session:
     def __init__(self, workdir, grace):
         self.workdir = workdir
         self.grace = grace
         self.calls = {}
         self.unconfirmed = []  # 本会话内所有清理未确认的调用，关闭时一并报告
+        self.retained = []
         self.accepting = True
         self.shutdown = asyncio.Event()  # 宿主请求关闭：仍可回复 closed
         self.disconnected = asyncio.Event()  # 无法再写协议输出
@@ -233,6 +435,22 @@ class Session:
         except (ValueError, KeyError, TypeError):
             log(f"invalid message: {line[:200]!r}")
             return
+        if kind == "managed":
+            call_id = message.get("id")
+            if not self.accepting or not isinstance(call_id, str) or call_id in self.calls:
+                return
+            command, cwd, env, log_path = (message.get(key) for key in ("command", "cwd", "env", "log"))
+            if (not isinstance(command, str) or not command.strip()
+                    or not isinstance(cwd, str) or not os.path.isabs(cwd)
+                    or not isinstance(log_path, str) or not os.path.isabs(log_path)
+                    or not isinstance(env, dict)
+                    or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items())):
+                self.send({"type": "result", "id": call_id, "reason": "not_started",
+                           "exit_code": None, "cleanup": "confirmed", "stdout": "",
+                           "stderr": "无效的 managed 参数", "truncated": False})
+                return
+            self.calls[call_id] = ManagedCall(self, call_id, command, cwd, env, log_path)
+            return
         if kind == "run":
             call_id = message.get("id")
             if not self.accepting or not isinstance(call_id, str) or call_id in self.calls:
@@ -242,13 +460,19 @@ class Session:
                 timeout = float(message["timeout"])
                 max_output = int(message["max_output"])
                 command = message["command"]
+                env = message.get("env", {})
+                if (not isinstance(env, dict)
+                        or any(not isinstance(k, str) or not isinstance(v, str)
+                               or not k or "=" in k or "\0" in k or "\0" in v
+                               for k, v in env.items())):
+                    raise ValueError
                 if not (math.isfinite(timeout) and timeout > 0 and max_output > 0 and isinstance(command, str)):
                     raise ValueError
             except (KeyError, TypeError, ValueError):
                 self.send({"type": "result", "id": call_id, "reason": "not_started", "exit_code": -1,
                            "cleanup": "confirmed", "stdout": "", "stderr": "无效的 run 参数", "truncated": False})
                 return
-            self.calls[call_id] = Call(self, call_id, command, timeout, max_output)
+            self.calls[call_id] = Call(self, call_id, command, timeout, max_output, env)
         elif kind == "cancel":
             call = self.calls.get(message.get("id"))
             if call is not None:  # 未知 id 说明已经结束：宿主保证 run 先于 cancel 发出
@@ -264,6 +488,8 @@ class Session:
         for call in list(self.calls.values()):
             call.stop("cancelled")
         await asyncio.gather(*(call.task for call in list(self.calls.values())), return_exceptions=True)
+        for call in self.retained:
+            call.reap()
         self.send({"type": "closed", "unconfirmed": self.unconfirmed})
 
 

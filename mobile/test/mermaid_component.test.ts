@@ -34,7 +34,7 @@ const hosts: Record<string, string> = {
   '@/components/ui/text.tsx': "export const Text='Text';",
   '@/components/ui/button.tsx': "export const Button='Button';",
   '@/components/ui/icon.tsx': "export const Icon='Icon';",
-  'lucide-react-native': "export const ArrowLeft='ArrowLeft', Minus='Minus', Plus='Plus', Code2='Code2', Play='Play', RotateCcw='RotateCcw';",
+  'lucide-react-native': "export const ArrowLeft='ArrowLeft', Minus='Minus', Plus='Plus', Code2='Code2', Play='Play', RotateCcw='RotateCcw', ChevronDown='ChevronDown', ChevronUp='ChevronUp';",
   '@/components/ui/toggle-group.tsx': "export const ToggleGroup='ToggleGroup', ToggleGroupItem='ToggleGroupItem';",
   '@/lib/i18n.ts': 'export const useTranslation=()=>({t:value=>value,language:"zh"});',
   '@/lib/session-context.tsx': 'export const useSession=()=>({api:{config:{computerId:"component-test"}}});',
@@ -240,7 +240,7 @@ test('inline preview is the only full-screen target, including while renderer ca
   }
 });
 
-test('inline preview without a valid opener stays static; renderer errors expose source instead', async () => {
+test('inline preview without a valid opener stays static; renderer errors show a reason with collapsible source', async () => {
   state.pending = [];
   state.focused = true;
   const disposed: string[] = [];
@@ -256,9 +256,14 @@ test('inline preview without a valid opener stays static; renderer errors expose
     assert.equal(byId(root, 'mermaid-preview-open').length, 1);
     await complete(0, 'file:///diagram/invalid.html', disposed);
     await act(async () => { frame(root).props.onMessage({ nativeEvent: { data: '{"kind":"error","code":"syntax"}' } }); });
+    // Mermaid.error: one sentence, source collapsed behind “查看源码”, no code/preview switch.
     assert.equal(byId(root, 'mermaid-preview-open').length, 0);
+    assert.equal(byId(root, 'rich-mermaid-error').length, 1);
+    assert.ok(root.container.queryAll(node => node.type === 'Text' && node.props.children === '流程图无法显示').length);
+    assert.equal(byId(root, 'rich-mermaid-source').length, 0);
+    assert.equal(byId(root, 'mermaid-view-preview').length, 0);
+    await act(async () => { byId(root, 'mermaid-error-source-toggle')[0].props.onPress(); });
     assert.equal(byId(root, 'rich-mermaid-source').length, 1);
-    assert.equal(byId(root, 'mermaid-view-preview')[0].props.disabled, true);
   } finally { await act(async () => { root.unmount(); }); }
   assert.deepEqual(disposed, ['file:///diagram/invalid.html']);
 });
@@ -507,4 +512,32 @@ test('inline renderer ignores even well-formed viewport reports', async () => {
     assert.equal(state.pending[0].viewport, undefined);
   } finally { await act(async () => { root.unmount(); }); }
   assert.deepEqual(disposed, ['file:///diagram/static.html']);
+});
+
+test('Mermaid.fit / Mermaid.tall: the inline viewport follows the rendered size up to 320 and long diagrams get a hint', async () => {
+  state.pending = [];
+  state.focused = true;
+  const disposed: string[] = [];
+  const root = createRoot();
+  const location = { conversationId: 'chat-1', messageSeq: 5, block: 0, element: 'nodes', index: 2 };
+  const container = () => byId(root, 'mermaid-renderer')[0].parent!;
+  const render = async (width: number, height: number) => {
+    await act(async () => { frame(root).props.onMessage({ nativeEvent: { data: JSON.stringify({
+      kind: 'render', svg: `<svg viewBox="0 0 ${width} ${height}"></svg>`, width, height, displayHeight: height,
+    }) } }); });
+  };
+  try {
+    await act(async () => { root.render(createElement(MermaidPicture, { source: 'flowchart LR\n A --> B', location })); });
+    const outer = root.container.queryAll(node => !!node.props.onLayout && node.props.style?.gap !== undefined)[0];
+    await act(async () => { outer.props.onLayout({ nativeEvent: { layout: { width: 360, height: 400 } } }); });
+    await layout(root);
+    assert.equal(container().props.style.height, 160, 'Mermaid.waiting');
+    await complete(0, 'file:///diagram/small.html', disposed);
+    await render(300, 90);
+    assert.equal(container().props.style.height, 90, 'Mermaid.fit: no empty space around a small diagram');
+    assert.equal(byId(root, 'mermaid-tall-hint').length, 0);
+    await render(300, 1640);
+    assert.equal(container().props.style.height, 320, 'Mermaid.tall: capped');
+    assert.equal(byId(root, 'mermaid-tall-hint').length, 1);
+  } finally { await act(async () => { root.unmount(); }); }
 });

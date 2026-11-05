@@ -5,7 +5,7 @@ import { setImmediate } from 'node:timers/promises';
 import type { DraftPreview, GatewayEvent } from '../src/gateway/api.ts';
 import { Drafts } from '../src/gateway/drafts.ts';
 import { ChatSession } from '../src/gateway/session.ts';
-import { buildItems } from '../src/lib/chat-timeline.ts';
+import { projectChatRows } from '../src/lib/chat-timeline.ts';
 import { DraftMarkdown, draftTailText } from '../src/lib/draft-markdown.ts';
 
 const draft = (id: string, conversation_id = 'root', agent = 'writer', text = 'Hello'): DraftPreview =>
@@ -38,18 +38,18 @@ test('global snapshots replace rather than append; revision, epoch, reconnect an
 test('separate sender messages retain separate rows; terminal replaces only its draft key', () => {
   const first = draft('one', 'root', 'writer');
   const second = { ...draft('two', 'root', 'critic'), phase: 'final_answer' };
-  assert.deepEqual(buildItems([], [], new Map(), [first, second]).map((i) => i.key), ['done', 'dtwo']);
-  const replaced = buildItems([terminal('one')], [], new Map(), [first, second]);
+  assert.deepEqual(projectChatRows({ events: [], pending: [], browserTasks: new Map(), drafts: [first, second] }).rows.map((i) => i.key), ['done', 'dtwo']);
+  const replaced = projectChatRows({ events: [terminal('one')], pending: [], browserTasks: new Map(), drafts: [first, second] }).rows;
   assert.deepEqual(replaced.map((i) => i.key), ['done', 'dtwo']);
   assert.equal(replaced[0].event?.data.status, 'completed');
   assert.equal(replaced[1].draft?.agent, 'critic');
-  assert.deepEqual(buildItems([terminal('one', 2, 'interrupted')], [], new Map(), [first]).map((i) => i.key), ['done']);
+  assert.deepEqual(projectChatRows({ events: [terminal('one', 2, 'interrupted')], pending: [], browserTasks: new Map(), drafts: [first] }).rows.map((i) => i.key), ['done']);
 });
 
 test('newer sibling completing first retains its row until the other draft terminates', () => {
   const state = new Drafts();
   state.snapshot({ epoch: 'a', revision: 1, as_of_seq: 0, drafts: [draft('a'), draft('b')] });
-  const rows = (events: GatewayEvent[]) => buildItems(events, [], new Map(), state.forConversation('root'), state.order).map((item) => item.key);
+  const rows = (events: GatewayEvent[]) => projectChatRows({ events: events, pending: [], browserTasks: new Map(), drafts: state.forConversation('root'), draftOrder: state.order }).rows.map((item) => item.key);
   assert.deepEqual(rows([]), ['da', 'db']);
   const b = terminal('b', 1);
   state.terminalEvent(b);
@@ -68,7 +68,7 @@ test('a second streaming round leaves the first formal reply at its historical s
   state.snapshot({ epoch: 'a', revision: 2, as_of_seq: 2, drafts: [] });
   const second = question(3);
   state.snapshot({ epoch: 'a', revision: 3, as_of_seq: 3, drafts: [draft('new')] }, () => 3);
-  assert.deepEqual(buildItems([first, reply, second], [], new Map(), state.forConversation('root'), state.order)
+  assert.deepEqual(projectChatRows({ events: [first, reply, second], pending: [], browserTasks: new Map(), drafts: state.forConversation('root'), draftOrder: state.order }).rows
     .map((item) => item.key), ['e1', 'dold', 'e3', 'dnew']);
   assert.equal(state.order.has('old'), false);
 });
@@ -81,7 +81,7 @@ test('old siblings retain their cohort before a newer question while another wor
   state.terminalEvent(b);
   const second = question(3);
   state.snapshot({ epoch: 'a', revision: 2, as_of_seq: 3, drafts: [draft('a'), draft('c')] }, () => 3);
-  const rows = (events: GatewayEvent[]) => buildItems(events, [], new Map(), state.forConversation('root'), state.order)
+  const rows = (events: GatewayEvent[]) => projectChatRows({ events: events, pending: [], browserTasks: new Map(), drafts: state.forConversation('root'), draftOrder: state.order }).rows
     .map((item) => item.key);
   assert.deepEqual(rows([first, b, second]), ['e1', 'da', 'db', 'e3', 'dc']);
   const a = terminal('a', 4);
@@ -100,7 +100,7 @@ test('a question backfilled after a snapshot still groups later siblings in that
   const b = terminal('b', 2);
   state.terminalEvent(b);
   assert.equal(state.order.get('a')?.cohort, state.order.get('b')?.cohort);
-  assert.deepEqual(buildItems([question(1), b, question(3)], [], new Map(), state.forConversation('root'), state.order)
+  assert.deepEqual(projectChatRows({ events: [question(1), b, question(3)], pending: [], browserTasks: new Map(), drafts: state.forConversation('root'), draftOrder: state.order }).rows
     .map((item) => item.key), ['e1', 'da', 'db', 'e3']);
 });
 
@@ -223,11 +223,8 @@ test('SSE reconnect active set, formal-before-snapshot and interrupted historica
       connections.push(controller);
       if (connections.length === 2) notifyReconnected();
     } }));
-    if (path === '/conversations') return Response.json({ as_of_seq: 0, conversations: [{
-      id: 'root', agent_id: 'writer', title: 'Chat', created_at: 1, updated_at: 1, read_seq: 0, last_agent_seq: 0,
-      status: 'working', unread: false, last_text: null, source: 'user', schedule_origin: null,
-    }] });
-    if (path === '/agents') return Response.json({ agents: [], as_of_seq: 0 });
+    if (path === '/conversations') return Response.json({ as_of_seq: 0, conversations: [{ id: 'root', agent_id: 'writer', title: 'Chat', created_at: 1, updated_at: 1, read_seq: 0, last_agent_seq: 0, status: 'working', unread: false, last_text: null, last_activity_seq: null, last_activity_at: null, source: 'user', schedule_origin: null, }] });
+    if (path === '/agents') return Response.json({ agents: [], as_of_seq: 0, order_revision: 1 });
     if (path === '/browser-tasks') return Response.json({ browser_tasks: [], as_of_seq: 0 });
     throw Error(`Unexpected request: ${path}`);
   }, { retryDelays: [0] });
@@ -243,7 +240,7 @@ test('SSE reconnect active set, formal-before-snapshot and interrupted historica
     assert.deepEqual(session.draftsFor('root').map((item) => item.draft_id), ['one', 'two']);
     send(terminal('one', 1));
     await setImmediate();
-    assert.deepEqual(buildItems(session.timeline('root').events, [], new Map(), session.draftsFor('root')).map((i) => i.key), ['done', 'dtwo']);
+    assert.deepEqual(projectChatRows({ events: session.timeline('root').events, pending: [], browserTasks: new Map(), drafts: session.draftsFor('root') }).rows.map((i) => i.key), ['done', 'dtwo']);
     send({ type: 'draft.snapshot', data: { epoch: 'a', revision: 2, as_of_seq: 0, drafts: [draft('one'), draft('two')] } });
     await setImmediate();
     assert.deepEqual(session.draftsFor('root').map((item) => item.draft_id), ['two']);
@@ -278,11 +275,8 @@ test('SSE reconnect snapshot before question replay reanchors new replies and la
       connections.push(controller);
       if (connections.length === 2) notifyReconnected();
     } }));
-    if (path === '/conversations') return Response.json({ as_of_seq: 0, conversations: [{
-      id: 'root', agent_id: 'writer', title: 'Chat', created_at: 1, updated_at: 1, read_seq: 0, last_agent_seq: 0,
-      status: 'working', unread: false, last_text: null, source: 'user', schedule_origin: null,
-    }] });
-    if (path === '/agents') return Response.json({ agents: [], as_of_seq: 0 });
+    if (path === '/conversations') return Response.json({ as_of_seq: 0, conversations: [{ id: 'root', agent_id: 'writer', title: 'Chat', created_at: 1, updated_at: 1, read_seq: 0, last_agent_seq: 0, status: 'working', unread: false, last_text: null, last_activity_seq: null, last_activity_at: null, source: 'user', schedule_origin: null, }] });
+    if (path === '/agents') return Response.json({ agents: [], as_of_seq: 0, order_revision: 1 });
     if (path === '/browser-tasks') return Response.json({ browser_tasks: [], as_of_seq: 0 });
     throw Error(`Unexpected request: ${path}`);
   }, { retryDelays: [0] });
@@ -291,8 +285,7 @@ test('SSE reconnect snapshot before question replay reanchors new replies and la
     connections.at(-1)!.enqueue(new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`));
     await setImmediate();
   };
-  const rows = () => buildItems(session.timeline('root').events, [], new Map(),
-    session.draftsFor('root'), session.drafts.order).map((item) => item.key);
+  const rows = () => projectChatRows({ events: session.timeline('root').events, pending: [], browserTasks: new Map(), drafts: session.draftsFor('root'), draftOrder: session.drafts.order }).rows.map((item) => item.key);
   try {
     await session.start();
     await setImmediate();
@@ -329,7 +322,7 @@ test('replayed question splits a provisional cohort without moving a lingering o
   state.reconnect();
   state.snapshot({ epoch: 'a', revision: 2, as_of_seq: 3, drafts: [draft('linger'), draft('new')] }, () => 1);
   state.questionEvent(question(3));
-  const rows = (events: GatewayEvent[]) => buildItems(events, [], new Map(), state.forConversation('root'), state.order)
+  const rows = (events: GatewayEvent[]) => projectChatRows({ events: events, pending: [], browserTasks: new Map(), drafts: state.forConversation('root'), draftOrder: state.order }).rows
     .map((item) => item.key);
   assert.deepEqual(rows([question(1), old, question(3)]), ['e1', 'dold', 'dlinger', 'e3', 'dnew']);
   const linger = terminal('linger', 4);
@@ -344,7 +337,6 @@ test('history refinement while reconnect awaits its snapshot preserves the origi
   state.questionEvent(question(3));
   state.questionEvent(question(5));
   state.snapshot({ epoch: 'a', revision: 2, as_of_seq: 5, drafts: [draft('reply')] }, () => 5);
-  assert.deepEqual(buildItems([question(1), question(3), question(5)], [], new Map(),
-    state.forConversation('root'), state.order).map((item) => item.key),
+  assert.deepEqual(projectChatRows({ events: [question(1), question(3), question(5)], pending: [], browserTasks: new Map(), drafts: state.forConversation('root'), draftOrder: state.order }).rows.map((item) => item.key),
   ['e1', 'e3', 'dreply', 'e5']);
 });

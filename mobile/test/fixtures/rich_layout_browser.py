@@ -159,7 +159,7 @@ def main():
 
     with tempfile.TemporaryFile() as log:
         metro = subprocess.Popen(
-            ["npm", "run", "start", "--", "--port", str(port), "--localhost"], cwd=mobile,
+            ["pnpm", "run", "start", "--port", str(port), "--localhost", "--max-workers", "2"], cwd=mobile,
             env={**os.environ, "CI": "1", "EXPO_NO_TELEMETRY": "1"},
             stdout=log, stderr=log, start_new_session=True,
         )

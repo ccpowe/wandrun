@@ -1,0 +1,18 @@
+import type { Meta, StoryObj } from '@storybook/react-native';
+import { AppsConnectorScenePage } from './apps-connector-scene';
+const meta = { title: 'connectors/flow', component: AppsConnectorScenePage, parameters: { fullScreen: true } } satisfies Meta<typeof AppsConnectorScenePage>;
+export default meta;
+type Story = StoryObj<typeof meta>;
+export const N2: Story = { name: 'N2 添加远程连接器', args: { entry: 'remote' } };
+export const N2Dark: Story = { name: 'N2 添加远程连接器（深色）', args: { entry: 'remote', theme: 'dark' } };
+export const N3: Story = { name: 'N3 添加本地连接器', args: { entry: 'local' } };
+export const D2: Story = { name: 'D2 已连接详情与编辑', args: { entry: 'detail' } };
+export const D2Dark: Story = { name: 'D2 已连接详情（深色）', args: { entry: 'detail', theme: 'dark' } };
+export const D6: Story = { name: 'D6 编辑后保存明确失败', args: { entry: 'detail', state: 'save-failure' } };
+export const D6Unknown: Story = { name: 'D6 编辑后保存结果未确认', args: { entry: 'detail', state: 'save-unknown' } };
+export const AU1: Story = { name: 'AU1 目录 Notion 未连接', args: { entry: 'catalog' } };
+export const AU1Github: Story = { name: 'AU1 目录 GitHub 未连接', args: { entry: 'catalog-github' } };
+export const AU1Dark: Story = { name: 'AU1 目录 Notion 未连接（深色）', args: { entry: 'catalog', theme: 'dark' } };
+export const N10: Story = { name: 'N10 创建结果未确认', args: { entry: 'remote', state: 'create-unknown' } };
+export const D9: Story = { name: 'D9 删除结果未确认', args: { entry: 'detail', state: 'delete-unknown' } };
+export const Entry: Story = { name: '设置实际入口', args: { entry: 'settings' } };

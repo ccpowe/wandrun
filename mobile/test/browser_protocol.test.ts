@@ -1,18 +1,28 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { BUTTON_MARGIN, buttonLayout, WHEEL_WIDTH } from "../src/takeover-lab/layout.ts";
+import { BUTTON_GAP, BUTTON_MARGIN, BUTTON_SIZE, buttonLayout, controlColumnLayout, portraitPicture } from "../src/takeover-lab/layout.ts";
 import { applyPages, EMPTY_PAGE_STATE, initialPageSelection, isEmptyControlPages, observePageSelection, rejectPageRestoration, resumePageSelection } from "../src/browser/pages.ts";
-import { decodeFrame, decodeHello, decodeInputDone, endedReason, inputFrame, rejectReason, type Frame, type Pages } from "../src/browser/protocol.ts";
+import { decodeFrame, decodeHello, decodeInputDone, endedReason, inputFrame, rejectReason, type Frame, type Input, type Pages } from "../src/browser/protocol.ts";
 import { BrowserStream, type StreamState } from "../src/browser/stream.ts";
 import { GatewayApi } from "../src/gateway/api.ts";
+import { translate } from "../src/lib/i18n.ts";
+const pictureProtocol = { protocol: 3, transport: 'jpeg', video_support: { available: false, reason: 'environment-unsupported' } } as const;
+function inputEnvelope(message: object | undefined) {
+  const { sent_ms, ts, page, ...envelope } = message as Record<string, unknown>;
+  assert.ok(typeof sent_ms === 'number' && Number.isFinite(sent_ms) && sent_ms >= 0);
+  assert.equal(typeof ts, 'number'); assert.equal(typeof page, 'string');
+  return envelope;
+}
 
 const frame: Frame = { t: "frame", connection_id: "gateway-1", seq: 5, page: "a", epoch: 3, vp: 7, css: [100, 50], dpr: 1, scroll: [0, 0], pageScale: 1, offsetTop: 0,
   max_in_flight: 2, in_flight: 1, in_flight_bytes: 1024, byte_budget: 4096, delivery_rate_bps: null, stop_reason: "none",
   frame_age_ms: null, credit_wait_ms: 0, send_lock_ms: null,
   ack_baseline_ms: null, ack_smoothed_ms: null, queue_delay_ms: null };
 const pages = (current: string | null, epoch = 3, vp = 7, state: Pages["state"] = "human", ids = ["a"]): Pages => ({
-  t: "pages", current, epoch, vp, state, max_pages: 8, css: [100, 50], dpr: 1,
+  t: "pages", current, epoch, vp, state, environment_id: "local", environment_name: "Local",
+  capacity: { pages_used: ids.length, pages_registered: ids.length, pages_creating: 0, pages_pending_cleanup: 0, pages_limit: 8 },
+  capacity_rejection: null, css: [100, 50], dpr: 1,
   pages: ids.map((id) => ({ id, title: `Page ${id}`, url: `https://${id}.example/` })),
 });
 const packet = (meta: unknown = frame) => {
@@ -136,14 +146,13 @@ test("binary frame preserves BE header, epoch and raw JPEG; malformed packets ar
 });
 
 test("hello and input completion timings have bounded finite protocol fields", () => {
-  const hello = { t: "hello", connection_id: "gateway-1", protocol: 1, ping_supported: true, window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 };
+  const hello = { t: "hello", connection_id: "gateway-1", ...pictureProtocol, ping_supported: true, window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 };
   assert.deepEqual(decodeHello(hello), hello);
   assert.deepEqual(decodeHello({ ...hello, window_mode: "fixed", max_in_flight: 32 }), { ...hello, window_mode: "fixed", max_in_flight: 32 });
   for (const broken of [{ max_in_flight: 0 }, { max_in_flight: 33 }, { max_in_flight_limit: 24 },
     { window_mode: "bogus" }, { max_in_flight: 3 }, { ping_supported: "true" }, { connection_id: "" }, { connection_id: 42 }]) {
     assert.throws(() => decodeHello({ ...hello, ...broken }), /invalid-hello/);
   }
-  assert.equal(decodeHello({ ...hello, connection_id: undefined }).connection_id, undefined, "legacy fixture may omit id");
   const done = { t: "input_done", id: 4, input_lock_wait_ms: 2, input_dispatch_ms: 7, input_cdp_ms: 5 };
   assert.deepEqual(decodeInputDone(done), done);
   for (const field of ["input_lock_wait_ms", "input_dispatch_ms", "input_cdp_ms"] as const) {
@@ -174,21 +183,26 @@ test("input credential matches page, epoch, viewport and human state", () => {
   assert.equal(inputFrame(frame, pages(null), true), null);
   assert.equal(inputFrame(frame, pages("a", 3, 7, "revoking"), true), null);
   assert.equal(inputFrame(frame, pages("a"), false), null);
-  assert.match(rejectReason("stale-frame"), /过期/);
-  assert.match(rejectReason("invalid-gesture"), /手势/);
 });
 
 test("unknown browser diagnostics never become user-facing text", () => {
   const diagnostic = "Protocol error (Input.dispatchMouseEvent): target closed";
   assert.doesNotMatch(rejectReason(diagnostic), /Protocol error|target closed/);
-  assert.match(rejectReason("no-page"), /新建页面/);
   assert.doesNotMatch(endedReason(`关闭未确认：${diagnostic}`), /Protocol error|target closed/);
-  assert.match(rejectReason("page-limit"), /上限/);
-  assert.match(rejectReason("task-ended"), /任务已结束/);
-  assert.match(endedReason("Agent 删除"), /Agent 已删除/);
-  assert.match(endedReason("对话删除"), /对话已删除/);
-  assert.match(endedReason("任务结束"), /任务已结束/);
-  assert.match(endedReason("浏览器空闲超时"), /超时|长时间/);
+});
+
+test("passive browser stops describe the known cause without inventing a Chrome restart", () => {
+  for (const [reason, effect] of [
+    ["浏览器连接中断", /disconnected/i],
+    ["Chrome 连接中断", /disconnected/i],
+    ["平台恢复", /environment.*recovered/i],
+  ] as const) {
+    const message = translate(endedReason(reason), "en");
+    assert.match(message, effect);
+    assert.match(message, /old pages.*ended/i);
+    assert.match(message, /Agent.*reopen/i);
+    assert.doesNotMatch(message, /restart/i);
+  }
 });
 
 test("new pages are notices, never automatic switches; closed notices expire", () => {
@@ -274,7 +288,7 @@ test("socket auth, displayed-only ack, pending gesture, page switch and disconne
   assert.equal(socket.binaryType, "arraybuffer");
   assert.equal(socket.options.headers.Authorization, "Bearer token");
   socket.open();
-  socket.emit({ t: "hello", connection_id: "gateway-1", protocol: 1, ping_supported: true, window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 });
+  socket.emit({ t: "hello", connection_id: "gateway-1", ...pictureProtocol, ping_supported: true, window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 });
   assert.deepEqual(socket.sent.at(-1), { t: "ping", id: 1 });
   socket.emit({ t: "pong", id: 1 });
   const firstRtt = stream.measurements.snapshot(performance.now()).rttMs;
@@ -283,17 +297,16 @@ test("socket auth, displayed-only ack, pending gesture, page switch and disconne
   socket.emit({ t: "pong", id: 999 }); // unsolicited response is ignored
   assert.equal(stream.measurements.snapshot(performance.now()).rttMs, firstRtt);
   socket.emit(pages("a"));
-  assert.equal(stream.input({ t: "click", x: 2, y: 3, button: "left" }), null);
+  assert.equal(stream.input({t: "pointer", x: 2, y: 3, buttons: 1}), null);
   stream.discardFrame(4); assert.equal(stream.input({ t: "reload" }), null);
   socket.emit(packet());
   assert.equal(stream.input({ t: "reload" }), null, "queued JPEG cannot authorize input");
   tick();
   assert.deepEqual(socket.sent.at(-1), { t: "ack", seq: 5, displayed: true });
-  const click = stream.input({ t: "click", x: 100, y: 50, button: "left" });
+  const click = stream.input({t: "pointer", x: 100, y: 50, buttons: 1});
   assert.ok(click);
-  assert.deepEqual(socket.sent.at(-1), { t: "click", x: 99.999, y: 49.999, button: "left", id: click, epoch: 3, vp: 7, frame: 5 });
-  socket.emit({ t: "input_pending", id: click });
-  assert.equal(stream.input({ t: "reload" }) !== null, true, "pending is not completion or revocation");
+  assert.deepEqual(inputEnvelope(socket.sent.at(-1)), {t: "pointer", x: 99.999, y: 49.999, buttons: 1, id: click, epoch: 3, vp: 7, frame: 5});
+  assert.equal(stream.input({ t: "reload" }) !== null, true, "an unfinished state report does not revoke input");
   assert.equal(stream.switchPage("b"), null, "unknown page cannot switch");
   assert.ok(stream.input({ t: "reload" }), "unknown page does not revoke current credential");
   socket.emit(pages("a", 4)); assert.equal(stream.input({ t: "reload" }), null);
@@ -303,6 +316,25 @@ test("socket auth, displayed-only ack, pending gesture, page switch and disconne
   assert.equal(socket.sent.length, count);
   assert.deepEqual(states, ["connecting", "open", "closed"]);
 }));
+
+for (const opened of [false, true]) {
+  test(`socket error ends ${opened ? "displayed" : "connecting"} stream without waiting for onclose`, () => withSocket((socket, stream, states, _refusals, tick, decoded) => {
+    if (opened) {
+      socket.open(); socket.emit(pages("a")); socket.emit(packet()); tick();
+      assert.ok(stream.input({ t: "reload" }), "the displayed frame initially authorizes input");
+    }
+    socket.close = () => { socket.readyState = 3; };
+    socket.onerror?.();
+    assert.equal(states.at(-1), "closed", "the screen must leave its connecting/image state on error alone");
+    assert.equal(stream.isOpen, false);
+    assert.equal(stream.input({ t: "reload" }), null, "an old frame cannot authorize more input");
+    const delivered = [...decoded];
+    socket.onopen?.(); socket.emit(packet({ ...frame, seq: 6 })); tick();
+    assert.deepEqual(decoded, delivered, "late socket events cannot restore the ended connection");
+    socket.onclose?.({ code: 1000 });
+    assert.equal(states.filter(state => state === "closed").length, 1);
+  }));
+}
 
 test("two-second pings measure slower roundtrips and stop with the socket", () => {
   const originalSet = globalThis.setInterval;
@@ -323,7 +355,7 @@ test("two-second pings measure slower roundtrips and stop with the socket", () =
   try {
     withSocket((socket, stream) => {
       socket.open();
-      socket.emit({ t: "hello", connection_id: "gateway-1", protocol: 1, ping_supported: true, window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 });
+      socket.emit({ t: "hello", connection_id: "gateway-1", ...pictureProtocol, ping_supported: true, window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 });
       assert.deepEqual(socket.sent.at(-1), { t: "ping", id: 1 });
       assert.ok(ticks.get(2000));
       now = 2000;
@@ -352,7 +384,7 @@ test("two-second pings measure slower roundtrips and stop with the socket", () =
 
 test("hello without ping support leaves RTT unknown", () => withSocket((socket, stream, _states, _refusals, tick) => {
   socket.open();
-  socket.emit({ t: "hello", connection_id: "gateway-1", protocol: 1, ping_supported: false, window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 });
+  socket.emit({ t: "hello", connection_id: "gateway-1", ...pictureProtocol, ping_supported: false, window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 });
   socket.emit(pages("a"));
   socket.emit(packet());
   tick();
@@ -360,12 +392,12 @@ test("hello without ping support leaves RTT unknown", () => withSocket((socket, 
   assert.equal(stream.measurements.snapshot(performance.now()).rttMs, null);
   assert.deepEqual([stream.measurements.snapshot(performance.now()).windowMode,
     stream.measurements.snapshot(performance.now()).maxInFlightLimit], ["adaptive", 32]);
-  assert.ok(stream.input({ t: "click", x: 2, y: 3, button: "left" }));
+  assert.ok(stream.input({t: "pointer", x: 2, y: 3, buttons: 1}));
 }));
 
 test("socket frame measurement follows actual display and bound input id", () => withSocket((socket, stream, _states, _refusals, tick) => {
   socket.open(); socket.emit(pages("a")); socket.emit(packet()); tick();
-  const id = stream.input({ t: "click", x: 2, y: 3, button: "left" })!;
+  const id = stream.input({t: "pointer", x: 2, y: 3, buttons: 1})!;
   socket.emit({ t: "input_done", id, input_lock_wait_ms: 2, input_dispatch_ms: 7, input_cdp_ms: 5 });
   const before = { ...frame, seq: 6, applied_input_id: id - 1 };
   socket.emit(packet(before)); tick();
@@ -399,16 +431,18 @@ test("Metro lines retain all completed click samples and cutoff pending after so
   try {
     withSocket((socket, stream, _states, _refusals, tick) => {
       socket.open();
-      socket.emit({ t: "hello", protocol: 1, ping_supported: false, connection_id: "gateway-1",
+      socket.emit({ t: "hello", ...pictureProtocol, ping_supported: false, connection_id: "gateway-1",
         window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 });
       socket.emit(pages("a")); socket.emit(packet()); tick();
       for (let n = 1; n <= 23; n++) {
-        const id = stream.input({ t: "click", x: 2, y: 3, button: "left" })!;
+        const id = stream.input({t: "pointer", x: 2, y: 3, buttons: 1})!;
+        tick();
         socket.emit({ t: "input_done", id, input_lock_wait_ms: 0, input_dispatch_ms: 0, input_cdp_ms: 0 });
         const next = { ...frame, seq: frame.seq + n, applied_input_id: id, ack_wait_ms: n };
         socket.emit(packet(next)); tick(); stream.displayedFrame(next);
       }
-      const pendingId = stream.input({ t: "click", x: 2, y: 3, button: "left" })!;
+      const pendingId = stream.input({t: "pointer", x: 2, y: 3, buttons: 1})!;
+      tick();
       stream.close();
       const clickLines = lines.filter((line) => line.startsWith("[stream-click] "))
         .map((line) => JSON.parse(line.slice("[stream-click] ".length)) as {
@@ -542,7 +576,7 @@ test("burst keeps only newest raw JPEG and ACKs every superseded frame once", ()
   ]);
   assert.equal(stream.measurements.snapshot(performance.now()).localDiscarded, 2);
   assert.ok(stream.input({ t: "reload" }));
-  assert.deepEqual(socket.sent.at(-1), { t: "reload", id: 1, epoch: 3, vp: 7, frame: 7 });
+  assert.deepEqual(inputEnvelope(socket.sent.at(-1)), { t: "reload", id: 1, epoch: 3, vp: 7, frame: 7 });
 
   socket.emit(packet({ ...frame, seq: 8 })); tick();
   socket.emit(packet({ ...frame, seq: 9 }));
@@ -558,7 +592,7 @@ test("burst keeps only newest raw JPEG and ACKs every superseded frame once", ()
   ]);
   assert.equal(stream.measurements.snapshot(performance.now()).localDiscarded, 3);
   assert.ok(stream.input({ t: "reload" }));
-  assert.deepEqual(socket.sent.at(-1), { t: "reload", id: 2, epoch: 3, vp: 7, frame: 10 });
+  assert.deepEqual(inputEnvelope(socket.sent.at(-1)), { t: "reload", id: 2, epoch: 3, vp: 7, frame: 10 });
   socket.emit(packet({ ...frame, seq: 11 })); tick();
   stream.discardFrame(11); stream.discardFrame(11);
   assert.deepEqual(acknowledgments().at(-1), { t: "ack", seq: 11, displayed: false });
@@ -568,7 +602,7 @@ test("burst keeps only newest raw JPEG and ACKs every superseded frame once", ()
 
 test("slow UI commit keeps active frame alive while a bounded latest slot absorbs four in-flight frames", () => withSocket((socket, stream, _states, _refusals, tick, decoded) => {
   socket.open();
-  socket.emit({ t: "hello", connection_id: "gateway-1", protocol: 1, ping_supported: false, window_mode: "fixed", max_in_flight: 4, max_in_flight_limit: 32 });
+  socket.emit({ t: "hello", connection_id: "gateway-1", ...pictureProtocol, ping_supported: false, window_mode: "fixed", max_in_flight: 4, max_in_flight_limit: 32 });
   socket.emit(pages("a"));
   socket.emit(packet({ ...frame, seq: 6 })); tick();
   assert.deepEqual(decoded, [6]);
@@ -578,12 +612,12 @@ test("slow UI commit keeps active frame alive while a bounded latest slot absorb
   assert.equal(stream.input({ t: "reload" }), null);
   assert.equal(stream.displayedFrame({ ...frame, seq: 6 }), true);
   assert.ok(stream.input({ t: "reload" }));
-  assert.deepEqual(socket.sent.at(-1), { t: "reload", id: 1, epoch: 3, vp: 7, frame: 6 });
+  assert.deepEqual(inputEnvelope(socket.sent.at(-1)), { t: "reload", id: 1, epoch: 3, vp: 7, frame: 6 });
   tick();
   assert.deepEqual(decoded, [6, 9], "latest pending packet is the next display candidate");
   assert.equal(stream.displayedFrame({ ...frame, seq: 9 }), true);
   assert.ok(stream.input({ t: "reload" }));
-  assert.deepEqual(socket.sent.at(-1), { t: "reload", id: 2, epoch: 3, vp: 7, frame: 9 });
+  assert.deepEqual(inputEnvelope(socket.sent.at(-1)), { t: "reload", id: 2, epoch: 3, vp: 7, frame: 9 });
   assert.deepEqual(socket.sent.filter((message) => "t" in message && message.t === "ack"), [
     { t: "ack", seq: 7, displayed: false }, { t: "ack", seq: 8, displayed: false },
     { t: "ack", seq: 6, displayed: true }, { t: "ack", seq: 9, displayed: true },
@@ -617,16 +651,44 @@ test("page/epoch/viewport transitions and close settle pending credits without s
   ]);
 }));
 
-test("mouse controls remain inside stage in portrait and keyboard mode", () => {
+test("browser.B8 mouse buttons sit at the band bottom, centered on the midline", () => {
   const area = { w: 400, h: 300 };
-  assert.equal(buttonLayout("touch", area, false), null);
-  for (const keyboard of [false, true]) {
-    const layout = buttonLayout("mouse", area, keyboard)!;
-    for (const rect of [layout.left, layout.right]) {
-      assert.ok(rect.left >= 0 && rect.top >= 0);
-      assert.ok(rect.left + rect.width <= area.w - WHEEL_WIDTH);
-      assert.ok(rect.top + rect.height <= area.h - BUTTON_MARGIN + 1e-9);
-    }
-    assert.ok(layout.left.left + layout.left.width < layout.right.left);
-  }
+  assert.equal(buttonLayout("touch", area), null);
+  const layout = buttonLayout("mouse", area)!;
+  assert.equal(layout.right.left - layout.left.left - layout.left.width, BUTTON_GAP);
+  assert.equal((layout.left.left + layout.right.left + layout.right.width) / 2, area.w / 2);
+  assert.equal(layout.left.top + BUTTON_SIZE, area.h - BUTTON_MARGIN);
 });
+
+// Stage 720 wide starting 100 below the screen top, 200 above the bottom (screen 1200); band 120.
+const edges = { above: 100, below: 200 };
+for (const [name, area, ratio, keyboard, top, height] of [
+  ["centered on the whole screen", { w: 720, h: 900 }, 9 / 16, false, 297.5, 405],
+  ["raised just enough to clear the band", { w: 720, h: 900 }, 3 / 4, false, 230, 540],
+  ["shrunk only because it cannot fit", { w: 720, h: 900 }, 1.5, false, 0, 780],
+  ["zero stage", { w: 0, h: 0 }, 9 / 16, false, 0, 0],
+  ["keyboard: centered in the remaining stage", { w: 720, h: 800 }, 9 / 16, true, 197.5, 405],
+  ["keyboard: fills a stage shorter than the picture", { w: 720, h: 400 }, 3 / 4, true, 0, 400],
+] as const) test(`browser.B8 portrait picture: ${name}`, () => {
+  const picture = portraitPicture(area, edges, ratio, keyboard ? 0 : 120, keyboard);
+  assert.ok(Math.abs(picture.top - top) < 1e-9 && Math.abs(picture.height - height) < 1e-9, JSON.stringify(picture));
+});
+
+test("browser.B6/W7 landscape control column: gathered with full gaps, then tighter, then icon-only dock", () => {
+  const roomy = controlColumnLayout(600);
+  assert.deepEqual([roomy.compact, roomy.gap, roomy.padding], [false, 24, 12]);
+  // 360 window without a banner: column 352, labels kept, gaps shrink.
+  const tight = controlColumnLayout(352);
+  assert.equal(tight.compact, false); assert.ok(tight.content + 2 * tight.gap + 2 * tight.padding <= 352);
+  // 360 with a banner, 320 with or without one: icon-only dock; fits whenever the content does.
+  for (const height of [304, 286, 312, 264]) {
+    const column = controlColumnLayout(height);
+    assert.equal(column.compact, true, String(height));
+    assert.ok(column.content <= height && column.gap >= 0 && column.padding >= 0, String(height));
+  }
+  // Larger text needs more room before the labels fit.
+  assert.equal(controlColumnLayout(352, 2).compact, true);
+  // Unmeasured: full layout.
+  assert.equal(controlColumnLayout(0).compact, false);
+});
+

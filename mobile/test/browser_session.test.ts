@@ -4,12 +4,15 @@ import { setImmediate } from "node:timers/promises";
 
 import type { BrowserTask, GatewayEvent } from "../src/gateway/api.ts";
 import { ChatSession } from "../src/gateway/session.ts";
-import { buildItems } from "../src/lib/chat-timeline.ts";
+import { projectChatRows } from "../src/lib/chat-timeline.ts";
 
 const task: BrowserTask = {
   id: "lease", task_id: "child", root_id: "conversation", agent_id: "desktop", entry_agent_id: "writer",
   conversation_title: "Research", entry_agent_name: "Writer", state: "agent", epoch: 1,
-  pages: [{ id: "page", title: "Research", url: "https://example.org" }], current: "page", max_pages: 8,
+  pages: [{ id: "page", title: "Research", url: "https://example.org" }], current: "page",
+  environment_id: "local", environment_name: "Local",
+  capacity: { pages_used: 1, pages_registered: 1, pages_creating: 0, pages_pending_cleanup: 0, pages_limit: 8 },
+  capacity_rejection: null,
   reason: null, requested_reason: null,
 };
 function event(seq: number, type: string, data: Record<string, unknown>): GatewayEvent {
@@ -22,11 +25,11 @@ test("lease updates replace one anchored card and handback stays after it", () =
     event(4, "takeover.ended", { id: task.id, duration_seconds: 80, text: "returned" }),
     event(5, "browser_task.updated", { ...task, epoch: 3 })];
   const live = { ...task, state: "released" as const, pages: [], reason: "用户关闭" };
-  const items = buildItems(events, [], new Map([[task.id, live]]));
+  const items = projectChatRows({ events: events, pending: [], browserTasks: new Map([[task.id, live]]) }).rows;
   assert.deepEqual(items.map((item) => item.key), ["e1", "blease", "e4"]);
   assert.equal(items[1].event?.seq, 2);
   assert.equal(items[1].browser?.state, "released");
-  assert.equal(buildItems(events, [])[1].browser?.epoch, 3);
+  assert.equal(projectChatRows({ events: events, pending: [] }).rows[1].browser?.epoch, 3);
 });
 
 /** Drive the public HTTP/SSE boundaries; delayed snapshots model an actual response race. */
@@ -39,7 +42,7 @@ async function connected() {
     if (path === "/browser-tasks") return new Promise<Response>((resolve) => {
       resolveSnapshot = resolve;
     });
-    if (path === "/agents") return Response.json({ agents: [], as_of_seq: 10 });
+    if (path === "/agents") return Response.json({ agents: [], as_of_seq: 10, order_revision: 1 });
     if (path === "/conversations") return Response.json({ conversations: [], as_of_seq: 10 });
     throw new Error(`Unexpected request ${path}`);
   });

@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import uuid4
 
 import httpx
 
@@ -34,7 +35,7 @@ class FileDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.gateway = Gateway(self.store)
         self.gateway.workspace_root = self.root
         self.gateway.manager = SimpleNamespace(root_of=lambda sender: sender, agent_name=lambda sender: "main")
-        self.conversation, _ = self.store.create_conversation("Report", "main")
+        self.conversation, _ = self.store.create_conversation("Report", "main", client_id=uuid4().hex)
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=create_app(self.gateway, "secret")),
             base_url="http://gateway", headers={"Authorization": "Bearer secret"},
@@ -206,6 +207,20 @@ class FileDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first["id"], second["id"])
         self.assertEqual(first["size"], 6)
         self.assertEqual((await self.client.get(f"/files/{first['id']}/content")).content, b"changed")
+
+    async def test_gateway_snapshot_replay_reuses_file_id_but_keeps_independent_content(self):
+        digest = "a" * 64
+        snapshot = self.root / "conversations" / self.conversation["id"] / "deliveries" / digest / "report.txt"
+        snapshot.parent.mkdir(parents=True)
+        snapshot.write_bytes(b"snapshot")
+        attachment = ResolvedAttachment(str(snapshot), "report.txt", 8, "text/plain", delivery_digest=digest)
+        self.gateway.on_human(self.conversation["id"], "First", [attachment])
+        first = self.store.history(self.conversation["id"], limit=2)[0].data["attachments"][0]
+        self.gateway.on_human(self.conversation["id"], "Replay", [attachment])
+        repeated = self.store.history(self.conversation["id"], limit=2)[0].data["attachments"][0]
+        self.assertEqual(first["id"], repeated["id"])
+        self.assertIsNone(repeated["remote_environment"])
+        self.assertEqual((await self.client.get(f"/files/{first['id']}/content")).content, b"snapshot")
 
     async def test_file_disappearing_after_preflight_does_not_fail_text_delivery(self):
         path = self.root / "gone.txt"

@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { createStateStore } from '@json-render/core';
 import { GatewayError } from '../src/gateway/api.ts';
-import { alignedSliderValue, displayFieldValue, fieldSummaries, parseRichSpec, pointerForKey, richComponentNames, submissionError, submissionValues } from '../src/components/rich-message/spec.ts';
+import { alignedSliderValue, displayFieldValue, fieldSummaries, parseRichSpec, pointerForKey, richBlockFramed, richComponentNames, submissionError, submissionValues } from '../src/components/rich-message/spec.ts';
 import { richScenarios } from '../src/dev/rich-scenarios.ts';
 
 const form = {
@@ -30,6 +30,29 @@ test('有效 spec 的本地状态绑定、全部提交值与已提交可读标�
   assert.deepEqual({ ...submissionValues(spec, snapshot) }, { plan: 'mountain', note: '周六出发' });
   assert.deepEqual(fieldSummaries(spec, snapshot), [{ label: '方案', value: '去山里' }, { label: '补充', value: '周六出发' }]);
   assert.equal(pointerForKey('a/b~c'), '/a~1b~0c');
+});
+
+test('A+ 边界：含任一输入或 Submit 的块整体 framed，纯展示块不 framed（模型无法自行开关）', () => {
+  const display = { root: 'card', state: {}, elements: {
+    card: { type: 'Card', props: { title: '概览' }, children: ['text', 'chart'] },
+    text: { type: 'Text', props: { text: '说明' }, children: [] },
+    chart: { type: 'BarChart', props: { labels: ['甲'], series: [{ name: '数值', values: [1] }] }, children: [] },
+  } };
+  const parsedDisplay = parseRichSpec(JSON.stringify(display));
+  assert.ok(parsedDisplay);
+  assert.equal(richBlockFramed(parsedDisplay), false);
+  for (const type of ['ChoiceGroup', 'Select', 'Segmented', 'MultiSelect', 'Switch', 'Slider', 'TextInput', 'DateInput', 'Submit']) {
+    assert.equal(richBlockFramed({ elements: { ...display.elements, extra: { type, props: {}, children: [] } } } as never), true, type);
+  }
+  // Inputs nested deep in a read-only Card still frame the whole block.
+  const form = parseRichSpec(JSON.stringify({ root: 'stack', state: { ok: false }, elements: {
+    stack: { type: 'Stack', props: {}, children: ['card', 'submit'] },
+    card: { type: 'Card', props: {}, children: ['switch'] },
+    switch: { type: 'Switch', props: { stateKey: 'ok', label: '确认' }, children: [] },
+    submit: { type: 'Submit', props: { label: '提交' }, children: [] },
+  } }));
+  assert.ok(form);
+  assert.equal(richBlockFramed(form), true);
 });
 
 test('两个界面块的状态隔离，合法 stateKey 按原键提交；路径编码仍处理旧输入', () => {
@@ -116,6 +139,20 @@ test('400 可修改、404/409 终止、网络未知结果可重试', () => {
   }
   assert.equal(submissionError(new GatewayError(0, 'network', 'offline')).retryable, true);
   assert.equal(submissionError(new GatewayError(503, 'unavailable', 'retry')).editable, false);
+});
+
+test('send 的超时与断线是结果未知，限流只允许同项重试，其他明确拒绝不可重发', () => {
+  for (const status of [0, 408, 503]) {
+    const failure = submissionError(new GatewayError(status, 'transport', 'interrupted'), true);
+    assert.equal(failure.unknown, true);
+    assert.equal(failure.retryable, false);
+    assert.equal(failure.editable, false);
+  }
+  assert.equal(submissionError(new GatewayError(429, 'rate_limited', 'busy'), true).retryable, true);
+  const rejected = submissionError(new GatewayError(400, 'ui_invalid_action', 'wrong action'), true);
+  assert.equal(rejected.unknown, undefined);
+  assert.equal(rejected.retryable, false);
+  assert.equal(rejected.editable, false);
 });
 
 test('root、元素与 stateKey 只接受非保留的 1～64 位 ASCII 标识符', () => {

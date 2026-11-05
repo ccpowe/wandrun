@@ -20,18 +20,18 @@ Object.assign(globalThis, { __markdownTestReact: React, __markdownDrawerContext:
 const hosts: Record<string, string> = {
   'react-native-drawer-layout': 'export const DrawerGestureContext=globalThis.__markdownDrawerContext;',
   'react-native-gesture-handler': `const React=globalThis.__markdownTestReact;
-    export const Gesture={Native:()=>({shouldCancelWhenOutside(){return this},disallowInterruption(){return this},blocksExternalGesture(){return this}})};
+    export const Gesture={Native:()=>({shouldActivateOnStart(){return this},shouldCancelWhenOutside(){return this},disallowInterruption(){return this},blocksExternalGesture(){return this}})};
     export const GestureDetector=({gesture,children})=>React.createElement('GestureDetector',{gesture},children);`,
   'react-native': `export const Text='Text', View='View', ScrollView='ScrollView',
     ActivityIndicator='ActivityIndicator', FlatList='FlatList', TouchableWithoutFeedback='TouchableWithoutFeedback';
     export const Animated={};
-    export function Pressable({ref,...props}) {
+    export function Pressable({ref,children,...props}) {
       const React=globalThis.__markdownTestReact;
       React.useImperativeHandle(ref,()=>({measure:callback=>{
         if(props.testID==='menu-backdrop') callback(0,0,390,800,0,0);
         else callback(0,0,0,0,0,1200);
       }}),[props.testID]);
-      return React.createElement('Pressable',props);
+      return React.createElement('Pressable',props,typeof children==='function'?children({pressed:false}):children);
     }
     export const StyleSheet={create:x=>x, flatten:x=>Object.assign({},...[x].flat(Infinity).filter(Boolean)),
       absoluteFill:{position:'absolute',top:0,left:0,right:0,bottom:0}};
@@ -43,8 +43,14 @@ const hosts: Record<string, string> = {
     export const BackHandler={addEventListener:()=>({remove(){}})};
     export const Alert={alert:(...args)=>{ globalThis.__alerts?.push(args); }};`,
   'expo-clipboard': `export const setStringAsync=async value=>{ globalThis.__copiedLinks?.push(value); return true; };`,
-  'lucide-react-native': `export const Copy=()=>null, ExternalLink=Copy, Check=Copy, ChevronDown=Copy, ChevronRight=Copy, ChevronUp=Copy;`,
-  'react-native-reanimated': `export const FadeIn={reduceMotion:()=>undefined}, ReduceMotion={System:0};`,
+  'lucide-react-native': `export const Copy=()=>null, ExternalLink=Copy, Check=Copy, ChevronDown=Copy, ChevronRight=Copy, ChevronUp=Copy, ChevronLeft=Copy, ImageOff=Copy;`,
+  '@/components/ui/button.tsx': `export const Button='Button';`,
+  'react-native-reanimated': `const React=globalThis.__markdownTestReact;
+    export const FadeIn={duration(){return this},easing(){return this},reduceMotion:()=>undefined}, ReduceMotion={System:0};
+    export const Easing={out:fn=>fn,in:fn=>fn,inOut:fn=>fn,quad:x=>x*x,cubic:x=>x*x*x,linear:x=>x};
+    export const useSharedValue=value=>React.useState(()=>({value,set(next){this.value=next;}}))[0];
+    export const useAnimatedStyle=read=>read(), withTiming=value=>value;
+    export default {View:'View'};`,
   'react-native-screens': `export const FullWindowOverlay='FullWindowOverlay';`,
   'react-native-safe-area-context': `export const useSafeAreaInsets=()=>({top:24,right:0,bottom:34,left:0});`,
   'react-native-keyboard-controller': `export const useKeyboardState=select=>select({isVisible:false,height:0});`,
@@ -64,7 +70,13 @@ const hosts: Record<string, string> = {
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier in hosts) return { url: `data:text/javascript,${encodeURIComponent(hosts[specifier])}`, shortCircuit: true };
-    if (specifier.startsWith('@/')) return nextResolve(new URL(`../src/${specifier.slice(2)}`, import.meta.url).href, context);
+    if (specifier.startsWith('@/')) {
+      const url = new URL(`../src/${specifier.slice(2)}`, import.meta.url);
+      if (existsSync(fileURLToPath(url))) return nextResolve(url.href, context);
+      for (const extension of ['.tsx', '.ts']) {
+        if (existsSync(fileURLToPath(url) + extension)) return nextResolve(url.href + extension, context);
+      }
+    }
     if (specifier === './dropdown-menu' && context.parentURL?.includes('/@rn-primitives/dropdown-menu/')) {
       return nextResolve('./dropdown-menu.mjs', context);
     }

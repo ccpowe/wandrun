@@ -84,6 +84,363 @@ class GatewayOAuthTests(unittest.IsolatedAsyncioTestCase):
         self.server.should_exit = True
         await asyncio.wait_for(self.serving, 5)
 
+    async def test_probe_classifies_without_credentials_registration_or_events(self):
+        before = self.store.last_seq()
+        for mode, expected in (("none", "none"), ("oauth", "oauth"), ("key", "key"), ("failed", "failed")):
+            self.peer.auth_mode = mode
+            response = await self.client.post("/connectors/probe", json={"url": self.peer.resource})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["result"], expected, response.text)
+            if expected == "oauth":
+                self.assertTrue(response.json()["oauth"]["dcr_supported"])
+        self.assertEqual(self.store.last_seq(), before)
+        self.assertFalse(any("authorization" in headers for headers in self.peer.received_headers))
+        self.assertFalse(any(kind == "register" for kind, _ in self.peer.requests))
+        self.peer.auth_mode, self.peer.support_dcr = "oauth", False
+        probe = (await self.client.post("/connectors/probe", json={"url": self.peer.resource})).json()
+        self.assertEqual(probe["result"], "oauth")
+        self.assertFalse(probe["oauth"]["dcr_supported"])
+        rejected = await self.client.post("/connectors", json={
+            "client_id": "unsupported", "url": self.peer.resource, "auth_type": "oauth",
+        })
+        self.assertEqual(rejected.status_code, 409, rejected.text)
+        self.assertEqual(rejected.json()["error"]["code"], "oauth_dcr_unsupported")
+        self.assertEqual(set(self.store.connector_definitions()), {"remote"})
+        self.peer.auth_mode, self.peer.unauthorized_status = "key", 403
+        forbidden = await self.client.post("/connectors/probe", json={"url": self.peer.resource})
+        self.assertEqual(forbidden.json()["result"], "key")
+        for invalid in ({"command": "npx"}, {"url": self.peer.resource, "headers": {"X-Key": "secret"}}):
+            rejected = await self.client.post("/connectors/probe", json=invalid)
+            self.assertEqual(rejected.status_code, 400)
+
+    async def test_probe_discovers_authorization_without_challenge_metadata(self):
+        self.peer.challenge_metadata, self.peer.prm_available = False, False
+        probe = await self.client.post("/connectors/probe", json={"url": self.peer.resource})
+        self.assertEqual(probe.json()["result"], "oauth", probe.text)
+
+    async def test_failed_creation_reuses_initial_response_without_reconnecting(self):
+        for mode, expected_status in (("failed", 502), ("oauth", 409)):
+            self.peer.auth_mode = mode
+            before = len(self.peer.mcp_requests)
+            response = await self.client.post("/connectors", json={
+                "client_id": "failed-" + mode, "url": self.peer.resource,
+            })
+            self.assertEqual(response.status_code, expected_status, response.text)
+            attempts = self.peer.mcp_requests[before:]
+            self.assertEqual(attempts.count(("POST", "initialize")), 1, attempts)
+
+    async def test_asm_only_creation_completes_oauth_with_resource_binding(self):
+        self.peer.challenge_metadata, self.peer.prm_available = False, False
+        response = await self.client.post("/connectors", json={
+            "client_id": "asm-only", "url": self.peer.resource, "auth_type": "oauth",
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        identity = response.json()["connector"]["id"]
+        started = await self.client.post(f"/connectors/{identity}/oauth/start")
+        self.assertEqual(started.status_code, 200, started.text)
+        self.assertEqual(parse_qs(urlsplit(started.json()["authorization_url"]).query)["resource"],
+                         [self.peer.resource])
+        redirect = await self.browser.get(started.json()["authorization_url"])
+        self.assertEqual(redirect.status_code, 302, redirect.text)
+        completed = await self.client.post(f"/connectors/{identity}/oauth/callback",
+                                           json={"url": redirect.headers["location"]})
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["connector"]["auth"]["status"], "authorized")
+        exchanges = [data for kind, data in self.peer.requests if kind == "token"]
+        self.assertEqual(exchanges[-1]["resource"], self.peer.resource)
+
+    async def test_imported_and_catalog_values_survive_successful_authorization(self):
+        from wandrun.gateway.connectors import MCP_APPS
+        with patch.dict(MCP_APPS["notion"], {"url": self.peer.resource}):
+            bound = await self.client.post("/apps/notion/connect", json={"client_id": "catalog-fixed"})
+        identities = ("remote", bound.json()["connector"]["id"])
+        for identity in identities:
+            before = (await self.client.get(f"/connectors/{identity}")).json()
+            started = await self.client.post(f"/connectors/{identity}/oauth/start")
+            self.assertEqual(started.status_code, 200, started.text)
+            redirect = await self.browser.get(started.json()["authorization_url"])
+            completed = await self.client.post(f"/connectors/{identity}/oauth/callback",
+                                               json={"url": redirect.headers["location"]})
+            self.assertEqual(completed.status_code, 200, completed.text)
+            after = completed.json()["connector"]
+            self.assertEqual((after["name"], after["description"]), (before["name"], before["description"]))
+            self.assertEqual((after["name_source"], after["description_source"]), ("user", "user"))
+
+    async def test_create_classifies_oauth_mismatch_and_failure_without_persistence(self):
+        before = self.store.last_seq()
+        for mode, fields, status, code in (
+            ("oauth", {}, 409, "authentication_mismatch"),
+            ("failed", {}, 502, "connection_failed"),
+            ("key", {"auth_type": "key", "headers": {"Authorization": "Bearer wrong-key"}}, 502, "connection_failed"),
+        ):
+            self.peer.auth_mode = mode
+            response = await self.client.post("/connectors", json={
+                "client_id": "retry-after-failure", "url": self.peer.resource, **fields,
+            })
+            self.assertEqual(response.status_code, status, response.text)
+            self.assertEqual(response.json()["error"]["code"], code)
+            self.assertNotIn("wrong-key", response.text)
+            self.assertEqual(self.store.last_seq(), before)
+            self.assertEqual(set(self.store.connector_definitions()), {"remote"})
+
+
+    async def test_connect_submits_credentials_derives_metadata_and_preserves_user_fields(self):
+        self.peer.auth_mode = "key"
+        self.peer.server_info.update(title="Notes", description="Search notes.",
+                                     icons=[{"src": "https://example.com/icon.png"}])
+        mismatch = await self.client.post("/connectors", json={
+            "client_id": "new", "url": self.peer.resource, "auth_type": "none",
+        })
+        self.assertEqual(mismatch.status_code, 409, mismatch.text)
+        self.assertEqual(mismatch.json()["error"]["code"], "authentication_mismatch")
+        self.assertEqual(mismatch.json()["error"]["details"]["probe"]["result"], "key")
+        created = await self.client.post("/connectors", json={
+            "client_id": "new", "url": self.peer.resource, "auth_type": "key",
+            "headers": {"Authorization": "Bearer fixture-key"},
+        })
+        self.assertEqual(created.status_code, 201, created.text)
+        value = created.json()["connector"]
+        self.assertEqual((value["name"], value["description"], value["status"]), ("Notes", "Search notes.", "connected"))
+        self.assertEqual(value["icon"], "https://example.com/icon.png")
+        self.assertNotIn("fixture-key", created.text)
+        identity = value["id"]
+        await self.client.patch(f"/connectors/{identity}", json={"name": "My notes", "description": ""})
+        tested = await self.client.post(f"/connectors/{identity}/test")
+        self.assertTrue(tested.json()["success"], tested.text)
+        detail = (await self.client.get(f"/connectors/{identity}")).json()
+        self.assertEqual((detail["name"], detail["description"]), ("My notes", ""))
+        self.assertEqual((detail["name_source"], detail["description_source"]), ("user", "user"))
+        self.assertTrue(detail["description_missing"])
+    async def test_connect_uses_raw_tool_titles_and_reports_empty_description(self):
+        self.peer.auth_mode = "none"
+        self.peer.server_info = {"name": "notes-server", "version": "1"}
+        self.peer.tools = [
+            {"name": "search_notes", "title": "Search", "description": "Search notes",
+             "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        first = await self.client.post("/connectors", json={"client_id": "tools", "url": self.peer.resource})
+        self.assertEqual(first.status_code, 201, first.text)
+        self.assertIn("Search", first.json()["connector"]["description"])
+        self.assertNotIn("search_notes", first.json()["connector"]["description"])
+        self.assertFalse(first.json()["connector"]["description_missing"])
+        self.peer.tools = []
+        empty = await self.client.post("/connectors", json={"client_id": "empty", "url": self.peer.resource})
+        self.assertEqual(empty.status_code, 201, empty.text)
+        self.assertEqual(empty.json()["connector"]["name"], "Notes 2")
+        self.assertEqual(empty.json()["connector"]["description"], "")
+        self.assertTrue(empty.json()["connector"]["description_missing"])
+
+    async def test_connector_tools_reads_negotiated_catalog_without_connecting(self):
+        before = list(self.peer.requests)
+        waiting = await self.client.get("/connectors/remote/tools")
+        self.assertEqual(waiting.status_code, 200)
+        self.assertEqual(waiting.json()["status"], "disconnected")
+        self.assertEqual(waiting.json()["tools"], [])
+        self.assertEqual(self.peer.requests, before)
+        self.peer.auth_mode = "none"
+        self.peer.tools = [{"name": "search_notes", "title": "Search notes",
+                            "description": "Find notes by text",
+                            "inputSchema": {"type": "object", "properties": {}}}]
+        created = await self.client.post("/connectors", json={"client_id": "tool-display", "url": self.peer.resource})
+        identity = created.json()["connector"]["id"]
+        before = list(self.peer.requests)
+        listed = await self.client.get(f"/connectors/{identity}/tools")
+        self.assertEqual(listed.json()["status"], "connected")
+        self.assertEqual(listed.json()["tools"], [{"name": "search_notes", "title": "Search notes",
+                                                  "description": "Find notes by text"}])
+        self.assertEqual(self.peer.requests, before)
+        self.assertEqual((await self.client.get("/connectors/missing/tools")).status_code, 404)
+
+    async def test_clear_key_retires_credentials_and_reconnects_after_reentry(self):
+        self.peer.auth_mode = "key"
+        response = await self.client.post("/connectors", json={
+            "client_id": "clear-key", "url": self.peer.resource, "auth_type": "key",
+            "name": "受控密钥连接器", "description": "供 Agent 查询的受控说明",
+            "headers": {"Authorization": "Bearer fixture-key"},
+        })
+        identity = response.json()["connector"]["id"]
+        self.assertEqual(response.json()["connector"]["status"], "connected")
+        assigned = await self.client.patch("/agents/main", json={"mcp_servers": [identity]})
+        self.assertEqual(assigned.status_code, 200, assigned.text)
+        before = (await self.client.get(f"/connectors/{identity}")).json()
+        self.assertEqual([agent["id"] for agent in before["used_by"]], ["main"])
+        cleared = await self.client.delete(f"/connectors/{identity}/key")
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertEqual(cleared.json()["connector"]["headers"], {})
+        self.assertNotEqual(cleared.json()["connector"]["status"], "connected")
+        self.assertEqual(self.store.connector_definitions()[identity]["headers"], {})
+        self.assertNotIn("fixture-key", cleared.text)
+        self.assertEqual(cleared.json()["connector"]["used_by"], before["used_by"])
+        self.assertEqual(self.store.agent("main")["mcp_servers"], [identity])
+        self.assertEqual(cleared.json()["connector"]["name"], "受控密钥连接器")
+        self.assertEqual(cleared.json()["connector"]["description"], "供 Agent 查询的受控说明")
+        restored = await self.client.patch(f"/connectors/{identity}", json={
+            "headers": {"Authorization": "Bearer fixture-key"},
+        })
+        self.assertEqual(restored.status_code, 200, restored.text)
+        tested = await self.client.post(f"/connectors/{identity}/test")
+        self.assertTrue(tested.json()["success"], tested.text)
+        self.assertFalse(tested.json()["pending_restart"])
+        self.assertEqual((await self.client.delete("/connectors/remote/key")).status_code, 400)
+    async def test_catalog_query_key_binding_sends_key_only_in_the_connection_url(self):
+        from wandrun.gateway.connectors import MCP_APPS
+        self.peer.auth_mode = "query-key"
+        apps = {app["id"]: app for app in (await self.client.get("/apps")).json()["apps"]}
+        self.assertEqual(apps["amap"]["auth"]["key"], {"in": "query", "name": "key"})
+        self.assertIsNone(apps["amap"]["connector"])
+        with patch.dict(MCP_APPS["amap"], {"url": self.peer.resource}):
+            bound = await self.client.post("/apps/amap/connect", json={"client_id": "amap-binding"})
+        self.assertEqual(bound.status_code, 200, bound.text)
+        connector = bound.json()["connector"]
+        identity = connector["id"]
+        self.assertEqual((connector["auth_type"], connector["headers"], connector["app_id"]), ("key", {}, "amap"))
+        self.assertNotEqual(connector["status"], "connected")
+        # Address / auth stay catalog-owned; only the Key may be written.
+        for fields in ({"url": self.peer.resource + "?key=x"}, {"auth_type": "none"},
+                       {"headers": {"key": "fixture-key"}, "url": self.peer.resource},
+                       # Only the declared Key may be written or cleared; no other header.
+                       {"headers": {"Authorization": "fixture-key"}},
+                       {"headers": {"key": "fixture-key", "X-Arbitrary": "x"}},
+                       {"headers": {"Authorization": None}}):
+            rejected = await self.client.patch(f"/connectors/{identity}", json=fields)
+            self.assertEqual(rejected.status_code, 400, (fields, rejected.text))
+        self.assertEqual(self.store.connector_definitions()[identity]["headers"], {})
+        wrong = await self.client.patch(f"/connectors/{identity}", json={"headers": {"key": "wrong-key"}})
+        self.assertEqual(wrong.status_code, 200, wrong.text)
+        failed = await self.client.post(f"/connectors/{identity}/test")
+        self.assertFalse(failed.json()["success"], failed.text)
+        failed_detail = (await self.client.get(f"/connectors/{identity}")).json()
+        # Invalid credentials are actionable, without exposing identifiers or secrets.
+        self.assertEqual(failed_detail["status"], "failed")
+        self.assertIn("Key", failed_detail["error"])
+        self.assertNotIn(identity, failed_detail["error"])
+        self.assertEqual(failed.json()["error"], failed_detail["error"])
+        self.assertNotIn("wrong-key", failed.text)
+        self.assertNotIn("wrong-key", str(failed_detail))
+        self.peer.received_urls.clear()
+        self.peer.received_headers.clear()
+        saved = await self.client.patch(f"/connectors/{identity}", json={"headers": {"key": "fixture-key"}})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["connector"]["headers"], {"key": True})
+        self.assertEqual(saved.json()["connector"]["url"], self.peer.resource)
+        self.assertNotIn("fixture-key", saved.text)
+        tested = await self.client.post(f"/connectors/{identity}/test")
+        self.assertTrue(tested.json()["success"], tested.text)
+        self.assertTrue(self.peer.received_urls and all("key=fixture-key" in url for url in self.peer.received_urls))
+        self.assertFalse(any("key" in headers for headers in self.peer.received_headers))
+        listed = (await self.client.get("/connectors")).text
+        self.assertNotIn("fixture-key", listed)
+        self.assertNotIn("fixture-key", (await self.client.get("/apps")).text)
+        cleared = await self.client.delete(f"/connectors/{identity}/key")
+        self.assertEqual(cleared.json()["connector"]["headers"], {})
+        self.assertNotEqual(cleared.json()["connector"]["status"], "connected")
+
+    async def test_catalog_key_standard_auth_rejection_and_unreachable_service(self):
+        from wandrun.gateway.connectors import MCP_APPS
+        unavailable = socket.socket()
+        unavailable.bind(("127.0.0.1", 0))
+        self.addCleanup(unavailable.close)
+        for status in (401, 403, None):
+            with self.subTest(status=status):
+                self.peer.auth_mode = "key"
+                self.peer.unauthorized_status = status or 401
+                url = self.peer.resource if status else f"http://127.0.0.1:{unavailable.getsockname()[1]}/mcp"
+                with patch.dict(MCP_APPS["amap"], {"url": url}):
+                    bound = await self.client.post("/apps/amap/connect", json={"client_id": f"key-{status}"})
+                identity = bound.json()["connector"]["id"]
+                await self.client.patch(f"/connectors/{identity}", json={"headers": {"key": "private-invalid"}})
+                result = await self.client.post(f"/connectors/{identity}/test")
+                self.assertFalse(result.json()["success"], result.text)
+                message = result.json()["error"]
+                self.assertEqual("Key" in message, status is not None)
+                self.assertNotIn(identity, message)
+                if status is None:
+                    self.assertIn("无法连接", message)
+                self.assertNotIn("private-invalid", message)
+                self.assertEqual((await self.client.get(f"/connectors/{identity}")).json()["error"], message)
+                await self.client.delete(f"/connectors/{identity}")
+
+    async def test_local_connect_initializes_command_args_and_environment_in_one_request(self):
+        script = self.workspace.root / "local_peer.py"
+        script.write_text(
+            "import os\nfrom fastmcp import FastMCP\n"
+            "mcp = FastMCP(os.environ['PEER_NAME'], instructions='Read local notes.')\n"
+            "@mcp.tool\n"
+            "def read_note() -> str:\n    return 'local note'\n"
+            "mcp.run(transport='stdio', show_banner=False)\n",
+            encoding="utf-8",
+        )
+        response = await self.client.post("/connectors", json={
+            "client_id": "local", "command": sys.executable, "args": [str(script)],
+            "env": {"PEER_NAME": "notes-server"},
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        connector = response.json()["connector"]
+        self.assertEqual((connector["name"], connector["description"], connector["tool_count"]),
+                         ("Notes", "Read local notes.", 1))
+        self.assertEqual(connector["env"], {"PEER_NAME": True})
+        self.assertEqual(connector["auth"]["status"], "not_required")
+
+
+
+    async def test_oauth_callback_returns_only_connector_and_result_to_app(self):
+        for fail in (False, True):
+            started = await self.client.post("/connectors/remote/oauth/start",
+                                             json={"return_url": "wandrun://oauth/done"})
+            self.assertEqual(started.status_code, 200, started.text)
+            redirect = await self.browser.get(started.json()["authorization_url"])
+            callback_url = redirect.headers["location"]
+            self.peer.force_unavailable = fail
+            result = await self.client.get("/oauth/callback?" + urlsplit(callback_url).query,
+                                           headers={"Authorization": ""})
+            self.assertEqual(result.status_code, 303, result.text)
+            self.assertEqual(result.headers["location"],
+                             "wandrun://oauth/done?connector=remote&result=" + ("error" if fail else "ok"))
+            self.assertEqual(result.headers["cache-control"], "no-store")
+            for secret in ("code=", "state=", "access-", "refresh-"):
+                self.assertNotIn(secret, str(result.headers) + result.text)
+        bad = await self.client.post("/connectors/remote/oauth/start", json={"return_url": "https://example.com"})
+        self.assertEqual(bad.status_code, 400)
+        invalid = await self.client.get("/oauth/callback?state=invalid&code=private")
+        self.assertNotIn("location", invalid.headers)
+
+    async def test_public_deployment_disables_manual_callback(self):
+        self.gateway.oauth.manual_callback = False
+        result = await self.client.post("/connectors/remote/oauth/callback", json={"url": "http://localhost"})
+        self.assertEqual((result.status_code, result.json()["error"]["code"]), (400, "manual_callback_disabled"))
+
+    async def test_oauth_transaction_identity_matches_pending_and_never_reuses_completed_material(self):
+        initial = (await self.client.get("/connectors/remote")).json()["auth"]
+        self.assertIsNone(initial["transaction_id"])
+        first = (await self.client.post("/connectors/remote/oauth/start")).json()
+        first_id = first["transaction_id"]
+        self.assertIsInstance(first_id, str)
+        self.assertGreater(len(first_id), 20)
+        pending = (await self.client.get("/connectors/remote")).json()["auth"]
+        self.assertTrue(pending["authorizing"])
+        self.assertEqual(pending["transaction_id"], first_id)
+        self.assertNotEqual(first_id, parse_qs(urlsplit(first["authorization_url"]).query)["state"][0])
+
+        cancelled = await self.client.delete("/connectors/remote/oauth/pending")
+        self.assertIsNone(cancelled.json()["connector"]["auth"]["transaction_id"])
+        second = (await self.client.post("/connectors/remote/oauth/start")).json()
+        self.assertNotEqual(second["transaction_id"], first_id)
+        self.assertEqual((await self.client.get("/connectors/remote")).json()["auth"]["transaction_id"],
+                         second["transaction_id"])
+        redirect = await self.browser.get(second["authorization_url"])
+        completed = await self.client.post("/connectors/remote/oauth/callback",
+                                           json={"url": redirect.headers["location"]})
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertIsNone(completed.json()["connector"]["auth"]["transaction_id"])
+
+        cold = ConnectorOAuth(GatewayOAuthRecords(self.store, self.gateway._persist), port=8765)
+        self.addAsyncCleanup(cold.aclose)
+        restarted = await cold.start("remote", self.peer.resource)
+        self.assertNotIn(restarted["transaction_id"], (first_id, second["transaction_id"]))
+        self.assertEqual(cold.status("remote", "oauth")["transaction_id"], restarted["transaction_id"])
+        cold.cancel("remote")
+        self.assertIsNone(cold.status("remote", "oauth")["transaction_id"])
+
     async def authorize(self, *, public=False):
         response = await self.client.post("/connectors/remote/oauth/start")
         self.assertEqual(response.status_code, 200, response.text)
@@ -115,7 +472,7 @@ class GatewayOAuthTests(unittest.IsolatedAsyncioTestCase):
         second = await self.client.post("/apps/notion/connect", json={"client_id": "again"})
         self.assertEqual(first.json()["connector"]["id"], second.json()["connector"]["id"])
         self.assertEqual(first.json()["connector"]["auth"], {
-            "status": "unauthorized", "authorizing": False, "scopes": [],
+            "status": "unauthorized", "authorizing": False, "transaction_id": None, "scopes": [],
         })
         identity = first.json()["connector"]["id"]
         self.assertEqual((await self.client.patch(f"/connectors/{identity}", json={

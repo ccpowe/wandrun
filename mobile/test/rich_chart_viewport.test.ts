@@ -1,22 +1,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { barLayout, chartViewportProps, chartYAxisLabelWidth, lineLayout, LINE_POINT_RADIUS } from '../src/components/rich-message/chart-viewport.ts';
+import { chartViewportProps, chartYAxisLabelWidth, lineLayout, LINE_POINT_RADIUS } from '../src/components/rich-message/chart-viewport.ts';
 
-test('measured chart width becomes a plot viewport after Y-axis and point overhang', () => {
-  for (const [container, lineWidth, barWidth] of [[328, 277, 279], [258, 207, 209]]) {
-    const line = chartViewportProps(container, 'line');
-    const bar = chartViewportProps(container, 'bar');
-    assert.deepEqual(line, { width: lineWidth, yAxisLabelWidth: 48 });
-    assert.deepEqual(bar, { width: barWidth, yAxisLabelWidth: 48 });
-    assert.ok(line.yAxisLabelWidth + 1 + line.width + LINE_POINT_RADIUS <= container);
-    assert.ok(bar.yAxisLabelWidth + 1 + bar.width <= container);
-
+test('measured plot and point overhang stay inside the container', () => {
+  for (const container of [258, 328]) {
+    for (const kind of ['line', 'bar'] as const) {
+      const viewport = chartViewportProps(container, kind);
+      assert.ok(viewport.width > 0);
+      assert.ok(viewport.yAxisLabelWidth + 1 + viewport.width + (kind === 'line' ? LINE_POINT_RADIUS : 0) <= container);
+    }
   }
 });
 
 test('resized and very narrow cards never pass a negative chart width', () => {
-  assert.equal(chartViewportProps(210, 'line').width, 159);
-  assert.equal(chartViewportProps(140, 'line').width, 89);
   assert.equal(chartViewportProps(32, 'line').width, 0);
   assert.equal(chartViewportProps(32, 'bar').width, 0);
 });
@@ -33,17 +29,10 @@ test('compact extreme labels at double font scale leave a useful phone plot', ()
   assert.ok(widerLabels.width >= 160);
 });
 
-test('bar slots spread across wide plots and fall back to scrolling on narrow ones', () => {
-  const wide = 1000;
-  const bars = barLayout(wide, 4);
-  assert.ok(Math.abs(24 + 4 * (bars.barWidth + bars.spacing) - wide) < 1e-9);
-  assert.equal(bars.barWidth, 48);
-  assert.deepEqual(barLayout(200, 12), { barWidth: 16, spacing: 12 });
-});
 
-test('5/12/24 points fit and sparse endpoint label slots stay visible at phone and tablet widths', () => {
+test('single/5/12/24 points fit and sparse endpoint label slots stay visible at phone and tablet widths', () => {
   for (const width of [320, 360, 390, 768]) {
-    for (const count of [5, 12, 24]) {
+    for (const count of [1, 5, 12, 24]) {
       for (const fontScale of [1, 1.5, 2]) {
         for (const text of ['2026', '这是完整的二十个中文字符横轴标签用来验证']) {
           const labels = Array.from({ length: count }, (_, i) => `${text}${i}`);

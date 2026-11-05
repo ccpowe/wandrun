@@ -4,7 +4,7 @@ export type AgentMessageSegment =
   | { kind: "markdown"; text: string }
   | { kind: "ui"; source: string; block: number; closed: boolean };
 
-export type UiSubmission = { values: Record<string, unknown>; createdAt: string };
+export type UiSubmission = { values: Record<string, unknown>; createdAt: string; actionId?: string };
 /** UI metadata may grant only exact paths belonging to image attachments in this same message. */
 export function authorizedImageFiles(
   status: { valid: boolean; files?: Record<string, string> } | undefined,
@@ -18,13 +18,15 @@ export function authorizedImageFiles(
   for (const [path, id] of Object.entries(status.files)) if (typeof id === "string" && images.has(id)) files[path] = id;
   return files;
 }
-/** In-memory, message-local UI state; an attempt remains frozen across unknown network results. */
+export type UiAttempt = { values: Record<string, unknown>; clientId: string; actionId?: string };
+export type UiFailure = { message: string; retryable: boolean; editable: boolean };
+/** Session-owned local flow; durable submissions remain solely in the timeline. */
 export type UiDraft = {
   values: Record<string, unknown>;
-  attempt: { values: Record<string, unknown>; clientId: string } | null;
-  pending: boolean;
-  completed: boolean;
-  error: { message: string; retryable: boolean; editable: boolean } | null;
+  flow:
+    | { status: 'editing' }
+    | { status: 'sending' | 'awaiting' | 'unknown' | 'checking'; attempt: UiAttempt }
+    | { status: 'failed'; attempt: UiAttempt | null; error: UiFailure };
 };
 
 /**
@@ -83,14 +85,16 @@ export function uiSubmissionFromEvent(event: GatewayEvent): { messageSeq: number
   if (event.type !== "message.user") return null;
   const raw: unknown = event.data?.ui_submission;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
-  const { message_seq, block, values } = raw as Record<string, unknown>;
+  const { message_seq, block, values, action_id } = raw as Record<string, unknown>;
   if (!Number.isSafeInteger(message_seq) || (message_seq as number) <= 0 || (message_seq as number) >= event.seq ||
     !Number.isSafeInteger(block) || (block as number) < 0 ||
-    typeof values !== "object" || values === null || Array.isArray(values) || !Number.isFinite(event.at)) return null;
+    typeof values !== "object" || values === null || Array.isArray(values) || !Number.isFinite(event.at) ||
+    action_id !== undefined && (typeof action_id !== 'string' || !action_id)) return null;
   const submittedAt = new Date(event.at * 1000);
   if (!Number.isFinite(submittedAt.getTime())) return null;
   return {
     messageSeq: message_seq as number, block: block as number,
-    submission: { values: values as Record<string, unknown>, createdAt: submittedAt.toISOString() },
+    submission: { values: values as Record<string, unknown>, createdAt: submittedAt.toISOString(),
+      ...(typeof action_id === 'string' ? { actionId: action_id } : {}) },
   };
 }

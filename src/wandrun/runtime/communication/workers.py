@@ -14,7 +14,7 @@ from langchain.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from dataclasses import asdict, dataclass
 
-from wandrun.runtime.execution.files import ResolvedAttachment
+from wandrun.runtime.execution.files import PreparedAttachments, ResolvedAttachment
 from wandrun.runtime.communication.messages import AgentOutput, runtime_message
 from wandrun.runtime.communication.scheduler_store import SchedulerStore, TaskSnapshot
 from wandrun.runtime.communication.preview import PreviewExecution, PreviewPersistenceError, current_preview
@@ -39,7 +39,7 @@ class _PreparedDelivery:
     to: str
     task_id: str | None
     paths: tuple[str, ...]
-    resolution: tuple[list[ResolvedAttachment], list[dict]] | None
+    resolution: PreparedAttachments | None
 
 
 
@@ -78,6 +78,9 @@ class WorkerManager:
     并按“每个根任务都被取消”停止旧执行，由用户和创建者逐级恢复（ADR-0008）。
     提交失败后停止调度并取消全部 Worker，close 等待清理后报告该失败。
     不传 store 时只在内存中运行。
+
+    accept_feedback 可在领取消息时拒绝已过期的输入；同时覆盖反馈、来信和失败重试，
+    被拒绝的消息作为已消费提交，不进入未确认副本。领域判断由调用方提供。
     """
 
     def __init__(
@@ -87,6 +90,7 @@ class WorkerManager:
         on_human: Callable[[str, str, list[ResolvedAttachment], str | None], None] | None = None,
         on_preview: Callable[[str, dict], list[dict] | None] | None = None,
         validate_human: Callable[[str, str, list[ResolvedAttachment]], str | None] | None = None,
+        accept_feedback: Callable[[str, HumanMessage], bool] | None = None,
         agent_workers: dict[str, tuple[str, ...]] | None = None,
         default_agent: str | None = "worker",
         store: SchedulerStore | None = None,
@@ -98,7 +102,7 @@ class WorkerManager:
             [str, str, list[str]], tuple[list[ResolvedAttachment], list[dict]]
         ] | None = None,
         attachment_preflight: Callable[
-            [str, str, list[str]], Awaitable[tuple[list[ResolvedAttachment], list[dict]] | None]
+            [str, str, list[str], str | None], Awaitable[PreparedAttachments]
         ] | None = None,
     ):
         # 字符串回调仅供原有的最小循环实验；正式 Agent 入口强制返回 AgentOutput。
@@ -119,6 +123,7 @@ class WorkerManager:
         self._previews: dict[asyncio.Task, PreviewExecution] = {}
         # 入口策略在任何交付副作用之前返回拒绝原因；不在可能已显示的观察者里拒绝。
         self._validate_human = validate_human
+        self._accept_feedback = accept_feedback
         self._attachment_resolver = attachment_resolver
         self._attachment_preflight = attachment_preflight
         # 可选的生命周期观察者：(task_id, 状态, 错误)；启动、结算及 waiting 被停止时报告。
@@ -195,12 +200,13 @@ class WorkerManager:
         self._default_agent = default_agent
 
     def running_tasks(self, agent: str) -> list[str]:
-        """返回绑定角色的在途任务，包括等待协作和执行已返回但尚未结算的任务。"""
+        """返回绑定角色的在途任务，包括等待协作、未结算执行和分支清理。"""
         return [
             task_id for task_id, name in self._task_agents.items()
             if name == agent and (
                 self._status(task_id)[0] in {"running", "waiting"}
                 or self._tasks.get(task_id) in self._unsettled
+                or any(task_id in scope for scope in self._branch_stops.values())
             )
         ]
 
@@ -350,42 +356,10 @@ class WorkerManager:
             not isinstance(sender_id, str) or not sender_id.strip()
         ):
             raise ValueError("协作消息的发送方 task_id 不能为空")
-        target_agent = agent_name or self._task_agents.get(task_id, self._default_agent)
-        if self._agent_workers is not None:
-            if target_agent not in self._agent_workers:
-                raise ValueError(f"未知 Agent: {target_agent}")
-            if sender_id is not None:
-                if sender_id not in self._task_agents:
-                    raise ValueError("未知发送方 task_id")
-                sender_agent = self.agent_name(sender_id)
-                if sender_agent not in self._agent_workers:
-                    raise ValueError(f"发送方 Agent 已删除: {sender_agent}")
-                if (
-                    task_id not in self._task_agents
-                    and target_agent not in self._agent_workers[sender_agent]
-                ):
-                    raise ValueError(f"{sender_agent} 不能创建 {target_agent}")
-        elif target_agent != self._default_agent:
-            raise ValueError(f"未知 Agent: {target_agent}")
-        if task_id in self._task_agents and self.agent_name(task_id) != target_agent:
-            raise ValueError("to 与目标任务绑定的 Agent 不匹配")
-        if target_agent in self._retired_agents:
-            raise ValueError(f"Agent 正在删除或已删除: {target_agent}")
+        target_agent = self._validate_start(task_id, sender_id, agent_name, user_resume=user_resume)
         if direct_user and sender_id is not None:
             raise ValueError("直接用户输入不能有协作任务发送方")
         if task_id in self._stopped:
-            # 隐式唤醒（通知、非创建者来信）一律拒绝；创建者的新消息是显式恢复。
-            if not user_resume and sender_id != self._callers.get(task_id):
-                raise ValueError(
-                    "目标任务已停止，只能由创建它的上级恢复；重新委派请用 task_id=null"
-                )
-            branch = self._descendants(task_id)
-            if any(
-                not self._tasks[identity].done()
-                for identity in branch
-                if identity in self._tasks
-            ) or any(branch & scope for scope in self._branch_stops.values()):
-                raise ValueError("任务分支正在停止，请等待清理完成后再发送")
             self._stopped.remove(task_id)
             self._restart_stopped.discard(task_id)
         # Root provenance is committed after enqueue, which may first settle a
@@ -427,6 +401,52 @@ class WorkerManager:
         if sender_id is not None:
             self._observe_fact(self._on_task_message, sender_id, task_id, prompt, attachments or [])
         return result
+
+    def _validate_start(
+        self, task_id: str | None, sender_id: str | None, agent_name: str | None, *, user_resume: bool = False,
+    ) -> str:
+        """Validate admission without mutating identities or removing stop barriers."""
+        if self._closed:
+            raise self._closed_error()
+        target_agent = agent_name or self._task_agents.get(task_id, self._default_agent)
+        if self._agent_workers is not None:
+            if target_agent not in self._agent_workers:
+                raise ValueError(f"未知 Agent: {target_agent}")
+            if sender_id is not None:
+                if sender_id not in self._task_agents:
+                    raise ValueError("未知发送方 task_id")
+                sender_agent = self.agent_name(sender_id)
+                if sender_agent not in self._agent_workers:
+                    raise ValueError(f"发送方 Agent 已删除: {sender_agent}")
+                if task_id not in self._task_agents and target_agent not in self._agent_workers[sender_agent]:
+                    raise ValueError(f"{sender_agent} 不能创建 {target_agent}")
+        elif target_agent != self._default_agent:
+            raise ValueError(f"未知 Agent: {target_agent}")
+        if task_id in self._task_agents and self.agent_name(task_id) != target_agent:
+            raise ValueError("to 与目标任务绑定的 Agent 不匹配")
+        if target_agent in self._retired_agents:
+            raise ValueError(f"Agent 正在删除或已删除: {target_agent}")
+        if task_id in self._stopped:
+            if not user_resume and sender_id != self._callers.get(task_id):
+                raise ValueError("目标任务已停止，只能由创建它的上级恢复；重新委派请用 task_id=null")
+            branch = self._descendants(task_id)
+            if any(
+                not self._tasks[identity].done() for identity in branch if identity in self._tasks
+            ) or any(branch & scope for scope in self._branch_stops.values()):
+                raise ValueError("任务分支正在停止，请等待清理完成后再发送")
+        return target_agent
+
+    def _validate_delivery(self, sender_id: str, target: str, task_id: str | None) -> None:
+        self.ensure_active(sender_id)
+        if target == "human":
+            if task_id is not None:
+                raise ValueError("当前只有一个用户入口，发给 human 时 task_id 必须为 null")
+            if self._on_human is None:
+                raise ValueError("没有 human 消息接收方")
+        else:
+            if task_id is not None and task_id not in self._callers:
+                raise ValueError("未知 task_id；创建新任务请使用 null")
+            self._validate_start(task_id, sender_id, target)
 
     @_transitional
     def interrupt(
@@ -705,19 +725,26 @@ class WorkerManager:
             raise asyncio.CancelledError()
         feedback = self._feedback.pop(task_id, [])
         messages = [*feedback, *self._inbox.pop(task_id, [])]
+        if self._accept_feedback is not None:
+            messages = [message for message in messages if self._accept_feedback(task_id, message)]
         if messages:
             self._inflight.setdefault(task_id, []).extend(messages)
         return messages
 
     async def prepare_attachments(self, output: AgentOutput, sender_id: str) -> list[_PreparedDelivery]:
-        """Preflight remote paths; deferred paths use the same dispatch resolver as direct calls."""
+        """Validate trusted targets before I/O and bind prepared bytes to the final delivery."""
         prepared = []
         for message in output.messages:
-            resolution = (
-                await self._attachment_preflight(sender_id, message.to, message.attachments)
-                if message.attachments and self._attachment_preflight is not None
-                else None
-            )
+            resolution = None
+            if message.attachments and self._attachment_preflight is not None:
+                try:
+                    self._validate_delivery(sender_id, message.to, message.task_id)
+                except ValueError:
+                    pass  # Dispatch records the same rejection; no file I/O was admitted.
+                else:
+                    resolution = await self._attachment_preflight(
+                        sender_id, message.to, message.attachments, message.task_id,
+                    )
             prepared.append(_PreparedDelivery(
                 message.to, message.task_id, tuple(message.attachments), resolution,
             ))
@@ -741,21 +768,15 @@ class WorkerManager:
             # 也不留下回执，否则失败回执会让模型继续调用，并在恢复时注入过期内容。
             raise asyncio.CancelledError()
         receipts = [
-            {"to": m.to, "task_id": m.task_id, "attachments": []}
+            {"to": m.to, "task_id": m.task_id, "attachments": [
+                {"path": path, "accepted": False, "error": "消息未投递"} for path in m.attachments
+            ]}
             for m in output.messages
         ]
         try:
             for index, (message, receipt) in enumerate(zip(output.messages, receipts)):
                 try:
-                    if message.to == "human":
-                        if message.task_id is not None:
-                            raise ValueError(
-                                "当前只有一个用户入口，发给 human 时 task_id 必须为 null"
-                            )
-                        if self._on_human is None:
-                            raise ValueError("没有 human 消息接收方")
-                    elif message.task_id is not None and message.task_id not in self._callers:
-                        raise ValueError("未知 task_id；创建新任务请使用 null")
+                    self._validate_delivery(sender_id, message.to, message.task_id)
                     attachments: list[ResolvedAttachment] = []
                     resolution = None
                     if message.attachments and prepared is not None:
@@ -767,8 +788,15 @@ class WorkerManager:
                         resolution = preflight.resolution
                     if message.attachments:
                         if resolution is not None:
-                            attachments, path_receipts = resolution
-                            receipt["attachments"] = [item.copy() for item in path_receipts]
+                            receipt["attachments"] = [item.copy() for item in resolution.receipts]
+                            try:
+                                resolution.validate()
+                            except ValueError as error:
+                                for item in receipt["attachments"]:
+                                    if item["accepted"]:
+                                        item.update(accepted=False, error=str(error))
+                            else:
+                                attachments = resolution.attachments
                         elif self._attachment_resolver is None:
                             receipt["attachments"] = [
                                 {"path": path, "accepted": False, "error": "未配置附件解析器"}
@@ -1036,9 +1064,10 @@ class WorkerManager:
         return self._descendants(root) | {root}
 
     def forget_stopped_root(self, root: str) -> None:
-        """只遗忘已停止且清理完成的根分支；调度快照在同一次转换提交。
+        """只遗忘已停止且本地执行已结算的根分支；调度快照在同一次转换提交。
 
-        调用方必须先停止并确认 shell 清理，再删除该分支检查点。重复调用在重启续删时安全。
+        调用方先停止执行、删除检查点，并记录外部清理未确认结果；不要求远端可达。
+        重复调用在重启续删时安全。外部资源 owner 仍持有自身未确认责任。
         """
         if self._closed:
             raise self._closed_error()

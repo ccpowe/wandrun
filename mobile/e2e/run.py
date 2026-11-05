@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Android + already-running Expo Go/Metro/gateway regression.
+"""Seven Android core chains against one isolated, already-running Expo Go/Metro/gateway.
 
-Run: python3 mobile/e2e/run.py [group ...] | --list
-Optional env: ANDROID_SERIAL, GATEWAY_URL, GATEWAY_TOKEN (default dev), E2E_AGENT_ID,
-E2E_ARTIFACTS, E2E_WORKSPACE, EXPO_URL. Requires agent-device 0.21.16.
-All groups authenticate API calls with GATEWAY_TOKEN (default dev). Pairing
-requires an initial development connection and restores that connection.
-Only this run's temporary conversations, Agents, connectors and paired device are cleaned.
-Only the system launcher permits reopening Expo Go; any other foreground app stops
-phone operations, except DocumentsUI inside upload's explicit selection hook.
+Run: uv run python mobile/e2e/run.py [group ...] | --list
+Required env: ANDROID_SERIAL, E2E_WORKSPACE. Optional: GATEWAY_URL (18785),
+GATEWAY_TOKEN (dev), EXPO_URL (8097), E2E_ARTIFACTS, E2E_MANUAL_COMMAND (JSON argv).
+Requires agent-device 0.21.16 and fixture_gateway.py for deterministic display content.
+Only owned fixture resources are removed. Pairing restores the initial development connection.
+The normal foreground guard permits only Expo Go; DocumentsUI has one explicit picker window.
+Camera permissions, save/share recipients and the Sources external handoff require timed receipts.
 """
 import hashlib
 import argparse
@@ -16,12 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.client import HTTPConnection, HTTPSConnection
 from urllib.error import HTTPError
 from ipaddress import ip_address
-from html import escape
 import json
 import os
 from pathlib import Path
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 import subprocess
 import sqlite3
 from contextlib import closing
@@ -33,51 +29,34 @@ import threading
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
-from urllib.error import HTTPError
 
-import compaction
-import rich
+import native_rich
 import collaboration
+import core
+import attachments
+import browser_native
+import manual_checks
+import audio_native
 
 
 ROOT = Path(__file__).resolve().parent
 GROUPS = {
-    "home": "首页、移出/放回、＋菜单、全部 Agent",
-    "drawer": "对话抽屉、新建/切换/返回、重命名、删除当前及非当前对话",
-    "collaboration": "真实委派、主进度/预览跳转、接收/发起胶囊抽屉、成员插话与完成后续聊、根删除及浅深色截图",
-    "profile": "聊天顶栏、资料页、成员跳转、空成员及记忆页",
-    "memory": "共享画像跨 Agent、独立工作记忆、详情创建/冲突/编辑/删除、草稿保留、根对话事件及浅深色截图",
-    "schedules": "定时列表/全屏编辑、外部创建同步、到点对话来源与运行记录、删除",
-    "agent": "新建、编辑、代码模式默认开启/关闭保存、外部同步、引用阻止删除、解除引用及删除",
-    "settings": "设置首页与关于/连接浅深色、单一入口及连接信息、模型/订阅额度/Agent 用量、默认档位、新建表单默认值、Agent 模型档位编辑及恢复",
-    "connectors": "连接器列表/编辑/测试、本地参数往返与既有传输保留、Agent 使用量、引用阻止删除、无事件保存、后台删除保留 Agent 草稿",
-    "skills": "技能正常/错误项、详情、引用删除冲突及解除、删除事件刷新、默认入口预填未发送、浅深色截图",
-    "capabilities": "Agent 系统能力、代码模式草稿取消/保存后未启用/重新启用、工具弹层、内置技能分组/详情/使用者、浅深色截图",
-    "files": "真实 Agent 原文件交付：卡片、全局/作用域搜索、预览、来源跳转、删除对话后独立登记与失效状态",
-    "upload": "系统文件选择、tus 上传、纯附件发送、我的消息卡片、文件预览及浅深色截图",
-    "pdf": "DocumentsUI 上传随机标记 PDF、真实模型直接读取 input_file、回复标记断言及截图",
-    "image": "真实 generate_image 生图、Agent 附件卡片、图片预览浅深色截图；额度耗尽明确失败",
-    "browser": "真实 browser skill 租约：聊天卡片、观看/接管/输入/交还、资料电脑、设置电脑、左滑关闭",
-    "pairing": "管理凭据申请短码、App 手动配对、首页/关于连接、断开与旧令牌 401、恢复开发连接",
-    "compaction": "真实多轮模型压缩、系统行、完整摘要、关闭重开一致及浅深色截图",
-    "rich": "真实模型富交互 P0/P1/P2、提交只读、图表、公式、媒体、Mermaid 与浅深色预览",
+    "chat": "真实聊天、键盘/侧拉/返回、目录短拖拽、委派插话与长摘要滚动",
+    "pairing": "真实相机/权限、凭据安装、一次电脑切换、自有令牌撤销与恢复",
+    "attachments": "确定性音频拖动/抽屉、系统选 PDF、真实 read_file、原文件交付与人工保存/分享接收",
+    "browser": "真实浏览器、Skia 帧、接管触控/输入/横竖布局、交还与关闭",
+    "rich": "确定性图表/公式/Mermaid、Sources/Gallery 手势与一次原生主题联动",
+    "schedules": "真实工具创建单次定时、真实到点执行、运行记录进入来源对话",
+    "image": "真实 generate_image、Agent 附件交付与 App 打开原图",
 }
 
-def restore_memory_profile(original, marker):
-    if original is None:
-        return
-    current = api("/memory/profile")
-    expected = original["content"] + ("\n" if original["content"] and not original["content"].endswith("\n") else "") + marker
-    if current["content"] == original["content"]:
-        return
-    assert current["content"] == expected and current["details"] == original["details"], (
-        "Shared profile changed outside this fixture; refusing to overwrite it"
-    )
-    api("/memory/profile", "PUT", {"content": original["content"], "version": current["version"]})
+
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("groups", nargs="*", help="Groups in execution order; default: all")
 parser.add_argument("--list", action="store_true", help="List groups without touching the phone")
+parser.add_argument("--attachment-audio-only", action="store_true",
+                    help="Run only the deterministic native audio subflow of attachments; no model or picker.")
 options = parser.parse_args()
 if options.list:
     for name, coverage in GROUPS.items():
@@ -87,24 +66,29 @@ unknown = set(options.groups) - GROUPS.keys()
 if unknown:
     parser.error("Unknown groups: " + ", ".join(sorted(unknown)))
 selected = list(dict.fromkeys(options.groups or GROUPS))
+if options.attachment_audio_only and selected != ["attachments"]:
+    parser.error("--attachment-audio-only requires exactly the attachments group")
+for required in ("ANDROID_SERIAL", "E2E_WORKSPACE"):
+    if not os.environ.get(required):
+        parser.error(required + " is required; never select a device or reuse a workspace implicitly")
 
 ARTIFACT_DIR = os.environ.get("E2E_ARTIFACTS")
 OUT = Path(ARTIFACT_DIR if ARTIFACT_DIR else tempfile.mkdtemp(prefix="wandrun-e2e-")).resolve()
 OUT.mkdir(parents=True, exist_ok=True)
-GATEWAY = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8765").rstrip("/")
+GATEWAY = os.environ.get("GATEWAY_URL", "http://127.0.0.1:18785").rstrip("/")
 TOKEN = os.environ.get("GATEWAY_TOKEN", "dev")
-WORKSPACE = Path(os.environ.get("E2E_WORKSPACE", str(ROOT.parents[1] / "workspace"))).resolve()
-EXPO = os.environ.get("EXPO_URL", "exp://127.0.0.1:8081")
+WORKSPACE = Path(os.environ["E2E_WORKSPACE"]).resolve()
+EXPO = os.environ.get("EXPO_URL", "exp://127.0.0.1:8097")
 PRESERVE_SYSTEM_THEME = os.environ.get("E2E_PRESERVE_SYSTEM_THEME") == "1"
-skipped_dark_screenshots = []
+DISMISS_DEV_WARNINGS = os.environ.get("E2E_DISMISS_DEV_WARNINGS") == "1"
 SESSION = "wandrun-regression"
 # Repeated runs share the same live device session; evidence remains per-run.
 STATE = Path(tempfile.gettempdir()) / ("wandrun-device-" + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12])
-ADB = ["adb"] + (["-s", os.environ["ANDROID_SERIAL"]] if os.environ.get("ANDROID_SERIAL") else [])
-AD = ["agent-device", "--state-dir", str(STATE), "--session", SESSION, "--platform", "android"]
-if os.environ.get("ANDROID_SERIAL"):
-    AD += ["--serial", os.environ["ANDROID_SERIAL"]]
-START = time.monotonic()
+ADB = ["adb", "-s", os.environ["ANDROID_SERIAL"]]
+AD = ["agent-device", "--state-dir", str(STATE), "--session", SESSION,
+      "--platform", "android", "--serial", os.environ["ANDROID_SERIAL"]]
+# A coordinator can include service provisioning in the same soft-budget clock.
+START = time.monotonic() - max(0, time.time() - float(os.environ.get("E2E_STARTED_AT", time.time())))
 LOG = (OUT / "commands.log").open("w")
 phone_stopped = False
 
@@ -182,13 +166,43 @@ def phone_command(args, timeout=120):
     return command(args, timeout)
 
 
+def dismiss_e2e_warning_overlay():
+    """Explicit e2e-only UI policy; console warnings/log capture remain untouched."""
+    for _ in range(4):
+        snapshot = json.loads(command([*AD, "snapshot", "-i", "--json"]))["data"]
+        if not any("React Native warning/error overlay detected" in str(item)
+                   for item in snapshot.get("warnings", [])):
+            return
+        labels = [str(node.get("label") or node.get("text") or "") for node in snapshot["nodes"]]
+        evidence = OUT / ("dev-warning-overlay-" + uuid4().hex)
+        evidence.with_suffix(".json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        command([*AD, "screenshot", str(evidence.with_suffix(".png")), "--json"])
+        if any(label in ("Console Error", "Render Error") or label.startswith(
+                ("TypeError:", "ReferenceError:", "SyntaxError:", "Invariant Violation:")) for label in labels):
+            raise RuntimeError("Development error overlay is not a warning; see " + str(evidence))
+        warning = any("Console Warning" == label or any(marker in label for marker in (
+            "InteractionManager has been deprecated", "LegendList", "[legend-list]", "[browser-stream]",
+        )) for label in labels)
+        if not warning:
+            raise RuntimeError("Unclassified development overlay; preserve it for review: " + str(evidence))
+        LOG.write("E2E-only warning screen dismissed; console retained; evidence: " + str(evidence) + "\n")
+        LOG.flush()
+        command([*AD, "react-native", "dismiss-overlay", "--json"])
+    raise RuntimeError("Development warning overlay did not clear after four observed dismissals")
+
+
 def ad(*args, timeout=120, redactions=()):
     require_expo()
+    if DISMISS_DEV_WARNINGS and args[0] not in ("snapshot", "screenshot"):
+        dismiss_e2e_warning_overlay()
     return json.loads(command([*AD, *args, "--json"], timeout, redactions=redactions))["data"]
 
 
 def dismiss_known_dev_overlay():
     """Dismiss only the observed LegendList LogBox warning, preserving evidence first."""
+    if globals().get("DISMISS_DEV_WARNINGS"):
+        dismiss_e2e_warning_overlay()
+        return
     marker = "[legend-list] No unused container available"
     for _ in range(8):
         nodes = ad("snapshot")["nodes"]
@@ -363,14 +377,14 @@ class PairingFixture:
         self.issued_name = name
         self.code = self.admin("/admin/pairing-codes", "POST", {"name": name})["code"]
 
-    def assert_paired(self):
+    def assert_paired(self, method):
         if not self.token or not self.device_id:
             raise AssertionError("App exchange was not observed by the private bridge")
         request = Request(GATEWAY + "/connection", headers={"Authorization": "Bearer " + self.token})
         with urlopen(request, timeout=10) as response:
             connection = json.load(response)
         assert connection["device_id"] == self.device_id
-        assert connection["pairing_method"] == "manual"
+        assert connection["pairing_method"] == method
         assert connection["paired_at"]
         return connection
 
@@ -378,13 +392,17 @@ class PairingFixture:
         if not self.token or not self.device_id:
             raise AssertionError("App exchange was not observed by the private bridge")
         request = Request(GATEWAY + "/connection", headers={"Authorization": "Bearer " + self.token})
-        try:
-            with urlopen(request, timeout=10) as response:
-                response.read()
-        except HTTPError as exc:
-            assert exc.code == 401, "Revoked device token did not receive 401"
-        else:
-            raise AssertionError("Revoked device token still authorizes /connection")
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                with urlopen(request, timeout=max(0.1, deadline - time.monotonic())) as response:
+                    response.read()
+            except HTTPError as exc:
+                assert exc.code == 401, f"Remote revocation check returned {exc.code}, not 401"
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("Local disconnect finished, but the old token still authorizes after 10 seconds")
+            time.sleep(max(0, min(0.25, deadline - time.monotonic())))
         devices = self.admin("/admin/devices")["devices"]
         assert any(item["id"] == self.device_id and item["revoked"] for item in devices), (
             "Fixture device was not marked revoked")
@@ -421,10 +439,6 @@ def conversation_path(identity):
     return "/conversations/" + quote(identity, safe="")
 
 
-def connector_path(identity):
-    return "/connectors/" + quote(identity, safe="")
-
-
 def create_owned_agent(name, workers=(), **fields):
     # Creation can commit even when its response cannot be read.
     owned_agent_names.add(name)
@@ -437,150 +451,6 @@ def create_owned_agent(name, workers=(), **fields):
     owned_agents.append(identity)
     return identity
 
-def model_options(model):
-    return [item["effort"] for item in model["supported_reasoning_efforts"]
-            if item["effort"] != "ultra"]
-
-
-def effort_point(model, effort):
-    """Tap a catalog ordinal inside the native slider, never a device coordinate."""
-    options = model_options(model)
-    if len(options) < 2 or effort not in options:
-        raise RuntimeError("Reasoning slider regression needs multiple supported efforts")
-    return f"{1 + 98 * options.index(effort) / (len(options) - 1):.4f}%,50%"
-
-
-def model_fixture():
-    """Derive two real, valid model/effort combinations without a catalog whitelist."""
-    settings = api("/settings")
-    models = [model for model in api("/models")["models"] if len(model_options(model)) > 1]
-    if not models:
-        raise RuntimeError("Model regression needs a nonempty subscription model catalog")
-    original = next((model for model in models if model["id"] == settings["default_model"]), models[0])
-    original_effort = settings["default_reasoning_effort"] or original["default_reasoning_effort"]
-    if original_effort not in model_options(original):
-        original_effort = model_options(original)[0]
-    default_choice = next(((model, effort) for model in [original, *models]
-                           for effort in model_options(model) if effort != original_effort), None)
-    if default_choice is None:
-        raise RuntimeError("Model regression needs another supported default reasoning effort")
-    default_model, default_effort = default_choice
-    changed = next(((model, effort) for model in models if model["id"] != original["id"]
-                    for effort in model_options(model) if effort != original_effort), None)
-    if changed is None:
-        raise RuntimeError("Model regression needs a second model with a different reasoning effort")
-    model, effort = changed
-    identity = create_owned_agent("E2E model " + run_id, model=original["id"],
-                                  reasoning_effort=original_effort)
-    return settings, {
-        "MODEL_AGENT_ID": identity,
-        "ORIGINAL_MODEL": original["id"], "ORIGINAL_EFFORT": original_effort,
-        "DEFAULT_MODEL": default_model["id"], "DEFAULT_MODEL_NAME": default_model["display_name"],
-        "DEFAULT_EFFORT": default_effort,
-        "CHANGED_MODEL": model["id"], "CHANGED_EFFORT": effort,
-        "ORIGINAL_EFFORT_POINT": effort_point(original, original_effort),
-        "DEFAULT_EFFORT_POINT": effort_point(default_model, default_effort),
-        "CHANGED_EFFORT_POINT": effort_point(model, effort),
-    }
-
-
-def agent_effort_fixture():
-    """The existing Agent flow changes a supported effort, regardless of live catalog."""
-    settings = api("/settings")
-    models = api("/models")["models"]
-    model = next((item for item in models if item["id"] == settings["default_model"]), None)
-    if model is None:
-        model = next((item for item in models if model_options(item)), None)
-    if model is None:
-        raise RuntimeError("Agent regression needs a nonempty subscription model catalog")
-    current = settings["default_reasoning_effort"] or model["default_reasoning_effort"]
-    changed = next((effort for effort in model_options(model) if effort != current), None)
-    if changed is None:
-        raise RuntimeError("Agent regression needs an alternate supported reasoning effort")
-    return changed, effort_point(model, changed), model["id"]
-
-
-def restore_settings(original):
-    if original is not None and api("/settings") != original:
-        saved = api("/settings", "PUT", original)
-        assert saved == original, "Default model restoration failed"
-        assert api("/settings") == original, "Restored default model did not persist"
-
-
-def replied(conversation):
-    if conversation["status"] == "working":
-        return False
-    events = api(conversation_path(conversation["id"]) + "/events?limit=200")["events"]
-    return {"message.user", "message.agent"} <= {event["type"] for event in events}
-
-
-def old_conversation(agent):
-    conversations = api("/conversations?agent_id=" + quote(agent["id"], safe=""))["conversations"]
-    existing = next((c for c in conversations if replied(c)), None)
-    if existing is not None:
-        return existing["id"]
-    created = api("/conversations", "POST", {"agent_id": agent["id"]})
-    identity = created["id"]
-    fixtures.append(identity)
-    api(conversation_path(identity) + "/messages", "POST", {
-        "client_id": "e2e-message-" + uuid4().hex, "text": "只回复好的",
-    })
-    deadline = time.monotonic() + 90
-    while time.monotonic() < deadline:
-        events = api(conversation_path(identity) + "/events?limit=200")["events"]
-        if any(event["type"] == "message.agent" for event in events):
-            # Keep one real baseline, rather than generating another model turn on every run.
-            fixtures.remove(identity)
-            return identity
-        if any(event["type"] == "turn.failed" for event in events):
-            raise RuntimeError("Fixture Agent turn failed before replying")
-        time.sleep(1)
-    raise RuntimeError("Fixture Agent did not reply within 90 seconds")
-
-
-def file_fixture(env):
-    """A real Agent produces one original file through SendMessage; no synthetic file records."""
-    name = "E2E files " + run_id
-    agent_id = create_owned_agent(name, system_prompt=(
-        "You can use local file tools and SendMessage. Follow user instructions exactly. "
-        "When asked to deliver a file, create it and send its relative path in SendMessage.attachments to human."))
-    conversation = api("/conversations", "POST", {"agent_id": agent_id})
-    fixtures.append(conversation["id"])
-    filename = f"e2e-delivery-{run_id}.md"
-    source = WORKSPACE / "conversations" / conversation["id"] / filename
-    env.update({"FILE_AGENT_ID": agent_id, "FILE_CONVERSATION_ID": conversation["id"],
-                "FILE_NAME": filename, "FILE_PATH": str(source)})
-    api(conversation_path(conversation["id"]) + "/messages", "POST", {
-        "client_id": "e2e-file-" + uuid4().hex,
-        "text": f"在当前对话工作目录用文件工具创建 {filename}，正文为 '# E2E original {run_id}\\n\\nDelivered from the original file.'。然后用 SendMessage 发给 human，attachments 必须包含相对路径 {filename}。不要只在文字中提文件名。",
-    })
-    deadline = time.monotonic() + 240
-    while time.monotonic() < deadline:
-        events = api(conversation_path(conversation["id"]) + "/events?limit=200")["events"]
-        attachments = [file for event in events if event["type"] == "message.agent"
-                       for file in event["data"].get("attachments", [])]
-        if attachments:
-            assert len(attachments) == 1 and attachments[0]["name"] == filename, attachments
-            file = attachments[0]
-            assert source.is_file(), f"Original file missing: {source}"
-            assert api("/files/" + quote(file["id"], safe=""))["available"]
-            env["FILE_ID"] = file["id"]
-            return
-        if any(event["type"] == "turn.failed" for event in events):
-            raise RuntimeError("File-delivery turn failed before producing an attachment")
-        time.sleep(1)
-    raise RuntimeError("Agent did not deliver the original file within 240 seconds")
-
-
-def cleanup_file_fixture(env):
-    source = Path(env.get("FILE_PATH", ""))
-    if "FILE_PATH" in env and source.exists():
-        source.unlink()
-    if "FILE_PATH" in env:
-        try:
-            source.parent.rmdir()
-        except OSError:
-            pass  # Other content must be retained, never recursively removed.
 
 def image_fixture(env):
     """Use an isolated local Agent; require failures to retain the tool's error code."""
@@ -593,48 +463,41 @@ def image_fixture(env):
             "do not retry or substitute another image."
         ),
     )
-    conversation = api("/conversations", "POST", {"agent_id": identity})
+    conversation = api("/conversations", "POST", {"client_id": uuid4().hex, "agent_id": identity})
     fixtures.append(conversation["id"])
     env.update({"IMAGE_AGENT_ID": identity, "IMAGE_CONVERSATION_ID": conversation["id"]})
 
 
-def await_media_reply(env, *, image=False):
-    """Wait for a real human-directed reply; retain replies/events as failure evidence."""
-    identity = env["IMAGE_CONVERSATION_ID" if image else "UPLOAD_CONVERSATION_ID"]
-    deadline = time.monotonic() + (300 if image else 180)
-    replies = []
+def await_media_reply(env):
+    """Require an actual generated PNG; preserve upstream failure/limit evidence without retry."""
+    identity = env["IMAGE_CONVERSATION_ID"]
+    deadline = time.monotonic() + 300
     while True:
         events = api(conversation_path(identity) + "/events?limit=200")["events"]
         replies = [event["data"] for event in events if event["type"] == "message.agent"]
         evidence = json.dumps(replies, ensure_ascii=False)
         (OUT / "model-events.json").write_text(json.dumps(events, ensure_ascii=False, indent=2))
-        if image:
-            if "image_generation_quota_exhausted" in evidence:
-                raise AssertionError("生图额度耗尽（FAIL，不重试；恢复额度后重跑）: " + evidence)
-            attachments = [file for reply in replies for file in reply.get("attachments", [])]
-            if attachments:
-                assert len(attachments) == 1, evidence
-                file = attachments[0]
-                detail = api("/files/" + quote(file["id"], safe=""))
-                assert detail["available"] and detail["media_type"] == "image/png", detail
-                assert detail["conversation_id"] == identity, detail
-                source = WORKSPACE / "conversations" / identity / file["name"]
-                assert source.parent == WORKSPACE / "conversations" / identity, file
-                with source.open("rb") as image_file:
-                    assert image_file.read(8) == b"\x89PNG\r\n\x1a\n", "Attachment is not a PNG"
-                env["IMAGE_FILE_ID"] = file["id"]
-                env["IMAGE_FILE_NAME"] = file["name"]
-                return
-        elif any(env["PDF_MARKER"] in reply.get("text", "") for reply in replies):
+        if "image_generation_quota_exhausted" in evidence:
+            raise AssertionError("生图额度耗尽（FAIL，不重试）: " + evidence)
+        files = [file for reply in replies for file in reply.get("attachments", [])]
+        if files:
+            assert len(files) == 1, evidence
+            file = files[0]
+            detail = api("/files/" + quote(file["id"], safe=""))
+            assert detail["available"] and detail["media_type"] == "image/png", detail
+            assert detail["conversation_id"] == identity, detail
+            source = WORKSPACE / "conversations" / identity / file["name"]
+            assert source.parent == WORKSPACE / "conversations" / identity, file
+            with source.open("rb") as content:
+                assert content.read(8) == b"\x89PNG\r\n\x1a\n", "Attachment is not a PNG"
+            env.update(IMAGE_FILE_ID=file["id"], IMAGE_FILE_NAME=file["name"])
             return
         failed = any(event["type"] == "turn.failed" for event in events)
-        settled = replies and next(
-            row for row in api("/conversations")["conversations"] if row["id"] == identity
-        )["status"] != "working"
+        settled = replies and next(row for row in api("/conversations")["conversations"] if row["id"] == identity)["status"] != "working"
         if failed or settled or time.monotonic() >= deadline:
-            kind = "生图未交付 PNG 附件" if image else "PDF 回复不含随机标记 " + env["PDF_MARKER"]
-            raise AssertionError(f"{kind}; failed={failed}; Agent 回复原文: {evidence}; events={events!r}")
+            raise AssertionError(f"生图未交付 PNG 附件; failed={failed}; Agent 回复原文: {evidence}; events={events!r}")
         time.sleep(1)
+
 
 
 def cleanup_image_fixture(env):
@@ -686,43 +549,22 @@ def marker_pdf(marker):
     body.extend(f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
     return bytes(body)
 
-def upload_fixture(env, *, pdf=False):
-    """Own both the Android selection source and the uploaded conversation file."""
-    identity = create_owned_agent(
-        "E2E upload " + run_id,
-        system_prompt=(
-            # read_file is the path under test: it returns the PDF as a file block that the
-            # adapter sends as input_file. Shell or code extraction would bypass that path.
-            "Read the attached PDF with the read_file tool. Never use the shell, code, or any "
-            "text extraction to inspect it. Reply to human with only the marker you see."
-            if pdf else
-            "When a user sends a file, reply only 'Received'. Do not create or change any files."
-        ),
-    )
-    conversation = api("/conversations", "POST", {"agent_id": identity})
-    fixtures.append(conversation["id"])
-    filename = f"e2e-upload-{run_id}." + ("pdf" if pdf else "txt")
-    body = f"E2E upload {run_id}\nSelected on the phone and uploaded with tus.\n"
+def upload_fixture(env):
+    """Own one PDF source; its independently random answer is never present in a prompt/name."""
+    identity = create_owned_agent("E2E attachments " + run_id, code_mode=False,
+        system_prompt="Read the user's attached PDF with read_file and follow the original-file delivery request.")
+    root = api("/conversations", "POST", {"client_id": uuid4().hex, "agent_id": identity})["id"]
+    fixtures.append(root)
+    filename = f"e2e-upload-{run_id}.pdf"
     local = OUT / filename
-    if pdf:
-        env["PDF_MARKER"] = "WR-" + run_id
-        body = marker_pdf(env["PDF_MARKER"])
-        local.write_bytes(body)
-    else:
-        local.write_text(body, encoding="utf-8")
-    env.update({
-        "UPLOAD_AGENT_ID": identity, "UPLOAD_CONVERSATION_ID": conversation["id"],
-        "UPLOAD_NAME": filename, "UPLOAD_BODY": "" if pdf else body,
-        "UPLOAD_LOCAL_PATH": str(local),
-        "UPLOAD_PROMPT": (
-            "Read this PDF with read_file and reply only with its marker. "
-            "Do not use shell commands, code, or text extraction."
-            if pdf else ""
-        ),
-        "UPLOAD_DEVICE_PATH": "/sdcard/Download/" + filename,
-        "UPLOAD_PATH": str(WORKSPACE / "conversations" / conversation["id"] / filename),
-    })
+    marker = "WR-" + uuid4().hex
+    local.write_bytes(marker_pdf(marker))
+    env.update(UPLOAD_AGENT_ID=identity, UPLOAD_CONVERSATION_ID=root, UPLOAD_NAME=filename,
+               PDF_MARKER=marker, UPLOAD_LOCAL_PATH=str(local),
+               UPLOAD_DEVICE_PATH="/sdcard/Download/" + filename,
+               UPLOAD_PATH=str(WORKSPACE / "conversations" / root / filename))
     phone_command([*ADB, "push", str(local), env["UPLOAD_DEVICE_PATH"]])
+
 
 
 def select_upload_document(env):
@@ -835,76 +677,27 @@ def cleanup_upload_fixture(env):
 
 
 def start_browser_fixture(env):
-    """Serve an isolated editable page on host loopback; record only real browser input."""
-    marker = "E2E browser " + run_id
-
-    class Page(BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path != "/":
-                self.send_error(404)
-                return
-            body = (
-                "<!doctype html><html><head><meta charset='utf-8'><title>"
-                + escape(marker)
-                + "</title></head><body><h1>"
-                + escape(marker)
-                + "</h1><label for='e2e-field'>Phone input</label>"
-                "<input id='e2e-field' aria-label='Phone input' type='text' autofocus>"
-                "<script>const field=document.getElementById('e2e-field');"
-                "field.focus();field.addEventListener('input',()=>"
-                "fetch('/input',{method:'POST',body:field.value}));</script></body></html>"
-            ).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self):
-            if self.path != "/input":
-                self.send_error(404)
-                return
-            size = int(self.headers.get("Content-Length", "0"))
-            if size > 4096:
-                self.send_error(413)
-                return
-            value = self.rfile.read(size).decode("utf-8")
-            with server.input_changed:
-                server.inputs.append(value)
-                server.input_changed.notify_all()
-            self.send_response(204)
-            self.end_headers()
-
-        def log_message(self, format, *args):
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Page)
-    server.daemon_threads = True
-    server.input_changed = threading.Condition()
-    server.inputs = []
-    server.thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server.thread.start()
-    env.update({"BROWSER_URL": f"http://127.0.0.1:{server.server_port}/",
-                "BROWSER_TITLE": marker, "BROWSER_INPUT": "phone-" + run_id})
-    return server
+    return browser_native.start_fixture(env, run_id)
 
 
 def browser_fixture(env):
     """A real local browser-skilled Agent opens the fixture and requests takeover."""
     if not any(skill["name"] == "browser" for skill in api("/skills")["skills"]):
         raise RuntimeError("Browser regression requires the browser skill in the gateway workspace")
-    capacity = api("/computer")["browser"]
-    if capacity["slots_limit"] < 1:
+    environments = api("/computer")["environments"]
+    local = environments[0] if environments else None  # Phase one only assembles Local browsers.
+    if local is None:
         raise RuntimeError("Browser regression requires a configured, running local CDP browser")
-    if capacity["slots_used"] >= capacity["slots_limit"]:
-        raise RuntimeError("Browser regression requires one free browser slot; existing leases are untouched")
+    capacity = local["capacity"]
+    if capacity["pages_used"] >= capacity["pages_limit"]:
+        raise RuntimeError("Browser regression requires one free environment page; existing leases are untouched")
     identity = create_owned_agent("E2E browser " + run_id, skills=["browser"],
                                   system_prompt=(
                                       "Use the browser skill and its task-specific CDP address for web tasks. "
                                       "Never use the shared Chrome CDP address. When the user needs to take over, "
                                       "call request_takeover and leave the page open even after handback. "
                                       "Do not type into the editable field or close the page until asked."))
-    conversation = api("/conversations", "POST", {"agent_id": identity})
+    conversation = api("/conversations", "POST", {"client_id": uuid4().hex, "agent_id": identity})
     fixtures.append(conversation["id"])
     env.update({"BROWSER_AGENT_ID": identity, "BROWSER_CONVERSATION_ID": conversation["id"]})
     api(conversation_path(conversation["id"]) + "/messages", "POST", {
@@ -942,125 +735,113 @@ def stop_browser_fixture(server):
     assert not server.thread.is_alive(), "Browser fixture HTTP server did not stop"
 
 
-def all_home():
-    for agent in api("/agents")["agents"]:
-        if not agent["home"]:
-            api("/agents/" + quote(agent["id"], safe="") + "/unhide", "POST")
-    assert all(a["home"] for a in api("/agents")["agents"]), "Agent restoration failed"
+def chat_entry():
+    """Return through real navigation; await each screen's exit before issuing another Back."""
+    for _ in range(12):
+        ad("wait", "stable")
+        nodes = ad("snapshot", "-i")["nodes"]
+        if any((node.get("id") or node.get("identifier")) == "agents-back" and node.get("hittable") for node in nodes):
+            ad("press", 'id="agents-back"', "--settle")
+            ad("wait", "absent", 'id="agent-list-screen"', "10000")
+            continue
+        if any(node.get("label") == "关闭对话列表" and node.get("hittable") for node in nodes):
+            ad("back")
+            ad("wait", "absent", 'label="关闭对话列表"', "10000")
+            continue
+        if (any((node.get("id") or node.get("identifier")) == "composer-input" and node.get("hittable")
+                for node in nodes)
+                and any((node.get("id") or node.get("identifier")) == "chat-open-drawer" and node.get("hittable") for node in nodes)):
+            ad("wait", "stable")
+            ad("wait", 'id="chat-open-drawer"', "10000")
+            return
+        ad("back")
+        ad("wait", "stable")
+    raise RuntimeError("Cannot return to chat entry")
 
 
 def home():
-    # Bounded navigation, not a retry of a failed behavioral assertion.
-    for _ in range(6):
-        nodes = ad("snapshot", "-i")["nodes"]
-        if any(n.get("label") == "设置" and n.get("hittable") for n in nodes):
-            return
-        ad("back")
-        # Back dispatch returns before the native transition. Do not issue a
-        # second back against the previous screen's still-visible snapshot.
+    """Open the Agent management directory through the drawer; rows open profiles."""
+    nodes = ad("snapshot", "-i")["nodes"]
+    if any((node.get("id") or node.get("identifier")) == "agents-add" and node.get("hittable") for node in nodes):
+        return
+    chat_entry()
+    ad("press", 'id="chat-open-drawer"', "--settle")
+    ad("wait", 'id="drawer-agents"', "10000")
+    ad("press", 'id="drawer-agents"', "--settle")
+    ad("wait", "absent", 'label="关闭对话列表"', "10000")
+    ad("wait", 'id="agent-list-screen"', "10000")
+
+
+def open_new_chat(identity):
+    """Choose through /chat draft chips or the all-Agents grid, never through the management list."""
+    chat_entry()
+    nodes = ad("snapshot", "-i")["nodes"]
+    if not any((node.get("id") or node.get("identifier")) == "new-chat-agent-chips" for node in nodes):
+        ad("press", 'id="chat-new-conversation"', "--settle")
+    ad("wait", 'id="new-chat-agent-chips"', "10000")
+    nodes = ad("snapshot", "-i")["nodes"]
+    if any((node.get("id") or node.get("identifier")) == "new-chat-agent-all" for node in nodes):
+        ad("press", 'id="new-chat-agent-all"', "--settle")
+        replay_steps("chat", {}, source=f"""appId: host.exp.exponent
+---
+- scrollUntilVisible:
+    element:
+      id: new-chat-agent-grid-{identity}
+    direction: DOWN
+- tapOn:
+    id: new-chat-agent-grid-{identity}
+""")
+    else:
+        ad("press", 'id=' + json.dumps("new-chat-agent-" + identity), "--settle")
+    ad("wait", 'id="composer-input"', "10000")
+    ad("wait", 'id=' + json.dumps("new-chat-agent-" + identity), "10000")
+
+
+def open_settings():
+    chat_entry()
+    ad("press", 'id="chat-open-drawer"', "--settle")
+    ad("wait", 'id="drawer-settings"', "10000")
+    ad("press", 'id="drawer-settings"', "--settle")
+    ad("wait", "absent", 'label="关闭对话列表"', "10000")
+    ad("wait", 'id="settings-models"', "10000")
+
+
+def open_agent_profile():
+    """The name area opens profile; the child counter is a separate control."""
+    ad("wait", 'id="chat-agent-profile"', "10000")
+    ad("press", 'id="chat-agent-profile"', "--settle")
+    ad("wait", 'id="profile-name"', "10000")
+
+
+def dismiss_keyboard():
+    """Back dismisses this IME, but must not navigate when no keyboard is visible."""
+    if ad("keyboard", "status")["visible"]:
+        ad("back", "--system")
         ad("wait", "stable")
-    raise RuntimeError("Cannot return to home")
+
+
+def open_root(identity):
+    """Persisted fixture content belongs to a root; select it in the drawer, never via an Agent row."""
+    chat_entry()
+    ad("press", 'id="chat-open-drawer"', "--settle")
+    row = "conversation-" + identity
+    replay_steps("home", {}, source=f"""appId: host.exp.exponent
+---
+- scrollUntilVisible:
+    element:
+      id: {row}
+    direction: DOWN
+- tapOn:
+    id: {row}
+""")
+    ad("wait", "absent", 'label="关闭对话列表"', "10000")
+    ad("wait", 'id="composer-input"', "10000")
 
 
 def assert_rows(agents):
     for agent in agents:
         selector = 'id=' + json.dumps("agent-row-" + agent["id"], ensure_ascii=False)
         ad("wait", selector, "10000")
-
-
-def profile_fixture():
-    """Own the profile team and its conversations so the computer tab is genuinely empty."""
-    member_name = "E2E profile member " + run_id
-    parent_name = "E2E profile team " + run_id
-    member_id = create_owned_agent(member_name)
-    parent_id = create_owned_agent(parent_name, [member_id])
-    for identity in (parent_id, member_id):
-        conversation = api("/conversations", "POST", {"agent_id": identity})
-        fixtures.append(conversation["id"])
-    parent = next(agent for agent in api("/agents")["agents"] if agent["id"] == parent_id)
-    return {
-        "PROFILE_AGENT_ID": parent_id,
-        "PROFILE_NAME": parent_name,
-        "PROFILE_TITLE": parent["latest_conversation"]["title"],
-        "MEMBER_ID": member_id,
-        "MEMBER_NAME": member_name,
-        "NO_MEMBERS_ID": member_id,
-        "NO_MEMBERS_NAME": member_name,
-    }
-
-
-def capture_dark_profiles(profile):
-    """Review the same real Agent header and profile states in system dark mode."""
-    def press_id(identity):
-        ad("wait", 'id=' + json.dumps(identity), "10000")
-        ad("press", 'id=' + json.dumps(identity))
-
-    def wait_id(identity):
-        ad("wait", 'id=' + json.dumps(identity), "10000")
-
-    press_id("agent-row-" + profile["PROFILE_AGENT_ID"])
-    wait_id("chat-agent-name")
-    wait_id("chat-conversation-title")
-    ad("screenshot", str(OUT / "20-chat-header-dark.png"))
-    press_id("chat-agent-profile")
-    wait_id("profile-tab-members")
-    wait_id("profile-member-" + profile["MEMBER_ID"])
-    ad("screenshot", str(OUT / "21-profile-members-dark.png"))
-    press_id("profile-tab-computer")
-    wait_id("profile-computer-empty")
-    ad("screenshot", str(OUT / "22-profile-computer-empty-dark.png"))
-    press_id("profile-tab-memory")
-    wait_id("profile-empty-memory")
-    ad("screenshot", str(OUT / "24-profile-memory-dark.png"))
-    press_id("profile-close")
-    press_id("chat-agent-profile")
-    wait_id("profile-tab-members")
-    ad("back")
-    wait_id("chat-agent-name")
-    home()
-
-    press_id("agent-row-" + profile["NO_MEMBERS_ID"])
-    wait_id("chat-agent-name")
-    press_id("chat-agent-profile")
-    wait_id("profile-empty-members")
-    ad("screenshot", str(OUT / "23-profile-empty-members-dark.png"))
-    press_id("profile-close")
-    home()
-
-
-def capture_dark_management(agent):
-    fixture = api("/conversations", "POST", {"agent_id": agent["id"]})
-    fixtures.append(fixture["id"])
-    row = 'id=' + json.dumps("conversation-" + fixture["id"])
-    ad("press", 'id=' + json.dumps("agent-row-" + agent["id"]))
-    ad("wait", 'label="对话列表"', "10000")
-    ad("press", 'label="对话列表"')
-    ad("wait", row, "10000")
-    ad("press", row)
-    ad("wait", "absent", 'id="new-conversation"', "10000")
-    ad("press", 'label="对话列表"')
-    ad("wait", row, "10000")
-    ad("longpress", row, "650")
-    ad("wait", 'id="conversation-menu-rename"', "10000")
-    ad("screenshot", str(OUT / "13-conversation-menu-dark.png"))
-    ad("press", 'id="conversation-menu-rename"')
-    ad("wait", 'id="conversation-rename-input"', "10000")
-    ad("press", 'id="conversation-rename-input"')
-    ad("screenshot", str(OUT / "14-conversation-rename-keyboard-dark.png"))
-    ad("press", 'id="conversation-rename-cancel"')
-    ad("wait", "absent", 'id="conversation-rename-input"', "10000")
-    ad("longpress", row, "650")
-    ad("wait", 'id="conversation-menu-delete"', "10000")
-    ad("press", 'id="conversation-menu-delete"')
-    ad("wait", 'label="删除这个对话？"', "10000")
-    ad("screenshot", str(OUT / "15-conversation-delete-dark.png"))
-    ad("press", 'id="conversation-delete-confirm"')
-    ad("wait", 'label="对话列表"', "10000")
-    ad("press", 'label="对话列表"')
-    ad("wait", "absent", row, "10000")
-    remaining = api("/conversations")["conversations"]
-    assert not any(c["id"] == fixture["id"] for c in remaining), "Current conversation was not deleted"
-    home()
 
 
 def cleanup_conversations():
@@ -1107,119 +888,25 @@ def cleanup_agents():
     for identity in [*owned_agents, *unrecorded]:
         ad("wait", "absent", 'id=' + json.dumps("agent-row-" + identity), "10000")
 
-def cleanup_connectors():
-    connectors = api("/connectors")["connectors"]
-    existing = {connector["id"] for connector in connectors}
-    unrecorded = [connector["id"] for connector in connectors
-                  if connector["name"] in owned_connector_names and connector["id"] not in owned_connectors]
-    errors = []
-    for identity in [*reversed(owned_connectors), *unrecorded]:
-        if identity in existing:
-            try:
-                api(connector_path(identity), "DELETE")
-                existing.remove(identity)
-            except Exception as exc:
-                errors.append(f"{identity}: {exc}")
-    if errors:
-        raise RuntimeError("; ".join(errors))
-
-def skills_fixture(env):
-    """Own two direct skill directories and a blank default-entry conversation; never replace skills."""
-    root = WORKSPACE / ".wandrun" / "skills"
-    root.mkdir(exist_ok=True)
-    env.update({"SKILL_NAME": "e2e-skill-" + run_id,
-                "BROKEN_SKILL_NAME": "e2e-broken-" + run_id,
-                "SKILL_AGENT_NAME": "E2E skills " + run_id})
-    # Register each directory immediately after exclusive creation, including partial setup failures.
-    env["SKILL_DIRS"] = []
-    for key in ("SKILL_NAME", "BROKEN_SKILL_NAME"):
-        directory = root / env[key]
-        directory.mkdir()
-        env["SKILL_DIRS"].append(str(directory))
-        content = (f"---\nname: {env[key]}\ndescription: E2E skill management fixture\n---\n"
-                   f"# Skill fixture\n\nVerified marker: {run_id}\n" if key == "SKILL_NAME"
-                   else "# Broken fixture: required YAML header is missing\n")
-        (directory / "SKILL.md").write_text(content, encoding="utf-8")
-    env["SKILL_AGENT_ID"] = create_owned_agent(env["SKILL_AGENT_NAME"], skills=[env["SKILL_NAME"]])
-    snapshot = api("/skills")
-    items = {item["name"]: item for item in snapshot["skills"]}
-    assert items[env["SKILL_NAME"]]["status"] == "ok", items
-    assert items[env["BROKEN_SKILL_NAME"]]["status"] == "error", items
-    default = snapshot["default_agent_id"]
-    assert default is not None, "Skills import needs a configured default-entry Agent"
-    env["SKILL_DEFAULT_AGENT_ID"] = default
-    # Make our empty conversation newest, so existing reusable empty conversations/drafts stay untouched.
-    conversation = api("/conversations", "POST", {"agent_id": default})
-    fixtures.append(conversation["id"])
-    env["SKILL_IMPORT_CONVERSATION_ID"] = conversation["id"]
-
-
-def cleanup_skills(env):
-    # Only files made by this group; rmdir refuses unexpected content rather than deleting it.
-    for name in env.get("SKILL_DIRS", []):
-        directory = Path(name)
-        (directory / "SKILL.md").unlink(missing_ok=True)
-        if directory.exists():
-            directory.rmdir()
-
-
 
 def replay_steps(group, env, browser_server=None, pairing=None, source=None):
-    """Replay one action at a time; secret inputs exist only in a 0600 transient step."""
+    """Run semantic YAML actions; only retained native-chain hooks can execute."""
     source = source if source is not None else (ROOT / f"{group}.yaml").read_text()
     header, body = source.split("---\n", 1)
     step = []
-    one_step = (pairing.tempdir / ("wandrun-pairing-step-" + uuid4().hex + ".yaml")
-                if pairing else Path(tempfile.gettempdir()) / ("wandrun-e2e-step-" + uuid4().hex + ".yaml"))
 
     def execute():
         if not step:
             return
-        text = header + "---\n" + "".join(step)
-        if PRESERVE_SYSTEM_THEME and "takeScreenshot:" in text:
-            if "-dark.png" in text:
-                skipped_dark_screenshots.append(text.split("takeScreenshot:", 1)[1].strip().replace("${ARTIFACTS}", str(OUT)))
-                step.clear()
-                return
-            text = text.replace("-light.png", "-system.png")
-        redactions = ()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", prefix="wandrun-e2e-", delete=False) as stream:
+            stream.write(header + "---\n" + "".join(step))
+            path = Path(stream.name)
         try:
-            if pairing:
-                if "${PAIR_CODE}" in text and not pairing.code:
-                    raise RuntimeError("Pairing code was not issued")
-                redactions = tuple(secret for marker, secret in (
-                    ("${PAIR_CODE}", pairing.code), ("${DEV_TOKEN}", TOKEN)) if marker in text)
-                text = text.replace("${PAIR_CODE}", json.dumps(pairing.code or "")).replace("${DEV_TOKEN}", json.dumps(TOKEN))
-                fd = os.open(one_step, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w") as stream:
-                    stream.write(text)
-            else:
-                one_step.write_text(text)
-            ad("replay", str(one_step), "--maestro", "--timeout", "30000",
-               *(part for key, value in env.items() for part in ("--env", key + "=" + str(value))),
-               timeout=40, redactions=redactions)
+            ad("replay", str(path), "--maestro", "--timeout", "30000",
+               *(part for key, value in env.items() for part in ("--env", key + "=" + str(value))), timeout=40)
         finally:
-            one_step.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
         step.clear()
-
-    def wait_api(read_current, matches, *, timeout=15):
-        deadline = time.monotonic() + timeout
-        while True:
-            current = read_current()
-            if matches(current) or time.monotonic() >= deadline:
-                return current
-            time.sleep(0.25)
-
-    def select_reasoning(identity, point):
-        # agent-device cannot combine a selector with a relative Maestro point.
-        # Resolve the live element first; never reuse device-specific coordinates.
-        node = ad("get", "attrs", "id=" + json.dumps(identity))
-        assert node.get("enabled") and node.get("hittable"), "Reasoning slider is not interactive"
-        rect = node["rect"]
-        horizontal, vertical = (float(value.removesuffix("%")) / 100 for value in point.split(","))
-        ad("press", str(round(rect["x"] + rect["width"] * horizontal)),
-           str(round(rect["y"] + rect["height"] * vertical)))
-
 
     for line in body.splitlines(keepends=True):
         if line.startswith("- "):
@@ -1228,680 +915,96 @@ def replay_steps(group, env, browser_server=None, pairing=None, source=None):
         elif line.startswith("# @"):
             execute()
             hook = line.strip()[3:]
-            reasoning = {
-                "reasoning-editor": ("editor-reasoning-slider", "EDIT_EFFORT_POINT"),
-                "reasoning-default": ("model-effort-slider", "DEFAULT_EFFORT_POINT"),
-                "reasoning-changed": ("model-effort-slider", "CHANGED_EFFORT_POINT"),
-                "reasoning-original": ("model-effort-slider", "ORIGINAL_EFFORT_POINT"),
-            }.get(hook)
-            if reasoning:
-                select_reasoning(reasoning[0], env[reasoning[1]])
-                continue
-            if hook.startswith("collaboration-"):
-                collaboration.action(sys.modules[__name__], env, hook.removeprefix("collaboration-"))
-                continue
-            if hook.startswith("compaction-"):
-                compaction.action(sys.modules[__name__], env, hook.removeprefix("compaction-"))
-                continue
-            if hook.startswith("rich-"):
-                rich.action(sys.modules[__name__], env, hook.removeprefix("rich-"))
-                continue
-            if hook == "known-dev-overlay":
+            runner = sys.modules[__name__]
+            if hook.startswith("phase "):
+                begin_phase(hook.removeprefix("phase "))
+            elif hook.startswith("core-"):
+                core.action(runner, env, hook.removeprefix("core-"))
+            elif hook.startswith("collaboration-"):
+                collaboration.action(runner, env, hook.removeprefix("collaboration-"))
+            elif hook.startswith("attachments-"):
+                attachments.action(runner, env, hook.removeprefix("attachments-"))
+            elif hook.startswith("audio-"):
+                audio_native.action(runner, env, hook.removeprefix("audio-"))
+            elif hook.startswith("rich-"):
+                native_rich.action(runner, env, hook.removeprefix("rich-"))
+            elif hook.startswith("browser-native-"):
+                browser_native.action(runner, env, hook.removeprefix("browser-native-"), browser_server)
+            elif hook.startswith("schedule-"):
+                core.schedule_action(runner, env, hook.removeprefix("schedule-"))
+            elif hook.startswith("manual "):
+                name = hook.removeprefix("manual ")
+                if name == "attachment-save-share":
+                    instructions = attachments.MANUAL_SAVE_SHARE.replace("<run_id>", run_id).replace("<DELIVERY_NAME>", env["DELIVERY_NAME"]).replace("<PDF_MARKER>", env["PDF_MARKER"])
+                elif name == "rich-source-external-link":
+                    instructions = native_rich.manual_instructions(name, env)
+                else:
+                    raise RuntimeError("Unknown manual check: " + name)
+                manual_checks.check(runner, name, instructions)
+                require_expo()
+            elif hook == "home":
+                home()
+            elif hook == "open-settings":
+                open_settings()
+            elif hook == "open-agent-profile":
+                open_agent_profile()
+            elif hook == "dismiss-keyboard":
+                dismiss_keyboard()
+            elif hook == "known-dev-overlay":
                 dismiss_known_dev_overlay()
-                continue
-            if hook == "tap-outside":
-                # Empty area near the top right; Maestro percentage points are not supported by agent-device.
-                # A tap right after a theme switch can land during the re-layout and be dropped.
-                time.sleep(1)
+            elif hook.startswith("open-new-chat "):
+                open_new_chat(env[hook.removeprefix("open-new-chat ")])
+            elif hook.startswith("open-root "):
+                open_root(env[hook.removeprefix("open-root ")])
+            elif hook == "tap-outside":
+                # A blank-chat attachment overlay has no semantic outside target.
+                # Retain the current screenshot and geometry before the coordinate fallback.
+                ad("snapshot", "-i")
+                ad("screenshot", str(OUT / "attachment-menu-before-outside.png"))
                 size = phone_command([*ADB, "shell", "wm", "size"]).split()[-1]
-                width, height = (int(part) for part in size.split("x"))
-                phone_command([*ADB, "shell", "input", "tap", str(width * 9 // 10), str(height // 5)])
-                time.sleep(0.5)
-                continue
-            if hook == "select-all":
-                # Native Ctrl+A replaces even Chinese names without installing/changing the user's IME.
-                phone_command([*ADB, "shell", "input", "keycombination", "113", "29"])
-                continue
-            if hook == "pairing-original-dev":
-                assert_pairing_selection(ad("snapshot", "-i")["nodes"], GATEWAY, "开发连接", current=True)
+                width, height = map(int, size.split("x"))
+                ad("press", str(width * 9 // 10), str(height // 5), "--settle")
+            elif hook == "pairing-original-dev":
+                nodes = ad("snapshot", "-i")["nodes"]
+                assert_pairing_selection(nodes, GATEWAY, "开发连接", current=True)
+                env["PAIRING_DEV_ROW"] = pairing_computer_row(nodes, GATEWAY)
                 env["PAIRING_ORIGINAL_DEV"] = True
-                continue
-            if hook == "pairing-issue":
-                pairing.issue(env["PAIR_DEVICE_NAME"])
-                continue
-            if hook == "pairing-exchanged":
-                connection = pairing.assert_paired()
-                env["PAIR_COMPUTER_NAME"] = connection["computer_name"]
-                continue
-            if hook == "pairing-fixture-current":
-                assert_pairing_selection(ad("snapshot", "-i")["nodes"], env["PAIRING_URL"], "手动输入", current=True)
-                continue
-            if hook == "pairing-fixture-selected":
-                assert_pairing_selection(ad("snapshot", "-i")["nodes"], env["PAIRING_URL"], "手动输入", current=False)
-                continue
-            if hook == "pairing-dev-selected":
-                assert_pairing_selection(ad("snapshot", "-i")["nodes"], GATEWAY, "开发连接", current=False)
-                continue
-            if hook == "pairing-dev-current":
+            elif hook == "pairing-camera":
+                manual_checks.pairing_camera(runner, pairing, env)
+            elif hook == "pairing-exchanged":
+                pairing.assert_paired("qr")
+            elif hook == "pairing-fixture-current":
+                nodes = ad("snapshot", "-i")["nodes"]
+                assert_pairing_selection(nodes, env["PAIRING_URL"], "扫码", current=True)
+                env["PAIRING_FIXTURE_ROW"] = pairing_computer_row(nodes, env["PAIRING_URL"])
+            elif hook == "pairing-fixture-selected":
+                assert_pairing_selection(ad("snapshot", "-i")["nodes"], env["PAIRING_URL"], "扫码", current=False)
+            elif hook == "pairing-dev-current":
                 assert_pairing_selection(ad("snapshot", "-i")["nodes"], GATEWAY, "开发连接", current=True)
-                continue
-            if hook == "pairing-restore-dev":
-                restore_pairing_connection(pairing, env)
-                continue
-            if hook == "pairing-revoked":
+            elif hook == "pairing-local-disconnected":
+                ad("wait", "absent", 'id=' + json.dumps(env["PAIRING_FIXTURE_ROW"]), "10000")
+                assert_pairing_selection(ad("snapshot", "-i")["nodes"], GATEWAY, "开发连接", current=True)
+            elif hook == "pairing-revoked":
                 pairing.assert_revoked()
-                continue
-            if hook == "pairing-dev-restored":
-                assert_pairing_selection(ad("snapshot", "-i")["nodes"], GATEWAY, "开发连接", current=True)
-                assert api("/connection")["pairing_method"] == "development"
-                env["PAIRING_RESTORED"] = True
-                home()
-                continue
-            if hook == "created-agent":
-                deadline = time.monotonic() + 15
-                while True:
-                    matches = [agent for agent in api("/agents")["agents"] if agent["name"] == env["NEW_NAME"]]
-                    if matches or time.monotonic() >= deadline:
-                        break
-                    time.sleep(0.25)
-                assert len(matches) == 1, "Created Agent name is not unique"
-                env["NEW_AGENT_ID"] = matches[0]["id"]
-                owned_agents.append(matches[0]["id"])
-            elif hook == "code-mode-created-on":
-                assert api(agent_path(env["NEW_AGENT_ID"]))["code_mode"] is True
-            elif hook == "edited-agent":
-                deadline = time.monotonic() + 15
-                while True:
-                    saved = api(agent_path(env["NEW_AGENT_ID"]))
-                    if (saved["name"] == env["RENAMED_NAME"]
-                            and saved["reasoning_effort"] == env["EDIT_EFFORT"]) or time.monotonic() >= deadline:
-                        break
-                    time.sleep(0.25)
-                assert saved["name"] == env["RENAMED_NAME"], "Agent rename did not persist"
-                assert saved["reasoning_effort"] == env["EDIT_EFFORT"], "Agent reasoning change did not persist"
-            elif hook == "code-mode-agent-off":
-                saved = wait_api(lambda: api(agent_path(env["NEW_AGENT_ID"])),
-                                 lambda value: value["code_mode"] is False)
-                assert saved["code_mode"] is False, saved
-            elif hook == "code-mode-capability-on":
-                identity = env["CAPABILITY_AGENT_ID"]
-                assert api(agent_path(identity))["code_mode"] is True
-                rows = api(agent_path(identity) + "/capabilities")["capabilities"]
-                assert next(row for row in rows if row["id"] == "code_mode")["status"] == "enabled", rows
-            elif hook in ("code-mode-capability-off", "code-mode-capability-restored"):
-                identity = env["CAPABILITY_AGENT_ID"]
-                enabled = hook == "code-mode-capability-restored"
-                rows = wait_api(lambda: api(agent_path(identity) + "/capabilities")["capabilities"],
-                                lambda current: next(row for row in current if row["id"] == "code_mode")["status"]
-                                == ("enabled" if enabled else "disabled"))
-                assert api(agent_path(identity))["code_mode"] is enabled
-                assert next(row for row in rows if row["id"] == "code_mode")["status"] == (
-                    "enabled" if enabled else "disabled"), rows
-            elif hook == "settings-entry":
-                nodes = ad("snapshot", "-i")["nodes"]
-                ids = [node.get("id", node.get("identifier")) for node in nodes]
-                assert ids.count("settings-about-connection") == 1, "About/connection entry is not unique"
-                assert "settings-gateway-connection" not in ids, "Legacy gateway entry remains"
-            elif hook == "quota-loaded":
-                usage = api("/usage/subscription")["usage"]
-                if usage and usage["windows"]:
-                    ad("wait", 'id="settings-subscription-window-0"', "10000")
-            elif hook == "settings-saved":
-                expected = {"default_model": env["DEFAULT_MODEL"],
-                            "default_reasoning_effort": env["DEFAULT_EFFORT"]}
-                assert api("/settings") == expected, "Saved default model/effort differs from selection"
-            elif hook == "new-form-default":
-                nodes = ad("snapshot", "-i")["nodes"]
-                slider = next((node for node in nodes
-                               if node.get("id", node.get("identifier")) == "editor-reasoning-slider"), None)
-                assert slider is not None, "New Agent form has no reasoning slider"
-                # Android's snapshot exposes the selected effort as accessible text, not a numeric range.
-                label = {"low": "低", "medium": "中", "high": "高", "xhigh": "极高", "max": "最高"}.get(
-                    env["DEFAULT_EFFORT"], env["DEFAULT_EFFORT"])
-                assert slider.get("label", "").endswith(", " + label), (
-                    "New Agent form did not select the saved effort"
-                )
-            elif hook in ("agent-model-saved", "agent-model-restored"):
-                target = ("CHANGED_MODEL", "CHANGED_EFFORT") if hook == "agent-model-saved" else (
-                    "ORIGINAL_MODEL", "ORIGINAL_EFFORT")
-                deadline = time.monotonic() + 15
-                while True:
-                    saved = api(agent_path(env["MODEL_AGENT_ID"]))
-                    if ((saved["model"], saved["reasoning_effort"]) ==
-                            (env[target[0]], env[target[1]])) or time.monotonic() >= deadline:
-                        break
-                    time.sleep(0.25)
-                assert (saved["model"], saved["reasoning_effort"]) == (
-                    env[target[0]], env[target[1]]), "Agent model/effort edit did not persist"
-            elif hook == "external-rename":
-                api(agent_path(env["NEW_AGENT_ID"]), "PATCH", {"name": env["EXTERNAL_NAME"]})
-            elif hook == "external-agent":
-                env["REMOTE_ID"] = create_owned_agent("E2E remote " + run_id)
-            elif hook == "external-delete":
-                api(agent_path(env["REMOTE_ID"]), "DELETE")
-            elif hook == "blocked-agent":
-                target = api(agent_path(env["NEW_AGENT_ID"]))
-                assert any(api(agent_path(parent_id))["name"] == env["REFERENCE_NAME"]
-                           for parent_id in target["member_of"]), (
-                    "Referenced Agent was deleted or lost its member relationship"
-                )
-            elif hook == "reference-agent":
-                reference = create_owned_agent("E2E reference " + run_id, [env["NEW_AGENT_ID"]])
-                env["REFERENCE_NAME"] = api(agent_path(reference))["name"]
-            elif hook == "connector-created":
-                deadline = time.monotonic() + 15
-                while True:
-                    matches = [item for item in api("/connectors")["connectors"]
-                               if item["name"] == env["CONNECTOR_NAME"]]
-                    if matches or time.monotonic() >= deadline:
-                        break
-                    time.sleep(0.25)
-                assert len(matches) == 1, "UI-created connector name is not unique"
-                env["CONNECTOR_ID"] = matches[0]["id"]
-                owned_connectors.append(matches[0]["id"])
-                assert matches[0]["url"] == "https://mcp.deepwiki.com/mcp"
-                assert matches[0]["used_by"] == []
-                assert "transport" not in matches[0], "UI creation must leave transport unspecified"
-            elif hook in ("connector-secret-saved", "connector-secret-redacted"):
-                detail = wait_api(
-                    lambda: api(connector_path(env["CONNECTOR_ID"])),
-                    lambda current: current.get("headers", {}).get("X-E2E-Check") is True,
-                )
-                assert detail.get("headers", {}).get("X-E2E-Check") is True, (
-                    "Connector secret header was not saved as a set-but-unreadable value"
-                )
-                assert env["CONNECTOR_SECRET"] not in json.dumps(detail), "Gateway leaked connector secret"
-                if hook == "connector-secret-redacted":
-                    nodes = ad("snapshot", "-i")["nodes"]
-                    assert env["CONNECTOR_SECRET"] not in json.dumps(nodes, ensure_ascii=False), (
-                        "Editor exposed the previously saved secret"
-                    )
-            elif hook == "connector-tested":
-                detail = api(connector_path(env["CONNECTOR_ID"]))
-                assert detail["status"] == "connected" and detail["tool_count"] > 0, (
-                    "Connector UI test did not expose a positive tool count"
-                )
-                env["TOOL_COUNT"] = detail["tool_count"]
-            elif hook == "connector-selected":
-                detail = wait_api(
-                    lambda: api(agent_path(env["CONNECTOR_AGENT_ID"])),
-                    lambda current: current["mcp_servers"] == [env["CONNECTOR_ID"]],
-                )
-                assert detail["mcp_servers"] == [env["CONNECTOR_ID"]], "Direct connector selection was not saved"
-                assert detail["searchable_mcp_servers"] == [], "Direct connector became searchable"
-                users = api(connector_path(env["CONNECTOR_ID"]))["used_by"]
-                assert users == [{"id": env["CONNECTOR_AGENT_ID"], "name": env["CONNECTOR_AGENT_NAME"]}], (
-                    "Connector usage did not reflect Agent selection"
-                )
-            elif hook == "connector-blocked":
-                detail = api(connector_path(env["CONNECTOR_ID"]))
-                assert detail["used_by"], "Blocked connector was deleted or lost its user"
-            elif hook == "connector-unselected":
-                detail = wait_api(
-                    lambda: api(agent_path(env["CONNECTOR_AGENT_ID"])),
-                    lambda current: not current["mcp_servers"] and not current["searchable_mcp_servers"],
-                )
-                assert not detail["mcp_servers"] and not detail["searchable_mcp_servers"], (
-                    "Agent retained connector after unselecting"
-                )
-                assert not api(connector_path(env["CONNECTOR_ID"]))["used_by"], "Connector still reports usage"
-            elif hook == "connector-search-disabled":
-                identity = "editor-connector-search-" + env["CONNECTOR_ID"]
-                nodes = ad("snapshot", "-i")["nodes"]
-                matches = [node for node in nodes
-                           if node.get("id", node.get("identifier")) == identity]
-                assert len(matches) == 1, "Search mode control is missing"
-                node = matches[0]
-                state = node.get("state") if isinstance(node.get("state"), dict) else {}
-                assert (
-                    node.get("enabled", state.get("enabled")) in (False, "false")
-                    or node.get("disabled", state.get("disabled")) in (True, "true")
-                    or node.get("hittable") is False
-                ), "Search mode must be disabled when the connector has no description"
-            elif hook == "connector-deleted":
-                remaining = wait_api(
-                    lambda: api("/connectors")["connectors"],
-                    lambda current: env["CONNECTOR_ID"] not in {item["id"] for item in current},
-                )
-                assert env["CONNECTOR_ID"] not in {item["id"] for item in remaining}, (
-                    "UI-deleted connector remains"
-                )
-            elif hook == "external-connector":
-                owned_connector_names.add(env["EXTERNAL_CONNECTOR_NAME"])
-                result = api("/connectors", "POST", {
-                    "client_id": "e2e-connector-" + uuid4().hex,
-                    "name": env["EXTERNAL_CONNECTOR_NAME"],
-                    "description": "", "url": "https://mcp.deepwiki.com/mcp",
-                    "transport": "streamable-http",
-                })
-                env["EXTERNAL_CONNECTOR_ID"] = result["connector"]["id"]
-                owned_connectors.append(env["EXTERNAL_CONNECTOR_ID"])
-            elif hook == "local-connector-created":
-                matches = wait_api(
-                    lambda: [item for item in api("/connectors")["connectors"]
-                             if item["name"] == env["LOCAL_CONNECTOR_NAME"]],
-                    bool,
-                )
-                assert len(matches) == 1, "UI-created local connector name is not unique"
-                env["LOCAL_CONNECTOR_ID"] = matches[0]["id"]
-                owned_connectors.append(env["LOCAL_CONNECTOR_ID"])
-                assert matches[0]["command"] == "fixture-mcp"
-                assert matches[0]["args"] == [env["LOCAL_ARGUMENT"], ""], (
-                    "Local argument boundaries or empty argument were not saved"
-                )
-                assert matches[0]["used_by"] == [], "Local fixture must not launch a command"
-            elif hook == "local-argument-value":
-                nodes = ad("snapshot", "-i")["nodes"]
-                field = next((node for node in nodes
-                              if node.get("id", node.get("identifier")) == "connector-arg-0"), None)
-                assert env["LOCAL_ARGUMENT"] in json.dumps(
-                    field, ensure_ascii=False
-                ), "Local argument was not restored to the editor"
-            elif hook == "local-arguments-roundtrip":
-                assert api(connector_path(env["LOCAL_CONNECTOR_ID"]))["args"] == [
-                    env["LOCAL_ARGUMENT"], "",
-                ]
-                nodes = ad("snapshot", "-i")["nodes"]
-                assert any(node.get("id", node.get("identifier")) == "connector-arg-1"
-                           for node in nodes), "Empty local argument was not restored"
-            elif hook == "external-transport-preserved":
-                detail = wait_api(
-                    lambda: api(connector_path(env["EXTERNAL_CONNECTOR_ID"])),
-                    lambda current: current["description"] == "Edited without transport",
-                )
-                assert detail["transport"] == "streamable-http", "Editing overwrote the existing transport"
-            elif hook == "external-connector-change":
-                changed = api(connector_path(env["EXTERNAL_CONNECTOR_ID"]), "PATCH", {
-                    "name": env["EXTERNAL_CONNECTOR_RENAMED"],
-                })["connector"]
-                assert changed["name"] == env["EXTERNAL_CONNECTOR_RENAMED"]
-            elif hook == "external-connector-delete":
-                api(connector_path(env["EXTERNAL_CONNECTOR_ID"]), "DELETE")
-            elif hook == "background-connector":
-                name = "E2E background connector " + run_id
-                owned_connector_names.add(name)
-                result = api("/connectors", "POST", {
-                    "client_id": "e2e-connector-" + uuid4().hex,
-                    "name": name, "url": "https://mcp.deepwiki.com/mcp",
-                })
-                env["BACKGROUND_CONNECTOR_ID"] = result["connector"]["id"]
-                owned_connectors.append(env["BACKGROUND_CONNECTOR_ID"])
-                selected = api(agent_path(env["CONNECTOR_AGENT_ID"]), "PATCH", {
-                    "mcp_servers": [env["BACKGROUND_CONNECTOR_ID"]],
-                })
-                assert selected["agent"]["mcp_servers"] == [env["BACKGROUND_CONNECTOR_ID"]]
-            elif hook == "background-external-unselect":
-                changed = api(agent_path(env["CONNECTOR_AGENT_ID"]), "PATCH", {
-                    "mcp_servers": [],
-                })
-                assert changed["event"] is not None
-                assert not api(connector_path(env["BACKGROUND_CONNECTOR_ID"]))["used_by"]
-                env["NO_EVENT_CURSOR"] = api("/connectors")["as_of_seq"]
-            elif hook == "background-no-event-save":
-                assert api("/connectors")["as_of_seq"] == env["NO_EVENT_CURSOR"], (
-                    "Saving the already-removed relationship unexpectedly emitted an event"
-                )
-                assert not api(agent_path(env["CONNECTOR_AGENT_ID"]))["mcp_servers"]
-            elif hook == "background-reselect":
-                selected = api(agent_path(env["CONNECTOR_AGENT_ID"]), "PATCH", {
-                    "mcp_servers": [env["BACKGROUND_CONNECTOR_ID"]],
-                })
-                assert selected["agent"]["mcp_servers"] == [env["BACKGROUND_CONNECTOR_ID"]]
-                assert api(connector_path(env["BACKGROUND_CONNECTOR_ID"]))["used_by"] == [{
-                    "id": env["CONNECTOR_AGENT_ID"], "name": env["CONNECTOR_AGENT_NAME"],
-                }]
-            elif hook == "background-external-delete":
-                changed = api(agent_path(env["CONNECTOR_AGENT_ID"]), "PATCH", {
-                    "mcp_servers": [],
-                })
-                assert changed["event"] is not None
-                deleted = api(connector_path(env["BACKGROUND_CONNECTOR_ID"]), "DELETE")
-                assert deleted["event"]["data"]["op"] == "deleted"
-            elif hook == "assert-agent-draft":
-                nodes = ad("snapshot", "-i")["nodes"]
-                description = next((node for node in nodes
-                                    if node.get("id", node.get("identifier")) == "editor-description"), None)
-                assert description is not None and env["DRAFT_MARKER"] in json.dumps(
-                    description, ensure_ascii=False
-                ), "Background connector deletion discarded the unsaved Agent draft"
-            elif hook == "skill-blocked":
-                path = "/skills/" + quote(env["SKILL_NAME"], safe="")
-                try:
-                    api(path, "DELETE")
-                except HTTPError as error:
-                    body = json.load(error)
-                    assert error.code == 409, body
-                    assert body["error"]["details"]["used_by"] == [{
-                        "id": env["SKILL_AGENT_ID"], "name": env["SKILL_AGENT_NAME"],
-                    }], body
-                else:
-                    raise AssertionError("Referenced skill was deleted")
-                assert api(path)["status"] == "ok"
-            elif hook == "skill-unselect":
-                api(agent_path(env["SKILL_AGENT_ID"]), "PATCH", {"skills": []})
-                assert api("/skills/" + quote(env["SKILL_NAME"], safe=""))["used_by"] == []
-            elif hook == "skill-deleted":
-                remaining = wait_api(
-                    lambda: api("/skills")["skills"],
-                    lambda current: env["SKILL_NAME"] not in {item["name"] for item in current},
-                )
-                assert env["SKILL_NAME"] not in {item["name"] for item in remaining}, (
-                    "UI-deleted skill remains"
-                )
-                assert not (WORKSPACE / ".wandrun" / "skills" / env["SKILL_NAME"]).exists()
-            elif hook == "skill-external-delete":
-                result = api("/skills/" + quote(env["BROKEN_SKILL_NAME"], safe=""), "DELETE")
-                assert result["event"]["data"] == {
-                    "kind": "skill", "id": env["BROKEN_SKILL_NAME"], "op": "deleted",
-                }, result
-            elif hook == "skill-import-draft":
-                nodes = ad("snapshot", "-i")["nodes"]
-                field = next((node for node in nodes
-                              if node.get("id", node.get("identifier")) == "composer-input"), None)
-                assert field is not None and "帮我导入这个技能：" in json.dumps(field, ensure_ascii=False), field
-                conversation = next(item for item in api("/conversations")["conversations"]
-                                    if item["id"] == env["SKILL_IMPORT_CONVERSATION_ID"])
-                assert conversation["agent_id"] == env["SKILL_DEFAULT_AGENT_ID"]
-                events = api(conversation_path(conversation["id"]) + "/events?limit=200")["events"]
-                assert not any(row["type"] in ("message.user", "message.agent") for row in events), events
-            elif hook == "skill-clear-draft":
-                phone_command([*ADB, "shell", "input", "keycombination", "113", "29"])
-                phone_command([*ADB, "shell", "input", "keyevent", "67"])
-            elif hook == "memory-ui-saved":
-                current = wait_api(
-                    lambda: api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory"),
-                    lambda snapshot: snapshot["content"] == env["MEMORY_SAVED"],
-                )
-                assert current["content"] == env["MEMORY_SAVED"] and current["updated_by"] == "user", (
-                    "Editor did not save the complete Markdown body"
-                )
-            elif hook == "memory-profile-shared":
-                current = api("/memory/profile")
-                marker = env["MEMORY_PROFILE_TEXT"]
-                saved = api("/memory/profile", "PUT", {
-                    "content": current["content"] + ("\n" if current["content"] and not current["content"].endswith("\n") else "") + marker,
-                    "version": current["version"],
-                })
-                assert saved["scope"] == "profile" and "agent_id" not in saved
-                assert saved["content"].endswith(marker)
-                assert api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")["content"] == env["MEMORY_SAVED"]
-            elif hook == "memory-detail-created":
-                slug = env["MEMORY_DETAIL_SLUG"]
-                index = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")
-                ref = index["details"][slug]
-                detail = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory/details/" + slug)
-                assert detail["content"] == env["MEMORY_DETAIL_CONTENT"]
-                assert detail["version"] == index["version"] and detail["path"] == ref["path"]
-                assert ref["path"] in index["content"] and index["scope"] == "work"
-            elif hook == "memory-detail-conflict":
-                slug = env["MEMORY_DETAIL_SLUG"]
-                path = agent_path(env["MEMORY_AGENT_ID"]) + "/memory/details/" + slug
-                current = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")
-                updated = api(path, "PUT", {
-                    "content": "Remote-" + run_id, "version": current["version"],
-                })
-                assert updated["version"] != current["version"]
-            elif hook == "memory-detail-draft-retained":
-                nodes = ad("snapshot", "-i")["nodes"]
-                field = next((node for node in nodes
-                              if node.get("id", node.get("identifier")) == "memory-detail-input"), None)
-                assert field is not None and env["MEMORY_DETAIL_DRAFT"] in json.dumps(
-                    field, ensure_ascii=False
-                ), "Remote change/reload discarded the unsaved detail draft"
-            elif hook == "memory-detail-saved":
-                detail = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory/details/" + env["MEMORY_DETAIL_SLUG"])
-                assert detail["content"] == env["MEMORY_DETAIL_DRAFT"]
-            elif hook == "memory-detail-deleted":
-                index = api(agent_path(env["MEMORY_AGENT_ID"]) + "/memory")
-                assert env["MEMORY_DETAIL_SLUG"] not in index["details"]
-                assert "/details/" + env["MEMORY_DETAIL_SLUG"] + "/" not in index["content"]
-            elif hook == "memory-shared-cross-agent":
-                ad("press", 'id=' + json.dumps("agent-row-" + env["MEMORY_MEMBER_ID"]))
-                ad("press", 'id="chat-agent-profile"')
-                ad("press", 'id="profile-tab-memory"')
-                ad("wait", 'id="profile-empty-memory"', "10000")
-                nodes = ad("snapshot", "-i")["nodes"]
-                assert not any(node.get("id", node.get("identifier")) == "profile-memory-content"
-                               for node in nodes), "Independent Agent work memory leaked across profiles"
-                ad("press", 'id="profile-about-you"')
-                ad("wait", 'id="profile-shared-memory-content"', "10000")
-                nodes = ad("snapshot", "-i")["nodes"]
-                assert env["MEMORY_PROFILE_TEXT"] in json.dumps(nodes, ensure_ascii=False)
-                home()
-            elif hook == "memory-member-link":
-                fixture = api("/conversations", "POST", {"agent_id": env["MEMORY_PARENT_ID"]})
-                fixtures.append(fixture["id"])
-                marker = "memory-" + run_id
-                api(conversation_path(fixture["id"]) + "/messages", "POST", {
-                    "client_id": "e2e-member-" + uuid4().hex,
-                    "text": (
-                        f"请委派给 {env['MEMORY_MEMBER_ID']}，转达我对其工作方式的长期反馈："
-                        f"今后给我做代码审查时，先列风险和复现场景，再列结论，因为我需要据此复核。"
-                        f"这条反馈编号 {marker}，请成员判断是否存入自己的工作记忆。你自己不要写记忆。"
-                    ),
-                })
-                wait_api(
-                    lambda: next(row for row in api("/conversations")["conversations"] if row["id"] == fixture["id"]),
-                    lambda row: row["status"] != "working",
-                    timeout=180,
-                )
-                events = api(conversation_path(fixture["id"]) + "/events?limit=200")["events"]
-                updates = [row for row in events if row["type"] == "memory.updated"]
-                assert updates and all(row["data"]["agent_id"] == env["MEMORY_MEMBER_ID"]
-                                       and row["data"]["scope"] == "work" for row in updates), (
-                    "Delegated work memory update must belong to member and source root conversation"
-                )
-                ad("press", 'id=' + json.dumps("agent-row-" + env["MEMORY_PARENT_ID"]))
-                target = "memory-updated-" + str(updates[-1]["seq"])
-                ad("wait", 'id=' + json.dumps(target), "10000")
-                ad("screenshot", str(OUT / ("11-memory-system-system.png" if PRESERVE_SYSTEM_THEME else "11-memory-system-light.png")))
-                if PRESERVE_SYSTEM_THEME:
-                    skipped_dark_screenshots.append(str(OUT / "12-memory-system-dark.png"))
-                else:
-                    set_theme("yes")
-                    ad("screenshot", str(OUT / "12-memory-system-dark.png"))
-                ad("press", 'id=' + json.dumps(target))
-                ad("wait", 'id="profile-memory-content"', "10000")
-                nodes = ad("snapshot", "-i")["nodes"]
-                assert "代码审查" in json.dumps(nodes, ensure_ascii=False), "Memory event opened the wrong Agent's memory"
-                if PRESERVE_SYSTEM_THEME:
-                    skipped_dark_screenshots.append(str(OUT / "13-member-memory-link-dark.png"))
-                else:
-                    ad("screenshot", str(OUT / "13-member-memory-link-dark.png"))
-                    set_theme("no")
-                home()
-            elif hook == "schedule-ui-created":
-                rows = wait_api(lambda: api(agent_path(env["SCHEDULE_AGENT_ID"]) + "/schedules")["schedules"],
-                                lambda items: any(row["name"] == env["SCHEDULE_NAME"] for row in items))
-                matches = [row for row in rows if row["name"] == env["SCHEDULE_NAME"]]
-                assert len(matches) == 1 and matches[0]["rule"] == {"kind": "daily", "time": "08:00"}
-                assert matches[0]["timezone"] == env["SCHEDULE_ZONE"]
-                env["SCHEDULE_ID"] = matches[0]["id"]
-            elif hook == "schedule-edited":
-                row = wait_api(lambda: api("/schedules/" + quote(env["SCHEDULE_ID"], safe="")),
-                               lambda item: item["name"] == env["SCHEDULE_EDITED_NAME"])
-                assert row["content"] == "Reply edited" and row["rule"] == {"kind": "daily", "time": "08:00"}
-            elif hook == "schedule-paused":
-                row = wait_api(lambda: api("/schedules/" + quote(env["SCHEDULE_ID"], safe="")),
-                               lambda item: not item["enabled"])
-                assert row["enabled"] is False and row["next_run_at"] is None
-            elif hook == "schedule-reenabled":
-                row = wait_api(lambda: api("/schedules/" + quote(env["SCHEDULE_ID"], safe="")),
-                               lambda item: item["enabled"])
-                assert row["next_run_at"] > time.time()
-            elif hook in ("schedule-weekly", "schedule-cron"):
-                expected = ({"kind": "weekly", "time": "08:00", "weekdays": [1, 5]}
-                            if hook == "schedule-weekly" else {"kind": "cron", "expression": "0 8 * * 1,5"})
-                wait_api(lambda: api("/schedules/" + quote(env["SCHEDULE_ID"], safe="")),
-                         lambda item: item["rule"] == expected)
-            elif hook == "schedule-external-edit":
-                api("/schedules/" + quote(env["SCHEDULE_ID"], safe=""), "PATCH",
-                    {"name": env["SCHEDULE_REMOTE_NAME"]})
-            elif hook == "schedule-draft-retained":
-                field = next(node for node in ad("snapshot", "-i")["nodes"]
-                             if node.get("id", node.get("identifier")) == "schedule-content")
-                assert env["SCHEDULE_DRAFT"] in json.dumps(field, ensure_ascii=False), "SSE discarded schedule draft"
-            elif hook == "schedule-draft-saved":
-                row = wait_api(lambda: api("/schedules/" + quote(env["SCHEDULE_ID"], safe="")),
-                               lambda item: item["content"] == env["SCHEDULE_DRAFT"])
-                assert row["name"] == env["SCHEDULE_REMOTE_NAME"], "Saving content overwrote external name edit"
-            elif hook == "schedule-agent-created":
-                when = (datetime.now(ZoneInfo(env["SCHEDULE_ZONE"])) + timedelta(minutes=2)).replace(second=0, microsecond=0)
-                local_at = when.strftime("%Y-%m-%dT%H:%M")
-                api(conversation_path(env["SCHEDULE_CHAT_ID"]) + "/messages", "POST", {
-                    "client_id": "e2e-agent-schedule-" + uuid4().hex,
-                    "text": (
-                        "请现在调用 create_schedule 工具为你自己创建定时；不要只回复文字。"
-                        f"名称必须精确为 {env['AGENT_SCHEDULE_NAME']}，"
-                        f"执行内容为“只回复好的”，规则为单次，local_at 必须精确为 {local_at}，"
-                        f"时区为 {env['SCHEDULE_ZONE']}。创建成功后只回复定时 id。"
-                    ),
-                })
-                rows = wait_api(lambda: api(agent_path(env["SCHEDULE_AGENT_ID"]) + "/schedules")["schedules"],
-                                lambda items: any(row["name"] == env["AGENT_SCHEDULE_NAME"] for row in items),
-                                timeout=180)
-                matching = [row for row in rows if row["name"] == env["AGENT_SCHEDULE_NAME"]]
-                assert len(matching) == 1 and matching[0]["rule"] == {"kind": "once", "local_at": local_at}
-                env["AGENT_SCHEDULE_ID"] = matching[0]["id"]
-            elif hook == "schedule-external":
-                zone = env["SCHEDULE_ZONE"]
-                result = api(agent_path(env["SCHEDULE_AGENT_ID"]) + "/schedules", "POST", {
-                    "client_id": "e2e-schedule-" + uuid4().hex,
-                    "name": env["EXTERNAL_SCHEDULE_NAME"], "content": "只回复好的",
-                    "rule": {"kind": "cron", "expression": "30 6 * * 1-5"}, "enabled": False,
-                    "timezone": zone,
-                })
-                env["EXTERNAL_SCHEDULE_ID"] = result["schedule"]["id"]
-            elif hook == "schedule-triggered":
-                identity = env["AGENT_SCHEDULE_ID"]
-                row = wait_api(lambda: api("/schedules/" + quote(identity, safe="") + "/runs")["runs"],
-                               lambda runs: any(run["status"] == "completed" and run["conversation_id"] for run in runs), timeout=240)
-                linked = next(run for run in row if run["conversation_id"])
-                env["SCHEDULE_RUN_ID"] = linked["id"]
-                env["SCHEDULE_CONVERSATION_ID"] = linked["conversation_id"]
-                fixtures.append(linked["conversation_id"])
-                conversation = next(row for row in api("/conversations")["conversations"]
-                                    if row["id"] == linked["conversation_id"])
-                assert conversation["source"] == "schedule"
-                assert conversation["schedule_origin"]["schedule_id"] == identity
-                events = api(conversation_path(linked["conversation_id"]) + "/events")["events"]
-                assert {"schedule.triggered", "message.user", "message.agent"} <= {event["type"] for event in events}
-                assert any("好的" in str(event["data"]) for event in events if event["type"] == "message.agent")
-                assert len(row) == 1 and linked["status"] == "completed"
-                home_row = next(item for item in api("/agents")["agents"] if item["id"] == env["SCHEDULE_AGENT_ID"])
-                assert home_row["latest_conversation"]["id"] == linked["conversation_id"]
-                env["SCHEDULE_TRIGGER_SEQ"] = next(event["seq"] for event in events if event["type"] == "schedule.triggered")
-            elif hook in ("schedule-source-header", "schedule-source-drawer"):
-                target = ("chat-conversation-title" if hook == "schedule-source-header"
-                          else "conversation-" + env["SCHEDULE_CONVERSATION_ID"])
-                node = next((node for node in ad("snapshot")["nodes"]
-                             if node.get("id", node.get("identifier")) == target), None)
-                assert node is not None, f"Source marker node is missing: {target}"
-                assert "定时" in json.dumps(node, ensure_ascii=False), "Schedule source marker is missing"
-            elif hook == "schedule-deleted":
-                rows = wait_api(lambda: api(agent_path(env["SCHEDULE_AGENT_ID"]) + "/schedules")["schedules"],
-                                lambda items: env["AGENT_SCHEDULE_ID"] not in {row["id"] for row in items})
-                assert env["AGENT_SCHEDULE_ID"] not in {row["id"] for row in rows}
-                conversation = next(item for item in api("/conversations")["conversations"]
-                                    if item["id"] == env["SCHEDULE_CONVERSATION_ID"])
-                assert conversation["source"] == "schedule" and conversation["schedule_origin"]["schedule_id"] == env["AGENT_SCHEDULE_ID"]
+            elif hook == "pairing-restore-dev":
+                restore_pairing_connection(pairing, env)
             elif hook in ("dark-mode", "light-mode"):
                 if not PRESERVE_SYSTEM_THEME:
                     mode = "yes" if hook == "dark-mode" else "no"
                     set_theme(mode)
-                    actual = phone_command([*ADB, "shell", "cmd", "uimode", "night"])
-                    assert mode in actual, actual
-                    time.sleep(1)  # Let native appearance changes settle before the next tap.
-            elif hook == "dark-management":
-                if PRESERVE_SYSTEM_THEME:
-                    skipped_dark_screenshots.extend(str(OUT / name) for name in (
-                        "13-conversation-menu-dark.png", "14-conversation-rename-keyboard-dark.png", "15-conversation-delete-dark.png"))
-                else:
-                    capture_dark_management(agent)
-            elif hook == "dark-profiles":
-                if PRESERVE_SYSTEM_THEME:
-                    skipped_dark_screenshots.extend(str(OUT / name) for name in (
-                        "20-chat-header-dark.png", "21-profile-members-dark.png", "22-profile-computer-empty-dark.png",
-                        "24-profile-memory-dark.png", "23-profile-empty-members-dark.png"))
-                else:
-                    capture_dark_profiles(env)
-            elif hook == "release-reference":
-                reference = owned_agents[-1]
-                api(agent_path(reference), "DELETE")
-                assert not api(agent_path(env["NEW_AGENT_ID"]))["member_of"]
-            elif hook == "file-conversation-deleted":
-                api(conversation_path(env["FILE_CONVERSATION_ID"]), "DELETE")
-                detail = api("/files/" + quote(env["FILE_ID"], safe=""))
-                assert detail["available"] and detail["conversation_id"] is None, detail
-                assert Path(env["FILE_PATH"]).is_file(), "Deleting chat removed the original file"
-                assert any(row["kind"] == "file" and row["id"] == env["FILE_ID"]
-                           for row in api("/search?q=" + quote(env["FILE_NAME"], safe=""))["results"])
-            elif hook == "upload-select-document":
-                select_upload_document(env)
-            elif hook == "pdf-reply":
-                await_media_reply(env)
-                ad("wait", "label=" + json.dumps(env["PDF_MARKER"]), "10000")
+                    assert mode in phone_command([*ADB, "shell", "cmd", "uimode", "night"])
             elif hook == "image-request":
                 api(conversation_path(env["IMAGE_CONVERSATION_ID"]) + "/messages", "POST", {
                     "client_id": "e2e-image-" + uuid4().hex,
-                    "text": "请调用 generate_image 生成一张白底蓝色圆形的简单图片，并把返回的原文件作为附件发给 human。失败时原样报告错误代码、详情及重置时间，不要重试。",
+                    "text": "请调用 generate_image 生成一张白底蓝色圆形的简单图片，把返回原文件作为附件发给 human。失败原样报告代码、详情和重置时间，不重试。",
                 })
-                await_media_reply(env, image=True)
-            elif hook == "upload-message-sent":
-                events = wait_api(
-                    lambda: api(conversation_path(env["UPLOAD_CONVERSATION_ID"]) + "/events?limit=200")["events"],
-                    lambda rows: any(row["type"] == "message.user" for row in rows),
-                )
-                messages = [row["data"] for row in events if row["type"] == "message.user"]
-                assert len(messages) == 1 and messages[0]["text"] == env["UPLOAD_PROMPT"], messages
-                attachments = messages[0]["attachments"]
-                assert len(attachments) == 1 and attachments[0]["name"] == env["UPLOAD_NAME"], attachments
-                env["UPLOAD_FILE_ID"] = attachments[0]["id"]
-                assert Path(env["UPLOAD_PATH"]).read_bytes() == Path(env["UPLOAD_LOCAL_PATH"]).read_bytes()
-                detail = api("/files/" + quote(env["UPLOAD_FILE_ID"], safe=""))
-                assert detail["available"] and detail["conversation_id"] == env["UPLOAD_CONVERSATION_ID"], detail
-            elif hook == "file-original-removed":
-                Path(env["FILE_PATH"]).unlink()
-                detail = api("/files/" + quote(env["FILE_ID"], safe=""))
-                assert not detail["available"] and detail["conversation_id"] is None, detail
-            elif hook == "browser-taken-over":
-                task = wait_api(lambda: api("/browser-tasks/" + quote(env["BROWSER_TASK_ID"], safe="")),
-                                lambda current: current["state"] == "human")
-                assert task["state"] == "human" and task["current"] == env["BROWSER_PAGE_ID"], task
-            elif hook == "browser-input":
-                assert browser_server is not None
-                with browser_server.input_changed:
-                    received = browser_server.input_changed.wait_for(
-                        lambda: env["BROWSER_INPUT"] in browser_server.inputs, timeout=20)
-                assert received, f"Phone text did not reach fixture page: {browser_server.inputs}"
-                task = api("/browser-tasks/" + quote(env["BROWSER_TASK_ID"], safe=""))
-                assert task["state"] == "human", task
-            elif hook == "browser-handed-back":
-                events = wait_api(
-                    lambda: api(conversation_path(env["BROWSER_CONVERSATION_ID"]) + "/events?limit=200")["events"],
-                    lambda rows: any(row["type"] == "takeover.ended"
-                                     and row["data"]["id"] == env["BROWSER_TASK_ID"]
-                                     and row["data"]["text"].endswith("已交还") for row in rows),
-                )
-                matching = [row for row in events if row["type"] == "takeover.ended"
-                            and row["data"]["id"] == env["BROWSER_TASK_ID"]
-                            and row["data"]["text"].endswith("已交还")]
-                assert len(matching) == 1, "Handback did not create one persisted system event"
-                env["TAKEOVER_SEQ"] = matching[0]["seq"]
-                task = api("/browser-tasks/" + quote(env["BROWSER_TASK_ID"], safe=""))
-                assert task["state"] == "agent" and task["pages"], task
-            elif hook == "browser-closed":
-                task = wait_api(lambda: api("/browser-tasks/" + quote(env["BROWSER_TASK_ID"], safe="")),
-                                lambda current: current["state"] == "released")
-                assert task["state"] == "released" and not task["pages"], task
-                assert not any(item["id"] == task["id"] and item["state"] != "released"
-                               for item in api("/browser-tasks")["browser_tasks"])
+                await_media_reply(env)
             else:
-                raise RuntimeError("Unknown regression hook: " + hook)
-        elif step:
-            # Comments directly after a hook belong to no command; only continuation lines are kept.
+                raise RuntimeError("Unknown native-chain hook: " + hook)
+        elif line.startswith("  "):
             step.append(line)
     execute()
+
 
 
 def restore(actions):
@@ -1943,13 +1046,14 @@ def assert_pairing_selection(nodes, url, method, *, current):
 
 
 def pairing_computer_row(nodes, url):
-    """Select by the saved computer's exact URL, never by shared display name."""
+    """Capture the current development computer by exact URL and current marker before switching."""
     target = url.rstrip("/")
     rows = [node.get("id", node.get("identifier")) for node in nodes
             if str(node.get("id", node.get("identifier")) or "").startswith("connection-computer-")
-            and str(node.get("label") or "").split(", ")[-1].rstrip("/") == target]
+            and str(node.get("label") or "").split(", ")[-1].rstrip("/") == target
+            and "当前" in str(node.get("label") or "").split(", ")]
     if len(rows) != 1:
-        raise RuntimeError("Cannot identify a unique saved development computer at " + url)
+        raise RuntimeError("Cannot identify a unique current development computer at " + url)
     return rows[0]
 
 
@@ -1982,17 +1086,18 @@ def restore_pairing_connection(pairing, env):
         elif "connection-method" in ids:
             address, method, is_current = pairing_selected(nodes)
             if address == GATEWAY and "开发连接" in method:
-                if is_current:
-                    home()
-                    env["PAIRING_RESTORED"] = True
-                    return
-                replay_steps("pairing", env, pairing=pairing, source="""appId: host.exp.exponent
+                if not is_current:
+                    replay_steps("pairing", env, pairing=pairing, source="""appId: host.exp.exponent
 ---
 - tapOn:
     id: connection-switch
 """)
+                    ad("wait", 'id="composer-input"', "10000")
+                home()
+                env["PAIRING_RESTORED"] = True
+                return
             else:
-                row = pairing_computer_row(nodes, GATEWAY)
+                row = env["PAIRING_DEV_ROW"]
                 replay_steps("pairing", env, pairing=pairing, source=f"""appId: host.exp.exponent
 ---
 - tapOn:
@@ -2007,7 +1112,7 @@ def restore_pairing_connection(pairing, env):
         elif any(node.get("label") == "设置" and node.get("hittable") for node in nodes):
             replay_steps("pairing", env, pairing=pairing, source="""appId: host.exp.exponent
 ---
-- tapOn: 设置
+# @open-settings
 """)
         else:
             ad("back")
@@ -2040,7 +1145,7 @@ def pairing_preflight():
     home()
     replay_steps("pairing", {}, source="""appId: host.exp.exponent
 ---
-- tapOn: 设置
+# @open-settings
 - tapOn:
     id: settings-about-connection
 """)
@@ -2086,169 +1191,138 @@ def overall_status(results, error=None, cleanup_errors=()):
     """Only a complete skip is SKIP; any real failure dominates other group outcomes."""
     if error or cleanup_errors or any(result["status"] == "FAIL" for result in results):
         return "FAIL"
+    if any(result["status"] == "PARTIAL" for result in results):
+        return "PARTIAL"
     return "SKIP" if results and all(result["status"] == "SKIP" for result in results) else "PASS"
 
 
+
+phase_times = {}
+phase_name = None
+phase_started = None
+
+
+def begin_phase(name):
+    global phase_name, phase_started
+    now = time.monotonic()
+    if phase_name is not None:
+        phase_times[phase_name] = phase_times.get(phase_name, 0) + now - phase_started
+    phase_name, phase_started = name, now
+    if name is not None:
+        print(json.dumps({"event": "phase", "phase": name}), flush=True)
+
+
 def run_group(group):
-    """Own temporary data until cleanup; failure is reported without skipping later groups."""
-    global OUT, fixtures, owned_agents, owned_agent_names, owned_connectors, owned_connector_names, run_id, skipped_dark_screenshots
+    """Own fixture lifetimes; a failed group is reported without skipping later groups."""
+    global OUT, fixtures, owned_agents, owned_agent_names, run_id, manual_results
+    global phase_times, phase_name, phase_started
+    phase_times, phase_name, phase_started = {}, None, None
+    begin_phase("prepare")
     OUT = run_out / group
     OUT.mkdir()
     started = time.monotonic()
-    fixtures, owned_agents, owned_connectors = [], [], []
-    skipped_dark_screenshots = []
+    fixtures, owned_agents, manual_results = [], [], []
+    owned_agent_names = set()
     run_id = uuid4().hex[:10]
-    owned_agent_names = {f"E2E {kind} {run_id}" for kind in ("Agent", "Edited", "Synced")}
-    owned_connector_names = {
-        f"E2E DeepWiki {run_id}", f"E2E external connector {run_id}",
-        f"E2E changed connector {run_id}",
-        f"E2E local connector {run_id}",
-    }
-    error = None
     browser_server = None
-    settings_original = None
-    memory_profile_original = None
     pairing = None
-    env = {"ARTIFACTS": str(OUT),
-           "NEW_NAME": "E2E Agent " + run_id, "RENAMED_NAME": "E2E Edited " + run_id,
-           "EXTERNAL_NAME": "E2E Synced " + run_id}
-    if agent is not None:
-        env.update({"AGENT_ID": agent["id"], "USAGE_AGENT_ID": agent["id"]})
+    error = None
+    env = {"ARTIFACTS": str(OUT)}
+    runner = sys.modules[__name__]
     try:
         require_expo()
-        if group == "collaboration":
-            collaboration.prepare(sys.modules[__name__], env)
-        elif group == "compaction":
-            compaction.prepare(sys.modules[__name__], env)
-        elif group == "rich":
-            rich.prepare(sys.modules[__name__], env)
-        elif group == "drawer":
-            env["OLD_ID"] = old_conversation(agent)
-            fixture = api("/conversations", "POST", {"agent_id": agent["id"]})
-            fixtures.append(fixture["id"])
-            env["MANAGED_ID"] = fixture["id"]
-        elif group == "profile":
-            env.update(profile_fixture())
-        elif group == "memory":
-            name = "E2E memory " + run_id
-            memory_profile_original = api("/memory/profile")
-            env.update({
-                "MEMORY_NAME": name,
-                "MEMORY_SAVED": "# E2E saved " + run_id,
-                "MEMORY_SAVED_TEXT": "E2E saved " + run_id,
-                "MEMORY_PROFILE_TEXT": "E2E shared profile " + run_id,
-                "MEMORY_DETAIL_SLUG": "e2e-" + run_id,
-                "MEMORY_DETAIL_CONTENT": "Detail " + run_id,
-                "MEMORY_DETAIL_DRAFT": "Revised-" + run_id,
-            })
-            env["MEMORY_AGENT_ID"] = create_owned_agent(name)
-            fixture = api("/conversations", "POST", {"agent_id": env["MEMORY_AGENT_ID"]})
-            fixtures.append(fixture["id"])
-            env["MEMORY_MEMBER_ID"] = create_owned_agent("E2E memory member " + run_id)
-            env["MEMORY_PARENT_ID"] = create_owned_agent(
-                "E2E memory parent " + run_id, [env["MEMORY_MEMBER_ID"]]
-            )
-        elif group == "schedules":
-            identity = create_owned_agent("E2E schedule " + run_id)
-            zone = api(agent_path(identity) + "/schedules")["default_timezone"] or "Asia/Shanghai"
-            env.update({"SCHEDULE_AGENT_ID": identity, "SCHEDULE_NAME": "E2E daily " + run_id,
-                        "SCHEDULE_EDITED_NAME": "E2E edited " + run_id,
-                        "SCHEDULE_REMOTE_NAME": "E2E remote " + run_id, "SCHEDULE_DRAFT": "retained draft " + run_id,
-                        "AGENT_SCHEDULE_NAME": "E2E agent schedule " + run_id,
-                        "EXTERNAL_SCHEDULE_NAME": "E2E external " + run_id, "SCHEDULE_ZONE": zone})
-            fixture = api("/conversations", "POST", {"agent_id": identity})
-            env["SCHEDULE_CHAT_ID"] = fixture["id"]
-            fixtures.append(fixture["id"])
-        elif group == "agent":
-            env["EDIT_EFFORT"], env["EDIT_EFFORT_POINT"], env["EDIT_MODEL"] = agent_effort_fixture()
-        elif group == "settings":
-            settings_original, model_env = model_fixture()
-            env.update(model_env)
-        elif group == "connectors":
-            env.update({
-                "CONNECTOR_NAME": "E2E DeepWiki " + run_id,
-                "CONNECTOR_AGENT_NAME": "E2E connector Agent " + run_id,
-                "EXTERNAL_CONNECTOR_NAME": "E2E external connector " + run_id,
-                "EXTERNAL_CONNECTOR_RENAMED": "E2E changed connector " + run_id,
-                "DRAFT_MARKER": "unsaved-" + run_id,
-                "LOCAL_CONNECTOR_NAME": "E2E local connector " + run_id,
-                "LOCAL_ARGUMENT": "literal with spaces",
-            })
-            env["CONNECTOR_AGENT_ID"] = create_owned_agent(env["CONNECTOR_AGENT_NAME"])
-            env["CONNECTOR_SECRET"] = "e2e-private-" + uuid4().hex
-        elif group == "skills":
-            skills_fixture(env)
-        elif group == "capabilities":
-            identity = create_owned_agent("E2E capabilities " + run_id)
-            fixture = api("/conversations", "POST", {"agent_id": identity})
-            fixtures.append(fixture["id"])
-            env.update({"CAPABILITY_AGENT_ID": identity, "CAPABILITY_CHAT_ID": fixture["id"]})
-        elif group == "files":
-            file_fixture(env)
-        elif group in ("upload", "pdf"):
-            upload_fixture(env, pdf=group == "pdf")
-        elif group == "image":
-            image_fixture(env)
-        elif group == "browser":
-            browser_server = start_browser_fixture(env)
-            browser_fixture(env)
+        if group == "chat":
+            core.prepare_chat(runner, env)
         elif group == "pairing":
             if api("/connection")["pairing_method"] != "development":
-                raise RuntimeError("Pairing regression requires a configured development token")
+                raise RuntimeError("Pairing requires this run's development connection")
             pairing = PairingFixture()
-            env.update({"PAIR_DEVICE_NAME": "E2E pairing " + run_id, "DEV_URL": GATEWAY,
-                        "PAIRING_URL": pairing.start()})
+            env.update(PAIR_DEVICE_NAME="E2E pairing " + run_id, DEV_URL=GATEWAY, PAIRING_URL=pairing.start())
+        elif group == "attachments":
+            audio_native.prepare(runner, env)
+            if not options.attachment_audio_only:
+                attachments.prepare(runner, env)
+        elif group == "browser":
+            browser_server = start_browser_fixture(env)
+            begin_phase("browser-model")
+            browser_fixture(env)
+        elif group == "rich":
+            native_rich.prepare(runner, env)
+        elif group == "schedules":
+            core.prepare_schedule(runner, env)
+        elif group == "image":
+            image_fixture(env)
         (OUT / "fixture.json").write_text(json.dumps(env, ensure_ascii=False, indent=2))
-        replay_steps(group, env, browser_server, pairing=pairing)
-        if group == "agent":
-            assert env["NEW_AGENT_ID"] not in {a["id"] for a in api("/agents")["agents"]}, "Deleted Agent remains"
-        if group == "connectors":
-            assert env["CONNECTOR_ID"] not in {
-                item["id"] for item in api("/connectors")["connectors"]
-            }, "Connector deletion did not persist"
-        assert all(a["home"] for a in api("/agents")["agents"]), "Flow did not restore home membership"
+        begin_phase("navigation")
+        home()
+        if group == "attachments":
+            replay_steps(group, env, source=(ROOT / "attachments-audio.yaml").read_text())
+        if not (group == "attachments" and options.attachment_audio_only):
+            replay_steps(group, env, browser_server, pairing=pairing)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-        # Foreground guard forbids captures when another application has taken over.
         capture_errors = restore([("failure screenshot", lambda: ad("screenshot", str(OUT / "failure.png")))])
     else:
         capture_errors = []
     finally:
+        begin_phase("cleanup")
         cleanup_errors = restore([
             ("paired fixture device", pairing.revoke_owned_device if pairing else lambda: None),
-            ("development connection", lambda: restore_pairing_connection(pairing, env)
-             if pairing else None),
+            ("development connection", lambda: restore_pairing_connection(pairing, env) if pairing else None),
             ("pairing bridge", pairing.close if pairing else lambda: None),
             ("browser leases", lambda: cleanup_browser_tasks(env) if group == "browser" else None),
             ("browser fixture server", lambda: stop_browser_fixture(browser_server) if browser_server else None),
-            ("original e2e file", lambda: cleanup_file_fixture(env) if group == "files" else None),
-            ("default settings", lambda: restore_settings(settings_original)),
-            ("shared profile", lambda: restore_memory_profile(memory_profile_original, env["MEMORY_PROFILE_TEXT"])
-             if group == "memory" and memory_profile_original and "MEMORY_PROFILE_TEXT" in env else None),
             ("fixture schedules", lambda: cleanup_schedules() if group == "schedules" else None),
             ("fixture conversations", cleanup_conversations),
-            ("compaction archive", lambda: compaction.cleanup(sys.modules[__name__], env) if group == "compaction" else None),
-            ("upload fixture", lambda: cleanup_upload_fixture(env) if group in ("upload", "pdf") else None),
+            ("audio fixture", lambda: audio_native.cleanup(runner, env) if group == "attachments" else None),
+            ("delivered original file", lambda: attachments.cleanup(runner, env) if group == "attachments" else None),
+            ("uploaded fixture", lambda: cleanup_upload_fixture(env) if group == "attachments" else None),
             ("image fixture", lambda: cleanup_image_fixture(env) if group == "image" else None),
             ("owned Agents", cleanup_agents),
-            ("owned connectors", cleanup_connectors),
-            ("owned skill directories", lambda: cleanup_skills(env) if group == "skills" else None),
         ])
     if error:
-        # Recovery leaves the user's appearance untouched when theme preservation is requested.
-        cleanup_errors += restore([
-            ("light mode", lambda: set_theme("no")),
-            ("home membership", all_home), ("home screen", home),
-        ])
-    result = {"group": group, "status": "FAIL" if error or cleanup_errors else "PASS",
+        begin_phase("recovery")
+        cleanup_errors += restore([("Agent directory", home)])
+    begin_phase(None)
+    status = ("FAIL" if error or cleanup_errors else
+              "PARTIAL" if any(item["status"] == "PARTIAL" for item in manual_results) else "PASS")
+    result = {"group": group, "status": status,
               "elapsed_seconds": round(time.monotonic() - started, 2), "error": error,
+              "phase_seconds": {name: round(seconds, 2) for name, seconds in phase_times.items()},
+              "manual_checks": manual_results,
               "cleanup_errors": capture_errors + cleanup_errors,
-              "screenshots": [str(p) for p in sorted(OUT.glob("*.png"))],
-              "theme_preserved": PRESERVE_SYSTEM_THEME,
-              "skipped_dark_screenshots": skipped_dark_screenshots}
+              "screenshots": [str(path) for path in sorted(OUT.glob("*.png"))]}
+    if options.attachment_audio_only:
+        result["subflow"] = "audio-native-only"
     (OUT / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
     print(json.dumps(result, ensure_ascii=False), flush=True)
     return result
+
+
+
+def budget_notice(minutes):
+    notice = {"event": "budget", "minutes": minutes, "phase": phase_name,
+              "elapsed_seconds": round(time.monotonic() - START, 2),
+              "status": "soft-limit" if minutes == 20 else "report-required"}
+    (run_out / f"budget-{minutes}m.json").write_text(json.dumps(notice, ensure_ascii=False, indent=2))
+    print(json.dumps(notice, ensure_ascii=False), flush=True)
+    reporter = os.environ.get("E2E_BUDGET_COMMAND")
+    if minutes == 24 and reporter:
+        try:
+            sent = subprocess.run([*json.loads(reporter), "--body", json.dumps(notice, ensure_ascii=False)],
+                                  capture_output=True, text=True, timeout=30)
+            if sent.returncode:
+                notice["report_error"] = sent.stderr or sent.stdout
+        except (OSError, subprocess.SubprocessError) as error:
+            notice["report_error"] = str(error)
+        (run_out / f"budget-{minutes}m.json").write_text(json.dumps(notice, ensure_ascii=False, indent=2))
+
+
+budget_timers = [threading.Timer(max(0, minutes * 60 - (time.monotonic() - START)),
+                                budget_notice, args=(minutes,)) for minutes in (20, 24)]
+for budget_timer in budget_timers:
+    budget_timer.daemon = True
+    budget_timer.start()
 
 
 run_out = OUT
@@ -2267,15 +1341,8 @@ try:
         shared_setup_started = True
         prepare_reverse()
         require_expo()
-        all_home()
+        original_theme = phone_command([*ADB, "shell", "cmd", "uimode", "night"]).split()[-1]
         agents = api("/agents")["agents"]
-        requested = os.environ.get("E2E_AGENT_ID")
-        candidates = [a for a in agents if requested is None or a["id"] == requested]
-        if not candidates and selected not in (["browser"], ["pairing"]):
-            raise RuntimeError("Need at least one Agent")
-        agent = (next((a for a in candidates if a.get("latest_conversation")
-                       and a["latest_conversation"]["status"] != "working"), candidates[0])
-                 if candidates else None)
         set_theme("no")
         ad("open", EXPO, "--foreground")
         home()
@@ -2298,8 +1365,8 @@ finally:
     OUT = run_out
     cleanup_started = time.monotonic()
     cleanup_errors = restore([
-        ("light mode", lambda: set_theme("no")),
-        ("home membership", all_home), ("home screen", home),
+        ("original theme", lambda: set_theme(globals().get("original_theme", "no"))),
+        ("Agent directory", home),
         ("restored screenshot", lambda: ad("screenshot", str(OUT / "home-restored.png"))),
     ]) if shared_setup_started else []
     total_status = overall_status(results, error, cleanup_errors)
@@ -2311,8 +1378,12 @@ finally:
               "reverse": json.loads((OUT / "reverse.json").read_text()) if (OUT / "reverse.json").exists() else None,
               "artifacts": str(OUT), "restored_screenshot": str(OUT / "home-restored.png") if shared_setup_started else None,
               "theme_preserved": PRESERVE_SYSTEM_THEME}
+    report["budget"] = ("report-required" if report["elapsed_seconds"] >= 1440 else
+                        "over-soft" if report["elapsed_seconds"] >= 1200 else "within-soft")
+    for timer in globals().get("budget_timers", []):
+        timer.cancel()
     (OUT / "result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
     LOG.close()
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
-sys.exit(0 if report["status"] != "FAIL" else 1)
+sys.exit(0 if report["status"] in ("PASS", "SKIP") else 1)

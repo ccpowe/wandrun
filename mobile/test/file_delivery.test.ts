@@ -29,8 +29,8 @@ test("搜索结果按真实来源导航：消息定位 seq，文件独立于可�
   ];
   assert.deepEqual(results.map(searchDestination), [
     { pathname: "/agents/[id]", params: { id: "entry" } },
-    { pathname: "/c/[id]", params: { id: "source" } },
-    { pathname: "/c/[id]", params: { id: "source", message_seq: "42" } },
+    { pathname: "/chat", params: { id: "source" } },
+    { pathname: "/chat", params: { id: "source", message_seq: "42" } },
     { pathname: "/files/[id]", params: { id: "opaque/id" } },
   ]);
 });

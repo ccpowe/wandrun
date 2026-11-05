@@ -110,7 +110,6 @@ export type ClickOutcome = {
 /** Logged in order under one connectionId; frame and selection events also cover evicted clicks. */
 export type ClickEvent = ClickOutcome
   | { status: "started"; id: number; atMonoMs: number; page: string | null; epoch: number | null; vp: number | null }
-  | { status: "input_pending"; id: number; atMonoMs: number }
   | { status: "input_done"; id: number; atMonoMs: number;
       inputLockWaitMs: number; inputDispatchMs: number; inputCdpMs: number }
   | { status: "reject"; id: number; atMonoMs: number; reason: string }
@@ -352,8 +351,8 @@ export class StreamMeter {
   }
 
   sent(id: number, input: Input, now: number): void {
-    // Held gestures (down/up and intermediate moves) are not direct clicks.
-    if (input.t !== "click") return;
+    // A pressed pointer state is the observable start of a remote interaction.
+    if (input.t !== "pointer" || !input.buttons) return;
     this.onClick?.({ status: "started", id, atMonoMs: now,
       page: this.selected?.page ?? null, epoch: this.selected?.epoch ?? null, vp: this.selected?.vp ?? null });
     // Retain only a bounded set for online latency; the event trace preserves every flight.
@@ -373,10 +372,6 @@ export class StreamMeter {
         if (this.pending.delete(reply.id))
           this.onClick?.({ id: reply.id, status: "rejected", reason: reply.why });
       }
-      return;
-    }
-    if (reply.t === "input_pending") {
-      this.onClick?.({ status: "input_pending", id: reply.id, atMonoMs: now });
       return;
     }
     if (reply.t !== "input_done") return;

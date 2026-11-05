@@ -11,6 +11,12 @@ export type Conversation = {
   title: string;
   created_at: number;
   updated_at: number;
+  /**
+   * Latest user send (also in a collaboration child) or schedule trigger on this root: seq orders, at displays.
+   * AI replies, status, browser requests, rename and read do not advance it (conversation-drawer.P1).
+   */
+  last_activity_seq: number | null;
+  last_activity_at: number | null;
   read_seq: number;
   /** 本根时间线最后一条 Agent 回复的位置；没有回复时为 0，不是全局快照水位。 */
   last_agent_seq: number;
@@ -52,16 +58,16 @@ export type ScheduleRun = {
 };
 
 /**
- * Agent 作为入口的最近一个对话的摘要。“最近”按产品活动（用户 / Agent 消息）的 seq 算，
- * 时间只用于展示；状态变化和已读不算活动，status 仍是对话当前状态。
- * 没有有活动的对话时选择最新创建的空对话，此时 last_text、last_activity_seq 与 last_activity_at 为 null。
+ * Agent 作为入口的最近一个对话的摘要。“最近”按排序活动（用户发送、定时触发）的 seq 算，
+ * 时间只用于展示；AI 回复、状态变化和已读不算活动，status 仍是对话当前状态。
+ * 没有排序活动的对话时选择最新创建的空对话（含只有 AI 回复的），此时 last_text、last_activity_seq 与 last_activity_at 为 null。
  */
 export type LatestConversation = {
   id: string;
   title: string;
   /** 用户或 Agent 的最后一条消息文字；还没有消息时为 null。 */
   last_text: string | null;
-  /** 最后一条产品活动的全局 seq；与本地事件比较新鲜度，不使用墙上时间。 */
+  /** 最后一条排序活动的全局 seq；与本地事件比较新鲜度，不使用墙上时间。 */
   last_activity_seq: number | null;
   last_activity_at: number | null;
   status: ConversationStatus;
@@ -76,7 +82,16 @@ export type AgentCore = {
   description: string;
   workers: string[];
 };
-/** 手机可编辑的定义字段；执行环境仍由电脑配置管理。 */
+/** Picker choices contain public machine metadata only; credentials remain on the gateway. */
+export type ExecutionEnvironment = {
+  id: string;
+  name: string;
+  type: "local" | "instabox";
+  machine_id?: string;
+  status: string | null;
+};
+
+/** 手机可编辑的定义字段。 */
 export type AgentEditableFields = {
   name: string;
   avatar: number;
@@ -86,6 +101,7 @@ export type AgentEditableFields = {
   reasoning_effort: string | null;
   fast_mode: boolean;
   code_mode: boolean;
+  environment: string;
   skills: string[];
   workers: string[];
   /** 省略保留原选择；两个列表互斥，按需搜索要求连接器有说明。 */
@@ -101,53 +117,75 @@ export type Connector = {
   id: string;
   name: string;
   description: string;
+  icon?: string | null;
   command?: string;
   args?: string[];
   url?: string;
   transport?: string;
+  transport_source?: "auto" | "user";
   headers?: Record<string, true>;
   env?: Record<string, true>;
-  auth_type: "none" | "oauth";
+  auth_type: "none" | "key" | "oauth";
   app_id: string | null;
   auth: ConnectorAuth;
   status: "connected" | "disconnected" | "failed";
   error: string | null;
   tool_count: number;
-  used_by: { id: string; name: string }[];
+  used_by: ConnectorAgent[];
   /** 已保存参数与当前连接不同；重启后生效，测试仍使用当前连接参数。 */
   pending_restart: boolean;
 };
 export type ConnectorAuth = {
   status: "not_required" | "unauthorized" | "authorized" | "reauthorization_required";
   authorizing: boolean;
+  /** Opaque public identity of the current pending transaction; never a URL, code or credential. */
+  transaction_id: string | null;
   scopes: string[];
   /** Classified terminal authorization failure; never includes upstream responses or secrets. */
   error?: { code: string; message: string } | null;
 };
-export type AppEntry = { id: string; name: string; description: string; connector: Connector | null };
+export type ConnectorAgent = { id: string; name: string; avatar?: number };
+export type AppEntry = {
+  id: string; name: string; description: string; url: string; transport: string;
+  /** `key` locates the single Key (header or URL query); the gateway applies it, the App only writes `headers[key.name]`. */
+  auth: { type: "oauth" | "device" | "none" } | { type: "key"; key_url: string; headers: Record<string, string>; key: { in: "header" | "query"; name: string } };
+  connector: Connector | null;
+};
+export type ConnectorProbe = {
+  result: "none" | "key" | "oauth" | "failed"; transport: string;
+  oauth?: { dcr_supported: boolean; pkce_supported: boolean; issuer: string };
+  error?: { code: string; message: string };
+};
+export type ConnectorTools = {
+  status: Connector["status"]; tools: { name: string; title: string | null; description: string | null }[]; as_of_seq: number;
+};
+/** Only an observed, settled attempt can prove not_created; absence of a receipt is unknown. */
+export type ConnectorCreationResult =
+  | { status: "pending" | "unknown" | "not_created" }
+  | { status: "created"; connector: Connector; event: GatewayEvent };
 /** Only the initiating page receives this transaction's URL/code; expiry is Unix seconds. */
 export type OAuthStart =
-  | { flow: "authorization_code"; authorization_url: string; expires_at: number; redirect_uri: string; manual_callback: boolean }
-  | { flow: "device_code"; authorization_url: string; user_code: string; expires_at: number };
+  | { flow: "authorization_code"; transaction_id: string; authorization_url: string; expires_at: number; redirect_uri: string; manual_callback: boolean }
+  | { flow: "device_code"; transaction_id: string; authorization_url: string; user_code: string; expires_at: number };
 
 type ConnectorSecrets = Record<string, string | null>;
 export type CreateConnectorInput = {
-  name: string;
+  name?: string;
   description?: string;
 } & (
-  { url: string; transport?: string; headers?: ConnectorSecrets; auth_type?: "none" | "oauth"; command?: never; args?: never; env?: never }
+  { url: string; transport?: string; headers?: ConnectorSecrets; auth_type?: "none" | "key" | "oauth"; command?: never; args?: never; env?: never }
   | { command: string; args?: string[]; env?: ConnectorSecrets; auth_type?: "none"; url?: never; transport?: never; headers?: never }
 );
-/** Omitted fields keep their existing values; null or empty secret values delete that key. */
+/** Omitted fields keep their values; transport=null restores auto; null/empty secrets delete that key. */
 export type PatchConnectorInput = {
   name?: string;
   description?: string;
   command?: string;
   args?: string[];
   url?: string;
-  transport?: string;
+  transport?: string | null;
   headers?: ConnectorSecrets;
-  auth_type?: "none" | "oauth";
+  auth_type?: "none" | "key" | "oauth";
   env?: ConnectorSecrets;
 };
 export type ConnectorTestResult = {
@@ -253,16 +291,14 @@ export type AgentDeleteConflictDetails = {
 };
 
 
-/**
- * 列表项，同时是首页的一行（首页是列表的派生视图）：只有列表和 hide / unhide 返回派生字段，详情不含。
- * home：是否在首页；latest_conversation：没有对话时为 null；unread：它作为入口的任一对话有未读。
- * 浏览器“等你接管”由 ChatSession 的租约快照按 entry_agent_id 派生，与消息未读独立。
- */
+/** All Agents, in the gateway's confirmed manual order. Conversation summaries remain for existing consumers. */
 export type AgentSummary = AgentCore & {
-  home: boolean;
+  /** Configured execution environment id (same value as the detail's `environment`). */
+  environment: string;
   latest_conversation: LatestConversation | null;
   unread: boolean;
 };
+export type AgentListSnapshot = { agents: AgentSummary[]; as_of_seq: number; order_revision: number };
 
 /** 详情：完整定义；member_of 由网关从其他 Agent 的 workers 反查，不含自动展开的下属树。不含首页派生字段。 */
 export type AgentDetail = AgentCore & {
@@ -319,18 +355,24 @@ export type FileThumbnailWidth = 240 | 480 | 960;
 
 /** One task's lease; entry Agent and holder Agent are deliberately distinct. */
 export type BrowserPage = { id: string; title: string; url: string };
+export type BrowserCapacity = {
+  pages_used: number; pages_registered: number; pages_creating: number;
+  pages_pending_cleanup: number; pages_limit: number;
+};
 export type BrowserTask = {
   id: string; task_id: string; root_id: string; agent_id: string; entry_agent_id: string;
   conversation_title: string; entry_agent_name: string;
   agent_name?: string;
   state: "agent" | "requested" | "human" | "revoking" | "stopping" | "released";
-  epoch: number; pages: BrowserPage[]; current: string | null; max_pages: number;
+  epoch: number; pages: BrowserPage[]; current: string | null;
+  environment_id: string; environment_name: string; capacity: BrowserCapacity;
+  capacity_rejection: { id: string; reason: string } | null;
   reason: string | null; requested_reason: string | null;
 };
 export type ComputerStatus = {
   name: string; online_since: number; uptime_seconds: number; cpu_percent: number | null;
   memory: { used_bytes: number; total_bytes: number; percent: number };
-  browser: { pages_used: number; pages_limit: number; slots_used: number; slots_limit: number };
+  environments: { environment_id: string; environment_name: string; capacity: BrowserCapacity }[];
 };
 export type FileDetail = FileRecord & { available: boolean; error: string | null; error_message: string | null };
 export type SearchResult =
@@ -479,7 +521,7 @@ export function exchangePairingCode(
         signal: requestSignal,
       });
     } catch {
-      throw new GatewayError(0, "network", "连不上电脑");
+      throw new GatewayError(0, "network", "连不上服务器");
     }
     const payload = await response.json().catch(() => null);
     if (!response.ok) throw new GatewayError(response.status, payload?.error?.code ?? "http_error", "配对失败");
@@ -495,6 +537,8 @@ type ThumbnailCacheEntry = {
   refs: number;
 };
 
+const EMPTY_FILE_PREVIEW: { preview: FilePreview | null; failed: boolean } = { preview: null, failed: false };
+
 export class GatewayApi {
   readonly config: Readonly<GatewayConfig>;
   private readonly fetch: Fetch;
@@ -506,10 +550,16 @@ export class GatewayApi {
   readonly signal: AbortSignal = this.lifetime.signal;
   /** Reconnect abandons only reads. Commands remain owned by the session lifetime. */
   private reads = new AbortController();
+  private readonly readCancellationListeners = new Set<() => void>();
   private static readonly readDeadlineMs = 15_000;
   private resetGeneration = 0;
-  private readonly filePreviewCache = new Map<string, Promise<FilePreview>>();
+  private readonly filePreviewCache = new Map<string, {
+    promise: Promise<FilePreview>; snapshot: { preview: FilePreview | null; failed: boolean }; listeners: Set<() => void>;
+  }>();
   private readonly thumbnailCache = new Map<string, ThumbnailCacheEntry>();
+  private static nextResourceIdentity = 0;
+  /** Native/metadata access boundaries distinguish new APIs even when connection config is identical. */
+  readonly resourceIdentity = ++GatewayApi.nextResourceIdentity;
 
   constructor(config: GatewayConfig, fetchImpl: Fetch = fetch, onUnauthorized?: (reason: "invalid" | "revoked") => void,
     resetConnections?: () => void) {
@@ -536,10 +586,18 @@ export class GatewayApi {
     }
   }
 
+  /** Query's session bridge cancels its retryers before snapshot transports abort, so recovery is not a read failure. */
+  subscribeReadCancellation(listener: () => void): () => void {
+    this.readCancellationListeners.add(listener);
+    return () => this.readCancellationListeners.delete(listener);
+  }
+
   /** Discard obsolete finite reads without interrupting commands or the SSE connection. */
   cancelReads(): void {
-    this.reads.abort();
+    const previous = this.reads;
     this.reads = new AbortController();
+    for (const listener of this.readCancellationListeners) listener();
+    previous.abort();
   }
 
   headers(extra: Record<string, string> = {}): Record<string, string> {
@@ -598,7 +656,7 @@ export class GatewayApi {
       try {
         response = await this.fetchAuthorized(path, { headers: this.headers(), signal: requestSignal });
       } catch (error) {
-        throw new GatewayError(0, "network", "连不上电脑，请检查网络和网关连接", undefined, { cause: error });
+        throw new GatewayError(0, "network", "连不上服务器，请检查网络和网关连接", undefined, { cause: error });
       }
       if (!response.ok) throw responseError(response, await response.json().catch(() => null));
       try {
@@ -656,9 +714,14 @@ export class GatewayApi {
     return confirmation;
   }
 
-  listAgents(): Promise<{ agents: AgentSummary[]; as_of_seq: number }> {
+  listAgents(): Promise<AgentListSnapshot> {
     return this.request("GET", "/agents", undefined, undefined, true);
   }
+
+  listExecutionEnvironments(cursor?: string, signal?: AbortSignal): Promise<{ environments: ExecutionEnvironment[]; next_cursor: string | null }> {
+    return this.request("GET", `/execution-environments${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`, undefined, signal);
+  }
+
   /** 创建时 client_id 独立于定义字段；同一请求重试返回原结果。 */
   createAgent(clientId: string, fields: CreateAgentInput): Promise<{ agent: AgentDetail; event: GatewayEvent; replayed: boolean }> {
     return this.request("POST", "/agents", { ...fields, client_id: clientId });
@@ -671,17 +734,17 @@ export class GatewayApi {
   deleteAgent(id: string): Promise<{ event: GatewayEvent }> {
     return this.request("DELETE", `/agents/${encodeURIComponent(id)}`);
   }
-  getAgentCapabilities(id: string): Promise<{ capabilities: AgentCapability[] }> {
-    return this.request("GET", `/agents/${encodeURIComponent(id)}/capabilities`);
+  getAgentCapabilities(id: string, signal?: AbortSignal): Promise<{ capabilities: AgentCapability[] }> {
+    return this.request("GET", `/agents/${encodeURIComponent(id)}/capabilities`, undefined, signal);
   }
-  listSchedules(agentId: string): Promise<{ schedules: Schedule[]; default_timezone: string | null; as_of_seq: number }> {
-    return this.request("GET", `/agents/${encodeURIComponent(agentId)}/schedules`);
+  listSchedules(agentId: string, signal?: AbortSignal): Promise<{ schedules: Schedule[]; default_timezone: string | null; as_of_seq: number }> {
+    return this.request("GET", `/agents/${encodeURIComponent(agentId)}/schedules`, undefined, signal);
   }
   createSchedule(agentId: string, clientId: string, fields: Omit<ScheduleFields, "timezone" | "enabled"> & Partial<Pick<ScheduleFields, "timezone" | "enabled">>): Promise<{ schedule: Schedule; event: GatewayEvent; replayed: boolean }> {
     return this.request("POST", `/agents/${encodeURIComponent(agentId)}/schedules`, { ...fields, client_id: clientId });
   }
-  getSchedule(id: string): Promise<Schedule> {
-    return this.request("GET", `/schedules/${encodeURIComponent(id)}`);
+  getSchedule(id: string, signal?: AbortSignal): Promise<Schedule> {
+    return this.request("GET", `/schedules/${encodeURIComponent(id)}`, undefined, signal);
   }
   updateSchedule(id: string, fields: Partial<ScheduleFields>): Promise<{ schedule: Schedule; event: GatewayEvent | null }> {
     return this.request("PATCH", `/schedules/${encodeURIComponent(id)}`, fields);
@@ -689,16 +752,28 @@ export class GatewayApi {
   deleteSchedule(id: string): Promise<{ event: GatewayEvent }> {
     return this.request("DELETE", `/schedules/${encodeURIComponent(id)}`);
   }
-  scheduleRuns(id: string, before?: number, limit = 20): Promise<{ runs: ScheduleRun[]; as_of_seq: number }> {
+  scheduleRuns(id: string, before?: number, limit = 20, signal?: AbortSignal): Promise<{ runs: ScheduleRun[]; as_of_seq: number }> {
     const query = new URLSearchParams({ limit: String(limit) });
     if (before !== undefined) query.set("before", String(before));
-    return this.request("GET", `/schedules/${encodeURIComponent(id)}/runs?${query}`);
+    return this.request("GET", `/schedules/${encodeURIComponent(id)}/runs?${query}`, undefined, signal);
   }
-  listConnectors(): Promise<{ connectors: Connector[]; as_of_seq: number }> {
-    return this.request("GET", "/connectors");
+  listConnectors(signal?: AbortSignal): Promise<{ connectors: Connector[]; as_of_seq: number }> {
+    return this.request("GET", "/connectors", undefined, signal);
   }
-  getConnector(id: string): Promise<Connector> {
-    return this.request("GET", `/connectors/${encodeURIComponent(id)}`);
+  getConnector(id: string, signal?: AbortSignal): Promise<Connector> {
+    return this.request("GET", `/connectors/${encodeURIComponent(id)}`, undefined, signal);
+  }
+  getConnectorCreationResult(clientId: string, signal?: AbortSignal): Promise<ConnectorCreationResult> {
+    return this.request("GET", `/connectors/creation-result?client_id=${encodeURIComponent(clientId)}`, undefined, signal);
+  }
+  probeConnector(url: string, transport?: string): Promise<ConnectorProbe> {
+    return this.request("POST", "/connectors/probe", { url, ...(transport ? { transport } : {}) });
+  }
+  connectorAgents(id: string, signal?: AbortSignal): Promise<{ agents: ConnectorAgent[]; as_of_seq: number }> {
+    return this.request("GET", `/connectors/${encodeURIComponent(id)}/agents`, undefined, signal);
+  }
+  connectorTools(id: string, signal?: AbortSignal): Promise<ConnectorTools> {
+    return this.request("GET", `/connectors/${encodeURIComponent(id)}/tools`, undefined, signal);
   }
   createConnector(clientId: string, fields: CreateConnectorInput): Promise<{ connector: Connector; event: GatewayEvent; replayed: boolean }> {
     return this.request("POST", "/connectors", { ...fields, client_id: clientId });
@@ -712,14 +787,14 @@ export class GatewayApi {
   testConnector(id: string): Promise<ConnectorTestResult> {
     return this.request("POST", `/connectors/${encodeURIComponent(id)}/test`);
   }
-  listApps(): Promise<{ apps: AppEntry[] }> {
-    return this.request("GET", "/apps", undefined, undefined, true);
+  listApps(signal?: AbortSignal): Promise<{ apps: AppEntry[] }> {
+    return this.request("GET", "/apps", undefined, signal);
   }
   connectApp(id: string, clientId: string): Promise<{ connector: Connector }> {
     return this.request("POST", `/apps/${encodeURIComponent(id)}/connect`, { client_id: clientId });
   }
   startConnectorOAuth(id: string): Promise<OAuthStart> {
-    return this.request("POST", `/connectors/${encodeURIComponent(id)}/oauth/start`);
+    return this.request("POST", `/connectors/${encodeURIComponent(id)}/oauth/start`, { return_url: "wandrun://oauth/done" });
   }
   completeConnectorOAuth(id: string, url: string): Promise<{ connector: Connector }> {
     return this.request("POST", `/connectors/${encodeURIComponent(id)}/oauth/callback`, { url });
@@ -730,65 +805,58 @@ export class GatewayApi {
   revokeConnectorOAuth(id: string): Promise<{ connector: Connector; remote_revoked: boolean | null }> {
     return this.request("DELETE", `/connectors/${encodeURIComponent(id)}/oauth`);
   }
+  clearConnectorKey(id: string): Promise<{ connector: Connector; event: GatewayEvent | null }> {
+    return this.request("DELETE", `/connectors/${encodeURIComponent(id)}/key`);
+  }
 
 
   /** A refresh asks the gateway to query upstream; it may still return its last good snapshot. */
-  listModels(refresh = false): Promise<ModelCatalog> {
-    return this.request("GET", `/models${refresh ? "?refresh=true" : ""}`);
+  listModels(refresh = false, signal?: AbortSignal): Promise<ModelCatalog> {
+    return this.request("GET", `/models${refresh ? "?refresh=true" : ""}`, undefined, signal);
   }
-  getSettings(): Promise<ModelSettings> {
-    return this.request("GET", "/settings");
+  getSettings(signal?: AbortSignal): Promise<ModelSettings> {
+    return this.request("GET", "/settings", undefined, signal);
   }
   updateSettings(settings: ModelSettings): Promise<ModelSettings> {
     return this.request("PUT", "/settings", settings);
   }
-  getSubscriptionUsage(refresh = false): Promise<SubscriptionStatus> {
-    return this.request("GET", `/usage/subscription${refresh ? "?refresh=true" : ""}`).then(subscriptionStatus);
+  getSubscriptionUsage(refresh = false, signal?: AbortSignal): Promise<SubscriptionStatus> {
+    return this.request("GET", `/usage/subscription${refresh ? "?refresh=true" : ""}`, undefined, signal).then(subscriptionStatus);
   }
-  getAgentUsage(days = 7): Promise<AgentUsageReport> {
-    return this.request("GET", `/usage/agents?${new URLSearchParams({ days: String(days) })}`);
+  getAgentUsage(days = 7, signal?: AbortSignal): Promise<AgentUsageReport> {
+    return this.request("GET", `/usage/agents?${new URLSearchParams({ days: String(days) })}`, undefined, signal);
   }
 
-  listSkills(): Promise<{ skills: Skill[]; as_of_seq: number; default_agent_id: string | null }> {
-    return this.request("GET", "/skills");
+  listSkills(signal?: AbortSignal): Promise<{ skills: Skill[]; as_of_seq: number; default_agent_id: string | null }> {
+    return this.request("GET", "/skills", undefined, signal);
   }
-  getSkill(name: string): Promise<SkillDetail> {
-    return this.request("GET", `/skills/${encodeURIComponent(name)}`);
+  getSkill(name: string, signal?: AbortSignal): Promise<SkillDetail> {
+    return this.request("GET", `/skills/${encodeURIComponent(name)}`, undefined, signal);
   }
   /** Missing skills are idempotent and return event=null. */
   deleteSkill(name: string): Promise<{ event: GatewayEvent | null }> {
     return this.request("DELETE", `/skills/${encodeURIComponent(name)}`);
   }
-  listBuiltinSkills(): Promise<{ skills: BuiltinSkill[] }> {
-    return this.request("GET", "/builtin-skills");
+  listBuiltinSkills(signal?: AbortSignal): Promise<{ skills: BuiltinSkill[] }> {
+    return this.request("GET", "/builtin-skills", undefined, signal);
   }
-  getBuiltinSkill(name: string): Promise<BuiltinSkillDetail> {
-    return this.request("GET", `/builtin-skills/${encodeURIComponent(name)}`);
-  }
-
-
-  /** 移出首页（只隐藏）。已经不在首页时是无操作；返回最新的列表项。 */
-  hideAgent(id: string): Promise<AgentSummary> {
-    return this.request("POST", `/agents/${encodeURIComponent(id)}/hide`);
+  getBuiltinSkill(name: string, signal?: AbortSignal): Promise<BuiltinSkillDetail> {
+    return this.request("GET", `/builtin-skills/${encodeURIComponent(name)}`, undefined, signal);
   }
 
-  /** 回到首页。本来就在首页（没有移出记录）时是无操作。 */
-  unhideAgent(id: string): Promise<AgentSummary> {
-    return this.request("POST", `/agents/${encodeURIComponent(id)}/unhide`);
-  }
 
-  getAgent(id: string): Promise<AgentDetail> {
-    return this.request("GET", `/agents/${encodeURIComponent(id)}`);
+  getAgent(id: string, signal?: AbortSignal): Promise<AgentDetail> {
+    return this.request("GET", `/agents/${encodeURIComponent(id)}`, undefined, signal);
   }
-  getMemory(scope: MemoryScope, id?: string): Promise<AgentMemory> {
-    return this.request("GET", memoryEndpoint(scope, id));
+  getMemory(scope: MemoryScope, id?: string, signal?: AbortSignal): Promise<AgentMemory> {
+    return this.request("GET", memoryEndpoint(scope, id), undefined, signal);
   }
   /** A save always uses the document version, including changes to individual details. */
   updateMemory(scope: MemoryScope, id: string | undefined, content: string, version: string): Promise<AgentMemory> {
     return this.request("PUT", memoryEndpoint(scope, id), { content, version });
   }
-  getMemoryDetail(scope: MemoryScope, id: string | undefined, slug: string): Promise<MemoryDetail> {
-    return this.request("GET", `${memoryEndpoint(scope, id)}/details/${encodeURIComponent(slug)}`);
+  getMemoryDetail(scope: MemoryScope, id: string | undefined, slug: string, signal?: AbortSignal): Promise<MemoryDetail> {
+    return this.request("GET", `${memoryEndpoint(scope, id)}/details/${encodeURIComponent(slug)}`, undefined, signal);
   }
   updateMemoryDetail(scope: MemoryScope, id: string | undefined, slug: string, content: string, version: string, indexContent?: string): Promise<AgentMemory> {
     return this.request("PUT", `${memoryEndpoint(scope, id)}/details/${encodeURIComponent(slug)}`,
@@ -799,16 +867,37 @@ export class GatewayApi {
   }
 
 
-  getFile(id: string): Promise<FileDetail> {
-    return this.request("GET", `/files/${encodeURIComponent(id)}`);
+  getFile(id: string, signal?: AbortSignal): Promise<FileDetail> {
+    return this.request("GET", `/files/${encodeURIComponent(id)}`, undefined, signal);
   }
   getFilePreview(id: string): Promise<FilePreview> {
     const key = encodeURIComponent(id);
     const cached = this.filePreviewCache.get(key);
-    if (cached) return cached;
-    const request = this.request("GET", `/files/${key}/preview`) as Promise<FilePreview>;
-    this.filePreviewCache.set(key, request);
-    return request;
+    if (cached) return cached.promise;
+    const promise = this.request("GET", `/files/${key}/preview`) as Promise<FilePreview>;
+    const entry = { promise, snapshot: EMPTY_FILE_PREVIEW, listeners: new Set<() => void>() };
+    this.filePreviewCache.set(key, entry);
+    void promise.then(preview => {
+      if (this.signal.aborted) return;
+      entry.snapshot = { preview, failed: false };
+      entry.listeners.forEach(listener => listener());
+    }, () => {
+      if (this.signal.aborted) return;
+      entry.snapshot = { preview: null, failed: true };
+      entry.listeners.forEach(listener => listener());
+    });
+    return promise;
+  }
+
+  filePreviewSnapshot(id: string): { preview: FilePreview | null; failed: boolean } {
+    return this.filePreviewCache.get(encodeURIComponent(id))?.snapshot ?? EMPTY_FILE_PREVIEW;
+  }
+
+  subscribeFilePreview(id: string, listener: () => void): () => void {
+    void this.getFilePreview(id).catch(() => {});
+    const entry = this.filePreviewCache.get(encodeURIComponent(id))!;
+    entry.listeners.add(listener);
+    return () => { entry.listeners.delete(listener); };
   }
 
   fileThumbnailPath(id: string, width: FileThumbnailWidth): string {
@@ -883,14 +972,14 @@ export class GatewayApi {
     return this.request("GET", this.mediaPath(conversationId, seq, block, element, index));
   }
 
-  search(q: string, agentId?: string, limit = 30, offset = 0): Promise<{ results: SearchResult[]; total: number; as_of_seq: number }> {
+  search(q: string, agentId?: string, limit = 30, offset = 0, signal?: AbortSignal): Promise<{ results: SearchResult[]; total: number; as_of_seq: number }> {
     const params = new URLSearchParams({ q, limit: String(limit), offset: String(offset) });
     if (agentId !== undefined) params.set("agent_id", agentId);
-    return this.request("GET", `/search?${params}`);
+    return this.request("GET", `/search?${params}`, undefined, signal);
   }
 
-  computer(): Promise<ComputerStatus> {
-    return this.request("GET", "/computer");
+  computer(signal?: AbortSignal): Promise<ComputerStatus> {
+    return this.request("GET", "/computer", undefined, signal);
   }
   connection(signal?: AbortSignal): Promise<ConnectionInfo> {
     return pairingDeadline(signal, (requestSignal) => this.request("GET", "/connection", undefined, requestSignal));
@@ -902,8 +991,8 @@ export class GatewayApi {
     const query = entryAgentId === undefined ? "" : `?${new URLSearchParams({ entry_agent_id: entryAgentId })}`;
     return this.request("GET", `/browser-tasks${query}`, undefined, undefined, true);
   }
-  browserTask(id: string): Promise<BrowserTask> {
-    return this.request("GET", `/browser-tasks/${encodeURIComponent(id)}`);
+  browserTask(id: string, signal?: AbortSignal): Promise<BrowserTask> {
+    return this.request("GET", `/browser-tasks/${encodeURIComponent(id)}`, undefined, signal);
   }
   takeoverBrowser(id: string, clientId: string): Promise<{ browser_task: BrowserTask; replayed: boolean }> {
     return this.request("POST", `/browser-tasks/${encodeURIComponent(id)}/takeover`, { client_id: clientId });
@@ -954,7 +1043,7 @@ export class GatewayApi {
 
   /** Task input is text-only. unavailable/stopped are explicit 409 refusals, not retryable transport errors. */
   sendTaskMessage(id: string, clientId: string, text: string): Promise<{ event: GatewayEvent; replayed: boolean }> {
-    return this.request("POST", `/tasks/${encodeURIComponent(id)}/messages`, { client_id: clientId, text });
+    return this.request("POST", `/tasks/${encodeURIComponent(id)}/messages`, { client_id: clientId, text }, undefined, false, 15_000);
   }
 
   stopTask(id: string, clientId: string): Promise<{ event: GatewayEvent; replayed: boolean }> {
@@ -965,9 +1054,9 @@ export class GatewayApi {
     return this.request("POST", `/tasks/${encodeURIComponent(id)}/read`, { seq });
   }
 
-  /** 入口 Agent 必须给出，且必须是已存在的 Agent。 */
-  createConversation(agentId: string, title?: string): Promise<Conversation> {
-    return this.request("POST", "/conversations", title ? { agent_id: agentId, title } : { agent_id: agentId });
+  /** Same clientId + parameters safely retry one creation; the gateway retains its first receipt. */
+  createConversation(agentId: string, title: string | undefined, clientId: string): Promise<Conversation> {
+    return this.request("POST", "/conversations", { agent_id: agentId, client_id: clientId, ...(title ? { title } : {}) }, undefined, false, 15_000);
   }
   /** 同一标题返回 event=null；不带 client_id，重试按资源当前标题自然幂等。 */
   renameConversation(id: string, title: string): Promise<{ conversation: Conversation; event: GatewayEvent | null }> {
@@ -988,14 +1077,19 @@ export class GatewayApi {
 
   /** 同一 client_id 的重试返回第一次的事件（replayed=true），网关不会再执行一次。 */
   sendMessage(id: string, clientId: string, text: string, attachments: string[] = []): Promise<{ event: GatewayEvent; replayed: boolean }> {
-    return this.request("POST", `/conversations/${id}/messages`, { client_id: clientId, text, attachments });
+    return this.request("POST", `/conversations/${id}/messages`, { client_id: clientId, text, attachments }, undefined, false, 15_000);
   }
 
   /** The gateway returns the persisted user message; callers merge it like an ordinary send response. */
-  submitUi(id: string, clientId: string, messageSeq: number, block: number, values: Record<string, unknown>): Promise<{ event: GatewayEvent; replayed: boolean }> {
+  submitUi(id: string, clientId: string, messageSeq: number, block: number, values: Record<string, unknown>, actionId?: string): Promise<{ event: GatewayEvent; replayed: boolean }> {
     return this.request("POST", `/conversations/${encodeURIComponent(id)}/ui-submissions`, {
-      client_id: clientId, message_seq: messageSeq, block, values,
+      client_id: clientId, message_seq: messageSeq, block, values, ...(actionId ? { action_id: actionId } : {}),
     });
+  }
+
+  /** Read only: absence permits retrying the same operation, never selecting a different action. */
+  uiSubmissionResult(id: string, messageSeq: number, block: number): Promise<{ event: GatewayEvent | null }> {
+    return this.request("GET", `/conversations/${encodeURIComponent(id)}/ui-submissions?message_seq=${messageSeq}&block=${block}`);
   }
 
   stop(id: string, clientId: string): Promise<{ event: GatewayEvent; replayed: boolean }> {
@@ -1006,7 +1100,7 @@ export class GatewayApi {
     return this.request("POST", `/conversations/${id}/read`, { seq });
   }
 
-  private async request(method: string, path: string, body?: unknown, signal?: AbortSignal, snapshot = false): Promise<any> {
+  private async request(method: string, path: string, body?: unknown, signal?: AbortSignal, snapshot = false, deadline?: number): Promise<any> {
     const read = snapshot ? this.reads.signal : undefined;
     const commandGeneration = ["POST", "PATCH", "PUT", "DELETE"].includes(method) ? this.resetGeneration : undefined;
     return this.withAbort(signal, async (requestSignal) => {
@@ -1022,7 +1116,7 @@ export class GatewayApi {
         if (commandGeneration !== undefined && commandGeneration !== this.resetGeneration) {
           throw new GatewayError(0, "timeout", "操作结果未确认。请重新加载核对结果。", undefined, { cause: error });
         }
-        throw new GatewayError(0, "network", "连不上电脑，请检查网络和网关连接", undefined, { cause: error });
+        throw new GatewayError(0, "network", "连不上服务器，请检查网络和网关连接", undefined, { cause: error });
       }
       if (response.status === 204) return undefined;
       // A successful status may already have committed a command; unreadable JSON is not an HTTP rejection.
@@ -1032,6 +1126,6 @@ export class GatewayApi {
       });
       if (!response.ok) throw responseError(response, payload);
       return payload;
-    }, method === "GET" ? GatewayApi.readDeadlineMs : undefined, read, method === "GET" ? "读取超时，请重试" : undefined);
+    }, method === "GET" ? GatewayApi.readDeadlineMs : deadline, read, method === "GET" ? "读取超时，请重试" : undefined);
   }
 }

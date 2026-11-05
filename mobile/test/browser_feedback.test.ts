@@ -31,7 +31,9 @@ test("quality changes keep CSS input mapping; actual viewport change rejects old
     frame_age_ms: null, credit_wait_ms: 0, send_lock_ms: null,
     ack_baseline_ms: null, ack_smoothed_ms: null, queue_delay_ms: null };
   const pages: Pages = { t: "pages", current: "page", pages: [{ id: "page", title: "page", url: "about:blank" }],
-    state: "human", max_pages: 3, epoch: 2, vp: 3, css: [1000, 500], dpr: 1 };
+    state: "human", environment_id: "local", environment_name: "Local",
+    capacity: { pages_used: 1, pages_registered: 1, pages_creating: 0, pages_pending_cleanup: 0, pages_limit: 3 },
+    capacity_rejection: null, epoch: 2, vp: 3, css: [1000, 500], dpr: 1 };
   const low: Frame = { ...frame, seq: 2, quality_tier: "low", quality_reason: "queue-delay" };
   const restored: Frame = { ...frame, seq: 3, quality_reason: "idle-refresh" };
   const contact = { x: 320, y: 180 };

@@ -31,6 +31,7 @@ from starlette.routing import Route, WebSocketRoute
 from wandrun.config import AGENT_ID_MAX
 from wandrun.gateway.browser_stream import browser_stream
 from wandrun.gateway.connectors import ConnectorConflict, InvalidConnector, UnknownConnector
+from wandrun.gateway.environments import EnvironmentCatalogUnavailable
 from wandrun.gateway.pairing import DeviceAuth
 from wandrun.integrations.mcp_oauth import OAuthIssue
 from wandrun.gateway.attachment_previews import AttachmentPreviewService, PreviewUnavailable, THUMBNAIL_WIDTHS
@@ -43,7 +44,9 @@ from wandrun.gateway.service import (
 )
 from wandrun.gateway.skills import InvalidSkill, SkillBoundaryError
 from wandrun.gateway.uploads import UploadError
-from wandrun.gateway.store import ClientIdConflict, InvalidReadPosition, UnknownAgent
+from wandrun.gateway.store import (
+    AgentNameConflict, AgentOrderConflict, ClientIdConflict, InvalidAgentOrder, InvalidReadPosition, UnknownAgent,
+)
 from wandrun.gateway.subscription import SubscriptionUnavailable
 from wandrun.runtime.context.memory import InvalidMemory, MemoryConflict, MemoryRetired
 from wandrun.runtime.browser.leases import BrowserRejected, UnknownBrowserTask
@@ -76,9 +79,11 @@ def _browser_rejection(message: str) -> str:
         return "浏览器控制权交接尚未确认，请稍后重试接管。"
     if message.startswith(("Chrome 尚未恢复：", "浏览器分配失败：")):
         return "浏览器暂时不可用，请稍后重试；若持续失败，请查看网关日志。"
+    if message.startswith("环境 ") and "浏览器页面总数已达上限" in message:
+        return "本环境页面总数已达上限，请先关闭页面。"
     if message in {
         "浏览器管理器已关闭", "任务浏览器仍在关闭", "任务没有可用的浏览器",
-        "浏览器正在关闭或已结束，无法新建页面", "浏览器页面数已达上限",
+        "浏览器正在关闭或已结束，无法新建页面",
         "浏览器租约正在关闭", "该浏览器租约不可接管", "接管期间租约已关闭",
         "浏览器未处于接管状态", "任务尚未使用浏览器", "当前控制状态不能请求接管",
         "浏览器未处于当前接管代际", "页面不可关闭或不属于本租约",
@@ -242,6 +247,8 @@ def create_app(
                 return _error(error.status, error.code, str(error))
             except SubscriptionUnavailable as error:
                 return _error(503, error.code, str(error))
+            except EnvironmentCatalogUnavailable as error:
+                return _error(503, "environment_catalog_unavailable", str(error))
             except MemoryConflict as error:
                 try:
                     current = gateway._memory_response(request.path_params.get("id"), error.current)
@@ -278,11 +285,19 @@ def create_app(
                 return _error(404, "not_found", "定时不存在")
             except UnknownSkill:
                 return _error(404, "not_found", "技能不存在")
+            except InvalidAgentOrder as error:
+                return _error(400, "invalid_request", str(error))
+            except AgentOrderConflict as error:
+                return _error(409, "agent_order_conflict", str(error))
+            except AgentNameConflict as error:
+                return _error(409, "agent_name_conflict", str(error))
             except ClientIdConflict:
                 return _error(409, "client_id_reused", "请求标识已用于其他操作，请检查此前操作的结果")
             except (InvalidAgent, InvalidConnector, InvalidSchedule, InvalidSkill) as error:
                 return _error(400, "invalid_request", str(error))
-            except (AgentConflict, ConnectorConflict, SkillConflict) as error:
+            except ConnectorConflict as error:
+                return _error(error.status, error.code, str(error), error.details)
+            except (AgentConflict, SkillConflict) as error:
                 return _error(409, "rejected", str(error), error.details)
             except SkillBoundaryError as error:
                 return _error(409, "rejected", str(error))
@@ -311,7 +326,7 @@ def create_app(
                     and getattr(gateway.runtime, "memory", None) is None
                 ) or (
                     request.url.path.startswith("/browser-tasks/")
-                    and getattr(gateway.runtime, "browser", None) is None
+                    and not getattr(gateway.runtime, "browsers", None)
                 ) or (
                     request.method == "DELETE" and gateway.checkpointer is None
                 ):
@@ -509,10 +524,12 @@ def create_app(
 
     async def create_conversation(request):
         body = await _json(request)
-        title = _string(body, "title", 200, required=False) or "新对话"
+        client_id = _string(body, "client_id", MAX_CLIENT_ID)
+        title = (_string(body, "title", 200, required=False) or "新对话").strip()
         # 必须显式给出入口 Agent：没有“默认 Agent”可回落，所有 Agent 平等（ADR-0021）。
         agent_id = _string(body, "agent_id", AGENT_ID_MAX)
-        return JSONResponse(gateway.create_conversation(title, agent_id), status_code=201)
+        conversation, created = gateway.create_conversation(title, agent_id, client_id)
+        return JSONResponse(conversation, status_code=201 if created else 200)
 
     async def manage_conversation(request):
         identity = request.path_params["id"]
@@ -607,10 +624,15 @@ def create_app(
         return JSONResponse({"connector": await gateway.connect_app(request.path_params["id"], client_id)})
 
     async def oauth_start(request):
-        return JSONResponse(await gateway.start_oauth(request.path_params["id"]),
+        body = await _json(request) if await request.body() else {}
+        if body.keys() - {"return_url"}:
+            raise HttpError(400, "invalid_request", "只接受 return_url")
+        return JSONResponse(await gateway.start_oauth(request.path_params["id"], body.get("return_url")),
                             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
     async def oauth_callback_manual(request):
+        if not gateway.oauth.manual_callback:
+            raise HttpError(400, "manual_callback_disabled", "公开部署请通过浏览器完成授权回调")
         body = await _json(request)
         if body.keys() != {"url"}:
             raise HttpError(400, "invalid_request", "只接受 url")
@@ -621,14 +643,24 @@ def create_app(
     async def oauth_callback_public(request):
         # Build exclusively from configured redirect + raw query: Host and proxy
         # headers are untrusted. No URL, code, state or issuer enters logs or HTML.
+        target = None
         try:
             query = request.scope.get("query_string", b"")
             if len(query) > 8192:
                 raise OAuthIssue("invalid_callback", "回调地址无效", 400)
-            await gateway.callback_oauth(gateway.oauth.redirect + "?" + query.decode("ascii"))
+            url = gateway.oauth.redirect + "?" + query.decode("ascii")
+            target = gateway.oauth.callback_target(url)
+            await gateway.callback_oauth(url)
             success = True
         except (OAuthIssue, UnicodeDecodeError):
             success = False
+        if target:
+            identity, return_url = target
+            return Response(status_code=303, headers={
+                "Location": return_url + "?connector=" + identity + "&result=" + ("ok" if success else "error"),
+                "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            })
         return Response(
             "<!doctype html><html><head><meta name=\"referrer\" content=\"no-referrer\"></head>"
             "<body>授权已处理，请回到 Wandrun。</body></html>" if success else
@@ -645,6 +677,24 @@ def create_app(
     async def oauth_revoke(request):
         connector, remote_revoked = await gateway.revoke_oauth(request.path_params["id"])
         return JSONResponse({"connector": connector, "remote_revoked": remote_revoked})
+
+    async def probe_connector(request):
+        return JSONResponse(await gateway.probe_connector(await _json(request)))
+
+    async def connector_agents(request):
+        connector = gateway.get_connector(request.path_params["id"])
+        return JSONResponse({"agents": connector["used_by"], "as_of_seq": gateway.store.last_seq()})
+
+    async def connector_tools(request):
+        return JSONResponse(gateway.get_connector_tools(request.path_params["id"]))
+
+    async def connector_key(request):
+        connector, event = await gateway.clear_connector_key(request.path_params["id"])
+        return JSONResponse({"connector": connector, "event": event.to_dict() if event else None})
+
+    async def connector_creation_result(request):
+        client_id = _string(dict(request.query_params), "client_id", MAX_CLIENT_ID)
+        return JSONResponse(gateway.connector_creation_result(client_id))
 
     async def connectors(request):
         if request.method in ("GET", "HEAD"):
@@ -774,16 +824,25 @@ def create_app(
             return JSONResponse({"event": event.to_dict() if event is not None else None})
         return JSONResponse(gateway.get_skill(name))
 
+    async def execution_environments(request):
+        cursor = request.query_params.get("cursor")
+        if cursor is not None and (not cursor or len(cursor) > 4096):
+            raise HttpError(400, "invalid_request", "机器列表分页标识无效")
+        return JSONResponse(await gateway.list_execution_environments(cursor))
+
     async def list_agents(request):
         # 与对话列表同样先取编号：Agent 定义变化将来也走事件流，App 用它开流不漏不重。
         as_of = gateway.store.last_seq()
-        return JSONResponse({"agents": gateway.store.agents(), "as_of_seq": as_of})
+        return JSONResponse({
+            "agents": gateway.store.agents(), "as_of_seq": as_of,
+            "order_revision": gateway.store.agent_order_revision(),
+        })
 
-    async def hide_agent(request):
-        return JSONResponse(gateway.set_agent_on_home(request.path_params["id"], False))
-
-    async def unhide_agent(request):
-        return JSONResponse(gateway.set_agent_on_home(request.path_params["id"], True))
+    async def reorder_agents(request):
+        body = await _json(request)
+        return JSONResponse(await gateway.reorder_agents(
+            body.get("agent_ids"), body.get("expected_revision"),
+        ))
 
     async def get_agent(request):
         agent = gateway.store.agent(request.path_params["id"])
@@ -864,14 +923,30 @@ def create_app(
         body = await _json(request)
         client_id = _string(body, "client_id", MAX_CLIENT_ID)
         message_seq, block = body.get("message_seq"), body.get("block")
+        if set(body) - {"client_id", "message_seq", "block", "values", "action_id"}:
+            raise HttpError(400, "invalid_request", "界面提交不接受文本或其他未声明字段")
+        action_id = body.get("action_id")
+        if "action_id" in body and (not isinstance(action_id, str) or not action_id or len(action_id) > 70):
+            raise HttpError(400, "invalid_request", "发送动作标识无效")
         if (type(message_seq) is not int or not 0 < message_seq <= SQLITE_MAX_INT
                 or type(block) is not int or not 0 <= block <= SQLITE_MAX_INT):
             raise HttpError(400, "invalid_request", "消息位置必须为正整数，界面块编号必须为非负整数")
         values = body.get("values")
         if not isinstance(values, dict):
             raise UIInvalidValues({"$": "界面输入值必须是对象"})
-        event, created = gateway.submit_ui(request.path_params["id"], client_id, message_seq, block, values)
+        event, created = gateway.submit_ui(request.path_params["id"], client_id, message_seq, block, values, action_id=action_id)
         return JSONResponse({"event": event.to_dict(), "replayed": not created})
+
+    async def ui_submission_result(request):
+        try:
+            message_seq = int(request.query_params["message_seq"])
+            block = int(request.query_params["block"])
+        except (KeyError, ValueError):
+            raise HttpError(400, "invalid_request", "消息位置和界面块编号无效") from None
+        if not 0 < message_seq <= SQLITE_MAX_INT or not 0 <= block <= SQLITE_MAX_INT:
+            raise HttpError(400, "invalid_request", "消息位置和界面块编号无效")
+        event = gateway.ui_submission_result(request.path_params["id"], message_seq, block)
+        return JSONResponse({"event": event.to_dict() if event is not None else None})
 
     async def stop(request):
         body = await _json(request)
@@ -1022,9 +1097,16 @@ def create_app(
         Route("/connectors/{id}/oauth/pending", handled(oauth_pending), methods=["DELETE"]),
         Route("/connectors/{id}/oauth", handled(oauth_revoke), methods=["DELETE"]),
         Route("/connectors", handled(connectors), methods=["GET", "POST"]),
+        Route("/connectors/probe", handled(probe_connector), methods=["POST"]),
+        Route("/connectors/creation-result", handled(connector_creation_result), methods=["GET"]),
         Route("/connectors/{id}", handled(manage_connector), methods=["GET", "PATCH", "DELETE"]),
         Route("/connectors/{id}/test", handled(test_connector), methods=["POST"]),
+        Route("/connectors/{id}/agents", handled(connector_agents), methods=["GET"]),
+        Route("/connectors/{id}/tools", handled(connector_tools), methods=["GET"]),
+        Route("/connectors/{id}/key", handled(connector_key), methods=["DELETE"]),
+        Route("/execution-environments", handled(execution_environments), methods=["GET"]),
         Route("/agents", handled(agents), methods=["GET", "POST"]),
+        Route("/agents/order", handled(reorder_agents), methods=["PUT"]),
         Route("/agents/{id}", handled(manage_agent), methods=["GET", "PATCH", "DELETE"]),
         Route("/agents/{id}/capabilities", handled(agent_capabilities), methods=["GET"]),
         Route("/agents/{id}/conversations", handled(agent_conversations), methods=["GET"]),
@@ -1049,8 +1131,6 @@ def create_app(
         Route("/builtin-skills/{name}", handled(builtin_skill_detail), methods=["GET"]),
         Route("/skills", handled(list_skills), methods=["GET"]),
         Route("/skills/{name}", handled(manage_skill), methods=["GET", "DELETE"]),
-        Route("/agents/{id}/hide", handled(hide_agent), methods=["POST"]),
-        Route("/agents/{id}/unhide", handled(unhide_agent), methods=["POST"]),
         Route("/conversations", handled(conversations), methods=["GET", "POST"]),
         Route("/conversations/{id}", handled(manage_conversation), methods=["PATCH", "DELETE"]),
         Route("/conversations/{id}/events", handled(history), methods=["GET"]),
@@ -1058,6 +1138,7 @@ def create_app(
         Route("/conversations/{id}/messages/{seq}/media/{block}/{element}/{index}", handled(message_media), methods=["GET"]),
         Route("/conversations/{id}/messages/{seq}/media/{block}/{element}/{index}/content", handled(message_media), methods=["GET"]),
         Route("/conversations/{id}/ui-submissions", handled(submit_ui), methods=["POST"]),
+        Route("/conversations/{id}/ui-submissions", handled(ui_submission_result), methods=["GET"]),
         Route("/conversations/{id}/stop", handled(stop), methods=["POST"]),
         Route("/conversations/{id}/read", handled(mark_read), methods=["POST"]),
         Route("/events", handled(events), methods=["GET"]),

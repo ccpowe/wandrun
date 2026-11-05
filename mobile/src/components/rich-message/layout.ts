@@ -1,4 +1,26 @@
 import { richSpace } from './tokens.ts';
+import type { RichChildWidth } from './spec.ts';
+
+/** Fractions share the row's gutters: two halves or one/two thirds sum to one complete row. */
+export function fractionWidth(available: number, gap: number, width: Exclude<RichChildWidth, 'auto'>): number {
+  const fraction = width === '1/2' ? 1 / 2 : width === '1/3' ? 1 / 3 : 2 / 3;
+  return Math.max(0, (available + gap) * fraction - gap);
+}
+
+/** Grid readability wins over a model's fraction; auto follows the responsive default column. */
+export function gridChildWidth(available: number, columns: number, minimum: number, fontScale: number, width?: RichChildWidth): number {
+  const standard = readableColumns(available, columns, minimum, fontScale).width;
+  return width && width !== 'auto'
+    ? Math.min(available, Math.max(Math.min(available, minimum * fontScale), fractionWidth(available, richSpace.sm, width)))
+    : standard;
+}
+
+/** Reserve the next card's glimpse plus its preceding gutter; gap=lg must not consume the entire hint. */
+export function scrollChildWidth(available: number, gap: number, width?: RichChildWidth): number {
+  return width && width !== 'auto'
+    ? fractionWidth(Math.max(0, available - richSpace.lg - gap), gap, width)
+    : available * 0.8;
+}
 
 /** Requested columns are a ceiling; measured content width and text scale own readability. */
 export function readableColumns(available: number, requested: number, minimum: number, fontScale = 1) {

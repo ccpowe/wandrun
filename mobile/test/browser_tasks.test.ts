@@ -9,7 +9,9 @@ function lease(id: string, over: Partial<BrowserTask> = {}): BrowserTask {
     id, task_id: `task-${id}`, root_id: `root-${id}`, agent_id: "delegate", entry_agent_id: "team",
     conversation_title: "本周新闻", entry_agent_name: "自媒体团队", state: "agent", epoch: 1,
     pages: [{ id: `${id}-one`, title: "登录 X", url: "https://x.com/login" }], current: `${id}-one`,
-    max_pages: 4, reason: null, requested_reason: null, ...over,
+    environment_id: "local", environment_name: "Local",
+    capacity: { pages_used: over.pages?.length ?? 1, pages_registered: over.pages?.length ?? 1, pages_creating: 0, pages_pending_cleanup: 0, pages_limit: 4 },
+    capacity_rejection: null, reason: null, requested_reason: null, ...over,
   };
 }
 

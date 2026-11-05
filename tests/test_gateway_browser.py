@@ -9,16 +9,18 @@ import tempfile
 import time
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import httpx
 
 from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.gateway.http import create_app
 from wandrun.gateway.service import Gateway, GatewayFailure
-from wandrun.gateway.store import ClientIdConflict, GatewayStore, SCHEMA_VERSION
+from wandrun.gateway.store import ClientIdConflict, GatewayStore
 from wandrun.runtime.browser.leases import BrowserRejected, UnknownBrowserTask
 from wandrun.runtime.communication.workers import WorkerManager
 
@@ -28,7 +30,10 @@ def snapshot(root, *, identity="lease-a", state="agent", agent_id="worker"):
         "id": identity, "task_id": "task-" + identity, "root_id": root,
         "agent_id": agent_id, "entry_agent_id": "entry", "state": state,
         "epoch": 1, "pages": [{"id": "page-a", "title": "测试", "url": "https://example.test/"}],
-        "current": "page-a", "max_pages": 3, "reason": None, "requested_reason": None,
+        "current": "page-a", "reason": None, "requested_reason": None,
+        "environment_id": "local", "environment_name": "Local", "capacity_rejection": None,
+        "capacity": {"pages_used": 1, "pages_registered": 1, "pages_creating": 0,
+                     "pages_pending_cleanup": 0, "pages_limit": 6},
     }
 
 
@@ -37,6 +42,8 @@ class FakeBrowser:
 
     def __init__(self, lease):
         self.lease = lease
+        self.environment_id = lease["environment_id"]
+        self.environment_name = lease["environment_name"]
         self.on_event = None
         self.takeovers = 0
         self.page_calls = []
@@ -48,10 +55,17 @@ class FakeBrowser:
         return [dict(self.lease)]
     def capacity(self):
         active = self.lease["state"] != "released"
-        return {"pages_used": len(self.lease["pages"]) if active else 0,
-                "pages_limit": 6, "slots_used": int(active), "slots_limit": 2}
+        count = len(self.lease["pages"]) if active else 0
+        return {"pages_used": count, "pages_registered": count, "pages_creating": 0,
+                "pages_pending_cleanup": 0, "pages_limit": 6}
+
+    def detail(self, identity):
+        if identity != self.lease["id"]:
+            raise UnknownBrowserTask(identity)
+        return {**self.lease, "capacity": self.capacity()}
 
     def _changed(self):
+        self.lease["capacity"] = self.capacity()
         self.on_event("browser_task.updated", dict(self.lease))
         return dict(self.lease)
 
@@ -111,7 +125,7 @@ class GatewayBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.store = GatewayStore(self.path)
         self.addCleanup(self.store.close)
         agent = AgentDefinition("测试角色说明", "做事", "offline", environment="local", name="测试")
-        self.store.import_agents(AgentCatalog("entry", {"entry": agent, "worker": agent}))
+        self.store.import_agents(AgentCatalog("entry", {"entry": agent, "worker": replace(agent, name="工作角色")}))
         self.gateway = Gateway(self.store)
 
         async def run(prompts, task_id):
@@ -120,10 +134,14 @@ class GatewayBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.manager = WorkerManager(run, on_task=self.gateway.on_task,
                                      default_agent="entry", notify_human_of_roots=False)
         self.addAsyncCleanup(self.manager.close)
-        self.root = self.gateway.create_conversation("对话", "entry")["id"]
+        self.root = self.gateway.create_conversation("对话", "entry", client_id=uuid4().hex)[0]["id"]
         self.lease = snapshot(self.root)
         self.browser = FakeBrowser(self.lease)
-        self.runtime = SimpleNamespace(browser=self.browser, files=None, mcp=None, memory=None)
+        from wandrun.runtime.session import Runtime
+        self.runtime = SimpleNamespace(
+            browsers={"local": self.browser}, files=None, mcp=None, memory=None,
+        )
+        self.runtime.browser_for_lease = lambda identity: Runtime.browser_for_lease(self.runtime, identity)
         self.gateway.attach(self.manager, Checkpointer(), runtime=self.runtime)
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=create_app(self.gateway, "secret")),
@@ -148,8 +166,8 @@ class GatewayBrowserTests(unittest.IsolatedAsyncioTestCase):
         listed = (await self.client.get("/browser-tasks?entry_agent_id=entry")).json()
         task, = listed["browser_tasks"]
         self.assertEqual((task["agent_id"], task["entry_agent_id"]), ("worker", "entry"))
-        self.assertEqual((task["conversation_title"], task["entry_agent_name"], task["max_pages"]),
-                         ("对话", "测试", 3))
+        self.assertEqual((task["conversation_title"], task["entry_agent_name"], task["capacity"]["pages_limit"]),
+                         ("对话", "测试", 6))
         self.assertEqual((task["pages"][0]["title"], task["pages"][0]["url"]),
                          ("测试", "https://example.test/"))
         self.assertEqual(listed["as_of_seq"], self.store.last_seq())
@@ -170,35 +188,15 @@ class GatewayBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.gateway.rename_conversation(self.root, "新对话")
         self.assertEqual((await self.client.get("/browser-tasks/lease-a")).json()["conversation_title"], "新对话")
 
-    async def test_requested_transition_restores_entry_home_without_title_activity(self):
-        self.store.hide_agent("entry")
-        self.store.hide_agent("worker")
+    async def test_requested_transition_is_not_ordering_activity(self):
+        before = self.store.agent_item("entry")["latest_conversation"]["last_activity_seq"]
         self.browser.lease["state"] = "requested"
         self.browser._changed()
-        requested_seq = self.store.last_seq()
-        entry = self.store.agent_item("entry")
-        self.assertTrue(entry["home"])
-        self.assertFalse(self.store.agent_item("worker")["home"])
-        self.assertEqual(entry["latest_conversation"]["last_activity_seq"], requested_seq)
-        self.assertTrue(self.store.after(requested_seq - 1)[0].data["entered_requested"])
-
-        self.store.hide_agent("entry")
-        self.browser.lease["pages"][0].update(title="另一个标题", url="https://example.test/next")
-        self.browser._changed()
-        entry = self.store.agent_item("entry")
-        self.assertFalse(entry["home"])
-        self.assertEqual(entry["latest_conversation"]["last_activity_seq"], requested_seq)
-        self.assertFalse(self.store.after(self.store.last_seq() - 1)[0].data["entered_requested"])
+        requested = self.store.after(self.store.last_seq() - 1)[0]
+        self.assertEqual(requested.type, "browser_task.updated")
+        self.assertNotIn("entered_requested", requested.data)
+        self.assertEqual(self.store.agent_item("entry")["latest_conversation"]["last_activity_seq"], before)
         self.assertNotIn("entered_requested", self.store.browser_task(self.lease["id"]))
-
-        self.browser.lease["state"] = "human"
-        self.browser._changed()
-        self.assertFalse(self.store.agent_item("entry")["home"])
-        self.browser.lease["state"] = "requested"
-        self.browser._changed()
-        self.assertTrue(self.store.agent_item("entry")["home"])
-        self.assertEqual(self.store.agent_item("entry")["latest_conversation"]["last_activity_seq"],
-                         self.store.last_seq())
 
     async def test_computer_auth_live_capacity_and_host_usage(self):
         unauthorized = await self.client.get("/computer", headers={"Authorization": "wrong"})
@@ -212,15 +210,17 @@ class GatewayBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(second["uptime_seconds"], first["uptime_seconds"])
         self.assertEqual(first["cpu_percent"], None)
         self.assertTrue(second["cpu_percent"] is None or 0 <= second["cpu_percent"] <= 100)
-        self.assertEqual(first["browser"], {
-            "pages_used": 1, "pages_limit": 6, "slots_used": 1, "slots_limit": 2,
-        })
+        self.assertEqual(first["environments"], [{
+            "environment_id": "local", "environment_name": "Local",
+            "capacity": {"pages_used": 1, "pages_registered": 1, "pages_creating": 0,
+                         "pages_pending_cleanup": 0, "pages_limit": 6},
+        }])
         mem = first["memory"]
         self.assertGreater(mem["total_bytes"], mem["used_bytes"])
         self.assertGreaterEqual(mem["used_bytes"], 0)
         self.assertAlmostEqual(mem["percent"], mem["used_bytes"] * 100 / mem["total_bytes"])
         await self.client.delete("/browser-tasks/lease-a/pages/page-a")
-        self.assertEqual((await self.client.get("/computer")).json()["browser"]["slots_used"], 0)
+        self.assertEqual((await self.client.get("/computer")).json()["environments"][0]["capacity"]["pages_used"], 0)
 
     async def test_computer_cpu_excludes_guest_time_already_in_user_counter(self):
         samples = iter(("cpu 100 0 0 100 0 0 0 0 50 0\n",
@@ -494,8 +494,27 @@ class GatewayBrowserTests(unittest.IsolatedAsyncioTestCase):
                 self.browser._changed()
         self.assertEqual((await self.client.get("/browser-tasks")).status_code, 503)
 
-    async def test_schema_13_and_restart_invalidates_only_active(self):
-        self.assertEqual(self.store._connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+    async def test_environment_routes_control_and_close_by_lease_with_independent_capacity(self):
+        other_snapshot = snapshot(self.root, identity="lease-b")
+        other_snapshot.update(environment_id="other", environment_name="Other environment")
+        other = FakeBrowser(other_snapshot)
+        other.on_event = self.gateway.on_browser_event
+        self.runtime.browsers.update(alias=self.browser, other=other)
+        other._changed()
+        response = await self.client.post("/browser-tasks/lease-b/takeover", json={"client_id": "other-control"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual((self.browser.lease["state"], other.lease["state"]), ("agent", "human"))
+        self.assertEqual(response.json()["browser_task"]["environment_id"], "other")
+        await self.client.delete("/browser-tasks/lease-a")
+        self.assertEqual((self.browser.lease["state"], other.lease["state"]), ("released", "human"))
+        environments = (await self.client.get("/computer")).json()["environments"]
+        self.assertEqual({item["environment_id"]: item["capacity"]["pages_used"] for item in environments},
+                         {"local": 0, "other": 1})
+        listed = (await self.client.get("/browser-tasks")).json()["browser_tasks"]
+        self.assertEqual({item["id"]: item["environment_name"] for item in listed},
+                         {"lease-a": "Local", "lease-b": "Other environment"})
+
+    async def test_restart_invalidates_only_active_browser_tasks(self):
         released = snapshot(self.root, identity="already-ended", state="released")
         released.update(reason="用户关闭", pages=[], current=None)
         self.store.record_browser_task(released)

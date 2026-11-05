@@ -13,7 +13,7 @@ let sequence = 0;
  * Callers release completed files on unmount or refresh.
  */
 export async function loadLocalImage(api: GatewayApi, path: string, signal: AbortSignal): Promise<LocalImageLease> {
-  if (!api.config.computerId) throw new Error('图片需要有效的电脑连接');
+  if (!api.config.computerId) throw new Error("图片需要有效的服务器连接");
   assertNotAborted(signal);
   assertNotAborted(api.signal);
   if (Platform.OS === 'web') {

@@ -2,7 +2,7 @@ import type { Token } from "markdown-it";
 
 import { splitAgentMessage } from "./agent-message.ts";
 import { parseMessageMarkdown } from "./agent-message-markdown.ts";
-import type { Item } from "./chat-timeline.ts";
+import type { ChatRow } from "./chat-timeline.ts";
 import { buildFileTree, type FileTreeNode } from "../components/rich-message/file-tree-model.ts";
 import { parseRichSpec, type RichSpec } from "../components/rich-message/spec.ts";
 import { t } from "./i18n.ts";
@@ -67,6 +67,9 @@ function summarizeUi(source: string): string {
       continue;
     }
     collect(props);
+    if ((element?.type === "StatCard" || element?.type === "Field") && typeof props?.value === "string" && props.value.trim()) {
+      result.push(props.value.trim());
+    }
     if (element?.type === "Table") {
       if (Array.isArray(props?.columns)) result.push(props.columns.filter((column): column is string => typeof column === "string").join("\t"));
       if (Array.isArray(props?.rows)) {
@@ -89,7 +92,7 @@ function summarizeUi(source: string): string {
         }
       }
     } else {
-      // Form option values identify submissions, unlike Metrics/KeyValue display values.
+      // Form option values identify submissions, unlike Metrics/KeyValue/StatCard/Field display values.
       for (const key of ["options", "items", "tabs"]) {
         const entries = props?.[key];
         if (Array.isArray(entries)) entries.forEach(collect);
@@ -168,7 +171,7 @@ export function messageText(text: string, attachments: readonly { name: string }
 }
 
 /** Pending/failed sends remain recoverable; system rows, browser cards and empty messages have no actions. */
-export function messageTextForItem(item: Item): MessageText | null {
+export function messageTextForItem(item: Pick<ChatRow, "key" | "pending" | "event" | "browser">): MessageText | null {
   if (item.browser) return null;
   const agentMessage = item.event?.type === "message.agent" || item.event?.type === "message.task";
   const data = item.pending ?? (agentMessage || item.event?.type === "message.user" ? item.event!.data : null);

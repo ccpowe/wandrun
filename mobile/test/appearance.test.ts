@@ -50,6 +50,15 @@ test("a failed preference save leaves the active language, theme, and last durab
   assert.ok(!store.snapshot().error?.includes("private storage detail"));
 });
 
+test("settings-appearance.A4 a save failure rejects without leaving error text in the device-level store", async () => {
+  const store = new AppearanceStore({ read: async () => null, write: async () => { throw new Error("disk"); } }, () => {});
+  await store.restore();
+  await assert.rejects(store.update({ language: "en" }));
+  assert.equal(store.snapshot().error, null);
+  assert.equal(store.snapshot().saving, false);
+  assert.equal(store.snapshot().language, "zh");
+});
+
 test("invalid saved preferences are not silently treated as defaults and a repaired read can be retried", async () => {
   let saved = '{"language":"unsupported","theme":"dark"}';
   const store = new AppearanceStore({ read: async () => saved, write: async () => {} }, () => {});
@@ -104,4 +113,43 @@ test("known system templates translate without translating captured names or swa
     }
   }
   assert.equal(translate("__proto__", "en"), "__proto__");
+});
+
+test("settings-appearance.B1 B2 concurrent restore shares one read; transient and invalid failures stay distinct", async () => {
+  const pending = Promise.withResolvers<string | null>();
+  let reads = 0;
+  let writes = 0;
+  const store = new AppearanceStore({
+    read: () => { reads++; return pending.promise; },
+    write: async () => { writes++; },
+  }, () => {});
+  const first = store.restore();
+  const second = store.restore();
+  assert.equal(first, second);
+  pending.reject(new Error("temporary read failure"));
+  await assert.rejects(first);
+  assert.equal(reads, 1);
+  assert.equal(store.restoreRetryable, true);
+  assert.equal(store.snapshot().ready, false);
+  const invalid = new AppearanceStore({ read: async () => '{"theme":"invalid"}', write: async () => { writes++; } }, () => {});
+  await assert.rejects(invalid.restore());
+  assert.equal(invalid.restoreRetryable, false);
+  assert.equal(invalid.snapshot().ready, false);
+  assert.equal(writes, 0);
+});
+
+test("settings-appearance.T1 T2 failed write does not block next queued change or overwrite the other preference", async () => {
+  let writes = 0;
+  let saved: string | null = null;
+  const store = new AppearanceStore({
+    read: async () => null,
+    write: async value => { if (++writes === 1) throw new Error("write failure"); saved = value; },
+  }, () => {});
+  await store.restore();
+  const failed = store.update({ language: "en" });
+  const next = store.update({ theme: "dark" });
+  await assert.rejects(failed);
+  await next;
+  assert.deepEqual(JSON.parse(saved!), { language: "zh", theme: "dark" });
+  assert.equal(store.snapshot().error, null);
 });

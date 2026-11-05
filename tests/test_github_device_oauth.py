@@ -91,6 +91,44 @@ class GitHubDeviceOAuthTests(unittest.IsolatedAsyncioTestCase):
             await self.finish()
         return start
 
+    async def test_device_transaction_identity_matches_pending_and_changes_after_cancel_and_restart(self):
+        self.assertIsNone(self.owner.status("github", "oauth")["transaction_id"])
+        with self.transport(lambda request: issued() if str(request.url) == CODE else
+                            httpx.Response(200, json={"error": "authorization_pending"})):
+            first = await self.owner.start_github("github", GITHUB_MCP_URL)
+            first_id = first["transaction_id"]
+            self.assertIsInstance(first_id, str)
+            self.assertGreater(len(first_id), 20)
+            self.assertNotIn(first_id, (first["user_code"], "private-device-code"))
+            self.assertEqual(self.owner.status("github", "oauth")["transaction_id"], first_id)
+            self.owner.cancel("github")
+            self.assertIsNone(self.owner.status("github", "oauth")["transaction_id"])
+            await self.finish()
+            second = await self.owner.start_github("github", GITHUB_MCP_URL)
+            self.assertNotEqual(second["transaction_id"], first_id)
+            self.assertEqual(self.owner.status("github", "oauth")["transaction_id"], second["transaction_id"])
+            await self.owner.aclose()
+
+            reopened = GatewayStore(self.path)
+            self.addCleanup(reopened.close)
+            cold = ConnectorOAuth(reopened, port=9000)
+            self.addAsyncCleanup(cold.aclose)
+            restarted = await cold.start_github("github", GITHUB_MCP_URL)
+            self.assertNotIn(restarted["transaction_id"], (first_id, second["transaction_id"]))
+            self.assertEqual(cold.status("github", "oauth")["transaction_id"], restarted["transaction_id"])
+            cold.cancel("github")
+            self.assertIsNone(cold.status("github", "oauth")["transaction_id"])
+
+        fresh = ConnectorOAuth(self.store, port=8765)
+        self.addAsyncCleanup(fresh.aclose)
+        with self.transport(lambda request: issued() if str(request.url) == CODE else granted()):
+            with patch.object(fresh, "_device_wait", return_value=False):
+                completed = await fresh.start_github("github", GITHUB_MCP_URL)
+                await asyncio.gather(*tuple(fresh._auth_tasks))
+        self.assertNotIn(completed["transaction_id"], (first_id, second["transaction_id"], restarted["transaction_id"]))
+        self.assertEqual(fresh.status("github", "oauth")["status"], "authorized")
+        self.assertIsNone(fresh.status("github", "oauth")["transaction_id"])
+
     async def test_fixed_catalog_binding_issue_pending_slowdown_and_durable_grant(self):
         steps = iter(("authorization_pending", "slow_down", "authorization_pending", None))
         def handle(request):
@@ -116,7 +154,7 @@ class GitHubDeviceOAuthTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(start["authorization_url"], DEVICE)
             self.assertEqual(start["user_code"], "ABCD-1234")
             self.assertGreater(start["expires_at"], time.time())
-            self.assertEqual(set(start), {"flow", "authorization_url", "user_code", "expires_at"})
+            self.assertEqual(set(start), {"flow", "transaction_id", "authorization_url", "user_code", "expires_at"})
             await self.finish()
         self.assertEqual(self.waits, [2, 2, 7, 7])
         generation, record = self.store.oauth_record("github")
@@ -129,7 +167,7 @@ class GitHubDeviceOAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.owner.authorized("github", generation, GITHUB_MCP_URL))
         self.assertFalse(self.owner.authorized("github", generation, GITHUB_MCP_URL + "other"))
         self.assertEqual(self.owner.status("github", "oauth"), {
-            "status": "authorized", "authorizing": False,
+            "status": "authorized", "authorizing": False, "transaction_id": None,
             "scopes": ["repo", "read:org", "offline_access"],
         })
         public = json.dumps([start, self.owner.status("github", "oauth"),
@@ -150,6 +188,7 @@ class GitHubDeviceOAuthTests(unittest.IsolatedAsyncioTestCase):
                     await self.finish()
                 snapshot = self.owner.status("github", "oauth")
                 self.assertFalse(snapshot["authorizing"])
+                self.assertIsNone(snapshot["transaction_id"])
                 self.assertEqual(snapshot["error"]["code"], expected)
                 self.assertNotIn("secret-from-provider", json.dumps(snapshot))
                 self.assertIsNone(self.store.oauth_record("github")[1])

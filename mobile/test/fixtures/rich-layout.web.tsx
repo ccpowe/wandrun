@@ -10,12 +10,15 @@ import { ChatSession } from '../../src/gateway/session.ts';
 const root = createRoot(document.getElementById('root')!);
 const fontStyle = document.createElement('style');
 document.head.append(fontStyle);
-const metricsSpec = JSON.stringify({ root: 'row', state: {}, elements: {
+const metricsSpec = JSON.stringify({ root: 'layout', state: {}, elements: {
+  layout: { type: 'Stack', props: {}, children: ['row', 'automatic', 'half'] },
   row: { type: 'Stack', props: { direction: 'horizontal' }, children: ['text', 'metrics'] },
   text: { type: 'Text', props: { text: '状态' }, children: [] },
   metrics: { type: 'Metrics', props: { items: [
     { label: '已完成', value: '12' }, { label: '失败', value: '1' },
   ] }, children: [] },
+  automatic: { type: 'Metrics', width: 'auto', props: { items: [{ label: '自动指标', value: '42' }] }, children: [] },
+  half: { type: 'Metrics', width: '1/2', props: { items: [{ label: '半宽指标', value: '7' }] }, children: [] },
 } });
 const longLabels = ['二零二六年第一季度第一阶段统计结果', '二零二六年第二季度第二阶段统计结果'];
 
@@ -39,31 +42,44 @@ async function runLayoutCase(kind: 'metrics' | 'labels' | 'extreme' | 'heading',
             series: [{ name: '原始值', values: kind === 'extreme' ? labels as number[] : [1000000, 1000001] }] }} />
         </View>)}
       </View>);
+  let previousMetrics: string | undefined;
+  let lastMetrics: unknown;
   const deadline = performance.now() + 10000;
   while (performance.now() < deadline) {
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     const block = document.querySelector('[data-testid="rich-block"]');
     const charts = [...document.querySelectorAll('[data-testid="rich-line-chart"]')];
     const ready = kind === 'metrics'
-      ? block?.textContent?.includes('已完成') && block?.textContent?.includes('失败')
+      ? block?.textContent?.includes('已完成') && block?.textContent?.includes('失败') && block?.textContent?.includes('自动指标') && block?.textContent?.includes('半宽指标')
       : charts.length === (kind === 'heading' ? 1 : 2) && charts.every((chart) =>
         chart.querySelector('[data-testid="rich-line-label-1"]') && Math.abs(chart.getBoundingClientRect().width - width) < 1);
     if (!ready) continue;
+    if (kind === 'metrics') {
+      const leaves = [...block!.querySelectorAll('div')].filter((element) => element.childElementCount === 0);
+      const labels = leaves.filter((element) => ['已完成', '失败'].includes(element.textContent ?? ''));
+      const adaptiveCells = ['自动指标', '半宽指标'].map(text => leaves.find(label => label.textContent === text)!.parentElement!.parentElement!.getBoundingClientRect().toJSON());
+      const container = labels[0].parentElement!.parentElement!;
+      const measurement = { kind, width, measuredWidth: container.getBoundingClientRect().width,
+        text: container.textContent, cells: labels.map((label) => label.parentElement!.getBoundingClientRect().toJSON()), adaptiveCells };
+      const signature = JSON.stringify(measurement);
+      const stable = signature === previousMetrics;
+      previousMetrics = signature;
+      lastMetrics = measurement;
+      // Text can survive a resize while ResizeObserver/onLayout and React still
+      // propagate the new width. Yield until the actual target geometry is stable.
+      if (!stable || Math.abs(measurement.measuredWidth - width) >= 1 || adaptiveCells.some((cell, index) =>
+        Math.abs(cell.width - (index === 0 ? width : width / 2)) >= 1 || cell.height <= 0)) continue;
+      return measurement;
+    }
     // Let ResizeObserver/onLayout updates and the resulting React commit settle.
     await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-    if (kind === 'metrics') {
-      const labels = [...block!.querySelectorAll('div')].filter((element) => element.childElementCount === 0 && ['已完成', '失败'].includes(element.textContent ?? ''));
-      const container = labels[0].parentElement!.parentElement!;
-      return { kind, width, measuredWidth: container.getBoundingClientRect().width,
-        text: container.textContent, cells: labels.map((label) => label.parentElement!.getBoundingClientRect().toJSON()) };
-    }
     if (kind === 'heading') {
       const chart = charts[0];
-      const toggle = chart.querySelector('[data-testid="rich-line-points-toggle"]')!;
+      const readout = chart.querySelector('[data-testid="rich-chart-readout"]')!;
       const plot = chart.querySelector('[data-testid="rich-line-plot"]')!;
       const wrapper = plot.firstElementChild!;
       const sections = wrapper.firstElementChild!;
-      return { kind, width, fontScale, headingBottom: toggle.getBoundingClientRect().bottom,
+      return { kind, width, fontScale, headingBottom: readout.getBoundingClientRect().bottom,
         plotTop: plot.getBoundingClientRect().top, sectionsTop: sections.getBoundingClientRect().top };
     }
     if (kind === 'extreme') {
@@ -78,13 +94,14 @@ async function runLayoutCase(kind: 'metrics' | 'labels' | 'extreme' | 'heading',
     }
     return { kind, width, fontScale, charts: charts.map((chart) => ({
       bounds: chart.getBoundingClientRect().toJSON(),
-      legend: chart.querySelector('[data-testid="rich-line-legend"]')!.getBoundingClientRect().toJSON(),
+      readout: chart.querySelector('[data-testid="rich-chart-readout"]')!.getBoundingClientRect().toJSON(),
       labels: [...chart.querySelectorAll('[data-testid^="rich-line-label-"]')].map((label) => ({
         text: label.textContent, bounds: label.getBoundingClientRect().toJSON(), scrollHeight: label.scrollHeight,
       })),
     })) };
   }
-  throw new Error(`Layout did not reveal ${kind} at ${width}/${fontScale}: ${document.body.textContent}`);
+  throw new Error(`Layout did not reveal ${kind} at ${width}/${fontScale}: ${document.body.textContent}`
+    + (kind === 'metrics' ? `; last measurements: ${JSON.stringify(lastMetrics)}` : ''));
 }
 
 // Review inputs run through the real validator, Grid metadata and renderer, not injected minimums.
@@ -125,10 +142,10 @@ async function runReviewLayout(kind: 'tabs' | 'tabs-scroll' | 'source-grid' | 's
     if (kind.startsWith('tabs')) {
       const triggers = [...block.querySelectorAll('[data-testid^="rich-tab-"]')];
       if (triggers.length !== count) continue;
+      // Foundation text-segment tabs (ADR-0081): the trigger itself is the painted segment; its text is the label.
       return { kind, width, tabs: triggers.map(trigger => {
-        const pill = trigger.firstElementChild!;
-        const label = pill.firstElementChild!;
-        return { trigger: trigger.getBoundingClientRect().toJSON(), pill: pill.getBoundingClientRect().toJSON(),
+        const label = trigger.firstElementChild!;
+        return { trigger: trigger.getBoundingClientRect().toJSON(),
           label: label.getBoundingClientRect().toJSON(), text: label.textContent,
           scrollWidth: label.scrollWidth, lineHeight: parseFloat(getComputedStyle(label).lineHeight) };
       }) };
@@ -205,7 +222,7 @@ async function runLinkLayout(kind: 'link-grid' | 'link-card' | 'link-stack' | 'l
       thumbnail: row.querySelector('[data-testid="rich-link-thumbnail"]')?.getBoundingClientRect().toJSON() ?? null,
       scrollWidth: row.scrollWidth,
     }));
-    if (measured.some(row => row.bounds.width <= 0 || !!row.thumbnail !== (row.bounds.width >= 238))) continue;
+    if (measured.some(row => row.bounds.width <= 0 || !!row.thumbnail !== (row.bounds.width >= 212))) continue;
     return { kind, width, links: measured,
       groups: [...block.querySelectorAll('[data-testid="rich-link-list"]')].map(group =>
         [...group.querySelectorAll('[data-testid="rich-link-card"]')].map(row => parseFloat(getComputedStyle(row).borderTopWidth))) };
@@ -231,7 +248,7 @@ async function runLinkTitleLayout(width: number) {
     await promise;
     const rows = [...document.querySelectorAll('[data-testid="rich-link-card"]')];
     if (rows.length !== captions.length || rows.some(row => Math.abs(row.getBoundingClientRect().width - width) > 1 ||
-      !!row.querySelector('[data-testid="rich-link-thumbnail"]') !== (width >= 238))) continue;
+      !!row.querySelector('[data-testid="rich-link-thumbnail"]') !== (width >= 212))) continue;
     return { kind: 'link-titles', width, titles: rows.map((row, index) => {
       const title = row.lastElementChild!.firstElementChild!;
       const walker = document.createTreeWalker(title, NodeFilter.SHOW_TEXT);

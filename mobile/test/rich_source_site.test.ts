@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { sourceSite } from '../src/components/rich-message/source-site.ts';
@@ -18,7 +19,7 @@ test('source identity normalizes case and terminal dots and groups subdomains de
   assert.deepEqual(sourceSite('WWW.dpm.org.cn..'), site);
   assert.deepEqual(sourceSite('news.dpm.org.cn'), site);
   assert.deepEqual(sourceSite('commons.wikimedia.org'), sourceSite('upload.wikimedia.org'));
-  assert.ok(richSourceColors.some(color => color === site.color));
+  assert.ok(site.colorIndex >= 0 && site.colorIndex < richSourceColors.length);
 });
 test('IP and single-label hosts remain usable decorative identities', () => {
   assert.equal(sourceSite('127.0.0.1').site, '127.0.0.1');
@@ -40,9 +41,15 @@ function relativeLuminance(color: string): number {
 }
 
 test('every source color meets white glyph contrast in light and dark themes', () => {
-  // The fixed palette is shared by both themes, so each color needs one contrast calculation.
-  for (const color of richSourceColors) {
-    const contrast = 1.05 / (relativeLuminance(color) + 0.05);
-    assert.ok(contrast >= 4.5, `${color}: ${contrast.toFixed(2)}:1`);
+  const css = readFileSync(new URL('../global.css', import.meta.url), 'utf8');
+  for (const theme of ['light', 'dark']) {
+    const declarations = css.match(new RegExp(`@variant ${theme} \\{([^}]+)\\}`))![1];
+    const palette = Object.fromEntries([...declarations.matchAll(/(--color-[\w-]+):\s*(#[\da-fA-F]+);/g)].map(([, name, value]) => [name, value]));
+    for (const name of richSourceColors) {
+      const foreground = relativeLuminance(palette['--color-source-foreground']);
+      const background = relativeLuminance(palette[name]);
+      const contrast = (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05);
+      assert.ok(contrast >= 4.5, `${theme} ${name}: ${contrast.toFixed(2)}:1`);
+    }
   }
 });

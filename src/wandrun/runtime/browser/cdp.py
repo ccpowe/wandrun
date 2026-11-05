@@ -217,15 +217,19 @@ class BrowserRelay:
 
     The shared lifecycle lock covers policy validation and physical relay sends.
     Creation is admitted under that lock, then its lease-owned operation settles
-    independently of the client. ``drain`` waits for forwarded Chrome replies,
+    independently of the client. ``drain`` requires confirmed command settlement,
     not client socket teardown; lost replies remain unconfirmed.
+
+    ``close_target`` returns only after confirming target absence. CDPRejected
+    confirms no outstanding close effect; other failures retain in-flight debt.
     """
 
     def __init__(self, client: Any, upstream_url: str, *, epoch: int, page: str | None,
                  owns: Callable[[str | None], bool],
                  guard: asyncio.Lock,
                  authorize: Callable[[str, dict], str | None],
-                 create: Callable[[dict], asyncio.Task[str]],
+                 create: Callable[[dict], asyncio.Future[str]],
+                 close_target: Callable[[str], Awaitable[None]],
                  claim: Callable[[dict], Awaitable[None]],
                  activated: Callable[[str], Awaitable[None]],
                  destroyed: Callable[[str], Awaitable[None]],
@@ -234,6 +238,7 @@ class BrowserRelay:
         self.epoch, self.page = epoch, page
         self.owns, self.guard, self.authorize = owns, guard, authorize
         self.create, self.claim, self.activated = create, claim, activated
+        self.close_target = close_target
         self.destroyed, self.activity = destroyed, activity
         self.sessions: dict[str, str] = {}
         # Targets already shown to this client retain lifecycle identity even
@@ -257,7 +262,7 @@ class BrowserRelay:
 
     @property
     def unsettled(self) -> bool:
-        """Whether any client or relay-generated Chrome command lacks a reply."""
+        """Whether a client or relay-generated command lacks confirmed settlement."""
         return bool(self.pending or self._internal_ids)
 
     async def close(self) -> None:
@@ -266,7 +271,7 @@ class BrowserRelay:
             await self.upstream.close()
 
     async def drain(self) -> None:
-        """Wait for forwarded Chrome replies; a lost reply is not confirmation.
+        """Wait for Chrome replies or owner-confirmed closes, never socket teardown.
 
         The Chrome reader stays alive after the client disconnects while requests
         remain. A natural upstream disconnect wakes waiters, but unresolved
@@ -370,6 +375,7 @@ class BrowserRelay:
             session = message.get("sessionId")
             key = (session, message["id"])
             creation = None
+            closing = None
             async with self.guard:
                 reason = self.check(message)
                 if reason is None:
@@ -385,6 +391,13 @@ class BrowserRelay:
                     except Exception as exc:
                         await self._reject(message, str(exc))
                         continue
+                elif message["method"] == "Target.closeTarget":
+                    # Raw Chrome success can race initial navigation and leave
+                    # a new target alive. The resource owner confirms removal.
+                    closing = message["params"]["targetId"]
+                    self.pending[key] = message["method"]
+                    self._drained.clear()
+                    self.activity()
                 else:
                     self.pending[key] = message["method"]
                     self._drained.clear()
@@ -412,6 +425,26 @@ class BrowserRelay:
                             reply["sessionId"] = session
                         await self.client.send(json.dumps(reply))
                         self._delivered_targets.add(target)
+            elif closing is not None:
+                try:
+                    await self.close_target(closing)
+                except CDPRejected as exc:
+                    self.pending.pop(key, None)
+                    if not self.pending and not self._internal_ids:
+                        self._drained.set()
+                    await self._reject(message, str(exc))
+                except Exception as exc:
+                    # An unconfirmed close retains its in-flight footprint.
+                    await self._reject(message, str(exc))
+                else:
+                    self.pending.pop(key, None)
+                    if not self.pending and not self._internal_ids:
+                        self._drained.set()
+                    async with self._client_send:
+                        reply = {"id": message["id"], "result": {"success": True}}
+                        if session is not None:
+                            reply["sessionId"] = session
+                        await self.client.send(json.dumps(reply))
 
     async def _from_chrome(self) -> None:
         try:

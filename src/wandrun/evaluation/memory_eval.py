@@ -77,7 +77,7 @@ class MemoryReplay:
                                         available_workers=workers, missing_workers=missing)
                         raise RunCaseError("unsupported_scenario", evidence,
                                            f"unavailable direct delegation: {agent_id} -> {missing}")
-                created = await _post(self.client, "/conversations", {"agent_id": agent_id, "title": title})
+                created = await _post(self.client, "/conversations", {"agent_id": agent_id, "title": title, "client_id": uuid4().hex})
                 identity = created["id"]
                 evidence["conversation_id"] = identity
                 if identity in self._roots:

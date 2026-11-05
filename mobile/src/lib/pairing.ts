@@ -76,7 +76,7 @@ export class PairingCoordinator {
       const pairingCode = normalizePairingCode(code);
       const key = JSON.stringify([baseUrl, pairingCode]);
       if (this.consumed.has(key)) {
-        const message = "此配对码已兑换。请在电脑上重新生成配对码后重试。";
+        const message = "此配对码已兑换。请在服务器上重新生成配对码后重试。";
         this.publish({ phase: "idle", error: message });
         return message;
       }
@@ -92,11 +92,11 @@ export class PairingCoordinator {
       this.publish({ phase: "idle", error: "" });
       return null;
     } catch (cause) {
-      let message = "无法安全保存设备令牌。请在电脑上重新生成配对码后重试。";
+      let message = "无法安全保存设备令牌。请在服务器上重新生成配对码后重试。";
       if (!exchanged) {
         const reason = pairingErrorMessage(cause);
         message = reason.includes("重新运行 wandrun pair") || reason.includes("重新生成配对码")
-          ? reason : `${reason} 可重试；若码已使用，请在电脑上重新生成。`;
+          ? reason : `${reason} 可重试；若码已使用，请在服务器上重新生成。`;
       }
       this.publish({ phase: "idle", error: message });
       return message;
@@ -131,27 +131,27 @@ export function normalizeGatewayAddress(value: string): string {
     }
     return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
   } catch {
-    throw new Error("电脑地址无效，请填写 http:// 或 https:// 地址");
+    throw new Error("服务器地址无效，请填写 http:// 或 https:// 地址");
   }
 }
 
 export function normalizePairingCode(value: string): string {
   const code = value.trim().replace(/[\s-]/g, "").toUpperCase();
-  if (!/^[A-Z0-9]{8}$/.test(code)) throw new Error("请输入电脑上显示的 8 位配对码");
+  if (!/^[A-Z0-9]{8}$/.test(code)) throw new Error("请输入服务器上显示的 8 位配对码");
   return code;
 }
 
 export function pairingErrorMessage(error: unknown): string {
   if (error instanceof GatewayError) {
     switch (error.code) {
-      case "pairing_expired": return "配对码已过期。请在电脑上重新运行 wandrun pair。";
-      case "pairing_invalid": return "配对码不正确。请核对后重试，或在电脑上重新运行 wandrun pair。";
-      case "pairing_used": return "配对码已使用。请在电脑上重新运行 wandrun pair。";
-      case "pairing_locked": return "配对码错误次数过多。请在电脑上重新运行 wandrun pair。";
-      case "network": return "连不上电脑。请检查网关地址、网络及电脑上的网关是否正在运行。";
+      case "pairing_expired": return "配对码已过期。请在服务器上重新运行 wandrun pair。";
+      case "pairing_invalid": return "配对码不正确。请核对后重试，或在服务器上重新运行 wandrun pair。";
+      case "pairing_used": return "配对码已使用。请在服务器上重新运行 wandrun pair。";
+      case "pairing_locked": return "配对码错误次数过多。请在服务器上重新运行 wandrun pair。";
+      case "network": return "连不上服务器。请检查服务器地址、网络及服务是否正在运行。";
       case "timeout": return "连接超时。请检查网络后重试。";
     }
-    if (error.status >= 500) return "电脑上的网关暂不可用。请检查网关与网络后重试。";
+    if (error.status >= 500) return "服务器暂不可用。请检查服务器与网络后重试。";
   }
-  return error instanceof Error && !(error instanceof GatewayError) ? error.message : "连接失败。请在电脑上重新生成配对码后重试。";
+  return error instanceof Error && !(error instanceof GatewayError) ? error.message : "连接失败。请在服务器上重新生成配对码后重试。";
 }

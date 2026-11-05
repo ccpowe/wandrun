@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urljoin, urlsplit
+from uuid import uuid4
 
 import httpx
 
@@ -47,7 +48,7 @@ class UploadProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.gateway.enable_uploads(max_size=8)
         self.prompts = []
         self.gateway.manager = SimpleNamespace(interrupt=lambda *args, **kwargs: self.prompts.append((args, kwargs)))
-        self.conversation, _ = self.store.create_conversation("New", "main")
+        self.conversation, _ = self.store.create_conversation("New", "main", client_id=uuid4().hex)
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=create_app(self.gateway, "secret")),
             base_url="http://gateway", headers={"Authorization": "Bearer secret"},
@@ -118,6 +119,19 @@ class UploadProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["Upload-Offset"], "0")
         self.assertEqual(self.store.pending_uploads(), before)
         self.assertEqual(self.store.last_seq(), seq)
+        self.assertFalse((self.root / "conversations" / self.conversation["id"]).exists())
+
+    async def test_first_upload_publishes_before_agent_has_ever_run(self):
+        directory = self.root / "conversations" / self.conversation["id"]
+        self.assertFalse(directory.exists())
+        created = await self.create(filename="first.txt", filetype="text/plain", length=3)
+        self.assertFalse(directory.exists())
+        completed = await self.patch(created.headers["Location"], 0, b"abc")
+        self.assertEqual(completed.status_code, 204, completed.text)
+        self.assertEqual((directory / "first.txt").read_bytes(), b"abc")
+        resumed = await self.head(created.headers["Location"])
+        self.assertEqual(resumed.headers["Upload-File-Id"], completed.headers["Upload-File-Id"])
+        self.assertEqual(self.prompts, [])
 
     async def test_creation_options_auth_version_metadata_limits_and_disk(self):
         unauth = await self.client.options("/uploads", headers={"Authorization": "Bearer wrong"})
@@ -162,7 +176,20 @@ class UploadProtocolTests(unittest.IsolatedAsyncioTestCase):
             "Tus-Resumable": "1.0.0", "Upload-Length": "1",
             "Upload-Metadata": metadata(self.conversation["id"]),
         })
-        self.assertEqual((remote.status_code, remote.json()["error"]["code"]), (409, "remote_environment"))
+        self.assertEqual(remote.status_code, 201, remote.text)
+        completed = await self.patch(remote.headers["Location"], 0, b"x")
+        self.assertEqual(completed.status_code, 204, completed.text)
+        file_id = completed.headers["Upload-File-Id"]
+        record, path = self.store.user_uploads(self.conversation["id"], [file_id])[0]
+        self.assertEqual(Path(path).read_bytes(), b"x")
+        self.assertIsNone(record["remote_environment"])
+        sent = await self.client.post(f"/conversations/{self.conversation['id']}/messages", json={
+            "client_id": "remote-upload-message", "text": "检查文件", "attachments": [file_id],
+        })
+        self.assertEqual(sent.status_code, 202, sent.text)
+        self.assertIn(file_id, self.prompts[-1][0][0])
+        self.assertNotIn(str(self.root), self.prompts[-1][0][0])
+        self.assertEqual(len(self.store.pending_uploads()), 0)
         self.gateway.runtime = None
 
     async def test_protocol_header_errors_and_options_override_do_not_change_offset(self):
@@ -315,7 +342,7 @@ class UploadProtocolTests(unittest.IsolatedAsyncioTestCase):
         created = await self.create(filename="notes.txt", filetype="text/plain", length=2)
         pending = await self.create(filename="waiting.txt", filetype="text/plain", length=2)
         file_id = (await self.patch(created.headers["Location"], 0, b"hi")).headers["Upload-File-Id"]
-        other, _ = self.store.create_conversation("Other", "main")
+        other, _ = self.store.create_conversation("Other", "main", client_id=uuid4().hex)
         other_upload = await self.create(conversation_id=other["id"], filename="other.txt", filetype="text/plain", length=0)
         agent_path = self.root / "agent.txt"
         agent_path.write_text("agent")
@@ -338,6 +365,7 @@ class UploadProtocolTests(unittest.IsolatedAsyncioTestCase):
                          (file_id, "user_upload", ""))
         prompt = self.prompts[0][0][0]
         self.assertIn("notes.txt", prompt)
+        self.assertIn(file_id, prompt)
         self.assertIn("用户上传", prompt)
         self.assertNotIn(str(self.root), prompt)
         replay = await self.client.post(endpoint, json={"client_id": "sent", "text": "different"})

@@ -108,7 +108,7 @@ const trend = spec(card("近一周趋势",
     series: [{ name: "已完成", values: [12, 18, 15, 24, 29] }, { name: "新增", values: [8, 13, 12, 19, 21] },
       { name: "待办变化", values: [-4, -5, -3, -5, -8] }], unit: "项" })));
 const comparison = spec(card("渠道效果",
-  node("BarChart", { title: "咨询量", labels: ["官网", "社群", "搜索", "活动"], values: [45, 72, 38, 56], unit: "次" })));
+  node("BarChart", { title: "咨询量", labels: ["官网", "社群", "搜索", "活动"], series: [{ name: "数值", values: [45, 72, 38, 56] }], unit: "次" })));
 const maximumLine = spec(card("折线容量边界 · 24 点 × 3 系列",
   node("LineChart", { xLabels: Array.from({ length: 24 }, (_, index) => `L${index + 1}`),
     series: [1, 2, 3].map((series) => ({
@@ -116,7 +116,7 @@ const maximumLine = spec(card("折线容量边界 · 24 点 × 3 系列",
     })) })));
 const maximumBar = spec(card("柱状容量边界 · 12 项",
   node("BarChart", { labels: Array.from({ length: 12 }, (_, index) => `B${index + 1}`),
-    values: Array.from({ length: 12 }, (_, index) => index + 1) })));
+    series: [{ name: "数值", values: Array.from({ length: 12 }, (_, index) => index + 1) }] })));
 const portions = spec(card("预算构成",
   node("PieChart", { title: "支出占比", items: [
     { label: "住宿", value: 3200 }, { label: "交通", value: 1800 },
@@ -180,7 +180,7 @@ const semanticColors = spec(card("语义颜色 · 状态与数据",
     { name: "精确小数", values: [0.000000123456789, 0.000000987654321] },
     { name: "负数", values: [-0.000000223456789, -0.000000887654321] },
   ] }),
-  node("BarChart", { labels: ["大数 A", "大数 B"], values: [1.23456789012345e100, 9.87654321098765e100] })));
+  node("BarChart", { labels: ["大数 A", "大数 B"], series: [{ name: "数值", values: [1.23456789012345e100, 9.87654321098765e100] }] })));
 const math = spec(card("物理公式 $E=mc^2$",
   node("Text", { text: "同一段内合并公式：速度 $v=at$，动能 $E_k=\\frac12mv^2$。不是逐公式创建视图。" }),
   node("Math", { tex: "\\int_0^t a\\tau\\,d\\tau=\\frac12at^2", display: true }),
@@ -298,7 +298,7 @@ const showcaseData = spec(card("数据图表与表格",
   node("Tabs", { tabs: [{ label: "折线" }, { label: "柱状" }, { label: "饼图" }] },
     node("LineChart", { xLabels: week, series: [{ name: "成功任务", values: [45, 62, 52, 98, 82, 120, 105] },
       { name: "失败任务", values: [8, 6, 9, 5, 7, 4, 6] }] }),
-    node("BarChart", { labels: week, values: [45, 62, 52, 98, 82, 120, 105] }),
+    node("BarChart", { labels: week, series: [{ name: "数值", values: [45, 62, 52, 98, 82, 120, 105] }] }),
     node("PieChart", { items: [{ label: "成功", value: 564 }, { label: "失败", value: 45 }] })),
   node("Text", { text: "同一图表区域按选择切换。", tone: "muted" }),
   node("Divider"),

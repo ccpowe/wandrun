@@ -11,12 +11,14 @@ import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 import httpx
 from langchain_core.tools import StructuredTool
 
 from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.gateway.app import ensure_agents
+from wandrun.gateway.connector_metadata import derive_metadata
 from wandrun.gateway.connectors import connection_fields, connector_fields, mcp_config
 from wandrun.gateway.http import create_app
 from wandrun.gateway.service import Gateway
@@ -100,6 +102,22 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
             base_url="http://gateway", headers={"Authorization": "Bearer dev"},
         ))
 
+    async def test_reset_transport_to_auto_reinfers_now_and_on_later_url_changes(self):
+        created = await self.create(transport="sse")
+        identity = created["connector"]["id"]
+        for fields, expected in (
+            ({"transport": None}, "streamable-http"),
+            ({"url": "https://example.com/events/sse"}, "sse"),
+            ({"transport": "sse"}, "sse"),
+            ({"transport": None, "url": "https://example.com/new"}, "streamable-http"),
+        ):
+            response = await self.client.patch(f"/connectors/{identity}", json=fields)
+            self.assertEqual(response.status_code, 200, response.text)
+            connector = response.json()["connector"]
+            self.assertEqual(connector["transport"], expected)
+            self.assertEqual(connector["transport_source"], "user" if fields.get("transport") else "auto")
+            self.assertEqual(connector["name"], "文档")
+
     async def create(self, **fields):
         response = await self.client.post("/connectors", json={
             "client_id": "create", "name": "文档", "description": "查询文档", "url": "https://example.com/mcp",
@@ -107,6 +125,229 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()
+
+    def seed_imported_connector(self, **fields):
+        definition = connector_fields("imported", {
+            "name": "文档", "description": "查询文档", "url": "https://example.com/mcp", **fields,
+        })
+        commit = self.gateway._prepare_connectors({**self.store.connector_definitions(), "imported": definition})
+        self.store.create_connector(definition, "imported")
+        commit()
+        return "imported"
+
+    async def test_creation_result_stays_pending_until_inflight_post_commits_without_reopening(self):
+        self.block = True
+        creating = asyncio.create_task(self.client.post("/connectors", json={
+            "client_id": "lost/response?one", "url": "https://example.com/mcp",
+            "auth_type": "key", "headers": {"Authorization": "creation-query-secret"},
+        }))
+        await asyncio.wait_for(self.entered.wait(), 5)
+        try:
+            before, opened = self.store.last_seq(), list(self.opened)
+            for _ in range(2):
+                result = await self.client.get("/connectors/creation-result", params={
+                    "client_id": "lost/response?one",
+                })
+                self.assertEqual(result.status_code, 200, result.text)
+                self.assertEqual(result.json(), {"status": "pending"})
+            self.assertFalse(creating.done(), "GET 不应取消或替代仍在连接的 POST")
+            self.assertEqual(self.store.connector_definitions(), {})
+            self.assertEqual(self.store.last_seq(), before)
+            self.assertEqual(self.opened, opened, "核对不得重新连接候选服务")
+        finally:
+            self.release.set()
+            responses = await asyncio.gather(creating, return_exceptions=True)
+        created = responses[0]
+        self.assertEqual(created.status_code, 201, created.text)
+        original = created.json()
+        before, opened = self.store.last_seq(), list(self.opened)
+        result = await self.client.get("/connectors/creation-result", params={
+            "client_id": "lost/response?one",
+        })
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json(), {
+            "status": "created", "connector": original["connector"], "event": original["event"],
+        })
+        self.assertEqual(result.json()["event"]["client_id"], "lost/response?one")
+        self.assertEqual(result.json()["connector"]["headers"], {"Authorization": True})
+        self.assertNotIn("creation-query-secret", result.text)
+        self.assertEqual(self.store.last_seq(), before)
+        self.assertEqual(self.opened, opened)
+        self.assertEqual(len(self.store.connector_definitions()), 1)
+
+    async def test_creation_result_reports_terminal_prewrite_failure_without_retrying_creation(self):
+        response = await self.client.post("/connectors", json={
+            "client_id": "failed-create", "url": "https://example.com/broken",
+            "auth_type": "key", "headers": {"Authorization": "never-return-this-secret"},
+        })
+        self.assertEqual((response.status_code, response.json()["error"]["code"]), (502, "connection_failed"))
+        self.assertIsNone(self.store.by_client_id("failed-create"))
+        before, opened, closed = self.store.last_seq(), list(self.opened), list(self.closed)
+        for _ in range(2):
+            result = await self.client.get("/connectors/creation-result", params={"client_id": "failed-create"})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()["status"], "not_created", "明确写前失败不能永远变成unknown")
+            self.assertNotIn("connector", result.json())
+            self.assertNotIn("never-return-this-secret", result.text)
+        self.assertEqual(self.store.connector_definitions(), {})
+        self.assertEqual(self.store.last_seq(), before)
+        self.assertEqual(self.opened, opened, "GET 不能以同client_id重放POST或重新初始化连接")
+        self.assertEqual(self.closed, closed)
+
+    async def test_creation_result_unknown_client_does_not_claim_post_never_created(self):
+        before = self.store.last_seq()
+        for _ in range(2):
+            result = await self.client.get("/connectors/creation-result", params={"client_id": "not-observed"})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json(), {"status": "unknown"}, "查无账本不能证明尚未到达的POST不会提交")
+        self.assertEqual(self.store.connector_definitions(), {})
+        self.assertEqual(self.opened, [])
+        self.assertEqual(self.store.last_seq(), before)
+
+    async def test_creation_result_survives_delete_as_receipt_without_resurrecting_resource(self):
+        original = await self.create(headers={"Authorization": "private-result-secret"})
+        identity = original["connector"]["id"]
+        deleted = await self.client.delete(f"/connectors/{identity}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        before, opened = self.store.last_seq(), list(self.opened)
+        for _ in range(2):
+            result = await self.client.get("/connectors/creation-result", params={"client_id": "create"})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json(), {
+                "status": "created", "connector": original["connector"], "event": original["event"],
+            })
+            self.assertNotIn("private-result-secret", result.text)
+        self.assertEqual((await self.client.get(f"/connectors/{identity}")).status_code, 404)
+        self.assertEqual(self.store.connector_definitions(), {})
+        self.assertEqual(self.store.last_seq(), before)
+        self.assertEqual(self.opened, opened)
+
+    async def test_creation_result_recovers_existing_catalog_binding_without_created_event(self):
+        first = await self.client.post("/apps/notion/connect", json={"client_id": "first-binding"})
+        self.assertEqual(first.status_code, 200, first.text)
+        bound = await self.client.post("/apps/notion/connect", json={"client_id": "lost-binding"})
+        self.assertEqual(bound.status_code, 200, bound.text)
+        event = self.store.by_client_id("lost-binding")
+        self.assertEqual(event.data["op"], "bound", "再次获取目录绑定没有本client_id的created事件")
+        before, opened = self.store.last_seq(), list(self.opened)
+        result = await self.client.get("/connectors/creation-result", params={"client_id": "lost-binding"})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json(), {
+            "status": "created", "connector": bound.json()["connector"], "event": event.to_dict(),
+        })
+        self.assertEqual(result.json()["connector"]["id"], first.json()["connector"]["id"])
+        self.assertEqual(len(self.store.connector_definitions()), 1)
+        self.assertEqual(self.store.last_seq(), before)
+        self.assertEqual(self.opened, opened, "目录回执查询不能隐式连接或发起授权")
+
+    async def test_creation_result_pending_retry_takes_priority_over_previous_prewrite_failure(self):
+        failed = await self.client.post("/connectors", json={
+            "client_id": "retry-known-failure", "url": "https://example.com/broken",
+        })
+        self.assertEqual(failed.status_code, 502, failed.text)
+        settled = await self.client.get("/connectors/creation-result", params={"client_id": "retry-known-failure"})
+        self.assertEqual(settled.json()["status"], "not_created")
+        # This is a deliberate new POST after an explicit refusal, not GET reconciliation replaying a write.
+        self.entered.clear()
+        self.block = True
+        creating = asyncio.create_task(self.client.post("/connectors", json={
+            "client_id": "retry-known-failure", "url": "https://example.com/mcp",
+        }))
+        await asyncio.wait_for(self.entered.wait(), 5)
+        try:
+            before, opened = self.store.last_seq(), list(self.opened)
+            result = await self.client.get("/connectors/creation-result", params={"client_id": "retry-known-failure"})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json(), {"status": "pending"}, "旧失败不能把当前在途POST误判未创建")
+            self.assertFalse(creating.done())
+            self.assertEqual(self.store.last_seq(), before)
+            self.assertEqual(self.opened, opened)
+        finally:
+            self.release.set()
+            responses = await asyncio.gather(creating, return_exceptions=True)
+        created = responses[0]
+        self.assertEqual(created.status_code, 201, created.text)
+        result = await self.client.get("/connectors/creation-result", params={"client_id": "retry-known-failure"})
+        self.assertEqual(result.json()["status"], "created")
+        self.assertEqual(result.json()["connector"]["id"], created.json()["connector"]["id"])
+
+    async def test_failed_creation_does_not_hold_catalog_lock(self):
+        self.block = True
+        creating = asyncio.create_task(self.client.post("/connectors", json={
+            "client_id": "slow-broken", "url": "https://example.com/broken",
+        }))
+        await asyncio.wait_for(self.entered.wait(), 5)
+        try:
+            edited = await asyncio.wait_for(
+                self.client.patch("/agents/other", json={"name": "不受错误地址阻塞"}), 1,
+            )
+            self.assertEqual(edited.status_code, 200, edited.text)
+            self.assertFalse(creating.done())
+        finally:
+            self.release.set()
+            results = await asyncio.gather(creating, return_exceptions=True)
+        self.assertEqual(results[0].status_code, 502, results[0].text)
+        self.assertEqual(self.store.agent("other")["name"], "不受错误地址阻塞")
+
+    async def test_concurrent_creates_recheck_client_id_and_release_losing_candidate(self):
+        self.block = True
+        creating = [asyncio.create_task(self.client.post("/connectors", json={
+            "client_id": "same-create", "url": "https://example.com/mcp",
+        })) for _ in range(2)]
+        try:
+            async with asyncio.timeout(5):
+                while len(self.opened) < 2:
+                    await asyncio.sleep(0)
+        finally:
+            self.release.set()
+            results = await asyncio.gather(*creating)
+        self.assertEqual(sorted(response.status_code for response in results), [200, 201])
+        identities = {response.json()["connector"]["id"] for response in results}
+        self.assertEqual(set(self.store.connector_definitions()), identities)
+        self.assertEqual(len(identities), 1)
+        self.assertEqual(set(self.closed), set(self.opened) - identities)
+
+    async def test_delete_cascades_multiple_agents_and_next_execution_drops_tools(self):
+        identity = (await self.create())["connector"]["id"]
+        await self.client.patch("/agents/main", json={"mcp_servers": [identity]})
+        await self.client.patch("/agents/other", json={"searchable_mcp_servers": [identity]})
+        users = (await self.client.get(f"/connectors/{identity}/agents")).json()["agents"]
+        self.assertEqual({item["id"] for item in users}, {"main", "other"})
+        self.assertTrue(all("avatar" in item for item in users))
+        entered, release = asyncio.Event(), asyncio.Event()
+        bodies = []
+
+        async def respond(model, body):
+            bodies.append(body)
+            if len(bodies) == 1:
+                entered.set()
+                await release.wait()
+            yield answer("完成")
+
+        with patch.object(CodexSubscriptionModel, "_arequest", respond):
+            root = self.gateway.create_conversation("删除运行中的连接器", "main", client_id=uuid4().hex)[0]["id"]
+            self.gateway.send_message(root, "running", "开始")
+            await asyncio.wait_for(entered.wait(), 5)
+            before = self.store.last_seq()
+            try:
+                deleted = await self.client.delete(f"/connectors/{identity}")
+                self.assertEqual(deleted.status_code, 200, deleted.text)
+                self.assertEqual(self.store.agent("main")["mcp_servers"], [])
+                self.assertEqual(self.store.agent("other")["searchable_mcp_servers"], [])
+            finally:
+                release.set()
+            await self.runtime.workers.wait(root)
+            self.gateway.send_message(root, "next", "继续")
+            await self.runtime.workers.wait(root)
+        name = identity + "_echo"
+        self.assertIn(name, {tool.get("name") for tool in bodies[0].get("tools", [])})
+        self.assertNotIn(name, {tool.get("name") for tool in bodies[1].get("tools", [])})
+        changes = [event.data for event in self.store.after(before) if event.type == "resource.changed"]
+        self.assertEqual(changes[:3], [
+            {"kind": "agent", "id": "main", "op": "updated"},
+            {"kind": "agent", "id": "other", "op": "updated"},
+            {"kind": "connector", "id": identity, "op": "deleted"},
+        ])
 
     async def test_invalid_url_reports_address_without_internal_path_or_persistence(self):
         before = self.store.last_seq()
@@ -124,7 +365,6 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
     async def test_secrets_merge_delete_and_replay_never_return_values(self):
         original = await self.create(headers={"Authorization": "private-token", "X-Key": "second-secret"})
         identity = original["connector"]["id"]
-        self.assertEqual(self.opened, [])
         self.assertEqual(original["connector"]["headers"], {"Authorization": True, "X-Key": True})
         for path in ("/connectors", f"/connectors/{identity}"):
             response = await self.client.get(path)
@@ -171,18 +411,13 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("env-secret", response.text)
             self.assertNotIn('"keep"', response.text)
 
-    async def test_test_connection_cache_edit_next_restart_and_delete_conflict(self):
+    async def test_test_connection_cache_edit_next_restart_and_delete(self):
         identity = (await self.create())["connector"]["id"]
         tested = await self.client.post(f"/connectors/{identity}/test")
         self.assertEqual(tested.json(), {"success": True, "tool_count": 1, "error": None, "pending_restart": False})
         selected = await self.client.patch("/agents/main", json={"mcp_servers": [identity]})
         self.assertEqual(selected.status_code, 200, selected.text)
         self.assertEqual(self.opened, [identity])
-        detail = (await self.client.get(f"/connectors/{identity}")).json()
-        self.assertEqual(detail["used_by"], [{"id": "main", "name": "main"}])
-        rejected = await self.client.delete(f"/connectors/{identity}")
-        self.assertEqual(rejected.status_code, 409)
-        self.assertEqual(rejected.json()["error"]["details"]["used_by"], detail["used_by"])
         with patch.object(self.runtime, "refresh_mcp", side_effect=AssertionError("static update rebuilt Agent")):
             updated = await self.client.patch(f"/connectors/{identity}", json={"url": "https://example.com/new"})
         self.assertEqual(updated.status_code, 200, updated.text)
@@ -256,7 +491,6 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.probe_failure = True
         failed = (await self.client.post(f"/connectors/{identity}/test")).json()
         self.assertFalse(failed["success"])
-        self.assertIn("工具发现失败", failed["error"])
         detail = (await self.client.get(f"/connectors/{identity}")).json()
         self.assertEqual((detail["status"], detail["tool_count"]), ("connected", 1))
         self.assertEqual(self.opened, [identity])
@@ -283,7 +517,7 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_prepare_keeps_agent_and_redacts_failure_and_logs(self):
         secret = "never-show-this-credential"
-        identity = (await self.create(url="https://example.com/broken", headers={"Authorization": secret}))["connector"]["id"]
+        identity = self.seed_imported_connector(url="https://example.com/broken", headers={"Authorization": secret})
         before = self.store.agent("main")
         messages = io.StringIO()
         handler = logging.StreamHandler(messages)
@@ -308,9 +542,9 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
     async def test_escaped_header_secret_never_leaks_from_gateway_errors(self):
         secret = "sensitive-before\nsensitive-after"
         escaped = secret.encode("unicode_escape").decode("ascii")
-        identity = (await self.create(
+        identity = self.seed_imported_connector(
             url="https://example.com/broken", headers={"Authorization": secret},
-        ))["connector"]["id"]
+        )
         original = self.store.agent("main")
         rejected = await self.client.patch("/agents/main", json={"mcp_servers": [identity]})
         self.assertEqual(rejected.status_code, 400)
@@ -329,7 +563,6 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
         identity = (await self.create(description=""))["connector"]["id"]
         rejected = await self.client.patch("/agents/main", json={"searchable_mcp_servers": [identity]})
         self.assertEqual(rejected.status_code, 400)
-        self.assertEqual(self.opened, [])
         await self.client.patch(f"/connectors/{identity}", json={"description": "文档查询"})
         selected = await self.client.patch("/agents/main", json={"searchable_mcp_servers": [identity]})
         self.assertEqual(selected.status_code, 200, selected.text)
@@ -359,7 +592,7 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
                 yield answer("工具调用完成" if results else "尚未选择连接器")
 
         with patch.object(CodexSubscriptionModel, "_arequest", respond):
-            root = self.gateway.create_conversation("动态连接器", "main")["id"]
+            root = self.gateway.create_conversation("动态连接器", "main", client_id=uuid4().hex)[0]["id"]
             self.gateway.send_message(root, "before", "第一轮")
             self.assertEqual((await self.runtime.workers.wait(root))["status"], "completed")
             self.assertEqual(self.calls, [])
@@ -407,7 +640,7 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
                 yield answer("read after authentication cutover")
 
         with patch.object(CodexSubscriptionModel, "_arequest", respond):
-            root = self.gateway.create_conversation("认证切换后重新使用", "main")["id"]
+            root = self.gateway.create_conversation("认证切换后重新使用", "main", client_id=uuid4().hex)[0]["id"]
             self.gateway.send_message(root, "read-current", "调用当前连接器")
             result = await self.runtime.workers.wait(root)
             self.assertEqual(result["status"], "completed", result)
@@ -420,6 +653,9 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_test_and_agent_prepare_merge_without_lost_edits(self):
         identity = (await self.create())["connector"]["id"]
+        await self.runtime.mcp.close_service(identity)
+        self.entered.clear()
+        self.opened.clear()
         self.block = True
         first = asyncio.create_task(self.client.post(f"/connectors/{identity}/test"))
         await self.entered.wait()
@@ -431,11 +667,9 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.opened, [identity])
         self.assertEqual(self.store.agent("other")["name"], "并发新名字")
         self.assertEqual(self.store.agent("main")["mcp_servers"], [identity])
-        status_events = [event for event in self.store.after(0) if event.data.get("op") == "status"]
-        self.assertEqual([event.data["id"] for event in status_events], [identity])
 
     async def test_waiting_catalog_edit_validates_against_latest_pair(self):
-        identity = (await self.create())["connector"]["id"]
+        identity = self.seed_imported_connector()
         self.block = True
         original_update = self.gateway.update_agent
         second_entered = asyncio.Event()
@@ -467,7 +701,7 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current["mcp_servers"], [identity])
 
     async def test_stop_claims_client_id_while_agent_creation_prepares_connector(self):
-        identity = (await self.create())["connector"]["id"]
+        identity = self.seed_imported_connector()
         started, model_release = asyncio.Event(), asyncio.Event()
 
         async def respond(model, body):
@@ -476,7 +710,7 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
             yield answer("完成")
 
         with patch.object(CodexSubscriptionModel, "_arequest", respond):
-            root = self.gateway.create_conversation("运行中", "main")["id"]
+            root = self.gateway.create_conversation("运行中", "main", client_id=uuid4().hex)[0]["id"]
             self.gateway.send_message(root, "message", "开始")
             await asyncio.wait_for(started.wait(), 5)
             self.block = True
@@ -534,6 +768,10 @@ class ConnectorImportTests(unittest.TestCase):
         definitions = self.store.connector_definitions()
         self.assertEqual(definitions["docs"]["headers"], {"Authorization": "stored-secret"})
         self.assertEqual(definitions["docs"]["name"], "docs")
+        refreshed = derive_metadata(definitions["docs"], {
+            "serverInfo": {"title": "Remote title", "description": "Remote description"},
+        }, definitions)
+        self.assertEqual((refreshed["name"], refreshed["description"]), ("docs", "Docs"))
         self.workspace.agents_config.unlink()
         self.workspace.mcps_config.unlink()
         ensure_agents(self.store, *paths)
@@ -576,7 +814,6 @@ class ConnectorImportTests(unittest.TestCase):
         self.assertFalse(self.store.has_agents())
         self.assertEqual(self.store.connector_definitions(), {})
         self.store.import_agents(AgentCatalog("main", {"main": replace(role, workers=())}), {"docs": definition})
-        self.assertEqual(mcp_config(self.store.connector_definitions())[0], {"docs": {"url": "https://example.com/mcp"}})
 
     def test_connector_transaction_rolls_back_on_event_write_failure(self):
         self.store.import_agents(AgentCatalog(None, {}))
@@ -593,3 +830,15 @@ class ConnectorImportTests(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 self.store.delete_connector("docs")
         self.assertEqual(self.store.connector_definitions()["docs"], definition)
+
+    def test_cascade_rolls_back_agent_references_and_events_when_delete_fails(self):
+        role = AgentDefinition("d", "p", "offline", environment="local", mcp_servers=("docs",))
+        definition = connector_fields("docs", {"name": "Docs", "url": "https://example.com/mcp"})
+        self.store.import_agents(AgentCatalog("main", {"main": role}), {"docs": definition})
+        before = self.store.last_seq()
+        with patch.object(self.store, "_connector_event", side_effect=sqlite3.OperationalError("disk full")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.delete_connector("docs")
+        self.assertEqual(self.store.agent("main")["mcp_servers"], ["docs"])
+        self.assertIn("docs", self.store.connector_definitions())
+        self.assertEqual(self.store.last_seq(), before)

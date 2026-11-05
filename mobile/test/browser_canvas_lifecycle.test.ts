@@ -6,13 +6,14 @@ import { test } from "node:test";
 import { act, createElement, startTransition, Suspense, useEffect, useState } from "react";
 import { createRoot } from "test-renderer";
 import ts from "typescript";
-import { useRuntimeCallback } from "../src/browser/use-runtime-callback.ts";
+import { useRuntimeCommit } from "../src/lib/use-runtime-commit.ts";
 
 import type { SkImage } from "@shopify/react-native-skia";
 import { GatewayApi } from "../src/gateway/api.ts";
 import type { Frame, Pages } from "../src/browser/protocol.ts";
 import type { FrameCandidate } from "../src/browser/frame-canvas.tsx";
 import type { TouchEvent } from "../src/takeover-lab/gestures.ts";
+import { MouseModeRecognizer, type MouseAction } from "../src/takeover-lab/mouse-gestures.ts";
 
 type GestureHandler = (...args: unknown[]) => void;
 interface ManualGesture {
@@ -83,6 +84,7 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const nativeModules: Record<string, string> = {
   "@shopify/react-native-skia": `export const Canvas = 'Canvas'; export const Image = 'SkiaImage'; export const Path = 'SkiaPath';`,
   "react-native": `export const View = 'View';`,
+  "uniwind": `export const useCSSVariable = () => ['foreground', 'surface'];`,
   "react-native-worklets": `export function scheduleOnUI(callback, ...args) { globalThis.__browserCanvasScheduler.ui.push(() => callback(...args)); }
     export function scheduleOnRN(callback, ...args) { globalThis.__browserCanvasScheduler.rn.push({ callback, args }); }`,
   "react-native-reanimated": `const { useEffect, useState } = globalThis.__browserCanvasReact;
@@ -118,7 +120,9 @@ const baseFrame: Frame = { t: "frame", seq: 1, page: "a", epoch: 3, vp: 7, css: 
   in_flight_bytes: 1024, byte_budget: 4096, delivery_rate_bps: null, stop_reason: "none",
   frame_age_ms: null, credit_wait_ms: 0, send_lock_ms: null, ack_baseline_ms: null, ack_smoothed_ms: null, queue_delay_ms: null };
 const pages = (epoch: number): Pages => ({ t: "pages", current: "a", epoch, vp: 7, state: "human",
-  max_pages: 8, css: [100, 50], dpr: 1, pages: [{ id: "a", title: "Page a", url: "https://a.example/" }] });
+  environment_id: "local", environment_name: "Local",
+  capacity: { pages_used: 1, pages_registered: 1, pages_creating: 0, pages_pending_cleanup: 0, pages_limit: 8 },
+  capacity_rejection: null, css: [100, 50], dpr: 1, pages: [{ id: "a", title: "Page a", url: "https://a.example/" }] });
 function packet(frame: Frame): ArrayBuffer {
   const header = new TextEncoder().encode(JSON.stringify(frame));
   const bytes = new Uint8Array(4 + header.length + 4);
@@ -352,6 +356,54 @@ test("four real region gestures retain native identity while each receives its l
   }
 });
 
+test("browser.B6 queued region data survives native payload reuse and malformed UP releases the drag", async () => {
+  const scheduler = globalThis.__browserCanvasScheduler = new Scheduler();
+  const mouse = new MouseModeRecognizer(), actions: MouseAction[] = [];
+  function Regions() {
+    useRegionGesture((event) => actions.push(...mouse.handle(event)));
+    useRegionGesture((event) => actions.push(...mouse.handleButton("left", event)));
+    return null;
+  }
+  const root = createRoot();
+  const manager = { activate() {}, end() {}, fail() {} };
+  try {
+    await act(async () => { root.render(createElement(Regions)); });
+    const [surface, button] = scheduler.gestures;
+    button.handlers.onTouchesDown({ allTouches: [{ id: 0, x: 0, y: 0 }] }, manager);
+    const point = { id: 1, x: 10, y: 20 };
+    const native: { allTouches?: typeof point[]; numberOfTouches: number } = {
+      allTouches: [point], numberOfTouches: 1,
+    };
+    surface.handlers.onTouchesDown(native, manager);
+    // Model an event whose backing data no longer describes this dispatch by RN delivery.
+    // This is a boundary regression, not evidence that RNGH actually reuses the JS object.
+    native.allTouches = undefined;
+    scheduler.flushRN();
+    assert.deepEqual(actions.splice(0), [{ kind: "press", button: "left", count: 1 }]);
+
+    point.x = 20;
+    surface.handlers.onTouchesMove({ allTouches: [point] });
+    point.x = 500;
+    scheduler.flushRN();
+    assert.deepEqual(actions.splice(0), [{ kind: "move", dx: 10, dy: 0, dragging: true }]);
+    surface.handlers.onTouchesUp({ numberOfTouches: 0 }, manager);
+    scheduler.flushRN();
+    assert.deepEqual(actions.splice(0), [{ kind: "release", button: "left", count: 1 }]);
+    button.handlers.onFinalize({}, false);
+    surface.handlers.onFinalize({}, false);
+    scheduler.flushRN();
+    assert.deepEqual(actions, [], "late finalization cannot duplicate the release");
+
+    surface.handlers.onTouchesDown({ allTouches: [{ id: 2, x: 30, y: 40 }] }, manager);
+    surface.handlers.onTouchesUp({ allTouches: [{ id: 2, x: 30, y: 40 }],
+      changedTouches: [{ id: 2, x: 30, y: 40 }], numberOfTouches: 0 }, manager);
+    scheduler.flushRN();
+    assert.deepEqual(actions, [{ kind: "click", button: "left", count: 1 }]);
+  } finally {
+    await act(async () => { root.unmount(); });
+  }
+});
+
 // Capture even attempted renders so the tests prove suspension occurred after the hook,
 // rather than passing because React never started the pending update.
 function callbackFixture() {
@@ -360,7 +412,7 @@ function callbackFixture() {
   const gate = Promise.withResolvers<void>();
   let blocked = true;
   function Receiver({ label, suspend }: { label: string; suspend: boolean }) {
-    const receive = useRuntimeCallback((event: string) => history.push(`${label}:${event}`));
+    const receive = useRuntimeCommit((event: string) => history.push(`${label}:${event}`));
     entries.set(label, receive);
     if (suspend && blocked) throw gate.promise;
     return createElement("receiver", { label });

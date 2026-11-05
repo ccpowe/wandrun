@@ -2,6 +2,9 @@ import { cn } from '@/lib/utils';
 import * as SwitchPrimitives from '@rn-primitives/switch';
 import { Platform } from 'react-native';
 
+// Preserve the 44×26 track; native hit testing needs at least 48×48.
+const DEFAULT_HIT_SLOP = { top: 11, bottom: 11, left: 2, right: 2 };
+
 function Switch({
   className,
   ...props
@@ -17,6 +20,7 @@ function Switch({
         props.disabled && 'opacity-50',
         className
       )}
+      hitSlop={DEFAULT_HIT_SLOP}
       {...props}>
       <SwitchPrimitives.Thumb
         className={cn(

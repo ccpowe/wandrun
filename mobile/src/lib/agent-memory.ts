@@ -1,5 +1,6 @@
 import { GatewayError, type AgentMemory, type MemoryScope } from "../gateway/api.ts";
-import { getLanguage, getLocale, t } from "./i18n.ts";
+import { getLanguage, t } from "./i18n.ts";
+import { formatActivityTime } from "./agent-list.ts";
 
 /** The host normalizes LF and counts index Unicode code points without truncation. */
 export function normalizeMemory(content: string): string {
@@ -82,26 +83,6 @@ export function conflictMemory(details: unknown, scope: MemoryScope, id?: string
   return current as AgentMemory;
 }
 
-export type MemoryDraft = {
-  base: AgentMemory;
-  content: string;
-  /** Observation, never the CAS baseline until explicit reload. */
-  remote: AgentMemory | null;
-};
-
-export function beginMemoryDraft(base: AgentMemory): MemoryDraft {
-  return { base, content: base.content, remote: null };
-}
-
-export function observeMemory(state: MemoryDraft | null, incoming: AgentMemory): MemoryDraft {
-  if (!state) return beginMemoryDraft(incoming);
-  return { ...state, remote: incoming.version === state.base.version ? null : incoming };
-}
-
-/** Explicitly adopt the latest version while keeping local text for review. */
-export function reloadMemoryBase(state: MemoryDraft, incoming: AgentMemory): MemoryDraft {
-  return { base: incoming, content: state.content, remote: null };
-}
 
 export function memoryAuthor(author: AgentMemory["updated_by"]): string {
   switch (author) {
@@ -114,6 +95,6 @@ export function memoryAuthor(author: AgentMemory["updated_by"]): string {
 
 export function memoryModified(memory: AgentMemory, agentName?: string): string | null {
   if (memory.updated_at === null) return null;
-  return t("{date} · {author}修改", { date: new Date(memory.updated_at * 1000).toLocaleString(getLocale()),
+  return t("{date} · {author} 修改", { date: formatActivityTime(memory.updated_at, new Date()),
     author: memory.updated_by === "agent" && agentName ? agentName : memoryAuthor(memory.updated_by) });
 }

@@ -9,8 +9,8 @@ import ts from "typescript";
 import { GatewayApi, type BrowserTask } from "../src/gateway/api.ts";
 
 const leases: { computerId: string; signal: AbortSignal; resolve(value: { uri: string; dispose(): void }): void }[] = [];
-const fixture = { session: { api: new GatewayApi({ baseUrl: "http://same", token: "a", computerId: "a" }), connection: "open" } };
-Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true, __thumbnailFixture: fixture,
+const fixture = { session: { api: new GatewayApi({ baseUrl: "http://same", token: "a", computerId: "a" }), connection: "open" as const, queryIdentity: "a" } };
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true,
   __thumbnailLoad: (api: GatewayApi, _path: string, signal: AbortSignal) => {
     const { promise, resolve } = Promise.withResolvers<{ uri: string; dispose(): void }>();
     leases.push({ computerId: api.config.computerId!, signal, resolve });
@@ -25,7 +25,6 @@ const hosts: Record<string, string> = {
   "@/components/ui/icon.tsx": "export const Icon='Icon';",
   "@/components/ui/text.tsx": "export const Text='Text';",
   "@/lib/local-image.ts": "export const loadLocalImage=(...args)=>globalThis.__thumbnailLoad(...args);",
-  "@/lib/session-context.tsx": "export const useSession=()=>globalThis.__thumbnailFixture.session;",
   "@/lib/utils.ts": "export const cn=(...args)=>args.filter(Boolean).join(' ');",
 };
 registerHooks({
@@ -51,16 +50,15 @@ test("hidden thumbnails render a waiting state; switching computers cannot displ
   let oldDisposed = 0;
   let currentDisposed = 0;
   try {
-    await act(async () => root.render(createElement(BrowserThumbnail, { task, active: false })));
+    await act(async () => root.render(createElement(BrowserThumbnail, { session: fixture.session, task, active: false })));
     assert.equal(leases.length, 0);
     assert.equal(root.container.queryAll((node) => node.type === "Image").length, 0);
-    assert.equal(root.container.queryAll((node) => node.type === "Text")[0].props.children, "等待浏览器画面");
-    await act(async () => root.render(createElement(BrowserThumbnail, { task, active: true })));
+    await act(async () => root.render(createElement(BrowserThumbnail, { session: fixture.session, task, active: true })));
     assert.equal(leases[0].computerId, "a");
     const oldApi = fixture.session.api;
     oldApi.close();
-    fixture.session = { api: new GatewayApi({ baseUrl: "http://same", token: "b", computerId: "b" }), connection: "open" };
-    await act(async () => root.render(createElement(BrowserThumbnail, { task, active: true })));
+    fixture.session = { api: new GatewayApi({ baseUrl: "http://same", token: "b", computerId: "b" }), connection: "open", queryIdentity: "b" };
+    await act(async () => root.render(createElement(BrowserThumbnail, { session: fixture.session, task, active: true })));
     assert.equal(leases[0].signal.aborted, true);
     assert.equal(leases[1].computerId, "b");
     await act(async () => leases[0].resolve({ uri: "file://a/private", dispose: () => { oldDisposed++; } }));

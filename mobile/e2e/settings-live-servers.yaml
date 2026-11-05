@@ -1,0 +1,78 @@
+# Two real, empty loopback gateways. PAIRING_CODE is injected privately at runtime.
+# Carousel has no native scroll action: the swipe is inside its observed 18–42% height.
+appId: host.exp.exponent
+---
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings--clear-live-records
+- extendedWaitUntil:
+    visible: { id: settings-live-storage-cleared }
+    timeout: 30000
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings--live-servers
+- extendedWaitUntil:
+    visible: 本机服务 A
+    timeout: 60000
+- takeScreenshot: ${ARTIFACTS}/01-real-single.png
+- tapOn: { id: settings-connection }
+- assertVisible: ".*127.0.0.1:18787.*"
+- tapOn: { id: connection-add }
+- tapOn: { id: pairing-manual }
+- tapOn: { id: pairing-address }
+- inputText: 127.0.0.1:18789
+- tapOn: { id: pairing-code }
+- inputText: ${PAIRING_CODE}
+- takeScreenshot: ${ARTIFACTS}/02-real-pairing-keyboard.png
+- tapOn: { id: pairing-submit }
+- extendedWaitUntil:
+    visible: "正在使用：${SERVER_B_NAME}"
+    timeout: 60000
+- takeScreenshot: ${ARTIFACTS}/03-real-paired-default-hostname.png
+- swipe:
+    start: 20%, 30%
+    end: 80%, 30%
+    duration: 400
+- assertVisible: { id: settings-server-use-settings-live-a }
+- assertVisible: "正在使用：${SERVER_B_NAME}"
+- takeScreenshot: ${ARTIFACTS}/04-browse-a-still-connected-b.png
+- tapOn: { id: settings-server-use-settings-live-a }
+- extendedWaitUntil:
+    visible: 正在使用：本机服务 A
+    timeout: 30000
+- tapOn: { id: settings-connection }
+- assertVisible: ".*127.0.0.1:18787.*"
+- takeScreenshot: ${ARTIFACTS}/05-explicit-a-details.png
+- tapOn: { id: gateway-back }
+- swipe:
+    start: 80%, 30%
+    end: 20%, 30%
+    duration: 400
+- assertVisible: "使用这台：${SERVER_B_NAME}"
+- assertVisible: 正在使用：本机服务 A
+- takeScreenshot: ${ARTIFACTS}/06-browse-b-still-connected-a.png
+- tapOn: "使用这台：${SERVER_B_NAME}"
+- extendedWaitUntil:
+    visible: "正在使用：${SERVER_B_NAME}"
+    timeout: 30000
+- tapOn: { id: settings-connection }
+- assertVisible: ".*127.0.0.1:18789.*"
+- takeScreenshot: ${ARTIFACTS}/07-explicit-b-details.png
+- stopApp
+- launchApp
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings--live-servers
+- extendedWaitUntil:
+    visible: "正在使用：${SERVER_B_NAME}"
+    timeout: 60000
+- takeScreenshot: ${ARTIFACTS}/08-native-storage-restored.png
+# Explicitly clear only the scene's private SecureStore key, then restore again.
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings--clear-live-records
+- extendedWaitUntil:
+    visible: { id: settings-live-storage-cleared }
+    timeout: 30000
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings--live-servers
+- extendedWaitUntil:
+    visible: 本机服务 A
+    timeout: 30000
+- assertNotVisible: "正在使用：${SERVER_B_NAME}"
+- takeScreenshot: ${ARTIFACTS}/09-private-storage-cleaned.png
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings--clear-live-records
+- extendedWaitUntil:
+    visible: { id: settings-live-storage-cleared }
+    timeout: 30000

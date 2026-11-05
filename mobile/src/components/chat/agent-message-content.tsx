@@ -17,7 +17,7 @@ export function AgentMessageContent({ text, ui, attachments, submissions, onSubm
   attachments?: readonly Pick<FileRecord, "id" | "media_type">[];
   submissions?: ReadonlyMap<number, UiSubmission>;
   draftOwner?: { session: ChatSession; conversationId: string; timelineId?: string; messageSeq: number };
-  onSubmit: (block: number, values: Record<string, unknown>, clientId: string) => Promise<void>;
+  onSubmit: (block: number, values: Record<string, unknown>, clientId: string, actionId?: string) => Promise<void>;
 }) {
   const segments = useMemo(() => splitAgentMessage(text), [text]);
   const parsed = useMemo(() => parseMessageMarkdown(segments), [segments]);
@@ -35,7 +35,7 @@ export function AgentMessageContent({ text, ui, attachments, submissions, onSubm
         imageFiles={authorizedImageFiles(ui?.find((entry) => entry?.block === part.block), attachments)}
         submission={submissions?.get(part.block)}
         draft={draftOwner && { ...draftOwner, block: part.block }}
-        onSubmit={(values, clientId) => onSubmit(part.block, values, clientId)} />)}
+        onSubmit={(values, clientId, actionId) => onSubmit(part.block, values, clientId, actionId)} />)}
     {parsed.tail.length ? <AgentMemoryMarkdown content=" " tokens={parsed.tail} media={media} selectable scrollCodeBlocks /> : null}
   </View>;
 }

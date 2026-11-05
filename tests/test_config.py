@@ -6,9 +6,12 @@ import unittest
 from pathlib import Path
 
 from wandrun.config import (
-    AgentCatalog, AgentDefinition, load_config, load_config_for_catalog,
+    AgentCatalog, AgentDefinition, EnvironmentDefinition, load_config, load_config_for_catalog,
     validate_catalog, validate_mcp_servers,
 )
+
+
+MACHINE_ID = "m_" + "a" * 26
 
 
 AGENTS = '''
@@ -82,36 +85,81 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "fast_mode 必须是布尔值"):
                 self.load(agents=configured)
 
-    def test_browser_settings_are_local_and_bounded(self):
+    def test_browser_settings_are_per_environment_and_bounded(self):
         browser = '\n[environments.local.browser]\ncdp_url = "http://127.0.0.1:9222"\n'
         config = self.load(environments=ENVIRONMENTS + browser)
-        self.assertEqual(config.environments["local"].browser.slots, 3)
+        self.assertEqual(config.environments["local"].browser.max_pages, 8)
         self.assertEqual(config.environments["local"].browser.idle_timeout, 7200)
-        custom = self.load(environments=ENVIRONMENTS + browser + "slots = 2\nmax_pages = 4\nidle_timeout = 0\nqueue_timeout = 0.5\n")
-        self.assertEqual(
-            (custom.environments["local"].browser.slots,
-             custom.environments["local"].browser.max_pages,
-             custom.environments["local"].browser.idle_timeout,
-             custom.environments["local"].browser.queue_timeout),
-            (2, 4, 0, 0.5),
-        )
+        custom = self.load(environments=ENVIRONMENTS + browser + "max_pages = 4\nidle_timeout = 0\n")
+        self.assertEqual((custom.environments["local"].browser.max_pages,
+                          custom.environments["local"].browser.idle_timeout), (4, 0))
         for extra in (
             'cdp_url = "ws://127.0.0.1:9222"',
             'cdp_url = "http://user:pass@127.0.0.1:9222"',
-            'cdp_url = ""',
-            'cdp_url = "http://127.0.0.1:9222"\nslots = 0',
+            'cdp_url = ""', 'max_pages = 4',
+            'cdp_url = "http://127.0.0.1:9222"\nslots = 2',
             'cdp_url = "http://127.0.0.1:9222"\nmax_pages = true',
             'cdp_url = "http://127.0.0.1:9222"\nidle_timeout = -1',
-            'cdp_url = "http://127.0.0.1:9222"\nqueue_timeout = 0',
+            'cdp_url = "http://127.0.0.1:9222"\nqueue_timeout = 30',
         ):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 self.load(environments=ENVIRONMENTS + '\n[environments.local.browser]\n' + extra + '\n')
-        ssh = '\n[environments.vps]\ntype = "ssh"\nhost = "example.com"\nworkdir = "/srv/work"\n'
-        with self.assertRaises(ValueError):
-            self.load(environments=ENVIRONMENTS + ssh + browser.replace("environments.local", "environments.vps"))
-        with self.assertRaisesRegex(ValueError, "一个本机浏览器"):
-            self.load(environments=ENVIRONMENTS + browser + '\n[environments.second]\ntype = "local"\n'
-                      + browser.replace("environments.local", "environments.second"))
+        alias = '\n[environments.second]\ntype = "local"\n' + browser.replace("environments.local", "environments.second")
+        config = self.load(environments=ENVIRONMENTS + browser + alias)
+        self.assertEqual(config.environments["local"].browser, config.environments["second"].browser)
+        for conflicting in (alias.replace("9222", "9333"), alias + "max_pages = 4\n"):
+            with self.subTest(conflicting=conflicting), self.assertRaisesRegex(ValueError, "浏览器配置冲突"):
+                self.load(environments=ENVIRONMENTS + browser + conflicting)
+
+    def test_instabox_browser_defines_phase_two_transport_without_host_url(self):
+        cloud = (
+            '\n[environments.cloud]\ntype = "instabox"\n'
+            f'machine_id = "{MACHINE_ID}"\nworkdir = "/data/home/wandrun"\n'
+            '[environments.cloud.browser]\n'
+        )
+        browser = self.load(environments=ENVIRONMENTS + cloud).environments["cloud"].browser
+        self.assertEqual((browser.cdp_url, browser.cdp_port, browser.profile_dir),
+                         (None, 9222, "/data/home/wandrun-browser/profile"))
+        for invalid in ('cdp_url = "http://localhost:9222"', 'cdp_port = true',
+                        'cdp_port = 0', 'cdp_port = 65536', 'profile_dir = "relative"',
+                        'slots = 1', 'queue_timeout = 30'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.load(environments=ENVIRONMENTS + cloud + invalid + "\n")
+
+    def test_instabox_requires_existing_instance_binding_and_host_key_reference(self):
+        sandbox = (
+            '\n[environments.cloud]\ntype = "instabox"\n'
+            f'machine_id = "{MACHINE_ID}"\nworkdir = "/data/home/wandrun"\n'
+        )
+        for invalid in (
+            sandbox.replace(f'machine_id = "{MACHINE_ID}"\n', ""),
+            sandbox.replace('workdir = "/data/home/wandrun"\n', ""),
+            sandbox.replace(f'"{MACHINE_ID}"', '"../other"'),
+            sandbox.replace(f'"{MACHINE_ID}"', '"m_existing"'),
+            sandbox.replace('"/data/home/wandrun"', '"relative"'),
+            sandbox + 'api_key_env = "KEY WITH SPACE"\n',
+            sandbox + 'api_key = "not-allowed"\n',
+            sandbox + 'host = "example.com"\n',
+            sandbox + '[environments.cloud.browser]\ncdp_url = "http://localhost:9222"\n',
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.load(environments=ENVIRONMENTS + invalid)
+
+    def test_one_instabox_instance_cannot_have_conflicting_execution_settings(self):
+        sandbox = (
+            '\n[environments.cloud]\ntype = "instabox"\n'
+            f'machine_id = "{MACHINE_ID}"\nworkdir = "/data/home/wandrun"\n'
+        )
+        alias = sandbox.replace("environments.cloud", "environments.alias")
+        self.load(environments=ENVIRONMENTS + sandbox + alias)
+        for conflicting in (
+            alias.replace('"/data/home/wandrun"', '"/data/home/other"'),
+            alias + 'api_key_env = "OTHER_ACCOUNT_KEY"\n',
+            alias + "command_timeout = 60\n",
+            alias + "termination_grace = 3\n",
+        ):
+            with self.subTest(conflicting=conflicting), self.assertRaisesRegex(ValueError, "实例配置冲突"):
+                self.load(environments=ENVIRONMENTS + sandbox + conflicting)
 
     def test_display_name_is_single_line_and_at_most_64_characters_in_toml(self):
         def named(value):
@@ -267,32 +315,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.environments["quick"].command_timeout, 120)
         self.assertEqual(config.environments["quick"].termination_grace, 0.5)
 
-    def test_ssh_environment_fields(self):
-        ssh = '\n[environments.vps]\ntype = "ssh"\nhost = "example.com"\nworkdir = "/srv/work/"\n'
-        config = self.load(environments=ENVIRONMENTS + ssh + 'port = 2222\nuser = "ubuntu"\n')
-        vps = config.environments["vps"]
-        self.assertEqual((vps.host, vps.port, vps.user, vps.workdir), ("example.com", 2222, "ubuntu", "/srv/work"))
-        minimal = self.load(environments=ENVIRONMENTS + ssh).environments["vps"]
-        self.assertEqual((minimal.port, minimal.user), (None, None))  # 交给 ~/.ssh/config
-        cases = (
-            ssh.replace('host = "example.com"\n', ""),
-            ssh.replace('workdir = "/srv/work/"\n', ""),
-            ssh.replace('"/srv/work/"', '"relative/dir"'),
-            ssh + "port = 0\n",
-            ssh + "port = 70000\n",
-            ssh + 'port = "22"\n',
-            ssh + 'password = "secret"\n',
-            ssh + 'user = ""\n',
-        )
-        for extra in cases:
-            with self.subTest(extra=extra):
-                with self.assertRaises(ValueError) as error:
-                    self.load(environments=ENVIRONMENTS + extra)
-                self.assertNotIn("secret", str(error.exception))
-        with self.assertRaisesRegex(ValueError, "同一远端工作目录"):
-            self.load(environments=ENVIRONMENTS + ssh + ssh.replace("vps", "vps2"))
-        with self.assertRaises(ValueError):  # local 不接受远端字段
-            self.load(environments=ENVIRONMENTS + 'host = "example.com"\n')
+    def test_ordinary_ssh_is_rejected_even_when_unreferenced(self):
+        ssh = '\n[environments.retired]\ntype = "ssh"\n'
+        for environments in (
+            ENVIRONMENTS.replace('type = "local"', 'type = "ssh"'),
+            ENVIRONMENTS + ssh,
+            ENVIRONMENTS + ssh + 'host = "example.com"\nport = 2222\nuser = "ubuntu"\nworkdir = "/srv/work"\n',
+        ):
+            with self.subTest(environments=environments), self.assertRaises(ValueError):
+                self.load(environments=environments)
+
+    def test_local_rejects_remote_execution_fields(self):
+        for field in (
+            'host = "example.com"', 'port = 2222', 'user = "ubuntu"',
+            'workdir = "/srv/work"', f'machine_id = "{MACHINE_ID}"',
+            'api_key_env = "REMOTE_API_KEY"',
+        ):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.load(environments=ENVIRONMENTS + field + "\n")
 
     def test_invalid_environments(self):
         cases = (
@@ -343,6 +383,49 @@ class CatalogSourceTests(unittest.TestCase):
     def test_valid_catalog_is_accepted(self):
         config = self.load({"main": self.agent(workers=("a-1",)), "a-1": self.agent()})
         self.assertEqual(config.catalog.agents["main"].workers, ("a-1",))
+
+    def test_restart_restores_selected_machine_and_keeps_existing_owner_parameters_for_new_alias(self):
+        machine = "m_" + "a" * 26
+        selected = EnvironmentDefinition(
+            type="instabox", machine_id=machine, workdir="/data/original",
+            api_key_env="HOST_CHOICE_KEY", command_timeout=77,
+        )
+        self.environments.write_text(
+            'default = "local"\n[environments.local]\ntype = "local"\n'
+            '[environments.new_alias]\ntype = "instabox"\n'
+            f'machine_id = "{machine}"\nworkdir = "/data/changed"\n',
+            encoding="utf-8",
+        )
+        original = self.environments.read_bytes()
+        config = load_config_for_catalog(
+            AgentCatalog("main", {"main": self.agent(environment="selected")}),
+            self.mcps, self.environments, environment_definitions={"selected": selected},
+        )
+        self.assertEqual(config.environments["selected"], selected)
+        self.assertEqual(config.environments["new_alias"], selected)
+        self.assertEqual(config.agents["main"].environment, "selected")
+        self.assertEqual(self.environments.read_bytes(), original)
+
+    def test_reserved_local_binding_is_checked_for_persisted_overrides_too(self):
+        bad_local = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "a" * 26, workdir="/data/home/wandrun",
+        )
+        with self.assertRaises(ValueError):
+            load_config_for_catalog(
+                AgentCatalog("main", {"main": self.agent()}), self.mcps, self.environments,
+                environment_definitions={"local": bad_local},
+            )
+
+    def test_invalid_persisted_machine_identity_is_rejected_before_backend_assembly(self):
+        with self.assertRaises(ValueError):
+            load_config_for_catalog(
+                AgentCatalog("main", {"main": self.agent(environment="cloud")}),
+                self.mcps, self.environments, environment_definitions={
+                    "cloud": EnvironmentDefinition(
+                        type="instabox", machine_id="m_existing", workdir="/data/home/wandrun",
+                    ),
+                },
+            )
 
     def test_field_rules_match_the_toml_source(self):
         for field, value in (

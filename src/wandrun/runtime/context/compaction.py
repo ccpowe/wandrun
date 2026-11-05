@@ -34,6 +34,7 @@ from wandrun.runtime.context.compaction_summary import (
     memory_execution_barriers, request_model_kwargs, summarize_request,
 )
 from wandrun.runtime.communication.messages import read_file_media_tool_call_id
+from wandrun.runtime.context.environment_runtime import environment_snapshot_index
 
 logger = logging.getLogger(__name__)
 _SUMMARY_HEADER = (
@@ -172,6 +173,11 @@ def context_messages(state, *, projected=None, event=None):
     selected = set(range(cutoff, len(raw)))
     selected.update(i for i, m in enumerate(raw) if m.id and m.id.startswith("undelivered:"))
     selected.update(protected)
+    # Keep the full current placement even when it precedes the cut. It is already
+    # a standalone runtime message, so pinning it cannot split an AI/tool batch.
+    environment_index = environment_snapshot_index(state)
+    if environment_index is not None:
+        selected.add(environment_index)
     # Retain the current instruction without pinning all following tool iterations.
     # A memory/receipt appended later must not displace it from the soft tail budget.
     latest_instruction = next((
@@ -194,6 +200,8 @@ def context_messages(state, *, projected=None, event=None):
     # Filesystem projection may replace/reorder copies; opaque execution receipts
     # must come from the original authority, including every sibling in that batch.
     retained.update((index, raw[index]) for index in protected)
+    if environment_index is not None:
+        retained[environment_index] = raw[environment_index]
     # Keep old execution barriers and instruction pins in original order, before
     # the bridge. Runtime notices remain after it; complete tool groups stay paired.
     old_pins = {

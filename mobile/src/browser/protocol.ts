@@ -1,5 +1,6 @@
 import type { BrowserTask } from "../gateway/api.ts";
 import { t } from "../lib/i18n.ts";
+import type { BrowserTransport, VideoSupportReason } from "../lib/browser-video.ts";
 
 /** The lease socket sends a BE header length, UTF-8 JSON metadata, then raw JPEG bytes. */
 export type Frame = {
@@ -30,19 +31,24 @@ export type Frame = {
 export type FramePacket = { frame: Frame; jpeg: Uint8Array };
 /** Validated envelope retained in a single latest slot until the image candidate can advance. */
 export type FrameEnvelope = { frame: Frame; data: ArrayBuffer; jpegOffset: number };
-export type Pages = { t: "pages"; current: string | null; pages: BrowserTask["pages"]; state: BrowserTask["state"]; max_pages: number; epoch: number; vp: number; css: [number, number]; dpr: number };
-export type Hello = { t: "hello"; protocol: number; ping_supported: boolean; window_mode: "adaptive" | "fixed"; max_in_flight: number; max_in_flight_limit: 32; connection_id?: string };
-export type Reply = { t: "input_done"; id: number; epoch?: number; vp?: number; input_lock_wait_ms: number; input_dispatch_ms: number; input_cdp_ms: number }
-  | { t: "input_pending" | "page_done"; id: number; epoch?: number; vp?: number; target?: string }
+export type Pages = {
+  t: "pages"; current: string | null; pages: BrowserTask["pages"]; state: BrowserTask["state"];
+  environment_id: string; environment_name: string; capacity: BrowserTask["capacity"];
+  capacity_rejection: BrowserTask["capacity_rejection"]; epoch: number; vp: number; css: [number, number]; dpr: number;
+};
+export type Hello = { t: "hello"; protocol: number; ping_supported: boolean; window_mode: "adaptive" | "fixed"; max_in_flight: number; max_in_flight_limit: 32; connection_id?: string;
+  transport: BrowserTransport; video_support: { available: boolean; reason: VideoSupportReason | null } };
+export type Reply = { t: "input_done"; id: number; outcome?: "sent" | "unknown"; epoch?: number; vp?: number; input_lock_wait_ms: number; input_dispatch_ms: number; input_cdp_ms: number }
+  | { t: "page_done"; id: number; epoch?: number; vp?: number; target?: string }
   | { t: "reject"; id: number | null; why: string } | { t: "pong"; id: number };
-export type Input =
-  | { t: "click" | "down" | "up"; x: number; y: number; button: "left" | "right"; count?: number }
-  | { t: "move"; x: number; y: number; buttons?: number }
+export type Input = (
+  | { t: "pointer"; x: number; y: number; buttons: number; count?: number }
+  | { t: "touch"; touches: { id: number; x: number; y: number }[] }
   | { t: "wheel"; x: number; y: number; dx: number; dy: number }
   | { t: "text"; text: string }
   | { t: "key"; key: string; code: string; vk: number; text?: string }
   | { t: "navigate"; url: string }
-  | { t: "back" | "reload" | "forward" };
+  | { t: "back" | "reload" | "forward" }) & { ts?: number };
 
 const decoder = typeof TextDecoder === "undefined" ? null : new TextDecoder("utf-8", { fatal: true });
 const duration = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
@@ -51,7 +57,10 @@ const optionalDuration = (n: unknown): n is number | null => n === null || durat
 /** Reject malformed diagnostic envelopes rather than laundering invalid timings into stats. */
 export function decodeHello(message: unknown): Hello {
   const hello = message as Hello;
-  if (!hello || hello.t !== "hello" || hello.protocol !== 1 || typeof hello.ping_supported !== "boolean"
+  if (!hello || hello.t !== "hello" || hello.protocol !== 3 || typeof hello.ping_supported !== "boolean"
+    || !["jpeg", "video"].includes(hello.transport)
+    || typeof hello.video_support?.available !== "boolean"
+    || ![null, "environment-unsupported", "video-not-configured", "player-unavailable"].includes(hello.video_support.reason)
     || !["adaptive", "fixed"].includes(hello.window_mode)
     || !Number.isSafeInteger(hello.max_in_flight) || hello.max_in_flight < 1 || hello.max_in_flight > 32
     || hello.max_in_flight_limit !== 32
@@ -63,7 +72,8 @@ export function decodeHello(message: unknown): Hello {
 export function decodeInputDone(message: unknown): Extract<Reply, { t: "input_done" }> {
   const reply = message as Extract<Reply, { t: "input_done" }>;
   if (!reply || reply.t !== "input_done" || !Number.isSafeInteger(reply.id) || reply.id < 0
-    || !duration(reply.input_lock_wait_ms) || !duration(reply.input_dispatch_ms) || !duration(reply.input_cdp_ms))
+    || !duration(reply.input_lock_wait_ms) || !duration(reply.input_dispatch_ms) || !duration(reply.input_cdp_ms)
+    || (reply.outcome !== undefined && reply.outcome !== "sent" && reply.outcome !== "unknown"))
     throw new Error("invalid-input-done");
   return reply;
 }
@@ -127,23 +137,27 @@ export function rejectReason(why: string): string {
     "stale-viewport": "页面视口已变化，请等待新画面", "stale-frame": "画面已过期，请等待新画面",
     "no-page": "没有可操作的页面，请先新建页面", "no-such-page": "页面已关闭", "out-of-bounds": "点击落在页面外",
     "invalid-gesture": "手势已取消，请重试", "incomplete-gesture": "手势不完整，请重试",
-    "no-history": "没有上一页", "page-limit": "已达到页面上限", "invalid-url": "网址无效，请输入 http 或 https 网址",
+    "no-history": "没有上一页", "page-limit": "本环境页面总数已达上限，请先关闭页面", "invalid-url": "网址无效，请输入 http 或 https 网址",
     "browser-unavailable": "浏览器暂不可用，请稍后重新打开",
     "task-ended": "任务已结束，无法继续操作浏览器",
     "browser-ended": "浏览器正在关闭或已结束，请重新打开",
     "invalid-input": "当前输入不受支持，请换一种操作方式",
     "browser-operation-failed": "浏览器操作失败，请重新打开后重试；如持续失败，请联系管理员",
+    "sequence-rejected": "手势已取消，请重试",
   };
   return t(reasons[why] ?? "操作未完成，请等待新画面后重试；如持续失败，请重新打开浏览器");
 }
 
 /** Lease closure reasons are server diagnostics, not display text. */
+// Chrome reachability errors go to CLI discovery, not lease-ended events.
 export function endedReason(reason: string | null): string {
   const reasons: Record<string, string> = {
     "用户关闭": "浏览器已关闭", "最后一张页面已关闭": "最后一张页面已关闭，可重新打开浏览器",
     "浏览器空闲超时": "浏览器因长时间未操作而结束，请重新打开",
     "重启": "浏览器因服务重启而结束，请重新打开",
-    "Chrome 重启": "浏览器因 Chrome 重启而结束，请重新打开",
+    "Chrome 连接中断": "浏览器连接已断开，旧页面已结束，可让 Agent 重新打开",
+    "浏览器连接中断": "浏览器连接已断开，旧页面已结束，可让 Agent 重新打开",
+    "平台恢复": "运行环境已恢复，旧页面已结束，可让 Agent 重新打开",
     "任务结束": "任务已结束，浏览器已关闭",
     "对话删除": "对话已删除，浏览器已关闭",
     "Agent 删除": "Agent 已删除，浏览器已关闭",

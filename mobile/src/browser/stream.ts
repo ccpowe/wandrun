@@ -1,21 +1,29 @@
 import type { GatewayApi } from "../gateway/api.ts";
-import { decodeFrameEnvelope, decodeHello, decodeInputDone, inputFrame, jpegBytes, type FrameEnvelope, type FramePacket, type Input, type Pages, type Reply } from "./protocol.ts";
+import { decodeFrameEnvelope, decodeHello, decodeInputDone, inputFrame, jpegBytes, type FrameEnvelope, type FramePacket, type Hello, type Input, type Pages, type Reply } from "./protocol.ts";
 import { StreamMeter } from "./measurements.ts";
+import type { BrowserTransport, VideoMessage } from "../lib/browser-video.ts";
+
+type Sample = { id: number; input: Input; epoch: number; vp: number; page: string; frame?: number };
 
 export type StreamState = "connecting" | "open" | "closed";
 type Events = {
-  state(state: StreamState): void;
+  state(state: StreamState, closeCode?: number): void;
   frame(packet: FramePacket): void;
   pages(pages: Pages): void;
   reply(reply: Reply): void;
   ended(reason: string | null): void;
   error(message: string): void;
+  hello?(hello: Hello): void;
+  video?(message: VideoMessage): void;
+  controlReject?(id: string): void;
+  sent?(id: number, at: number): void;
+  inputResumed?(): void;
 };
 
 /** One visible lease page. One delivered image stays active until commit or invalidation,
  * while a single raw pending slot coalesces arrivals. Every seq is ACKed once:
- * false on pending replacement/invalidation, true only after UI commit. No retry here:
- * screen focus or explicit reconnect opens a fresh socket; inputs are never replayed.
+ * false on pending replacement/invalidation, true only after UI commit. BrowserRuntime
+ * owns replacement sockets; this connection never retries or replays inputs.
  */
 export class BrowserStream {
   private socket!: WebSocket;
@@ -39,8 +47,14 @@ export class BrowserStream {
   private readonly leaseId: string;
   private readonly api: GatewayApi;
   private readonly stopForApi = () => this.close();
+  private transport: BrowserTransport = "jpeg";
+  private nextControlId = 1;
+  private samples: Sample[] = [];
+  private inputFrameHandle: number | null = null;
+  private buttons: number | null = null;
+  private touchIds: string | null = null;
 
-  constructor(api: GatewayApi, leaseId: string, control: boolean, events: Events) {
+  constructor(api: GatewayApi, leaseId: string, control: boolean, events: Events, videoAvailable = false) {
     this.control = control;
     this.api = api;
     this.leaseId = leaseId;
@@ -61,7 +75,9 @@ export class BrowserStream {
     const NativeSocket = WebSocket as unknown as {
       new(url: string, protocols: string[], options: { headers: Record<string, string> }): WebSocket;
     };
-    this.socket = new NativeSocket(api.browserStreamUrl(leaseId, control ? "control" : "view"), [], { headers: api.headers() });
+    const url = new URL(api.browserStreamUrl(leaseId, control ? "control" : "view"));
+    url.searchParams.set("video_player", videoAvailable ? "1" : "0");
+    this.socket = new NativeSocket(url.toString(), [], { headers: api.headers() });
     api.signal.addEventListener("abort", this.stopForApi, { once: true });
     this.socket.binaryType = "arraybuffer";
     this.socket.onopen = () => {
@@ -105,17 +121,30 @@ export class BrowserStream {
           if (hello.connection_id && this.measurements.gatewayId && hello.connection_id !== this.measurements.gatewayId)
             throw new Error("hello-connection-id-mismatch");
           this.measurements.hello(hello);
+          this.transport = hello.transport;
+          this.events.hello?.(hello);
           if (hello.ping_supported && !this.stopPing) {
             this.ping();
             const timer = setInterval(() => this.ping(), 2000);
             this.stopPing = () => { clearInterval(timer); this.pingSent.clear(); };
           }
         }
+        if (message.t === "video" || message.t === "video_failed") {
+          if (this.transport === "video") this.events.video?.(message as VideoMessage);
+          return;
+        }
+        if (message.t === "reject" && typeof message.id === "string") {
+          this.events.controlReject?.(message.id);
+          return;
+        }
         if (message.t === "pages") {
           if (this.awaitingPage === message.current || this.awaitingPage === "" && message.current !== this.pages?.current) {
             this.awaitingPage = null;
             this.awaitingPageId = null;
           }
+          const previous = this.pages;
+          if (previous && (previous.current !== message.current || previous.epoch !== message.epoch || previous.vp !== message.vp || message.state !== "human"))
+            this.pauseInputs();
           this.pages = message;
           if (this.pending && !this.accepts(this.pending.frame) || this.active && !this.accepts(this.active)) this.skipFrames();
           this.measurements.select(message);
@@ -133,10 +162,11 @@ export class BrowserStream {
             this.measurements.pong(performance.now() - startedAt);
             this.pingSent.delete(message.id);
           }
-        } else if (message.t === "reject" || message.t === "input_done" || message.t === "input_pending" || message.t === "page_done") {
+        } else if (message.t === "reject" || message.t === "input_done" || message.t === "page_done") {
           if (message.t === "reject" && message.id === this.awaitingPageId) {
             this.awaitingPage = null;
             this.awaitingPageId = null;
+            this.events.inputResumed?.();
           }
           const reply = message.t === "input_done" ? decodeInputDone(message) : message as Reply;
           this.measurements.reply(reply, performance.now());
@@ -145,29 +175,36 @@ export class BrowserStream {
       } catch (error) {
         console.warn("[browser-stream] invalid message", { lease: this.leaseId, error: error instanceof Error ? error.name : typeof error, size: event.data instanceof ArrayBuffer ? event.data.byteLength : String(event.data).length });
         this.events.error("画面数据无法读取，请重新打开浏览器连接");
+        this.close(1002);
       }
     };
     this.socket.onerror = () => {
       if (!this.closed) {
         this.events.error("画面连接失败");
+        // An error is terminal even if the platform delays its close callback.
+        this.close(1006);
         void api.checkUnauthorized();
       }
     };
     this.socket.onclose = (event) => {
+      // A native error can precede close; an explicit 4401 still revokes that session.
+      if (event.code === 4401) api.handleRevoked();
       if (this.closed) return;
       this.closed = true;
       this.api.signal.removeEventListener("abort", this.stopForApi);
       this.cancelFrames();
+      this.pauseInputs();
       this.stopPing?.();
       this.finishMeasurements();
       this.displayed = null;
-      this.events.state("closed");
-      if (event.code === 4401) api.handleRevoked();
-      else void api.checkUnauthorized();
+      this.events.state("closed", event.code);
+      if (event.code !== 4401) void api.checkUnauthorized();
     };
   }
 
   get isOpen(): boolean { return !this.closed && this.socket.readyState === WebSocket.OPEN; }
+  /** Last allocated operation ID includes accepted samples still waiting for rAF. */
+  get inputWatermark(): number { return this.nextId - 1; }
   /** Accept only the current image candidate after its React/Skia view has committed. */
   displayedFrame(frame: FramePacket["frame"]): boolean {
     if (this.closed || this.active?.seq !== frame.seq) return false;
@@ -192,7 +229,7 @@ export class BrowserStream {
   }
 
   private accepts(frame: FramePacket["frame"]): boolean {
-    return this.pages !== null && this.awaitingPage === null && frame.page === this.pages.current
+    return this.transport === "jpeg" && this.pages !== null && this.awaitingPage === null && frame.page === this.pages.current
       && frame.epoch === this.pages.epoch && frame.vp === this.pages.vp;
   }
   private schedulePending(): void {
@@ -265,26 +302,90 @@ export class BrowserStream {
     this.socket.send(JSON.stringify(message));
     return true;
   }
-
-  /** Input is gated by the displayed frame, the selected page and the human control epoch. */
-  input(input: Input): number | null {
-    const frame = inputFrame(this.displayed, this.pages, this.control);
-    if (!frame || this.awaitingPage !== null) return null;
-    let payload: Input = input;
+  private inputCredential(videoPages?: Pages | null) {
+    if (!this.isOpen || this.awaitingPage !== null) return null;
+    if (this.transport === "jpeg") return inputFrame(this.displayed, this.pages, this.control);
+    return this.control && this.pages?.state === "human" && videoPages?.current != null
+      && videoPages.current === this.pages.current && videoPages.vp === this.pages.vp
+      && videoPages.epoch === this.pages.epoch ? videoPages : null;
+  }
+  input(input: Input, videoPages?: Pages | null): number | null {
+    const credential = this.inputCredential(videoPages);
+    if (!credential || !this.pages?.current) return null;
+    const point = (x: number, y: number) => Number.isFinite(x) && Number.isFinite(y)
+      && x >= 0 && y >= 0 && x <= credential.css[0] && y <= credential.css[1];
+    let payload: Input = { ...input, ts: input.ts ?? performance.now() };
     if ("x" in input) {
-      if (!Number.isFinite(input.x) || !Number.isFinite(input.y) || input.x < 0 || input.y < 0 || input.x > frame.css[0] || input.y > frame.css[1]) return null;
-      payload = { ...input, x: Math.min(input.x, frame.css[0] - 0.001), y: Math.min(input.y, frame.css[1] - 0.001) };
+      if (!point(input.x, input.y)) return null;
+      payload = { ...input, ts: payload.ts, x: Math.min(input.x, credential.css[0] - .001), y: Math.min(input.y, credential.css[1] - .001) };
     }
+    if (input.t === "pointer" && (!Number.isInteger(input.buttons) || input.buttons < 0 || input.buttons > 31)) return null;
+    if (input.t === "touch" && (input.touches.length > 10 || new Set(input.touches.map(touch => touch.id)).size !== input.touches.length
+      || input.touches.some(touch => !Number.isInteger(touch.id) || touch.id < 0 || touch.id > 2147483647 || !point(touch.x, touch.y)))) return null;
+    if (input.t === "touch") payload = { ...input, ts: payload.ts, touches: input.touches.map(touch => ({
+      id: touch.id, x: Math.min(touch.x, credential.css[0] - .001), y: Math.min(touch.y, credential.css[1] - .001),
+    })) };
     const id = this.nextId++;
-    if (!this.sendRaw({ ...payload, id, epoch: frame.epoch, vp: frame.vp, frame: frame.seq })) return null;
-    this.measurements.sent(id, input, performance.now());
+    const sample: Sample = { id, input: payload, epoch: credential.epoch, vp: credential.vp,
+      page: this.pages.current, ...(credential.t === "frame" ? { frame: credential.seq } : {}) };
+    const ids = input.t === "touch" ? input.touches.map(touch => touch.id).sort((a, b) => a - b).join(",") : null;
+    const boundary = input.t === "pointer" ? input.buttons !== this.buttons
+      : input.t === "touch" ? ids !== this.touchIds : false;
+    if (input.t === "pointer") this.buttons = input.buttons;
+    if (input.t === "touch") this.touchIds = ids;
+    if (boundary) {
+      // This full state supersedes unsent motion, never another button/contact change.
+      this.samples = this.samples.filter(entry => entry.input.t !== input.t);
+      this.writeInput(sample);
+    } else if (input.t === "pointer" || input.t === "touch" || input.t === "wheel") {
+      if (input.t === "pointer" || input.t === "touch") {
+        this.samples = this.samples.filter(entry => entry.input.t !== input.t);
+        this.samples.push(sample);
+      } else {
+        const previous = this.samples.at(-1), a = previous?.input;
+        if (previous && a?.t === "wheel" && payload.t === "wheel" && a.x === payload.x && a.y === payload.y
+          && Math.sign(a.dx) === Math.sign(payload.dx) && Math.sign(a.dy) === Math.sign(payload.dy))
+          this.samples[this.samples.length - 1] = { ...sample, input: { ...payload, dx: a.dx + payload.dx, dy: a.dy + payload.dy } };
+        else this.samples.push(sample);
+      }
+      this.scheduleInput();
+    } else this.writeInput(sample);
     return id;
+  }
+  private writeInput(entry: Sample) {
+    if (!this.isOpen || this.awaitingPage !== null || this.pages?.state !== "human"
+      || entry.page !== this.pages.current || entry.epoch !== this.pages.epoch || entry.vp !== this.pages.vp) return;
+    const at = performance.now();
+    if (this.sendRaw({ ...entry.input, id: entry.id, epoch: entry.epoch, vp: entry.vp, page: entry.page,
+      ...(entry.frame !== undefined ? { frame: entry.frame } : {}), sent_ms: at })) {
+      this.measurements.sent(entry.id, entry.input, at); this.events.sent?.(entry.id, at);
+    }
+  }
+  private scheduleInput() {
+    if (this.inputFrameHandle !== null || !this.samples.length) return;
+    this.inputFrameHandle = requestAnimationFrame(() => {
+      this.inputFrameHandle = null;
+      const sample = this.samples.shift();
+      if (sample) this.writeInput(sample);
+      this.scheduleInput();
+    });
+  }
+  pauseInputs() {
+    if (this.inputFrameHandle !== null) cancelAnimationFrame(this.inputFrameHandle);
+    this.inputFrameHandle = null; this.samples = []; this.buttons = null; this.touchIds = null;
+  }
+
+  retryVideo(): string | null {
+    if (this.transport !== "video") return null;
+    const id = `video-retry:${this.nextControlId++}`;
+    return this.sendRaw({ t: "video_retry", id }) ? id : null;
   }
 
   switchPage(target: string): number | null {
     if (this.awaitingPage !== null || target === this.pages?.current || !this.pages?.pages.some((page) => page.id === target)) return null;
     const id = this.nextId++;
     if (!this.sendRaw({ t: "switch_page", id, target })) return null;
+    this.pauseInputs();
     this.awaitingPage = target;
     this.awaitingPageId = id;
     this.skipFrames();
@@ -296,21 +397,23 @@ export class BrowserStream {
     const id = this.nextId++;
     if (!this.sendRaw({ t: "new_page", id, epoch: this.pages.epoch })) return null;
     this.awaitingPage = "";
+    this.pauseInputs();
     this.awaitingPageId = id;
     this.skipFrames();
     return id;
   }
 
-  close(): void {
+  close(closeCode = 1000): void {
     if (this.closed) return;
     this.api.signal.removeEventListener("abort", this.stopForApi);
     this.skipFrames();
     this.closed = true;
+    this.pauseInputs();
     this.cancelFrames();
     this.stopPing?.();
     this.finishMeasurements();
     this.displayed = null;
-    this.socket.close();
-    this.events.state("closed");
+    this.socket?.close();
+    this.events.state("closed", closeCode);
   }
 }

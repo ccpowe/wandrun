@@ -92,10 +92,9 @@ Create an empty workspace. On first start the gateway writes default
 install -d -m 700 ~/wandrun-workspace
 ```
 
-- **Agents and MCP servers** are imported from the TOML files into the gateway database on the
-  first start only. After that, edit them in the app (Settings → Agents / Connectors).
-- **Environments** (`environments.toml`) are read on every start.
-- **Skills** live in `.wandrun/skills/<name>/SKILL.md`; you can also import them from the app.
+- **Agents and MCP servers** are imported only when the database has no import marker; edit them in the app afterwards. Emptying the list does not re-import TOML.
+- **Environments** are read and validated on every start, but persisted definitions take precedence; editing TOML does not replace an existing binding or browser configuration. Set the parameters below before first startup.
+- **Skills** live in `.wandrun/skills/<name>/SKILL.md`. Ask an agent to import them using `skill-installer`, then select them in the app. New agents do not inherit the default skills or MCP selections.
 
 What you get by default:
 
@@ -117,11 +116,12 @@ command_timeout = 120
 
 [environments.local.browser]
 cdp_url = "http://127.0.0.1:9222"
-slots = 1          # concurrent browser tasks
-max_pages = 3      # pages per task
-idle_timeout = 900 # seconds before an idle lease is released
-queue_timeout = 30
+max_pages = 3      # total pages in this Chrome, shared by all tasks
+idle_timeout = 900 # idle browser-lease expiry, not machine suspension; 0 disables it
 ```
+
+`max_pages` is the shared budget for the environment's Chrome, including pages being created or not yet confirmed closed; excess requests fail immediately rather than queue. Human-controlled leases and leases with viewers do not expire under this idle rule.
+An empty workspace copies only the two default skills. The checked-in workspace also includes an unselected `news-brief` example with separately configured Reader and other dependencies. The gateway's automatic `wandrun-ui` protocol skill is not written into this skill directory.
 
 Agents you create later need the `browser` skill selected in the app to use web pages.
 
@@ -251,7 +251,7 @@ With the gateway running:
 
 ```bash
 cd ~/wandrun
-.venv/bin/python -m wandrun.gateway pair --workspace ~/wandrun-workspace \
+uv run --locked --no-dev python -m wandrun.gateway pair --workspace ~/wandrun-workspace \
   --url https://wandrun.example.com --name "My phone"
 ```
 
@@ -259,29 +259,145 @@ Set `--url` to the address the phone actually uses (the domain or private addres
 Scan the QR code in the app, or type the address and code manually. Codes are single-use and
 expire after five minutes. `--list` shows paired devices and `--revoke <device id>` revokes one.
 
+## Optional Instabox cloud execution
+
+Skip this section for a local-only setup; local execution and screenshots need neither Instabox nor LiveKit.
+Wandrun binds **existing** [Instabox](https://instabox.sh) machines; it does not create, delete or proactively suspend them. Their files, commands and browser data live under your Instabox account rather than only on the gateway host.
+
+Set `INSTABOX_API_KEY=<your Key>` in the gateway's explicit `EnvironmentFile`, with mode `0600`, and restart the gateway.
+This is a systemd loading convention: Wandrun does not automatically read `instabox.env` or `.env`.
+Choose an existing machine in the agent editor. The server page shows platform states, agent references and page counts, with a full-list subpage. Listing does not wake machines; platform state does not prove SSH, Chrome or video readiness.
+
+Alternatively, add an explicit definition to `.wandrun/environments.toml` **before first import**, keeping the existing local table:
+
+```toml
+[environments.cloud]
+type = "instabox"
+machine_id = "<existing machine ID>"
+api_key_env = "INSTABOX_API_KEY" # variable name, not the Key value
+workdir = "/data/home/wandrun"
+
+[environments.cloud.browser]
+```
+
+The empty `browser` table enables cloud browser defaults: CDP 9222, profile `/data/home/wandrun-browser/profile`, 8 total pages and 7200-second idle lease expiry. Omitting the table disables this browser. Still select the machine as the agent's execution environment in the app. Only `local` and `instabox` are supported; the old `type="ssh"` configuration is no longer accepted.
+
+The cloud machine needs Python 3.13, npm, uv and Chrome / Chromium, plus access to npm and Python package sources.
+When the agent follows the browser skill's `start_browser.py`, it installs pinned `agent-browser@0.38.1` and a separate video venv with `livekit==1.2.0`, `pillow==13.0.0` and `websockets==17.4` in persistent storage. The publisher venv is `/data/home/wandrun-browser/video-publisher/venv/`; the gateway runs it but never installs dependencies during publishing. The cloud startup script uses headless Chrome with a regular Chrome UA; local Chrome still uses Xvfb as in section 5.
+
+Connections are prepared only for actual I/O. `suspended` machines are resumed; `stopped` machines are not automatically started. Files on `/data` may persist, but processes and pages are not promised to survive suspension. Recovery never automatically replays commands with unknown outcomes. Cloud storage does not replace a backup of the gateway's `.wandrun/state`.
+
+## Optional LiveKit browser video
+
+Video requires **an Instabox environment, a LiveKit SFU, and an Android APK / development build with the native LiveKit modules and project patches**. Expo Go does not have the required player. Missing `[stream.video]`, local execution or an unsupported app automatically uses screenshots without changing takeover input. Video has no audio.
+Once video is selected, failures remain explicit and retryable, **not an automatic downgrade to screenshots**. Invalid configuration or unavailable key files prevent gateway startup.
+
+### Deploy the SFU
+
+The project's existing deployment uses [LiveKit Server 1.13.11](https://github.com/livekit/livekit/releases/tag/v1.13.11). Follow the [official self-hosting guide](https://docs.livekit.io/home/self-hosting/deployment/) to install that binary at `~/.local/bin/livekit-server`. This example is a single node with the gateway and Caddy on the same host, without TURN; it does not guarantee connectivity on every network.
+
+Generate your own API-key-to-secret mapping shared by the SFU and gateway; do not put values in the repository or logs. `generate-keys` prints labeled fields, so convert them to a YAML mapping:
+
+```bash
+install -d -m 700 ~/.config/wandrun
+(umask 077; ~/.local/bin/livekit-server generate-keys |
+  uv run --no-project python -c 'import sys; fields = dict(line.split(":", 1) for line in sys.stdin if ":" in line); print(fields["API Key"].strip() + ": " + fields["API Secret"].strip())' \
+  > ~/.config/wandrun/livekit-keys.yaml)
+```
+
+Create `~/.config/wandrun/livekit.yaml`, replacing the user path, public IP and interface name:
+
+```yaml
+port: 7880
+bind_addresses: ["127.0.0.1"]
+key_file: /home/<user>/.config/wandrun/livekit-keys.yaml
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  node_ip: <SFU public IP>
+  use_external_ip: false
+  interfaces:
+    includes: [<public network interface>]
+turn:
+  enabled: false
+```
+
+Allow **TCP 7881 and UDP 7882** as described in [LiveKit ports and firewall](https://docs.livekit.io/home/self-hosting/ports-firewall/). Signaling port 7880 stays loopback-only. Media connects directly, not through Caddy. Both the app and cloud machine must reach the SFU; restricted networks may require TURN, which this example does not configure. Set the public interface explicitly on hosts with multiple bridges.
+
+`~/.config/systemd/user/wandrun-livekit.service`:
+
+```ini
+[Unit]
+Description=Wandrun LiveKit SFU
+
+[Service]
+ExecStart=%h/.local/bin/livekit-server --config %h/.config/wandrun/livekit.yaml
+UMask=0077
+Restart=on-failure
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+Reload and start it with `systemctl --user daemon-reload && systemctl --user enable --now wandrun-livekit`.
+Replace section 6's Caddy site with the same-site routing below, keeping the `/rtc` prefix:
+
+```caddyfile
+wandrun.example.com {
+    handle /rtc* {
+        reverse_proxy 127.0.0.1:7880
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8765 {
+            flush_interval -1
+        }
+    }
+}
+```
+
+Validate and reload Caddy. The SFU runs independently of the gateway and never replaces its authorization or input channel.
+
+### Configure gateway video
+
+Create `~/.config/wandrun/stream.toml`:
+
+```toml
+[stream.video]
+url = "wss://wandrun.example.com" # site root, without /rtc
+api_url = "http://127.0.0.1:7880"
+key_file = "~/.config/wandrun/livekit-keys.yaml"
+```
+
+Append `--stream-config %h/.config/wandrun/stream.toml` to the gateway unit's `ExecStart`, reload the unit and restart.
+`url` must be WSS reachable by the app and publisher; the management API must be loopback HTTP. The key file must be a nonempty YAML mapping with permissions no broader than `0600`. There is no automatic configuration-file discovery.
+The current protocol selects the picture transport automatically and uses streaming state input, with no picture/input mode switches. Old `default_transport`, `default_input_mode` and `mode_switch_timeout_s` keys are rejected; do not copy old experimental configurations.
+
+Check that unauthenticated gateway requests still return 401, port 7880 is loopback-only and media ports are allowed. Have a cloud agent open a page, then watch and take over with the new APK. This sends that page's picture through your SFU to the app; the gateway still issues short-lived, least-privilege room tokens. Remove `[stream.video]` and restart the gateway to disable video.
+
 ## Build the Android app
 
-The app is in `mobile/` (Expo SDK 57, React Native). Expo Go is fine for quick UI previews, but
-use an APK or a development build day to day: a native module and native patches only apply there.
+The app is in `mobile/` (Expo SDK 57, React Native). The v0.3.0 attachment is a new signed build from `95bf9fc`; its internal version remains **0.2.0 / versionCode 3**.
+Video requires the APK / development build's native LiveKit modules and two project patches; Expo Go automatically uses screenshots. Verify keyboard/chat pinning on a native build with the pinned keyboard-controller 1.22.9, not Expo Go's different bundled version.
 
 ```bash
 cd mobile
-npm ci
-npx eas-cli login
-npx eas-cli init                                        # links the app to your Expo account
-npx eas-cli build --platform android --profile preview  # produces an installable APK
+corepack enable pnpm
+pnpm install --frozen-lockfile  # packageManager pins pnpm 10.34.9
+pnpm dlx eas-cli login
+pnpm dlx eas-cli init                                        # links the app to your Expo account
+pnpm dlx eas-cli build --platform android --profile preview  # produces an installable APK
 ```
 
-For local development, `npx expo run:android` builds and installs a debug build on a connected device.
+For local development, `pnpm exec expo run:android` builds and installs a debug build on a connected device.
 
 ## Fast support
 
-The v0.2.1 gateway release supports the existing app's independent lightning toggle beside each
-agent's model and discrete reasoning-effort slider. Its release APK is the existing signed app
-version **0.2.0**, Android versionCode **3**, not a rebuild. Fast is off by default; it applies to the agent's main and compaction
-model requests without changing reasoning effort. When enabled, it requests `service_tier=priority`
-with `x-codex-routing-hint`; when disabled, neither is sent. There is no client-side fallback
-retry without Fast if the provider rejects the request.
+v0.3.0 supports the independent lightning toggle beside each agent's model and the discrete reasoning-effort slider.
+Fast is off by default; it applies to the agent's main and compaction model requests without changing reasoning effort.
+When enabled, it requests `service_tier=priority` with `x-codex-routing-hint`; when disabled, neither is sent.
+There is no client-side fallback retry without Fast if the provider rejects the request.
 
 The app enables the control only after the gateway advertises `capabilities.fast_mode=true`
 through `/models` or `/connection`. This declares implementation support, **not** account
@@ -318,93 +434,15 @@ against your LangSmith quota. Harbor forwarding also requires the adapter's
 2. Back up `~/wandrun-workspace` and `~/wandrun-chrome` while stopped, including SQLite sidecars.
    Keep credentials private; see the token rollback warning below.
 3. Check out the new tag and run `uv sync --locked --no-dev`.
-4. Choose the state path below: either remove old state as described, or convert the retained
-   gateway database to schema **24** before starting services. Then wait for the 401 check above.
-   First startup creates fresh schema-24 state; the application rejects older schemas and does not migrate them.
+4. v0.3.0 requires schema **31** and **is incompatible with old state, with no migration**.
+   While stopped, move `~/wandrun-workspace/.wandrun/state` to a backup location, then start services
+   and wait for the 401 readiness check above.
 
-### Fresh state
-
-Prefer **fresh state** if retaining history is unnecessary:
-move `~/wandrun-workspace/.wandrun/state` to a backup location while stopped. Conversations,
-schedules and device pairings start afresh; agents and connectors are re-imported from TOML,
-not recovered from edits in the old database. Old memory is not imported.
-
-### From v0.2.0 (gateway schema 23 → 24)
-
-To retain agents, conversations, schedules and pairings, install the `sqlite3` CLI with JSON
-support. Run this **one-time operator SQL only on a stopped, backed-up schema-23 database**.
-It adds `fast_mode=0` for all existing agents and JSON `fast_mode=false` to every stored original
-Agent-create response, including agents later edited or deleted. These replay snapshots must not
-be rebuilt from current agents: retries must retain the original result. This is a bounded
-offline conversion, not application migration or a guarantee about old execution checkpoints;
-start new conversations rather than resuming old checkpoints.
-
-```bash
-sqlite3 -bail "$HOME/wandrun-workspace/.wandrun/state/gateway.sqlite" <<'SQL'
-.bail on
-PRAGMA foreign_keys = ON;
-BEGIN IMMEDIATE;
-CREATE TEMP TABLE upgrade_guard (version INTEGER CHECK (version = 23));
-INSERT INTO upgrade_guard SELECT user_version FROM pragma_user_version;
-CREATE TEMP TABLE upgrade_assert (ok INTEGER NOT NULL CHECK (ok = 1));
-INSERT INTO upgrade_assert
-    SELECT count(*) = 0 FROM created_agent_results WHERE NOT json_valid(detail);
-INSERT INTO upgrade_assert
-    SELECT count(*) = 0 FROM created_agent_results
-    WHERE json_type(detail) != 'object' OR json_type(detail, '$.fast_mode') IS NOT NULL;
-ALTER TABLE agents ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0 CHECK (fast_mode IN (0, 1));
-UPDATE created_agent_results SET detail = json_set(detail, '$.fast_mode', json('false'));
-CREATE TEMP TABLE upgrade_integrity (result TEXT NOT NULL CHECK (result = 'ok'));
-INSERT INTO upgrade_integrity SELECT integrity_check FROM pragma_integrity_check;
-INSERT INTO upgrade_assert SELECT count(*) = 0 FROM pragma_foreign_key_check;
-PRAGMA user_version = 24;
-COMMIT;
-PRAGMA user_version;
-PRAGMA integrity_check;
-PRAGMA foreign_key_check;
-SQL
-```
-
-Expect `24` and `ok`, with no foreign-key rows. On any error, keep services stopped; `.bail on`
-exits and rolls back an uncommitted transaction. Investigate against the backup, never bypass
-guards or just change `user_version`. The column's SQL default initializes old agents; it does
-not turn Fast on. The command is not repeatable and must not be used on schema 22 or 24.
-
-### From v0.1.x (gateway schema 22 → 23 → 24)
-
-Alternatively, to retain the gateway database, first run this **one-time SQL only on a stopped,
-backed-up schema-22 database**. It drops memory authorship metadata, rebuilds `memory_metadata`
-and sets version 23. This is only an intermediate step: **do not start v0.2.1 yet**.
-Old memory is not converted to shared profile or working memory: re-enter what you need in
-the app, and start new conversations rather than resuming old execution checkpoints.
-
-```bash
-sqlite3 "$HOME/wandrun-workspace/.wandrun/state/gateway.sqlite" <<'SQL'
-.bail on
-PRAGMA foreign_keys = ON;
-BEGIN IMMEDIATE;
-CREATE TEMP TABLE upgrade_guard (version INTEGER CHECK (version = 22));
-INSERT INTO upgrade_guard SELECT user_version FROM pragma_user_version;
-DROP TABLE memory_metadata;
-CREATE TABLE memory_metadata (
-    scope TEXT NOT NULL CHECK (scope IN ('profile', 'work')),
-    agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,
-    version TEXT NOT NULL,
-    updated_by TEXT NOT NULL CHECK (updated_by IN ('user', 'agent')),
-    CHECK ((scope = 'profile' AND agent_id IS NULL) OR (scope = 'work' AND agent_id IS NOT NULL))
-);
-CREATE UNIQUE INDEX memory_metadata_profile ON memory_metadata(scope) WHERE scope = 'profile';
-CREATE UNIQUE INDEX memory_metadata_work ON memory_metadata(agent_id) WHERE scope = 'work';
-PRAGMA user_version = 23;
-COMMIT;
-PRAGMA user_version;
-PRAGMA integrity_check;
-SQL
-```
-
-Expect `23` and `ok`, then run the **23 → 24 SQL above while still stopped**, and require its
-`24` / `ok` result and no foreign-key rows before startup. On error, keep services stopped and
-inspect the backup; do not bypass the version guard. This SQL does not update other schema versions.
+Fresh state resets conversations, schedules, pairings and database-stored agent/connector settings.
+Agents and connectors are re-imported from TOML; edits made in the old database are not recovered.
+Prepare the intended TOML and skills before upgrading, then pair the phone and authorize connectors again.
+Do not just change SQLite `user_version` or apply the old schema-22-to-24 operator SQL.
+Moving state does not automatically remove user files or browser profiles outside it; back up and inspect those separately.
 
 **Rollback and OAuth:** tokens may rotate during acceptance checks. Never restore an older
 Codex `auth.json` or connector refresh token from a database backup over the current credentials.
@@ -423,4 +461,7 @@ consistently, sign in or authorize again rather than replaying an old refresh to
 | Chrome port busy / profile locked | Another Chrome is using the port or profile; use your own unit and profile directory |
 | Google sign-in says the browser is not secure | Chrome is running headless; run it headed on Xvfb as above |
 | Browser view freezes or the view connection fails | Usually Chrome stopped responding for lack of memory: check `free -h`; close heavy pages or wait for it to recover |
-| Browser task waits for a slot | All `slots` are busy; close idle pages or raise `slots` if memory allows |
+| Browser page creation is rejected | The environment reached `max_pages`; close idle pages, or raise `max_pages` if memory allows |
+| Cloud machine says paused but cannot execute | Platform `stopped` is not started automatically; restore a supported state in Instabox first. A platform state is not an SSH readiness check |
+| Video fails | Check the SFU, `/rtc*` proxy, TCP 7881 / UDP 7882, native app player and cloud publisher venv; retry explicitly, with no automatic screenshot downgrade |
+| Editing environment TOML has no effect | Persisted definitions take precedence; use a fresh workspace rather than changing SQLite to rebind machines |

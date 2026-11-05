@@ -5,8 +5,10 @@ import json
 import sqlite3
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import uuid4
 
 import httpx
 from langgraph.checkpoint.memory import InMemorySaver
@@ -16,7 +18,7 @@ from test_ui_submissions import FORM, ui
 from wandrun.gateway.http import create_app
 from wandrun.gateway.service import CollaborationUnavailable, Gateway, UnknownConversation
 from wandrun.gateway.store import ClientIdConflict, GatewayStore
-from wandrun.integrations.shell_backend import ManagedShellBackend
+from test_file_transfer import remote_backend
 from wandrun.runtime.execution.files import ResolvedAttachment, TaskFiles
 from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 from wandrun.runtime.communication.scheduler_store import SchedulerStore
@@ -39,7 +41,7 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager = gateway_manager(
             self.gateway, run, attachment_resolver=lambda *args: self.files.resolve_attachments(*args),
-            attachment_preflight=lambda *args: self.files.prepare_attachments(*args),
+            attachment_preflight=lambda sender, target, paths, task: self.files.prepare_attachments(sender, target, paths, task),
         )
         self.files = TaskFiles(
             self.directory, self.manager,
@@ -49,7 +51,7 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.gateway.workspace_root = self.directory
         self.addAsyncCleanup(self.manager.close)
         self.gateway.checkpointer = InMemorySaver()
-        self.root = self.gateway.create_conversation("根", "c")["id"]
+        self.root = self.gateway.create_conversation("根", "c", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(self.root, "root-message", "开始")
         self.child = self.delegate(self.root, "a", "查找第一项\n第二行")
         await asyncio.sleep(0)
@@ -102,7 +104,7 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_received_and_created_lists_sort_and_keep_independent_read_positions(self):
         with patch("wandrun.gateway.store.time.time", return_value=2000000000):
-            direct = self.gateway.create_conversation("直接", "a")["id"]
+            direct = self.gateway.create_conversation("直接", "a", client_id=uuid4().hex)[0]["id"]
         with patch("wandrun.gateway.store.time.time", return_value=2000000010):
             newer = self.delegate(self.root, "a", "较新委派")
         received = self.store.received_conversations("a")
@@ -199,9 +201,7 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             self.send(grandchild, self.child, "a", "已停止的后代不能回报")
 
-    async def test_human_delivery_and_frozen_draft_belong_to_child_not_home(self):
-        self.store.hide_agent("c")
-        self.store.hide_agent("a")
+    async def test_human_delivery_and_frozen_draft_belong_to_child_not_root_summary(self):
         scope = self.manager._previews[self.manager._tasks[self.child]]
         draft_id = scope.update(scope.begin(), 0, 0, "未完成的消息", "final_answer")
         self.gateway._flush_drafts()
@@ -210,18 +210,21 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.gateway.send_task_message(self.child, "freeze", "打断")
         frozen = next(e for e in self.store.task_history(self.child) if e.type == "message.agent")
         self.assertEqual((frozen.data["draft_id"], frozen.data["status"]), (draft_id, "interrupted"))
+        self.gateway.mark_task_read(self.child, self.store.last_seq())
+        self.assertFalse(self.store.task_conversation(self.child)["unread"])
+        root_history = self.store.history(self.root)
+        root_summary = self.store.conversation(self.root)
         self.gateway.on_human(self.child, "第一行\n第二行", [])
         messages = [e for e in self.store.task_history(self.child) if e.type == "message.agent"]
         self.assertEqual(messages[-1].data["text"], "第一行\n第二行")
+        self.assertEqual(messages[-1].data["timeline_ids"], [self.child])
+        self.assertEqual(messages[-1].data["agent"], "a")
+        self.assertTrue(self.store.task_conversation(self.child)["unread"])
         root = self.store.history(self.root)
         self.assertFalse(any(e.type == "message.agent" for e in root))
-        preview = [e for e in root if e.type == "message.task_preview"][-1]
-        self.assertEqual((preview.data["agent_id"], preview.data["task_id"], preview.data["text"]),
-                         ("a", self.child, "第一行"))
-        self.assertEqual(preview.data["message_seq"], messages[-1].seq)
+        self.assertEqual(root, root_history)
+        self.assertEqual(self.store.conversation(self.root), root_summary)
         self.assertFalse(self.store.conversation(self.root)["unread"])
-        self.assertFalse(self.store.agent_item("c")["home"])
-        self.assertFalse(self.store.agent_item("a")["home"])
         result = self.store.search("第一行", "a", 10, 0)["results"][0]
         self.assertEqual((result["task_id"], result["seq"]), (self.child, messages[-1].seq))
 
@@ -337,8 +340,7 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_ssh_attachment_retains_origin_and_explicitly_rejects_host_download(self):
         remote = temp_dir(self)
-        backend = ManagedShellBackend(root_dir=remote, virtual_mode=False)
-        self.addCleanup(backend.close)
+        backend = await self.enterAsyncContext(remote_backend(remote))
         self.files.update_environments(
             {"c": ("local", str(self.directory)), "a": ("shared-ssh", str(remote)),
              "b": ("shared-ssh", str(remote))},
@@ -364,15 +366,24 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(produced.data["file"], record)
         self.assertEqual(self.store.search(path.name, "b", 10, 0)["results"][0]["file"], record)
 
-        # SSH → human 仍只投递文字，附件跨环境拒绝，不借这次修复引入远端复制。
+        # Human receives an independent complete gateway copy; same-environment
+        # collaboration above still retains its original remote provenance.
         human = AgentOutput(messages=[SendMessage(
             to="human", task_id=None, message="远端结果", attachments=[str(path)],
         )], next="done")
         prepared = await self.manager.prepare_attachments(human, nested)
         receipt = self.manager.dispatch(human, nested, prepared=prepared)[0]
         self.assertTrue(receipt["accepted"])
-        self.assertFalse(receipt["attachments"][0]["accepted"])
-        self.assertEqual(len([e for e in self.store.task_history(nested) if e.type == "file.produced"]), 1)
+        self.assertTrue(receipt["attachments"][0]["accepted"])
+        self.assertEqual(len([e for e in self.store.task_history(nested) if e.type == "file.produced"]), 2)
+        delivered = next(
+            event for event in reversed(self.store.task_history(nested))
+            if event.type == "message.agent"
+        ).data["attachments"][0]
+        self.assertIsNone(delivered["remote_environment"])
+        copied_path = self.store.file(delivered["id"])[1]
+        self.assertNotEqual(copied_path, str(path))
+        self.assertEqual(Path(copied_path).read_bytes(), b"remote result")
 
         # 重新打开登记库，不依赖当前 Agent 配置、Manager 或活动 SSH 连接来判定文件来源。
         reopened = GatewayStore(self.directory / "gateway.sqlite")
@@ -423,7 +434,7 @@ class CollaborationResumeTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(gateway.end_streams)
         root_inputs = []
         child_inputs = []
-        root = gateway.create_conversation("完成后续聊", "c")["id"]
+        root = gateway.create_conversation("完成后续聊", "c", client_id=uuid4().hex)[0]["id"]
 
         async def run(prompts, task_id):
             if task_id == root:
@@ -463,7 +474,7 @@ class CollaborationResumeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
 
         manager = gateway_manager(gateway, run, store=scheduler)
-        root = gateway.create_conversation("恢复", "c")["id"]
+        root = gateway.create_conversation("恢复", "c", client_id=uuid4().hex)[0]["id"]
         manager.start("根", root, agent_name="c")
         child = manager.start("成员", sender_id=root, agent_name="a")["task_id"]
         nested = manager.start("孙任务", sender_id=child, agent_name="b")["task_id"]
@@ -492,7 +503,7 @@ class CollaborationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(lambda: self.scheduler.close())
         self.gateway = Gateway(self.store)
         self.addCleanup(self.gateway.end_streams)
-        self.root = self.gateway.create_conversation("恢复链", "c")["id"]
+        self.root = self.gateway.create_conversation("恢复链", "c", client_id=uuid4().hex)[0]["id"]
         self.inputs = {}
         self.root_next = "wait"
         self.root_gate = None

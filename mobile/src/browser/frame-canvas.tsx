@@ -1,13 +1,15 @@
 import { Canvas, Image as SkiaImage, Path, type SkImage } from "@shopify/react-native-skia";
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
+import { memo, useMemo, type ReactNode } from "react";
 import { View, type ViewProps } from "react-native";
 import { useAnimatedReaction, useSharedValue } from "react-native-reanimated";
 import { scheduleOnRN, scheduleOnUI } from "react-native-worklets";
+import { useCSSVariable } from "uniwind";
+import { useMountEffect } from "../lib/use-mount-effect.ts";
 
 import type { Size, View as LocalView } from "../takeover-lab/geometry.ts";
 import type { Frame } from "./protocol.ts";
 import type { BrowserStream } from "./stream.ts";
-import { useRuntimeCallback } from "./use-runtime-callback.ts";
+import { useRuntimeCommit } from "../lib/use-runtime-commit.ts";
 
 /** The native clipping boundary encloses the transformed frame and untransformed overlays.
  * Keep it outside the zoomed View: clipping the Canvas itself would move the boundary
@@ -51,24 +53,27 @@ export const FrameCanvas = memo(function FrameCanvas({ candidate, containerWidth
   const imageHeight = useSharedValue(height);
   const submittedSeq = useSharedValue(-1);
   const ackHandle = useSharedValue(-1);
-  const pending = useRef<FrameCandidate | null>(null);
+  const publish = (next: FrameCandidate) => {
+    const nextImage = next.image, seq = next.frame.seq;
+    scheduleOnUI(() => {
+      "worklet";
+      image.value = nextImage;
+      imageX.value = x; imageY.value = y;
+      imageWidth.value = width; imageHeight.value = height;
+      submittedSeq.value = seq;
+    });
+  };
   const source = candidate.source;
   const children = useMemo(() => <SkiaImage image={image} fit="fill" x={imageX} y={imageY} width={imageWidth} height={imageHeight} />,
     [image, imageX, imageY, imageWidth, imageHeight]);
 
   // Same children-identity boundary as Skia 2.6.2 Canvas.tsx, not shared-value draws.
-  useLayoutEffect(() => {
+  useMountEffect(() => {
     if (source.isOpen) source.measurements.canvasRendered("frame");
-  }, [children, source]);
-  useLayoutEffect(() => {
-    pending.current = candidate;
-    return () => { pending.current = null; };
-  }, [candidate]);
-  // UI retains only the stable RN entry; its latest callback is replaced after
-  // each commit and cleared on unmount, never pinning an old image render.
-  const confirm = useRuntimeCallback((seq: number) => {
-    const next = pending.current;
-    if (next?.frame.seq === seq) onDisplayed(next);
+    return () => {};
+  });
+  const confirm = useRuntimeCommit((seq: number) => {
+    if (candidate.frame.seq === seq) onDisplayed(candidate);
   });
 
   useAnimatedReaction(() => submittedSeq.value, (seq, previous) => {
@@ -82,37 +87,33 @@ export const FrameCanvas = memo(function FrameCanvas({ candidate, containerWidth
       scheduleOnRN(confirm, seq);
     });
   });
-  useEffect(() => {
-    const nextImage = candidate.image;
-    const seq = candidate.frame.seq;
-    // This per-frame UI worklet captures the image/scalars/shared values, but no RN
-    // callback or candidate/stream.
-    scheduleOnUI(() => {
-      "worklet";
-      image.value = nextImage;
-      imageX.value = x; imageY.value = y;
-      imageWidth.value = width; imageHeight.value = height;
-      submittedSeq.value = seq;
-    });
-  }, [candidate, x, y, width, height, image, imageX, imageY, imageWidth, imageHeight, submittedSeq]);
-  useEffect(() => () => {
+  useMountEffect(() => () => {
     scheduleOnUI(() => {
       "worklet";
       if (ackHandle.value !== -1) cancelAnimationFrame(ackHandle.value);
       ackHandle.value = -1;
     });
-  }, [ackHandle]);
+  });
 
-  return <Canvas pointerEvents="none" style={{ width: containerWidth, height: containerHeight }}>{children}</Canvas>;
+  return <><FrameSubmission key={`${candidate.frame.seq}:${x}:${y}:${width}:${height}`} candidate={candidate} publish={publish} />
+    <Canvas pointerEvents="none" style={{ width: containerWidth, height: containerHeight }}>{children}</Canvas></>;
 });
+
+/** Only the metadata bridge remounts per submission; Canvas and its recorded children do not. */
+function FrameSubmission({ candidate, publish }: { candidate: FrameCandidate; publish(candidate: FrameCandidate): void }) {
+  useMountEffect(() => { publish(candidate); return () => {}; });
+  return null;
+}
 
 const ARROW = "M0 0 L0 17 L4.2 13 L7 19.5 L9.6 18.4 L6.9 12 L12.5 12 Z";
 
 /** Position belongs to the outer native View; pointer movement never changes this tree. */
-export const CursorCanvas = memo(function CursorCanvas({ source }: { source: BrowserStream }) {
-  const children = useMemo(() => <><Path path={ARROW} color="#fff"/><Path path={ARROW} color="#000" style="stroke" strokeWidth={1.5}/></>, []);
-  useLayoutEffect(() => {
-    if (source.isOpen) source.measurements.canvasRendered("cursor");
-  }, [children, source]);
+export const CursorCanvas = memo(function CursorCanvas({ source }: { source?: BrowserStream }) {
+  const [foreground, surface] = useCSSVariable(["--color-immersive-foreground", "--color-immersive-surface"]);
+  const children = useMemo(() => <><Path path={ARROW} color={String(foreground)}/><Path path={ARROW} color={String(surface)} style="stroke" strokeWidth={1.5}/></>, [foreground, surface]);
+  useMountEffect(() => {
+    if (source?.isOpen) source.measurements.canvasRendered("cursor");
+    return () => {};
+  });
   return <Canvas pointerEvents="none" style={{ width: 20, height: 28 }}>{children}</Canvas>;
 });

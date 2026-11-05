@@ -11,10 +11,12 @@ import Yoga, { type Node as YogaNode } from "yoga-layout";
 import MarkdownIt from "markdown-it";
 import ts from "typescript";
 
-import { GatewayApi, type BrowserTask, type GatewayEvent } from "../src/gateway/api.ts";
+import type { BrowserTask, GatewayEvent } from "../src/gateway/api.ts";
 import { ChatSession } from "../src/gateway/session.ts";
-import { buildItems } from "../src/lib/chat-timeline.ts";
+import { attachSessionQueries } from "../src/lib/gateway-queries.ts";
+import { projectChatRows } from "../src/lib/chat-timeline.ts";
 import { collaborationEvents } from "./fixtures/collaboration-timeline.ts";
+import { chatDisplay } from "./fixtures/chat-projection.ts";
 
 declare global {
   var __compactionRowReact: typeof React;
@@ -48,9 +50,11 @@ after(() => {
 // Mount the real chat row and Markdown wrapper. Only native host components and
 // platform packages unavailable to Node are substituted; event routing and message lookup remain real.
 const platform: Record<string, string> = {
-  "@/components/chat/drawer-horizontal-gesture.tsx": "export const DrawerHorizontalGesture=({children})=>children;",
+  "@/components/chat/drawer-horizontal-gesture.tsx": "export const DrawerHorizontalGesture=({children})=>children; export const DrawerNativeControlGesture=({children})=>children;",
   "react-native-drawer-layout": "export const DrawerGestureContext=globalThis.__compactionRowReact.createContext(undefined);",
-  "react-native": `export const View='View', Text='Text', Pressable='Pressable', ScrollView='ScrollView', Image='Image', TextInput='TextInput', ActivityIndicator='ActivityIndicator';
+  "react-native": `export const View='View', Text='Text', ScrollView='ScrollView', Image='Image', TextInput='TextInput', ActivityIndicator='ActivityIndicator';
+    export const PixelRatio={get:()=>1};
+    export function Pressable({children,...props}) {return globalThis.__compactionRowReact.createElement('Pressable',props,typeof children==='function'?children({pressed:false}):children);}
     export const Animated={};
     export function FlatList({ref,...props}) {
       const React=globalThis.__compactionRowReact;
@@ -65,17 +69,20 @@ const platform: Record<string, string> = {
     export const AccessibilityInfo={setAccessibilityFocus(){}},findNodeHandle=()=>null;
     export const Dimensions={get:()=>({width:390,height:800})};
     export const useWindowDimensions=()=>({width:390,height:800});`,
-  "expo-router": `export const router={push(route){globalThis.__attachmentRoutes.push(route)}}; export const Stack={Screen:'StackScreen'}; export const useLocalSearchParams=()=>globalThis.__attachmentParams; export const useIsFocused=()=>globalThis.__galleryHost.focused;`,
+  "expo-router": `export const router={push(route){globalThis.__attachmentRoutes.push(route)}}; export const Stack={Screen:'StackScreen'}; export const useLocalSearchParams=()=>globalThis.__attachmentParams; export const useIsFocused=()=>globalThis.__galleryHost.focused;
+    export function useFocusEffect(effect) { const React=globalThis.__compactionRowReact, focused=globalThis.__galleryHost.focused; React.useEffect(()=>focused ? effect() : undefined,[effect,focused]); }`,
   "expo-secure-store": `export async function getItemAsync(){return null} export async function setItemAsync(){} export async function deleteItemAsync(){}`,
-  "expo-network": `export const NetworkStateType={NONE:'NONE'}; export const addNetworkStateListener=()=>({remove(){}});`,
+  "expo-network": `export const NetworkStateType={NONE:'NONE'}; export const addNetworkStateListener=()=>({remove(){}}); export const getNetworkStateAsync=async()=>({type:'WIFI',isConnected:true});`,
   "expo": `export const requireOptionalNativeModule=()=>null;`,
+  "expo-status-bar": `export const StatusBar={setStyle(){}};`,
   "expo-file-system": `export class Directory {
     static async pickDirectoryAsync(){globalThis.__galleryHost.pickerRequests++; throw new Error('Unexpected native directory picker')}
   } export class File {} export const FileMode={ReadOnly:0}; export const Paths={document:'/mock-documents'};`,
   "expo-image": `export const Image=props=>globalThis.__compactionRowReact.createElement('ExpoImage',props);`,
   "expo-clipboard": `export const setStringAsync=async()=>true;`,
+  "expo-linear-gradient": `export const LinearGradient="LinearGradient";`,
   "expo-sharing": `export const isAvailableAsync=async()=>false; export const shareAsync=async()=>{throw new Error('Native sharing is unavailable in this Web fixture')};`,
-  "react-native-safe-area-context": `export const useSafeAreaInsets=()=>({top:0,right:0,bottom:0,left:0});`,
+  "react-native-safe-area-context": `export const SafeAreaView='SafeAreaView'; export const useSafeAreaInsets=()=>({top:0,right:0,bottom:0,left:0});`,
   "react-native-gesture-handler": `const gesture=()=>({onStart(){return this},onUpdate(){return this},onEnd(){return this},maxPointers(){return this},activeOffsetY(){return this},failOffsetX(){return this},enabled(){return this}}); export const Gesture={Pinch:gesture,Pan:gesture,Simultaneous:()=>({})}; export const GestureDetector='GestureDetector';`,
   "react-native-worklets": `export const scheduleOnRN=(fn,value)=>fn(value);`,
   "react-native-keyboard-controller": `export const useKeyboardState=(select)=>select({isVisible:false,height:0});`,
@@ -85,10 +92,10 @@ const platform: Record<string, string> = {
   "@react-native-community/datetimepicker": `export default 'DateTimePicker'; export const DateTimePickerAndroid={open(){}};`,
   "react-native-gifted-charts": `export const BarChart='BarChart', LineChart='LineChart', PieChart='PieChart';`,
   "react-native-screens": `export const FullWindowOverlay='FullWindowOverlay';`,
-  "react-native-reanimated": `const animation={duration(){return this},delay(){return this},reduceMotion(){return this}};
+  "react-native-reanimated": `const animation={duration(){return this},delay(){return this},easing(){return this},reduceMotion(){return this}};
     export const FadeIn=animation,FadeOut=animation,FadeOutUp=animation,LinearTransition=animation;
     export const ReduceMotion={System:0},Extrapolation={CLAMP:0};
-    export const Easing={linear:(value)=>value},cancelAnimation=()=>{};
+    export const Easing={out:fn=>fn,in:fn=>fn,inOut:fn=>fn,quad:x=>x*x,cubic:x=>x*x*x,linear:x=>x},cancelAnimation=()=>{};
     export const useSharedValue=(value)=>({value,get(){return this.value},set(next){this.value=next}}),useAnimatedReaction=()=>{},withRepeat=(value)=>value;
     export const LayoutAnimationConfig='LayoutAnimationConfig';
     export const useAnimatedStyle=(fn)=>fn(),useDerivedValue=(fn)=>({value:fn()});
@@ -107,10 +114,13 @@ const platform: Record<string, string> = {
   "@json-render/react-native": `export const JSONUIProvider='JSONUIProvider',Renderer='Renderer';
     export const defineRegistry=(_catalog,registry)=>({registry}); export const useStateStore=()=>({});`,
   "@json-render/react-native/schema": `export const schema={createCatalog:(catalog)=>catalog};`,
+  "@/components/ui/accordion.tsx": `export const Accordion='Accordion',AccordionItem='AccordionItem',AccordionTrigger='Pressable',AccordionContent='AccordionContent';`,
+  "@/components/ui/surface-pressable.tsx": `export const SurfacePressable='Pressable';`,
+  "./ui/button.tsx": `export const Button='Pressable';`,
 };
-const icons = ["Copy", "ExternalLink", "Brain", "ChevronRight", "CircleAlert", "Clock", "Hand", "RefreshCw", "Square",
-  "Monitor", "Clapperboard", "File", "FileText", "Image", "CalendarDays", "Check", "X", "ChevronDown", "ChevronUp",
-  "ArrowLeft", "ArrowUpRight", "Folder", "FolderOpen", "FolderTree", "FileCode2", "Minus", "Plus", "Code2", "Expand", "Play", "RotateCcw", "Download", "Share2"];
+const icons = ["Copy", "ExternalLink", "ChevronLeft", "Info", "CircleCheck", "TriangleAlert", "Brain", "ChevronRight", "CircleAlert", "Clock", "Hand", "RefreshCw", "Square",
+  "Monitor", "Clapperboard", "File", "FileText", "Image", "ImageOff", "CalendarDays", "Check", "X", "ChevronDown", "ChevronUp",
+  "ArrowLeft", "ArrowUpRight", "Folder", "FolderOpen", "FolderTree", "FileCode2", "FilePenLine", "FileSpreadsheet", "FileType", "Minus", "Plus", "Code2", "Expand", "Play", "RotateCcw", "Download", "Share2"];
 const richIconNames: string[] = JSON.parse(readFileSync(new URL("../../src/wandrun/gateway/ui_icons.json", import.meta.url), "utf8"));
 const iconExports = new Set([...icons, ...richIconNames.map(name => name.split("-").map(part => part[0].toUpperCase() + part.slice(1)).join(""))]);
 platform["lucide-react-native"] = [...iconExports].map((name) => `export const ${name}='Icon${name}';`).join("\n");
@@ -193,7 +203,7 @@ test("成员及深层任务附件点击按所在时间线定位完整图片组",
       // timeline must open its own copy of the same message's attachment gallery.
       for (const timeline of timelines) {
         await act(async () => root.render(React.createElement(MessageRow, {
-          item: { key: `e${entry.seq}`, event: entry }, session: chat, timelineId: timeline,
+          item: projectChatRows({ events: [entry], pending: [], timelineId: timeline, display: chatDisplay(chat, timeline), tasks: chat.tasks }).rows[0], session: chat, timelineId: timeline,
         })));
         const image = root.container.queryAll(node => node.props.testID === "attachment-image-two")[0];
         assert.ok(image, "real row renders its second attachment");
@@ -220,14 +230,17 @@ test("成员及深层任务附件点击按所在时间线定位完整图片组",
 test("a native drag without end events keeps the visible image actionable and rejects the old image's late work", async () => {
   const requests: string[] = [];
   const oldMetadata = Promise.withResolvers<Response>();
-  const api = new GatewayApi({ baseUrl: "http://gallery.test", token: "test", computerId: "gallery" }, async (input) => {
+  const metadata = (id: string, available: boolean) => ({ id, name: `${id}.png`, media_type: 'image/png', available,
+    size: 10, conversation_id: null, agent_id: null, task_id: 'root', created_at: 1, remote_environment: null });
+  const chat = new ChatSession({ baseUrl: "http://gallery.test", token: "test", computerId: "gallery" }, async (input) => {
     const pathname = new URL(String(input)).pathname;
     requests.push(pathname);
     return pathname === "/files/one" ? oldMetadata.promise
-      : Response.json({ id: "two", name: "two.png", media_type: "image/png", available: false });
+      : Response.json(metadata('two', false));
   });
+  attachSessionQueries(chat);
   Object.assign(globalThis, {
-    __attachmentSession: { api },
+    __attachmentSession: chat,
     __attachmentParams: { file_id: "one", file_ids: JSON.stringify(["one", "two"]) },
   });
   galleryHost.os = "android";
@@ -249,13 +262,13 @@ test("a native drag without end events keeps the visible image actionable and re
     assert.equal(download().props.disabled, false, "the new visible image must not inherit a stale drag or action lock");
     await act(async () => download().props.onPress());
     assert.equal(requests.at(-1), "/files/two", "delivery must resolve the image now visible");
-    oldMetadata.resolve(Response.json({ id: "one", name: "one.png", media_type: "image/png", available: true }));
+    oldMetadata.resolve(Response.json(metadata('one', true)));
     await act(async () => { await oldMetadata.promise; });
     assert.equal(galleryHost.pickerRequests, 0, "the image left behind cannot open a late native picker");
   } finally {
-    oldMetadata.resolve(Response.json({ available: false }));
+    oldMetadata.resolve(Response.json(metadata('one', false)));
     await act(async () => root.unmount());
-    api.close();
+    await chat.close();
     galleryHost.os = "web";
     Reflect.deleteProperty(globalThis, "__attachmentSession");
     Reflect.deleteProperty(globalThis, "__attachmentParams");
@@ -294,7 +307,7 @@ test("压缩系统行点击展开当次完整摘要，关闭后旧事件不被�
   try {
     await act(async () => root.render(React.createElement("Timeline", null,
       ...[older, newer, failure].map((entry) => React.createElement(MessageRow, {
-        key: entry.seq, item: { key: `e${entry.seq}`, event: entry }, session,
+        key: entry.seq, item: projectChatRows({ events: [entry], pending: [], display: chatDisplay(session) }).rows[0], session,
       })),
       React.createElement(PortalHost))));
     assert.equal(visibleText(root), "");
@@ -388,13 +401,11 @@ test("只有其他 Agent 的草稿和回复显示发送者，使用目录显示�
   const chat = new ChatSession({ baseUrl: "http://sender-test", token: "test" });
   chat.agents.close();
   chat["reset"]([{ id: "root", agent_id: "parent-id", title: "Root", status: "idle", unread: false,
-    read_seq: 0, last_agent_seq: 0, created_at: 1, updated_at: 1, last_text: null, source: "user", schedule_origin: null }], 1);
+    read_seq: 0, last_agent_seq: 0, created_at: 1, updated_at: 1, last_text: null, last_activity_seq: null, last_activity_at: null, source: "user", schedule_origin: null }], 1);
   chat["apply"](event(2, "task.created", { task_id: "child", creator_task_id: "root",
     creator_agent_id: "parent-id", agent_id: "member-id", title: "Child", status: "running",
     timeline_ids: ["root", "child"] }));
-  chat.agents.agents = [["parent-id", "规划员"], ["member-id", "计算员"], ["unnamed-id", ""]].map(([id, name]) => ({
-    id, name, avatar: 0, description: "", workers: [], home: true, latest_conversation: null, unread: false,
-  }));
+  chat.agents.agents = [["parent-id", "规划员"], ["member-id", "计算员"], ["unnamed-id", ""]].map(([id, name]) => ({ id, name, avatar: 0, description: "", workers: [], environment: "local", latest_conversation: null, unread: false, }));
   const root = createRoot({ textComponentTypes: ["Text", "Markdown"] });
   try {
     for (const [timelineId, agent, expected] of [
@@ -403,11 +414,12 @@ test("只有其他 Agent 的草稿和回复显示发送者，使用目录显示�
       ["root", "unnamed-id", "Agent"], ["root", "absent-id", "Agent"],
     ]) {
       for (const phase of ["draft", "sent", "interrupted"]) {
-        const item = phase === "draft"
-          ? { key: "draft", draft: { draft_id: "draft", conversation_id: "root", task_id: timelineId,
-            sender: timelineId, agent, text: "323", phase: null } }
-          : { key: "message", event: event(3, "message.agent", { agent, text: "323", task_id: timelineId,
-            status: phase === "interrupted" ? "interrupted" : "completed" }) };
+        const item = projectChatRows({ timelineId, pending: [], display: chatDisplay(chat, timelineId),
+          events: phase === "draft" ? [] : [event(3, "message.agent", { agent, text: "323", task_id: timelineId,
+            status: phase === "interrupted" ? "interrupted" : "completed" })],
+          drafts: phase === "draft" ? [{ draft_id: "draft", conversation_id: "root", task_id: timelineId,
+            sender: timelineId, agent, text: "323", phase: null }] : [],
+        }).rows[0];
         await act(async () => root.render(React.createElement(MessageRow, { item, session: chat, timelineId })));
         // Inspect all visible Text, not a new selector which the broken implementation lacks.
         const text = root.container.queryAll((node) => node.type === "Text").map((node) =>
@@ -419,8 +431,9 @@ test("只有其他 Agent 的草稿和回复显示发送者，使用目录显示�
       }
     }
     await act(async () => root.render(React.createElement(MessageRow, {
-      item: { key: "incoming", event: event(4, "message.task", { sender_agent_id: "parent-id",
-        recipient_agent_id: "member-id", sender_task_id: "root", recipient_task_id: "child", text: "Compute" }) },
+      item: projectChatRows({ timelineId: "child", pending: [], display: chatDisplay(chat, "child"),
+        events: [event(4, "message.task", { sender_agent_id: "parent-id",
+          recipient_agent_id: "member-id", sender_task_id: "root", recipient_task_id: "child", text: "Compute" })] }).rows[0],
       session: chat, timelineId: "child",
     })));
     assert.ok(root.container.queryAll((node) => node.type === "Text").some((node) => node.props.children === "规划员"));
@@ -438,7 +451,7 @@ test("协作历史的根列表没有正文占位，成员列表仍渲染上级�
   const root = createRoot({ textComponentTypes: ["Text", "Markdown"] });
   try {
     for (const timelineId of ["root", "search-1"]) {
-      const items = buildItems(chat.timeline(timelineId).events, [], undefined, [], undefined, timelineId, chat.tasks);
+      const items = projectChatRows({ events: chat.timeline(timelineId).events, pending: [], timelineId, tasks: chat.tasks, display: chatDisplay(chat, timelineId) }).rows;
       await act(async () => root.render(React.createElement("Timeline", null,
         ...items.map((item) => React.createElement("Row", { key: item.key },
           React.createElement(MessageRow, { item, session: chat, timelineId }))))));
@@ -499,7 +512,7 @@ test("委派视觉行与普通进度行等高，44dp 实体点击区不越父边
     for (const status of ["running", "waiting", "completed", "failed", "cancelled", "unavailable"] as const) {
       await act(async () => root.render(React.createElement("View", null,
         ...[1, 2, 3].map((id) => React.createElement("View", { key: id },
-          React.createElement(MessageRow, { item: { key: String(id), delegation: { taskId: String(id), agentId: "search", status } }, session: chat }))),
+          React.createElement(MessageRow, { item: { kind: "delegation", key: String(id), agentName: "Search", delegation: { taskId: String(id), agentId: "search", status } }, session: chat }))),
         React.createElement("View", { style: { paddingTop: 12 } },
           jsx(ProgressRow, { testID: "ordinary", children: React.createElement("Text", null, "正在调用工具") })))));
       const tree = build(root.container.children[0] as TestInstance);
@@ -547,7 +560,9 @@ test("浏览器卡片不重复委派标题，独立或隔着消息仍在卡内�
       agent_id: scenario === "direct" ? "planner" : "browser_agent", entry_agent_id: "planner",
       agent_name: scenario === "direct" ? "规划员" : "官网核查员",
       conversation_title: "Research", entry_agent_name: "Planner", state: "released", epoch: 1,
-      pages: [], current: null, max_pages: 8, reason: "Agent 关闭", requested_reason: null,
+      pages: [], current: null, environment_id: "local", environment_name: "Local",
+      capacity: { pages_used: 0, pages_registered: 0, pages_creating: 0, pages_pending_cleanup: 0, pages_limit: 8 },
+      capacity_rejection: null, reason: "Agent 关闭", requested_reason: null,
     };
     const events = [
       ...(scenario === "direct" ? [] : [event(1, "task.status", {
@@ -559,7 +574,7 @@ test("浏览器卡片不重复委派标题，独立或隔着消息仍在卡内�
     ];
     try {
       for (const entry of events) chat["apply"](entry);
-      const items = buildItems(chat.timeline("root").events, [], chat.browserTasks, [], undefined, "root", chat.tasks);
+      const items = projectChatRows({ events: chat.timeline("root").events, pending: [], browserTasks: chat.browserTasks, timelineId: "root", tasks: chat.tasks, display: chatDisplay(chat, "root") }).rows;
       await act(async () => root.render(React.createElement(SessionProvider, null,
         React.createElement("Timeline", null,
           ...items.map((item) => React.createElement("Row", { key: item.key, rowKey: item.key },
@@ -580,7 +595,7 @@ test("浏览器卡片不重复委派标题，独立或隔着消息仍在卡内�
       if (scenario === "separated") {
         assert.deepEqual(items.map(item => item.key), ["tchild", "e2", "blease"]);
       }
-      const memberItems = buildItems(chat.timeline("child").events, [], chat.browserTasks, [], undefined, "child", chat.tasks);
+      const memberItems = projectChatRows({ events: chat.timeline("child").events, pending: [], browserTasks: chat.browserTasks, timelineId: "child", tasks: chat.tasks, display: chatDisplay(chat, "child") }).rows;
       assert.ok(memberItems.every(item => !item.browser), "browser events remain scoped to the root conversation");
     } finally {
       await act(async () => root.unmount());
@@ -589,7 +604,7 @@ test("浏览器卡片不重复委派标题，独立或隔着消息仍在卡内�
   }
 });
 
-test("浏览器状态切换保留卡内归属、待接管红点与卡片和观看按钮的租约入口", async (t) => {
+test("浏览器状态切换保留卡内归属与卡片和观看按钮的租约入口", async (t) => {
   // Static import would load native Expo before the platform resolution hooks above.
   const { router } = await import("expo-router");
   const push = t.mock.method(router, "push", () => {});
@@ -600,23 +615,22 @@ test("浏览器状态切换保留卡内归属、待接管红点与卡片和观�
     id: "lease", task_id: "child", root_id: "root", agent_id: "browser_agent", entry_agent_id: "planner",
     agent_name: "官网核查员",
     conversation_title: "Research", entry_agent_name: "Planner", state: "agent", epoch: 1,
-    pages: [{ id: "page", title: "Research", url: "https://example.org" }], current: "page", max_pages: 8,
+    pages: [{ id: "page", title: "Research", url: "https://example.org" }], current: "page",
+    environment_id: "local", environment_name: "Local",
+    capacity: { pages_used: 1, pages_registered: 1, pages_creating: 0, pages_pending_cleanup: 0, pages_limit: 8 },
+    capacity_rejection: null,
     reason: null, requested_reason: null,
   };
   try {
     for (const state of ["agent", "requested", "human", "revoking", "stopping", "released"] as const) {
       await act(async () => root.render(React.createElement(SessionProvider, null,
         React.createElement(MessageRow, {
-          item: { key: "blease", browser: { ...task, state } }, session: chat,
+          item: { kind: "browser", key: "blease", browser: { ...task, state }, agentName: chatDisplay(chat).agentName(task.agent_id, task.agent_name) }, session: chat,
         }))));
       const card = root.container.queryAll(node => node.props.testID === "browser-card-lease")[0];
       const text = card.queryAll(node => node.type === "Text").map(node => [node.props.children].flat().join("")).join("\n");
       assert.ok(text.includes("官网核查员"), `holder stays identifiable in ${state}`);
       assert.ok(text.includes("https://example.org"));
-      assert.equal(card.queryAll(node => node.props.className === "size-1.5 rounded-full bg-destructive").length,
-        state === "requested" ? 1 : 0);
-      assert.equal(card.queryAll(node => node.props.className === "size-1.5 rounded-full bg-white").length,
-        state !== "requested" && state !== "released" ? 1 : 0);
       await act(async () => card.props.onPress());
       await act(async () => card.queryAll(node => node.props.testID === "browser-watch-lease")[0].props.onPress());
       assert.deepEqual(push.mock.calls.slice(-2).map(call => call.arguments),
@@ -632,13 +646,14 @@ test("历史卡片和消息优先目录名、再取快照；加载失败与删�
   const chat = new ChatSession({ baseUrl: "http://historical-agent-name", token: "test" }, async () => new Response("{}"));
   chat.agents.close();
   const root = createRoot({ textComponentTypes: ["Text", "Markdown"] });
-  const holder = { id: "a_8f4e0034aa684ee0bb067dc29cfba782", name: "当前核查员", avatar: 0, description: "", workers: [],
-    home: true, latest_conversation: null, unread: false };
+  const holder = { id: "a_8f4e0034aa684ee0bb067dc29cfba782", name: "当前核查员", avatar: 0, description: "", workers: [], environment: "local", latest_conversation: null, unread: false }
   const entry = { ...holder, id: "a_72ac0034aa684ee0bb067dc29cfba782", name: "规划员" };
   const task: BrowserTask = {
     id: "lease", task_id: "child", root_id: "root", agent_id: holder.id, entry_agent_id: entry.id,
     conversation_title: "Research", entry_agent_name: entry.name, state: "released", epoch: 1,
-    pages: [], current: null, max_pages: 8, reason: "Agent 关闭", requested_reason: null,
+    pages: [], current: null, environment_id: "local", environment_name: "Local",
+    capacity: { pages_used: 0, pages_registered: 0, pages_creating: 0, pages_pending_cleanup: 0, pages_limit: 8 },
+    capacity_rejection: null, reason: "Agent 关闭", requested_reason: null,
   };
   try {
     for (const state of ["loading", "failed", "named", "unnamed", "deleted", "absent"] as const) {
@@ -654,22 +669,27 @@ test("历史卡片和消息优先目录名、再取快照；加载失败与删�
         const events = [
           event(1, "browser_task.updated", { ...task, agent_name: snapshot }),
           event(2, "message.agent", { task_id: "root", agent: holder.id, agent_name: snapshot, text: "核查正文" }),
-          event(3, "message.task_preview", { task_id: "child", agent_id: holder.id, agent_name: snapshot, text: "成员预览", message_seq: 2 }),
           event(4, "task.status", { task_id: "child", creator_task_id: "root", agent_id: holder.id, agent_name: snapshot, status: "completed" }),
           { ...summary(5, "历史摘要"), data: { ...summary(5, "历史摘要").data, agent_id: holder.id, agent_name: snapshot } },
         ];
-        const items = buildItems(events, [], undefined, [], undefined, "root");
-        await act(async () => root.render(React.createElement(SessionProvider, null,
-          React.createElement("Timeline", null, ...items.map(item =>
-            React.createElement("Row", { key: item.key }, React.createElement(MessageRow, { item, session: chat, timelineId: "root" })))))));
-        for (const row of root.container.queryAll(node => node.type === "Row")) {
-          const text = row.queryAll(node => node.type === "Text").map(node => [node.props.children].flat().join("")).join("\n");
-          assert.ok(text.includes(expected), `${state}/${snapshot}: ${text}`);
-          assert.ok(!text.includes(holder.id) && !text.includes(entry.id), "identity is not a display-name fallback");
-          assert.ok(!text.includes(entry.name), "entry Agent is not the holder or sender");
-          if (expected !== "历史核查员") assert.ok(!text.includes("历史核查员"), "current directory names override snapshots");
-          for (const node of row.queryAll(node => typeof node.props.accessibilityLabel === "string")) {
-            assert.ok(!node.props.accessibilityLabel.includes(holder.id), "accessibility labels must not leak IDs either");
+        const memberEvent = event(3, "message.agent", {
+          task_id: "child", agent: holder.id, agent_name: snapshot, text: "成员正文", timeline_ids: ["child"],
+        });
+        for (const [timelineId, timelineEvents] of [["root", events], ["child", [memberEvent]]] as const) {
+          const items = projectChatRows({ events: [...timelineEvents], pending: [], timelineId, display: chatDisplay(chat, timelineId) }).rows;
+          await act(async () => root.render(React.createElement(SessionProvider, null,
+            React.createElement("Timeline", null, ...items.map(item =>
+              React.createElement("Row", { key: item.key }, React.createElement(MessageRow, { item, session: chat, timelineId })))))));
+          assert.ok(items.length > 0, `${timelineId}: snapshot assertions require rendered consumers`);
+          for (const row of root.container.queryAll(node => node.type === "Row")) {
+            const text = row.queryAll(node => node.type === "Text").map(node => [node.props.children].flat().join("")).join("\n");
+            assert.ok(text.includes(expected), `${timelineId}/${state}/${snapshot}: ${text}`);
+            assert.ok(!text.includes(holder.id) && !text.includes(entry.id), "identity is not a display-name fallback");
+            assert.ok(!text.includes(entry.name), "entry Agent is not the holder or sender");
+            if (expected !== "历史核查员") assert.ok(!text.includes("历史核查员"), "current directory names override snapshots");
+            for (const node of row.queryAll(node => typeof node.props.accessibilityLabel === "string")) {
+              assert.ok(!node.props.accessibilityLabel.includes(holder.id), "accessibility labels must not leak IDs either");
+            }
           }
         }
       }
@@ -698,7 +718,7 @@ test("成员来信、交还和插话回执的对端名字缺失时不暴露身�
       chat.agents.loaded = loaded;
       for (const entry of events) {
         await act(async () => root.render(React.createElement(MessageRow, {
-          item: { key: `e${entry.seq}`, event: entry }, session: chat, timelineId: "child",
+          item: projectChatRows({ events: [entry], pending: [], timelineId: "child", tasks: chat.tasks, display: chatDisplay(chat, "child") }).rows[0], session: chat, timelineId: "child",
         })));
         const text = root.container.queryAll(node => node.type === "Text")
           .map(node => [node.props.children].flat().join("")).join("\n");

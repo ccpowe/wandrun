@@ -8,10 +8,10 @@ Agent 定义与对话放在同一个库：对话必须引用存在的入口 Agen
 网关首次启动时从 agents.toml 与 mcps.toml 一起导入，之后以这里为唯一来源。
 
 ADR-0043：task_conversations 保存成员会话；事件的 conversation_id 始终指向根，
-data.timeline_ids 指定展示时间线，无此字段的事件只属于根。成员 human 正文与根预览
-同事务保存，草稿终态仍按 draft_id 去重；协作消息不参与首页未读和产品活动。
-浏览器进入 requested 仍计入入口 Agent 首页活动；协作行红点由 App 合并未读与租约状态。
-协作记录随根删除，不能独立改名/删除；结构版本 22 不兼容旧库。
+data.timeline_ids 指定展示时间线，无此字段的事件只属于根。成员 human 正文只在成员
+时间线展示，草稿终态仍按 draft_id 去重；协作消息不推进根对话未读和排序活动，只有用户在成员
+对话里的插话（message.user）推进根的排序活动。浏览器请求不是排序活动；协作行红点由 App 合并未读与租约状态。
+协作记录随根删除，不能独立改名/删除；结构兼容边界见 SCHEMA_VERSION。
 """
 
 import hashlib
@@ -20,17 +20,17 @@ import math
 import secrets
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from wandrun.config import AgentCatalog, AgentDefinition
+from wandrun.config import AgentCatalog, AgentDefinition, BrowserDefinition, EnvironmentDefinition
 from wandrun.gateway.connectors import UnknownConnector, public_connector
 from wandrun.gateway.schedules import UnknownSchedule, next_run_at
 
-# 24：Agent 独立保存 Fast 订阅优先级开关；不兼容旧 state，不执行迁移。
-SCHEMA_VERSION = 24
+# 31：Agent 名称的 Unicode casefold 唯一键；不兼容旧 state，升级需清空 state，不执行迁移。
+SCHEMA_VERSION = 31
 AVATAR_COUNT = 8
 
 
@@ -44,8 +44,13 @@ def _validate_fast_mode(fast_mode: bool) -> None:
         raise ValueError("fast_mode 必须是布尔值")
 
 
-# 消息/定时触发总是产品活动；浏览器事件仅进入 requested 的那次算活动。
-HOME_EVENT_TYPES = ("message.user", "message.agent", "schedule.triggered")
+# 排序活动只有两种：用户发送（message.user，含用户在协作子对话里的插话，事件仍记在根 id 下）和用户设置的
+# 定时任务触发（schedule.triggered，只算根时间线）。AI 回复、状态、浏览器请求、已读、重命名、协作内部消息
+# 都不是活动：它们只会让红点亮起，不改变对话次序（2026-11-04 用户决定）。
+_ROOT_ACTIVITY_FILTER = (
+    "(e.type = 'message.user'"
+    " OR (e.type = 'schedule.triggered' AND json_extract(e.data, '$.timeline_ids') IS NULL))"
+)
 
 # AUTOINCREMENT 保证 seq 删除后也不复用：App 用 seq 续传，复用会让已删事件的位置指向新事件。
 _SCHEMA = f"""
@@ -55,6 +60,7 @@ BEGIN;
 CREATE TABLE agents (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    name_key TEXT NOT NULL UNIQUE,
     avatar INTEGER NOT NULL DEFAULT 0,
     description TEXT NOT NULL,
     system_prompt TEXT NOT NULL,
@@ -69,8 +75,12 @@ CREATE TABLE agents (
     code_mode INTEGER NOT NULL,
     fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1)),
     environment TEXT NOT NULL,
-    -- 移出首页时的全局 seq；空表示没移出。是否在首页由它与对话里的新事件共同决定（见 agents）。
-    hidden_after_seq INTEGER
+    display_order INTEGER NOT NULL
+);
+-- 只保存宿主连接策略和可信机器身份，不保存 API key 值。
+CREATE TABLE execution_environments (
+    id TEXT PRIMARY KEY,
+    definition TEXT NOT NULL
 );
 -- 直接委派关系（tuple 顺序即 position，影响委派目录的顺序）。“是谁的成员”从这里反查，不另存。
 CREATE TABLE agent_workers (
@@ -154,6 +164,13 @@ CREATE TABLE conversations (
     status TEXT NOT NULL DEFAULT 'idle',
     source TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'schedule')),
     schedule_origin TEXT
+);
+-- 不引用会话或历史事件：删除后仍须占用键并重放首次成功结果。
+CREATE TABLE created_conversation_results (
+    client_id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL
 );
 -- Agent 身份是历史快照，不加 Agent 外键：删除成员不能抹掉其他入口下的协作记录。
 CREATE TABLE task_conversations (
@@ -320,6 +337,18 @@ COMMIT;
 
 class UnknownAgent(LookupError):
     """引用了库里不存在的 Agent。"""
+
+
+class AgentNameConflict(ValueError):
+    """去首尾空白、忽略大小写后与其他 Agent 同名；本次写入未生效。"""
+
+
+class InvalidAgentOrder(ValueError):
+    """排序请求不是每个现存 Agent 恰好一次的完整排列。"""
+
+
+class AgentOrderConflict(ValueError):
+    """排序基于旧版本；本次没有写入，调用方必须重读而不是重放。"""
 
 
 class ClientIdConflict(ValueError):
@@ -504,7 +533,10 @@ class GatewayStore:
             "SELECT 1 FROM settings WHERE key = 'agents_imported'"
         ).fetchone() is not None
 
-    def import_agents(self, catalog: AgentCatalog, connectors: dict[str, dict] | None = None) -> None:
+    def import_agents(
+        self, catalog: AgentCatalog, connectors: dict[str, dict] | None = None,
+        environments: dict[str, EnvironmentDefinition] | None = None,
+    ) -> None:
         """只在首次启动导入已校验的完整定义；空集也记为已导入。
 
         Agent、连接器、委派关系和入口设置一起提交，失败不留部分数据。
@@ -512,7 +544,10 @@ class GatewayStore:
         with self._connection:
             if self.has_imported_agents() or self.has_agents():
                 raise RuntimeError("库里已有 Agent 导入记录，不能再导入")
+            for name, definition in (environments or {}).items():
+                self._save_environment(name, definition)
             for identity, definition in (connectors or {}).items():
+                definition = {**definition, "name_source": "user", "description_source": "user"}
                 self._connection.execute(
                     "INSERT INTO connectors (id, definition) VALUES (?, ?)",
                     (identity, json.dumps(definition, ensure_ascii=False)),
@@ -532,6 +567,36 @@ class GatewayStore:
             self._connection.execute(
                 "INSERT INTO settings (key, value) VALUES ('agents_imported', '1')"
             )
+            self._bump_agent_order()
+
+    def environment_definitions(self) -> dict[str, EnvironmentDefinition]:
+        """Trusted persisted bindings; provider credentials remain environment-variable references."""
+        result = {}
+        for name, encoded in self._connection.execute(
+            "SELECT id, definition FROM execution_environments"
+        ):
+            fields = json.loads(encoded)
+            if fields.get("browser") is not None:
+                fields["browser"] = BrowserDefinition(**fields["browser"])
+            result[name] = EnvironmentDefinition(**fields)
+        return result
+
+    def _save_environment(self, name: str, definition: EnvironmentDefinition) -> None:
+        encoded = json.dumps(asdict(definition), sort_keys=True)
+        current = self._connection.execute(
+            "SELECT definition FROM execution_environments WHERE id = ?", (name,)
+        ).fetchone()
+        if current is not None and current[0] != encoded:
+            raise ValueError(f"执行环境身份不能重新绑定：{name}")
+        self._connection.execute(
+            "INSERT OR IGNORE INTO execution_environments (id, definition) VALUES (?, ?)",
+            (name, encoded),
+        )
+
+    def save_environment_definitions(self, definitions: dict[str, EnvironmentDefinition]) -> None:
+        with self._connection:
+            for name, definition in definitions.items():
+                self._save_environment(name, definition)
 
     def agent_catalog(self) -> AgentCatalog:
         """库里的全部定义，供运行时装配；引用是否成立由运行时按文件来源的同一规则再检查。"""
@@ -566,12 +631,25 @@ class GatewayStore:
 
     def connector_users(self, identity: str) -> list[dict]:
         return [
-            {"id": agent_id, "name": name}
-            for agent_id, name, direct, searchable in self._connection.execute(
-                "SELECT id, name, mcp_servers, searchable_mcp_servers FROM agents ORDER BY rowid"
+            {"id": agent_id, "name": name, "avatar": avatar}
+            for agent_id, name, avatar, direct, searchable in self._connection.execute(
+                "SELECT id, name, avatar, mcp_servers, searchable_mcp_servers FROM agents ORDER BY display_order"
             )
             if identity in json.loads(direct) or identity in json.loads(searchable)
         ]
+
+    def connector_creation_result(self, client_id: str) -> tuple[dict, Event] | None:
+        """Read a custom creation or catalog acquisition receipt without replaying either command."""
+        event = self.by_client_id(client_id)
+        if event is None:
+            return None
+        row = self._connection.execute(
+            "SELECT detail FROM created_connector_results WHERE client_id = ? AND event_seq = ?",
+            (client_id, event.seq),
+        ).fetchone()
+        if row is None:
+            raise ClientIdConflict("client_id 已用于其他命令")
+        return json.loads(row[0]), event
 
     def replay_create_connector(self, client_id: str) -> tuple[dict, Event] | None:
         event = self.by_client_id(client_id)
@@ -589,7 +667,7 @@ class GatewayStore:
             raise ClientIdConflict("client_id 已用于应用绑定")
         return json.loads(row[0]), event
 
-    def create_connector(self, definition: dict, client_id: str) -> tuple[dict, Event, bool]:
+    def create_connector(self, definition: dict, client_id: str, detail: dict | None = None) -> tuple[dict, Event, bool]:
         with self._connection:
             if replay := self.replay_create_connector(client_id):
                 return *replay, False
@@ -598,12 +676,12 @@ class GatewayStore:
                 "INSERT INTO connectors (id, definition) VALUES (?, ?)",
                 (identity, json.dumps(definition, ensure_ascii=False)),
             )
-            detail = {
+            detail = detail or {
                 **public_connector(definition), "status": "disconnected", "error": None,
                 "tool_count": 0, "used_by": [], "pending_restart": False,
                 "auth": {
                     "status": "unauthorized" if definition.get("auth_type") == "oauth" else "not_required",
-                    "authorizing": False, "scopes": [],
+                    "authorizing": False, "transaction_id": None, "scopes": [],
                 },
             }
             event = self._connector_event(identity, "created", client_id)
@@ -640,7 +718,7 @@ class GatewayStore:
             detail = {
                 **public_connector(definition), "status": "disconnected", "error": None,
                 "tool_count": 0, "used_by": [], "pending_restart": False,
-                "auth": {"status": "unauthorized", "authorizing": False, "scopes": []},
+                "auth": {"status": "unauthorized", "authorizing": False, "transaction_id": None, "scopes": []},
             }
             event = self._connector_event(definition["id"], "created", client_id)
             self._connection.execute(
@@ -753,8 +831,16 @@ class GatewayStore:
                 return event
             if identity not in self.connector_definitions():
                 raise UnknownConnector(identity)
-            if self.connector_users(identity):
-                raise ValueError("连接器仍被 Agent 引用")
+            for agent in self.connector_users(identity):
+                direct, searchable = self._connection.execute(
+                    "SELECT mcp_servers, searchable_mcp_servers FROM agents WHERE id = ?", (agent["id"],),
+                ).fetchone()
+                self._connection.execute(
+                    "UPDATE agents SET mcp_servers = ?, searchable_mcp_servers = ? WHERE id = ?",
+                    (json.dumps([item for item in json.loads(direct) if item != identity]),
+                     json.dumps([item for item in json.loads(searchable) if item != identity]), agent["id"]),
+                )
+                self._resource_changed(agent["id"], "updated")
             self._connection.execute("DELETE FROM connectors WHERE id = ?", (identity,))
             event = self._connector_event(identity, "deleted")
             self._connection.execute(
@@ -891,18 +977,37 @@ class GatewayStore:
 
 
 
+    def check_agent_name(self, name: str, identity: str = "") -> None:
+        """写入前尽早拒绝重名；最终仍由数据库唯一约束保证并发正确性。"""
+        if self._connection.execute(
+            "SELECT 1 FROM agents WHERE name_key = ? AND id != ?",
+            (name.strip().casefold(), identity),
+        ).fetchone():
+            raise AgentNameConflict("已有同名 Agent")
+
+    def _write_agent_name(self, statement: str, parameters: tuple) -> None:
+        """只将名称唯一键冲突转为业务拒绝；其他完整性错误不能伪装成重名。"""
+        try:
+            self._connection.execute(statement, parameters)
+        except sqlite3.IntegrityError as error:
+            if error.sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE" and "agents.name_key" in str(error):
+                raise AgentNameConflict("已有同名 Agent") from error
+            raise
+
     def _insert_agent(
         self, identity: str, definition: AgentDefinition, name: str, avatar: int
     ) -> None:
         _validate_avatar(avatar)
         _validate_fast_mode(definition.fast_mode)
-        self._connection.execute(
-            "INSERT INTO agents (id, name, avatar, description, system_prompt, model,"
+        name = name.strip()
+        self._write_agent_name(
+            "INSERT INTO agents (id, name, name_key, avatar, description, system_prompt, model,"
             " reasoning_effort, context_window, compaction_keep_tokens, compaction_model,"
-            " mcp_servers, searchable_mcp_servers, skills, code_mode, fast_mode, environment)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " mcp_servers, searchable_mcp_servers, skills, code_mode, fast_mode, environment, display_order)"
+            " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            " COALESCE(MAX(display_order), -1) + 1 FROM agents",
             (
-                identity, name, avatar, definition.description, definition.system_prompt,
+                identity, name, name.casefold(), avatar, definition.description, definition.system_prompt,
                 definition.model, definition.reasoning_effort, definition.context_window,
                 definition.compaction_keep_tokens, definition.compaction_model,
                 json.dumps(definition.mcp_servers), json.dumps(definition.searchable_mcp_servers),
@@ -931,7 +1036,7 @@ class GatewayStore:
         self, identity: str, definition: AgentDefinition, name: str, avatar: int | None,
         client_id: str,
     ) -> tuple[dict, Event, bool]:
-        """原子保存定义、委派关系、首次响应和同步事件；头像缺省时取最少使用编号。"""
+        """原子保存定义、唯一名称、委派关系、首次响应和同步事件；先重放再校验名称。"""
         with self._connection:
             if (replayed := self.replay_create_agent(client_id)) is not None:
                 return *replayed, False
@@ -940,6 +1045,7 @@ class GatewayStore:
             if avatar is None:
                 avatar = self._least_used_avatar()
             self._insert_agent(identity, definition, name, avatar)
+            self._bump_agent_order()
             self._connection.executemany(
                 "INSERT INTO agent_workers (agent_id, worker_id, position) VALUES (?, ?, ?)",
                 [(identity, worker, position) for position, worker in enumerate(definition.workers)],
@@ -958,43 +1064,42 @@ class GatewayStore:
     def update_agent(
         self, identity: str, definition: AgentDefinition, name: str, avatar: int
     ) -> tuple[dict, Event | None]:
-        """修改可编辑定义及关系；完全相同不写事件，执行环境不可通过此接口改动。"""
+        """修改可编辑定义及关系；调用方已确保环境切换没有在途任务。"""
         _validate_avatar(avatar)
         _validate_fast_mode(definition.fast_mode)
+        name = name.strip()
         with self._connection:
             current = self.agent(identity)
             if current is None:
                 raise UnknownAgent(identity)
             if self.agent_deleting(identity):
                 raise RuntimeError(f"Agent 正在删除：{identity}")
-            if current["environment"] != definition.environment:
-                raise ValueError("不能修改 Agent 的执行环境")
             changed = (
                 (current["name"], current["avatar"], current["description"],
                  current["system_prompt"], current["model"], current["reasoning_effort"],
                  current["context_window"], current["compaction_keep_tokens"], current["compaction_model"],
                  current["skills"], current["workers"], current["mcp_servers"], current["searchable_mcp_servers"],
-                 current["code_mode"], current["fast_mode"])
+                 current["code_mode"], current["fast_mode"], current["environment"])
                 != (name, avatar, definition.description, definition.system_prompt,
                     definition.model, definition.reasoning_effort, definition.context_window,
                     definition.compaction_keep_tokens, definition.compaction_model,
                     list(definition.skills), list(definition.workers),
                     list(definition.mcp_servers), list(definition.searchable_mcp_servers),
-                    definition.code_mode, definition.fast_mode)
+                    definition.code_mode, definition.fast_mode, definition.environment)
             )
             if not changed:
                 return current, None
-            self._connection.execute(
-                "UPDATE agents SET name = ?, avatar = ?, description = ?, system_prompt = ?,"
+            self._write_agent_name(
+                "UPDATE agents SET name = ?, name_key = ?, avatar = ?, description = ?, system_prompt = ?,"
                 " model = ?, reasoning_effort = ?, context_window = ?,"
                 " compaction_keep_tokens = ?, compaction_model = ?, skills = ?, mcp_servers = ?,"
-                " searchable_mcp_servers = ?, code_mode = ?, fast_mode = ? WHERE id = ?",
-                (name, avatar, definition.description, definition.system_prompt,
+                " searchable_mcp_servers = ?, code_mode = ?, fast_mode = ?, environment = ? WHERE id = ?",
+                (name, name.casefold(), avatar, definition.description, definition.system_prompt,
                  definition.model, definition.reasoning_effort, definition.context_window,
                  definition.compaction_keep_tokens, definition.compaction_model,
                  json.dumps(definition.skills), json.dumps(definition.mcp_servers),
                  json.dumps(definition.searchable_mcp_servers), int(definition.code_mode),
-                 int(definition.fast_mode), identity),
+                 int(definition.fast_mode), definition.environment, identity),
             )
             if current["workers"] != list(definition.workers):
                 self._connection.execute("DELETE FROM agent_workers WHERE agent_id = ?", (identity,))
@@ -1073,8 +1178,8 @@ class GatewayStore:
         ).fetchone()
         return _event(row) if row else None
 
-    def finish_delete_agent(self, identity: str) -> Event:
-        """仅在对话/外部成员引用都已清理后原子删除，并永久保存删除墓碑供重试。"""
+    def finish_delete_agent(self, identity: str, cleanup_unconfirmed: list[dict] | None = None) -> Event:
+        """原子删除定义并保存墓碑；保留外部清理未确认结果供查询和幂等重放。"""
         with self._connection:
             if (event := self.deleted_agent_event(identity)) is not None:
                 return event
@@ -1095,97 +1200,63 @@ class GatewayStore:
             self._connection.execute("DELETE FROM agent_workers WHERE agent_id = ?", (identity,))
             self._connection.execute("DELETE FROM deleting_agents WHERE id = ?", (identity,))
             self._connection.execute("DELETE FROM agents WHERE id = ?", (identity,))
+            self._bump_agent_order()
             self._connection.execute(
                 "DELETE FROM settings WHERE key = 'main_agent' AND value = ?", (identity,)
             )
-            event = self._resource_changed(identity, "deleted")
+            event = self._resource_changed(identity, "deleted", cleanup_unconfirmed=cleanup_unconfirmed)
             self._connection.execute(
                 "INSERT INTO deleted_agents (id, event_seq) VALUES (?, ?)", (identity, event.seq)
             )
             return event
 
     def agents(self) -> list[dict]:
-        """首页视图（ADR-0022 约定 9）：身份、显示信息、直接委派对象 id 和从对话派生的字段。
-
-        排序按“产品活动”（见 HOME_EVENT_TYPES）：有活动的按最近一条活动倒序排在前面；
-        没有活动的（从没对话过，或只有还没发过消息的空对话）在后面，保持导入顺序——
-        它们没有活动时间可比，稳定的创建次序比按名字排更不易跳动。
-        """
-        items = self._agent_items(None)
-        items.sort(key=lambda item: (item["_activity_seq"] is None, -(item["_activity_seq"] or 0)))
-        for item in items:
-            del item["_activity_seq"]
-        return items
+        """全部 Agent 的持久手排顺序；聊天活动只更新摘要，不改变轮播与默认 Agent。"""
+        return self._agent_items(None)
 
     def agent_item(self, identity: str) -> dict | None:
         """单个 Agent 的列表项；只读取这个 Agent 相关的数据。"""
         items = self._agent_items(identity)
         if not items:
             return None
-        del items[0]["_activity_seq"]
         return items[0]
 
     def _agent_items(self, only: str | None) -> list[dict]:
-        """列表项（含内部排序键 _activity_seq）。only 限定单个 Agent，None 为全部。
+        """列表项与对话摘要。only 限定单个 Agent，None 为全部；Agent 始终按 display_order。
 
-        “最近对话”取该 Agent 作为入口、最近一次有产品活动的对话；摘要给出那条事件的 seq 和时间，
+        “最近对话”取该 Agent 作为入口、最近一次有排序活动（用户发送或定时触发）的对话；摘要给出那条事件的 seq 和时间，
         seq 用于比较新鲜度，时间只用于展示（墙上时间可能回拨）。
-        状态变化和已读不是活动：它们不改变排序、摘要选哪个对话和时间（状态字段仍是对话当前状态）。
-        一个对话都没有活动（刚新建、还没发消息）时，若 Agent 只有这类空对话，摘要指向其中最新创建的，
-        让点首页一行有地方可去；此时没有活动时间，也不参与排序——与“新建对话不回首页”一致。
+        AI 回复、状态变化和已读不是活动：它们不改变摘要选哪个对话和时间（状态字段仍是对话当前状态）。
+        没有产品活动时摘要指向最新创建的空对话，供仍需恢复最近对话的入口使用；没有活动时间。
         有活动的对话存在时，空对话不会成为摘要：它没有可显示的内容。
         """
-        placeholders = ", ".join("?" for _ in HOME_EVENT_TYPES)
-        activity_filter = (
-            f"(e.type IN ({placeholders}) OR (e.type = 'browser_task.updated'"
-            " AND json_extract(e.data, '$.entered_requested') = 1))"
-            " AND json_extract(e.data, '$.timeline_ids') IS NULL"
-        )
         where, params = ("WHERE a.id = ?", (only,)) if only is not None else ("", ())
         rows = self._connection.execute(
-            "SELECT a.id, a.name, a.avatar, a.description,"
-            # 在首页：没移出过，或移出后它作为入口的对话里有产品意义上的新事件。
-            " a.hidden_after_seq IS NULL OR EXISTS (SELECT 1 FROM events e JOIN conversations c"
-            "  ON c.id = e.conversation_id WHERE c.agent_id = a.id AND e.seq > a.hidden_after_seq"
-            f"  AND {activity_filter})"
-            f" FROM agents a {where} ORDER BY a.rowid",
-            (*HOME_EVENT_TYPES, *params),
+            f"SELECT a.id, a.name, a.avatar, a.description, a.environment FROM agents a {where} ORDER BY a.display_order",
+            params,
         ).fetchall()
-        # 每个对话最后一次活动：SQLite 对单个 MAX 的裸列取最大行的值，at 即那条事件的时间。
-        activity = {
-            conversation_id: (seq, at)
-            for conversation_id, seq, at in self._connection.execute(
-                "SELECT e.conversation_id, MAX(e.seq), e.at FROM events e JOIN conversations c"
-                f" ON c.id = e.conversation_id WHERE {activity_filter}"
-                + (" AND c.agent_id = ?" if only is not None else "")
-                + " GROUP BY e.conversation_id",
-                (*HOME_EVENT_TYPES, *((only,) if only is not None else ())),
-            )
-        }
         workers = self._workers(only)
         conversations: dict[str, list[dict]] = {}
         for conversation in self.conversations(only):
             conversations.setdefault(conversation["agent_id"], []).append(conversation)
         items = []
-        for identity, name, avatar, description, home in rows:
+        for identity, name, avatar, description, environment in rows:
             own = conversations.get(identity, [])
-            active = [c for c in own if c["id"] in activity]
+            active = [c for c in own if c["last_activity_seq"] is not None]
             if active:
-                latest = max(active, key=lambda c: activity[c["id"]][0])
-                activity_seq, activity_at = activity[latest["id"]]
+                latest = max(active, key=lambda c: c["last_activity_seq"])
+                activity_seq, activity_at = latest["last_activity_seq"], latest["last_activity_at"]
             else:
                 latest = max(own, key=lambda c: c["created_at"], default=None)
                 activity_seq = activity_at = None
             items.append({
                 "id": identity, "name": name, "avatar": avatar, "description": description,
-                "workers": workers.get(identity, []),
-                "home": bool(home),
+                "environment": environment, "workers": workers.get(identity, []),
                 "latest_conversation": None if latest is None else {
                     "id": latest["id"], "title": latest["title"], "last_text": latest["last_text"],
                     "last_activity_seq": activity_seq, "last_activity_at": activity_at, "status": latest["status"],
                 },
                 "unread": any(conversation["unread"] for conversation in own),
-                "_activity_seq": activity_seq,
             })
         return items
 
@@ -1193,38 +1264,55 @@ class GatewayStore:
         if self._connection.execute("SELECT 1 FROM agents WHERE id = ?", (identity,)).fetchone() is None:
             raise UnknownAgent(identity)
 
-    def hide_agent(self, identity: str) -> Event | None:
-        """移出首页：记下当前全局 seq，之后它的对话里有更大 seq 的新事件才回到首页。
+    def agent_order_revision(self) -> int:
+        row = self._connection.execute(
+            "SELECT value FROM settings WHERE key = 'agent_order_revision'"
+        ).fetchone()
+        return int(row[0]) if row else 0
 
-        已经不在首页时什么也不做并返回 None（幂等）；移出后又因新事件回到首页的，可以再次移出。
-        成功时记录 resource.changed，让其他设备重新拉取；该事件不属于任何对话，不会把它判回首页。
+    def _bump_agent_order(self) -> int:
+        self._connection.execute(
+            "INSERT INTO settings (key, value) VALUES ('agent_order_revision', '1')"
+            " ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1"
+        )
+        return self.agent_order_revision()
+
+    def reorder_agents(self, agent_ids: list[str], expected_revision: int) -> Event | None:
+        """原子比较版本、校验全集、改序并记列表事件；旧版本与非法排列绝不部分写入。
+
+        写锁先于读版本，跨连接也只能有一个同版本提交获胜。无序变化不推进版本。
         """
-        item = self.agent_item(identity)
-        if item is None:
-            raise UnknownAgent(identity)
-        if not item["home"]:
-            return None
+        if (type(expected_revision) is not int or expected_revision < 0
+                or not isinstance(agent_ids, list) or any(not isinstance(i, str) for i in agent_ids)):
+            raise InvalidAgentOrder("排序需要 Agent id 数组和非负整数版本")
         with self._connection:
-            self._connection.execute(
-                "UPDATE agents SET hidden_after_seq = ? WHERE id = ?", (self.last_seq(), identity)
+            self._connection.execute("BEGIN IMMEDIATE")
+            if expected_revision != self.agent_order_revision():
+                raise AgentOrderConflict("Agent 列表已变化，请重新排序")
+            current = [row[0] for row in self._connection.execute(
+                "SELECT id FROM agents ORDER BY display_order"
+            )]
+            if len(agent_ids) != len(current) or set(agent_ids) != set(current):
+                raise InvalidAgentOrder("排序必须包含每个现存 Agent，且只能出现一次")
+            if current == agent_ids:
+                return None
+            self._connection.executemany(
+                "UPDATE agents SET display_order = ? WHERE id = ?", enumerate(agent_ids)
             )
-            return self._resource_changed(identity, "hidden")
-
-    def unhide_agent(self, identity: str) -> Event | None:
-        """回到首页：清除移出记录。本来就没有移出记录时什么也不做并返回 None（幂等）。"""
-        self._require_agent(identity)
-        with self._connection:
-            cursor = self._connection.execute(
-                "UPDATE agents SET hidden_after_seq = NULL WHERE id = ? AND hidden_after_seq IS NOT NULL",
-                (identity,),
-            )
-            return self._resource_changed(identity, "unhidden") if cursor.rowcount else None
+            revision = self._bump_agent_order()
+            return self._insert(None, "resource.changed", {
+                "kind": "agent_order", "op": "updated", "order_revision": revision,
+            }, None, time.time())
 
     def _resource_changed(
-        self, agent_id: str, op: str, client_id: str | None = None
+        self, agent_id: str, op: str, client_id: str | None = None,
+        *, cleanup_unconfirmed: list[dict] | None = None,
     ) -> Event:
+        data = {"kind": "agent", "id": agent_id, "op": op}
+        if cleanup_unconfirmed:
+            data["cleanup_unconfirmed"] = cleanup_unconfirmed
         return self._insert(
-            None, "resource.changed", {"kind": "agent", "id": agent_id, "op": op},
+            None, "resource.changed", data,
             client_id, time.time(),
         )
 
@@ -1627,7 +1715,8 @@ class GatewayStore:
         self, task_id: str, kind: str, data: dict, *, client_id: str | None = None,
         timeline_ids: list[str] | None = None,
     ) -> tuple[Event, bool]:
-        """只改变所属成员的活动；不让协作消息点亮首页。命令键仍在全局去重。"""
+        """只改变所属成员的活动，不推进根对话的摘要与未读；命令键仍在全局去重。
+        例外：kind 为 message.user 的插话按 _ROOT_ACTIVITY_FILTER 推进根的排序活动。"""
         task = self.task_conversation(task_id)
         if task is None:
             raise LookupError(task_id)
@@ -1707,22 +1796,39 @@ class GatewayStore:
                 "task_id": task_id, "seq": seq, "timeline_ids": [task_id],
             }, None, time.time())
 
-    def create_conversation(self, title: str, agent_id: str) -> tuple[dict, Event]:
-        """新建对话并记录 conversation.created；对话 ID 同时是运行时的根任务 ID。
+    def replay_create_conversation(self, title: str, agent_id: str, client_id: str) -> dict | None:
+        """键保留至 state 清空；同键不同有效参数拒绝，删除资源不改变首次回执。"""
+        row = self._connection.execute(
+            "SELECT agent_id, title, detail FROM created_conversation_results WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()
+        if row is not None:
+            if row[:2] != (agent_id, title):
+                raise ClientIdConflict("client_id 已用于不同的建对话参数")
+            return json.loads(row[2])
+        if self.by_client_id(client_id) is not None:
+            raise ClientIdConflict("client_id 已用于其他命令")
+        return None
 
-        agent_id 是这个对话的入口 Agent，创建后不变；Agent 不存在时抛 UnknownAgent。
-        """
-        if self._connection.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,)).fetchone() is None:
-            raise UnknownAgent(agent_id)
-        identity = uuid4().hex
-        now = time.time()
+    def create_conversation(self, title: str, agent_id: str, client_id: str) -> tuple[dict, Event | None]:
+        """原子创建对话、事件和首次回执；重放返回原快照与 None，不产生新事件。"""
         with self._connection:
-            event = self._insert_conversation(identity, title, agent_id, now)
-        return self.conversation(identity), event
+            if (replayed := self.replay_create_conversation(title, agent_id, client_id)) is not None:
+                return replayed, None
+            if self.agent(agent_id) is None:
+                raise UnknownAgent(agent_id)
+            identity = uuid4().hex
+            event = self._insert_conversation(identity, title, agent_id, time.time(), client_id=client_id)
+            conversation = self.conversation(identity)
+            self._connection.execute(
+                "INSERT INTO created_conversation_results (client_id, agent_id, title, detail) VALUES (?, ?, ?, ?)",
+                (client_id, agent_id, title, json.dumps(conversation, ensure_ascii=False)),
+            )
+            return conversation, event
 
     def _insert_conversation(
         self, identity: str, title: str, agent_id: str, now: float,
-        *, source: str = "user", schedule_origin: dict | None = None,
+        *, source: str = "user", schedule_origin: dict | None = None, client_id: str | None = None,
     ) -> Event:
         """不提交：触发路径须与运行记录、首条消息共用外层事务。"""
         self._connection.execute(
@@ -1735,7 +1841,7 @@ class GatewayStore:
         return self._insert(
             identity, "conversation.created",
             {"title": title, "agent_id": agent_id, "source": source, "schedule_origin": schedule_origin},
-            None, now,
+            client_id, now,
         )
 
     def rename_conversation(self, identity: str, title: str) -> tuple[dict, Event | None]:
@@ -1894,10 +2000,6 @@ class GatewayStore:
                 self._connection.execute(
                     "UPDATE task_conversations SET updated_at = ? WHERE task_id = ?", (now, task_id)
                 )
-                self._insert(conversation_id, "message.task_preview", {
-                    "task_id": task_id, "agent_id": agent, "text": text.split("\n", 1)[0],
-                    "message_seq": event.seq, "status": status, "timeline_ids": [conversation_id],
-                }, None, now)
             else:
                 self._connection.execute(
                     "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id)
@@ -1910,6 +2012,16 @@ class GatewayStore:
         """登记已校验文件及预检时的环境；路径不能跨环境解释，调用方持有消息事务。"""
         files = []
         for attachment in attachments:
+            if attachment.delivery_digest is not None:
+                existing = self._connection.execute(
+                    "SELECT id FROM files WHERE conversation_id = ? AND task_id = ? AND path = ?"
+                    " AND name = ? AND remote_environment IS NULL AND source = 'agent'",
+                    (conversation_id, task_id, attachment.path, attachment.name),
+                ).fetchone()
+                if existing is not None:
+                    record, _ = self.file(existing[0])
+                    files.append((record, attachment.requested_path or attachment.path))
+                    continue
             record = {
                 "id": "f_" + uuid4().hex, "name": attachment.name, "size": attachment.size,
                 "media_type": attachment.media_type, "conversation_id": conversation_id,
@@ -1926,7 +2038,7 @@ class GatewayStore:
         return files
 
     def _file_produced_events(self, message: Event, files: list[tuple[dict, str]]) -> list[Event]:
-        # 文件通知与正文拥有相同展示范围；不能让成员附件单独泄漏到根时间线或首页。
+        # 文件通知与正文拥有相同展示范围；不能让成员附件单独泄漏到根时间线或摘要。
         scope = {key: message.data[key] for key in ("task_id", "timeline_ids") if key in message.data}
         return [
             self._insert(message.conversation_id, "file.produced",
@@ -2093,8 +2205,8 @@ class GatewayStore:
                 results.append({"kind": kind, "id": identity, "title": title, "file": self.file(identity)[0]})
         return {"results": results, "total": total, "as_of_seq": self.last_seq()}
 
-    def finish_delete(self, identity: str) -> Event:
-        """移除对话及其历史，保留不属于对话的全局墓碑；同一事务提交。"""
+    def finish_delete(self, identity: str, cleanup_unconfirmed: list[dict] | None = None) -> Event:
+        """原子删除本地历史并保存墓碑；外部清理未确认同事务留在墓碑中，重放不丢失。"""
         with self._connection:
             if (event := self.deleted_event(identity)) is not None:
                 return event
@@ -2108,9 +2220,10 @@ class GatewayStore:
             self._connection.execute("DELETE FROM events WHERE conversation_id = ?", (identity,))
             self._connection.execute("DELETE FROM deleting_conversations WHERE id = ?", (identity,))
             self._connection.execute("DELETE FROM conversations WHERE id = ?", (identity,))
-            event = self._insert(
-                None, "conversation.deleted", {"id": identity, "agent_id": row[0]}, None, time.time()
-            )
+            data = {"id": identity, "agent_id": row[0]}
+            if cleanup_unconfirmed:
+                data["cleanup_unconfirmed"] = cleanup_unconfirmed
+            event = self._insert(None, "conversation.deleted", data, None, time.time())
             self._connection.execute(
                 "INSERT INTO deleted_conversations (id, event_seq) VALUES (?, ?)", (identity, event.seq)
             )
@@ -2127,16 +2240,19 @@ class GatewayStore:
         return self._conversations("WHERE c.agent_id = ?", (agent_id,))
 
     def _conversations(self, where: str, params: tuple) -> list[dict]:
-        # 未读与实际最后根回复位置共用同一查询；全局快照水位不是本对话的消息位置。
+        # 同一行排序活动（用户发送 / 定时触发）提供 seq 与时间；管理时间与 AI 回复不参与。全局水位也不是本对话的回复位置。
         rows = self._connection.execute(
             "SELECT c.id, c.agent_id, c.title, c.created_at, c.updated_at, c.read_seq, c.status,"
-            " c.source, c.schedule_origin,"
+            " c.source, c.schedule_origin, activity.seq, activity.at,"
             " COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.conversation_id = c.id"
             "  AND e.type = 'message.agent' AND json_extract(e.data, '$.timeline_ids') IS NULL), 0),"
             " (SELECT e.data FROM events e WHERE e.conversation_id = c.id"
             "  AND json_extract(e.data, '$.timeline_ids') IS NULL"
             "  AND e.type IN ('message.user', 'message.agent') ORDER BY e.seq DESC LIMIT 1)"
-            f" FROM conversations c {where} ORDER BY c.updated_at DESC",
+            " FROM conversations c LEFT JOIN events activity ON activity.seq ="
+            " (SELECT e.seq FROM events e WHERE e.conversation_id = c.id"
+            f"  AND {_ROOT_ACTIVITY_FILTER} ORDER BY e.seq DESC LIMIT 1)"
+            f" {where} ORDER BY c.updated_at DESC",
             params,
         ).fetchall()
         return [
@@ -2148,6 +2264,8 @@ class GatewayStore:
                 "source": source,
                 "schedule_origin": json.loads(schedule_origin) if schedule_origin else None,
                 "updated_at": updated_at,
+                "last_activity_seq": last_activity_seq,
+                "last_activity_at": last_activity_at,
                 "read_seq": read_seq,
                 "status": status,
                 "last_agent_seq": last_agent_seq,
@@ -2155,7 +2273,7 @@ class GatewayStore:
                 "last_text": json.loads(last)["text"] if last else None,
             }
             for identity, agent_id, title, created_at, updated_at, read_seq, status, source,
-            schedule_origin, last_agent_seq, last in rows
+            schedule_origin, last_activity_seq, last_activity_at, last_agent_seq, last in rows
         ]
 
     # ---- 浏览器任务：租约状态与全局事件同一事务提交 ----
@@ -2214,11 +2332,7 @@ class GatewayStore:
                  snapshot["entry_agent_id"], snapshot["state"],
                  json.dumps(snapshot, ensure_ascii=False), now),
             )
-            # Transition metadata belongs to the durable event, not the snapshot:
-            # title/URL updates while requested must not count as new activity.
-            data = {**snapshot, "entered_requested": snapshot["state"] == "requested"
-                    and (current is None or current["state"] != "requested")}
-            return self._insert(root_id, "browser_task.updated", data, None, now)
+            return self._insert(root_id, "browser_task.updated", snapshot, None, now)
 
     def record_takeover_end(self, data: dict) -> Event | None:
         """交还文字属于根对话的聊天历史，而不是只推临时通知。"""
@@ -2371,6 +2485,10 @@ class GatewayStore:
         return _event(row) if row else None
 
     def by_client_id(self, client_id: str) -> Event | None:
+        if self._connection.execute(
+            "SELECT 1 FROM created_conversation_results WHERE client_id = ?", (client_id,),
+        ).fetchone() is not None:
+            raise ClientIdConflict("client_id 已用于建对话")
         if self._connection.execute(
             "SELECT 1 FROM browser_command_results WHERE client_id = ?", (client_id,)
         ).fetchone() is not None:

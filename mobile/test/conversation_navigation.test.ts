@@ -16,7 +16,7 @@ test("confirmed deletion removes stale chat search destinations, but not indepen
       id: "file", name: "report.txt", size: 12, media_type: "text/plain", conversation_id: "gone",
       agent_id: "agent", task_id: "task", created_at: 1, remote_environment: null,
     } };
-    assert.deepEqual(liveSearchDestination(message, session), { pathname: "/c/[id]", params: { id: "gone", message_seq: "42" } });
+    assert.deepEqual(liveSearchDestination(message, session), { pathname: "/chat", params: { id: "gone", message_seq: "42" } });
     assert.deepEqual(missingConversationAction(session, "gone", undefined), { type: "wait" });
 
     session["apply"]({ seq: 10, type: "conversation.deleted", at: 10, data: { id: "gone", agent_id: "agent" } });
@@ -24,9 +24,9 @@ test("confirmed deletion removes stale chat search destinations, but not indepen
     assert.equal(liveSearchDestination(message, session), null);
     assert.deepEqual(liveSearchDestination(file, session), { pathname: "/files/[id]", params: { id: "file" } });
     assert.deepEqual(missingConversationAction(session, "gone", undefined), { type: "leave" });
-    assert.deepEqual(missingConversationAction(session, "gone", "agent"), { type: "wait" });
+    assert.deepEqual(missingConversationAction(session, "gone", "agent"), { type: "leave" });
     session.connection = "open";
-    assert.deepEqual(missingConversationAction(session, "gone", "agent"), { type: "recover", agentId: "agent" });
+    assert.deepEqual(missingConversationAction(session, "gone", "agent"), { type: "leave" });
   } finally {
     await session.close();
   }

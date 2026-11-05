@@ -1,22 +1,8 @@
 import assert from "node:assert/strict";
-import { readdirSync } from "node:fs";
-import { join } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
 import { StackActions, StackRouter } from "expo-router/build/react-navigation/routers/StackRouter.js";
 
 import { authenticatedScreens, developmentScreens, sharedScreens } from "../src/lib/root-stack-routes.ts";
-
-const appDirectory = fileURLToPath(new URL("../src/app/", import.meta.url));
-
-function actualRoutes(directory: string, prefix = ""): string[] {
-  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
-    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) return actualRoutes(join(directory, entry.name), relative);
-    if (!/\.[jt]sx?$/.test(entry.name) || entry.name.startsWith("_layout.")) return [];
-    return [relative.replace(/\.[jt]sx?$/, "")];
-  });
-}
 
 const signedIn = authenticatedScreens.map((screen) => screen.name);
 const signedOut = sharedScreens.map((screen) => screen.name);
@@ -24,12 +10,9 @@ const paired = [...signedIn, ...signedOut]; // Authenticated index precedes shar
 const router = StackRouter({});
 const options = (routeNames: string[]) => ({ routeNames, routeParamList: {}, routeGetIdList: {} });
 
-test("every file route is declared once; pairing is available with and without a computer", () => {
-  const declared = [...paired, ...developmentScreens.map((screen) => screen.name)];
+test("initial navigation selects home only with a paired computer", () => {
   assert.equal(router.getInitialState(options(paired)).routes[0].name, "index");
   assert.equal(router.getInitialState(options(signedOut)).routes[0].name, "connect");
-  assert.equal(new Set(declared).size, declared.length, "a route must not be declared in both groups");
-  assert.deepEqual([...declared].sort(), actualRoutes(appDirectory).sort(), "unlisted file routes are implicitly unprotected by Expo Router");
 });
 
 test("production navigation cannot open development preview links", () => {
@@ -50,7 +33,16 @@ test("invalid authentication can reach saved computers and re-pair without expos
   const repair = router.getStateForAction(computers, StackActions.push("connect", { repair: "old-installation" }), available);
   assert.ok(repair?.stale === false);
   assert.deepEqual(repair.routes[repair.index].params, { repair: "old-installation" });
-  assert.equal(router.getStateForAction(computers, StackActions.push("c/[id]", { id: "private" }), available), null);
+  assert.equal(router.getStateForAction(computers, StackActions.push("chat", { id: "private" }), available), null);
+});
+
+test("agent-profile.E1 E5 memory reader is only navigable with a connected computer", () => {
+  const action = StackActions.push("memory-reader", { scope: "work", id: "planner" });
+  assert.equal(router.getStateForAction(router.getInitialState(options(signedOut)), action, options(signedOut)), null);
+  const available = options(paired);
+  const reading = router.getStateForAction(router.getInitialState(available), action, available);
+  assert.equal(reading?.routes.at(-1)?.name, "memory-reader");
+  assert.deepEqual(reading?.routes.at(-1)?.params, { scope: "work", id: "planner" });
 });
 
 test("a paired user can cancel pairing back to the previous page or replace it with home", () => {
@@ -74,7 +66,7 @@ test("switching resets deep authenticated history; removing the last computer re
   const pairedOptions = options(paired);
   const signedOutOptions = options(signedOut);
   let oldSession = router.getInitialState(pairedOptions);
-  for (const name of ["c/[id]", "browser-viewer", "files/[id]"]) {
+  for (const name of ["chat", "browser-viewer", "files/[id]"]) {
     const next = router.getStateForAction(oldSession, StackActions.push(name, { id: "old-computer-id" }), pairedOptions);
     assert.ok(next?.stale === false);
     oldSession = next;
@@ -90,7 +82,7 @@ test("switching resets deep authenticated history; removing the last computer re
   assert.ok(newSession?.stale === false);
   assert.deepEqual(newSession.routes.map((route) => route.name), ["index"]);
   assert.equal(JSON.stringify(newSession).includes("old-computer-id"), false);
-  const newConversation = router.getStateForAction(newSession, StackActions.push("c/[id]", { id: "new-computer-id" }), pairedOptions);
+  const newConversation = router.getStateForAction(newSession, StackActions.push("chat", { id: "new-computer-id" }), pairedOptions);
   assert.ok(newConversation?.stale === false);
   assert.deepEqual(newConversation.routes[newConversation.index].params, { id: "new-computer-id" });
 

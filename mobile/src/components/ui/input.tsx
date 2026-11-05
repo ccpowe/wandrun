@@ -3,12 +3,18 @@ import { Platform, TextInput } from 'react-native';
 
 function Input({
   className,
+  variant = 'filled',
+  tone = 'card',
   ...props
-}: React.ComponentProps<typeof TextInput> & React.RefAttributes<TextInput>) {
+}: React.ComponentProps<typeof TextInput> & React.RefAttributes<TextInput> & {
+  variant?: 'filled';
+  /** 页底字段用 card；已经在 card 内的字段用 muted。 */
+  tone?: 'card' | 'muted';
+}) {
   return (
     <TextInput
       className={cn(
-        'border-input bg-background text-foreground flex min-h-12 w-full min-w-0 flex-row items-center rounded-[12px] border px-3 py-1 text-base leading-5',
+        'text-foreground flex min-h-12 w-full min-w-0 flex-row items-center rounded-[12px] py-1',
         props.editable === false &&
           cn(
             'opacity-50',
@@ -21,6 +27,7 @@ function Input({
             'aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive'
           ),
         }),
+        variant === 'filled' && cn('border-0 px-4 text-body leading-5 shadow-none', tone === 'card' ? 'bg-card' : 'bg-muted'),
         className
       )}
       placeholderTextColorClassName="accent-muted-foreground"

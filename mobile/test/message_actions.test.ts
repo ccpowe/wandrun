@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { messageText, messageTextForItem, prependQuote, quotePreview } from "../src/lib/message-actions.ts";
-import { buildItems } from "../src/lib/chat-timeline.ts";
+import { projectChatRows } from "../src/lib/chat-timeline.ts";
 import type { GatewayEvent } from "../src/gateway/api.ts";
 import type { Pending } from "../src/gateway/session.ts";
 
@@ -95,7 +95,7 @@ test("system/generation rows and absent/empty content do not offer actions", () 
 
 test("a later turn failure leaves already delivered content actionable", () => {
   const events = [event("message.agent", "已完成的内容"), { ...event("turn.failed"), seq: 2 }];
-  assert.deepEqual(buildItems(events, []).map(messageTextForItem), [{ copy: "已完成的内容", quote: "已完成的内容" }, null]);
+  assert.deepEqual(projectChatRows({ events: events, pending: [] }).rows.map(messageTextForItem), [{ copy: "已完成的内容", quote: "已完成的内容" }, null]);
 });
 
 test("Table, Metrics and KeyValue copy their display values, not form option identifiers", () => {
@@ -115,6 +115,26 @@ test("Table, Metrics and KeyValue copy their display values, not form option ide
     assert.ok(result, `${type} must remain actionable`);
     assert.equal(result.copy.trim(), expected);
     assert.equal(prependQuote("问题", quotePreview(result.quote)), `${expected.split("\n").map((line) => `> ${line}`).join("\n")}\n\n问题`);
+  }
+});
+
+test("StatCard and Field preserve display values in copy and quote without exposing form identifiers", () => {
+  const text = ui({ root: "root", elements: {
+    root: { type: "Stack", props: {}, children: ["stat", "field"] },
+    stat: { type: "StatCard", props: { label: "本周完成", value: "28", description: "最近 7 天", badge: { text: "稳定", tone: "success" } }, children: [] },
+    field: { type: "Field", props: { label: "周期", value: "每周" }, children: ["select"] },
+    select: { type: "Select", props: { stateKey: "period", label: "周期选择", options: [
+      { label: "按周", value: "weekly-private" }, { label: "按月", value: "monthly-private" },
+    ] }, children: [] },
+  }, state: { period: "weekly-private" } });
+  const result = messageTextForItem({ key: "e1", event: event("message.agent", text) })!;
+  for (const projection of [result.copy, prependQuote("继续分析", quotePreview(result.quote))]) {
+    for (const display of ["本周完成", "28", "最近 7 天", "稳定", "周期", "每周", "按周", "按月"]) {
+      assert.ok(projection.includes(display), `missing visible content: ${display}`);
+    }
+    for (const internal of ["weekly-private", "monthly-private", "stateKey", "wandrun-ui"]) {
+      assert.ok(!projection.includes(internal), `internal form data leaked: ${internal}`);
+    }
   }
 });
 

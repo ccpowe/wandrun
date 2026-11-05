@@ -1,5 +1,5 @@
 import { router, useIsFocused } from 'expo-router';
-import { ArrowLeft, Minus, Plus } from 'lucide-react-native';
+import { ArrowLeft, ChevronDown, ChevronUp, Minus, Plus } from 'lucide-react-native';
 import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Ref, RefObject } from 'react';
 import { ActivityIndicator, Platform, Pressable, ScrollView, View } from 'react-native';
@@ -13,6 +13,7 @@ import { useTranslation } from '@/lib/i18n.ts';
 import { useSession } from '@/lib/session-context.tsx';
 import { renderBudget } from '@/lib/render-budget.ts';
 import { mermaidCache } from '@/lib/mermaid-cache.ts';
+import { MERMAID_INLINE_MAX, mermaidInlineHeight, type MermaidNaturalSize } from '@/lib/mermaid-inline.ts';
 import { parseMermaidEvent } from '@/lib/mermaid-document.ts';
 import type { MermaidCommand, MermaidInput, MermaidPage, MermaidTheme, MermaidViewport } from '@/lib/mermaid-document.ts';
 import { prepareMermaidPage } from './mermaid-page';
@@ -22,7 +23,7 @@ import type { MediaLocation } from './media.tsx';
 import { MermaidToolbar } from './mermaid-toolbar.tsx';
 import { richGeometry, richRadius, richSpace, richType } from './tokens.ts';
 
-const INLINE_HEIGHT = 320;
+
 type DiagramStatus = { ready: boolean; zoom: number };
 type SavedViewport = { layout: Omit<MermaidInput, 'day'>; day: string; viewport: MermaidViewport };
 type CommandSender = (action: MermaidCommand['action']) => void;
@@ -43,9 +44,12 @@ function safeColor(value: unknown, fallback: string): string {
 
 /** The same four permits cover formulas, inline diagrams and full-screen diagrams.
  * A hidden/unfocused owner removes its frame before returning the permit. */
-export function MermaidDiagram({ ref, source, full = false, visible = true, onError, onStatus }: {
+export function MermaidDiagram({ ref, source, full = false, visible = true, height: inlineHeight = MERMAID_INLINE_MAX, onError, onStatus, onRendered }: {
   ref?: Ref<DiagramControl>; source: string; full?: boolean; visible?: boolean;
+  /** Inline viewport height; the viewer derives it from the rendered size (`Mermaid.fit` / `.tall`). */
+  height?: number;
   onError?: (message: string | null) => void; onStatus?: (status: DiagramStatus) => void;
+  onRendered?: (size: MermaidNaturalSize) => void;
 }) {
   const { t } = useTranslation();
   const view = useRef<View>(null);
@@ -77,7 +81,7 @@ export function MermaidDiagram({ ref, source, full = false, visible = true, onEr
   useEffect(() => {
     if (full && !eligible) onStatus?.({ ready: false, zoom: savedViewportRef.current?.layout === input ? savedViewportRef.current.viewport.zoom : 1 });
   }, [eligible, full, input, onStatus]);
-  const height = INLINE_HEIGHT;
+  const height = inlineHeight;
   return <View ref={view} collapsable={false} testID="mermaid-renderer"
     accessibilityElementsHidden={!visible} importantForAccessibility={visible ? 'auto' : 'no-hide-descendants'}
     style={full ? { flex: 1, minHeight: 0, width: '100%' } : { width: '100%', height }}
@@ -88,7 +92,7 @@ export function MermaidDiagram({ ref, source, full = false, visible = true, onEr
     {error ? <View className="items-center justify-center" style={{ padding: richSpace.lg, ...(full ? { flex: 1 } : { minHeight: height }) }} testID="mermaid-error">
       <Text className="text-center text-destructive" style={richType.subtle}>{t(error)}</Text>
     </View> : eligible && permitted ? <ActiveDiagram key={rendererKey} input={input} viewportHeight={full ? box.height : height}
-      savedViewportRef={savedViewportRef} senderRef={senderRef} commandIdRef={commandIdRef} onStatus={full ? onStatus : undefined} onFailure={onFailure} />
+      savedViewportRef={savedViewportRef} senderRef={senderRef} commandIdRef={commandIdRef} onStatus={full ? onStatus : undefined} onFailure={onFailure} onRendered={onRendered} />
       : <View className="items-center justify-center" testID={focused && near ? 'mermaid-waiting' : undefined}
           style={full ? { flex: 1 } : { height }} accessibilityLabel={t('流程图')}>
         {focused && near ? <Text className="text-muted-foreground" style={richType.subtle}>{t('等待显示')}</Text> : null}
@@ -96,10 +100,10 @@ export function MermaidDiagram({ ref, source, full = false, visible = true, onEr
   </View>;
 }
 
-function ActiveDiagram({ input: layout, viewportHeight, savedViewportRef, senderRef, commandIdRef, onStatus, onFailure }: {
+function ActiveDiagram({ input: layout, viewportHeight, savedViewportRef, senderRef, commandIdRef, onStatus, onFailure, onRendered }: {
   input: Omit<MermaidInput, 'day'>; viewportHeight: number;
   savedViewportRef: RefObject<SavedViewport | undefined>; senderRef: RefObject<CommandSender | undefined>; commandIdRef: RefObject<number>;
-  onStatus?: (status: DiagramStatus) => void; onFailure: (code: string) => void;
+  onStatus?: (status: DiagramStatus) => void; onFailure: (code: string) => void; onRendered?: (size: MermaidNaturalSize) => void;
 }) {
   // One date belongs to this mounted renderer, including delayed preparation/results.
   const input = useMemo<MermaidInput>(() => ({ ...layout, day: new Date().toISOString().slice(0, 10) }), [layout]);
@@ -162,6 +166,7 @@ function ActiveDiagram({ input: layout, viewportHeight, savedViewportRef, sender
       return;
     }
     mermaidCache.put(input, computerId, { svg: event.svg, width: event.width, height: event.height });
+    if (!layout.full) onRendered?.({ width: event.width, height: event.height });
     readyDocument.current = documentInput;
     setReadyFor(documentInput);
     if (layout.full) onStatus?.({ ready: true, zoom: savedViewportRef.current?.layout === layout ? savedViewportRef.current.viewport.zoom : 1 });
@@ -221,7 +226,7 @@ function touchPosition(event: TouchPositionEvent, released = false) {
   return typeof x === 'number' && Number.isFinite(x) && typeof y === 'number' && Number.isFinite(y) ? { x, y } : undefined;
 }
 
-function PreviewOpen({ onOpen }: { onOpen: () => void }) {
+function PreviewOpen({ onOpen, pill = true }: { onOpen: () => void; pill?: boolean }) {
   const { t } = useTranslation();
   // undefined: no pending touch; null: pending touch was rejected.
   const touch = useRef<{ x: number; y: number } | null | undefined>(undefined);
@@ -271,9 +276,9 @@ function PreviewOpen({ onOpen }: { onOpen: () => void }) {
       touch.current = undefined;
       if (accepted) onOpen();
     }}>
-    <View className="absolute border border-border bg-card" style={{ bottom: richSpace.sm, right: richSpace.sm, borderRadius: richRadius.full, paddingHorizontal: richSpace.md, paddingVertical: richSpace.xs }}>
+    {pill ? <View className="absolute border border-border bg-card" style={{ bottom: richSpace.sm, right: richSpace.sm, borderRadius: richRadius.full, paddingHorizontal: richSpace.md, paddingVertical: richSpace.xs }}>
       <Text className="text-muted-foreground" style={richType.caption}>{t('点击放大')}</Text>
-    </View>
+    </View> : null}
   </Pressable>;
 }
 
@@ -302,36 +307,86 @@ export function MermaidViewer({ source, title, full = false, onOpen, onBack }: {
       ? previous : { source, ready: next.ready, zoom: value };
   }), [source]);
   const control: CommandSender = action => controlRef.current?.run(action);
-  return <View className={full ? 'min-h-0 flex-1' : ''} style={full ? undefined : { gap: richSpace.sm }}>
-    <View className={`flex-row items-center ${full ? 'border-b border-border' : ''}`} style={{ gap: richSpace.sm, ...(full ? { paddingHorizontal: richSpace.lg, paddingVertical: richSpace.sm } : {}) }}>
-      {full && onBack ? <Button variant="ghost" size="icon" style={{ width: richGeometry.touch, height: richGeometry.touch, borderRadius: richRadius.full }} accessibilityLabel={t('返回')} onPress={onBack}>
+  if (!full) return <InlineMermaid source={source} title={title} onOpen={onOpen} view={view} error={error}
+    onViewChange={next => setSelection({ source, view: next })} onError={onError} />;
+  return <View className="min-h-0 flex-1">
+    <View className="flex-row items-center border-b border-border" style={{ gap: richSpace.sm, paddingHorizontal: richSpace.lg, paddingVertical: richSpace.sm }}>
+      {onBack ? <Button variant="ghost" size="icon" style={{ width: richGeometry.touch, height: richGeometry.touch, borderRadius: richRadius.full }} accessibilityLabel={t('返回')} onPress={onBack}>
         <Icon as={ArrowLeft} className="size-5" /></Button> : null}
-      <View className="min-w-0 flex-1">
-        {full ? <Text numberOfLines={1} style={richType.title}>{title || t('流程图')}</Text>
-          : <RichText style={richType.title}>{title || t('流程图')}</RichText>}
-      </View>
-      <MermaidToolbar full={full} view={view} onViewChange={next => setSelection({ source, view: next })}
-        canPreview={!error} controls={full ? { ready, zoomed: zoom > 1, onReset: () => control('reset') } : undefined} />
+      <View className="min-w-0 flex-1"><Text numberOfLines={1} style={richType.title}>{title || t('流程图')}</Text></View>
+      <MermaidToolbar full view={view} onViewChange={next => setSelection({ source, view: next })}
+        canPreview={!error} controls={{ ready, zoomed: zoom > 1, onReset: () => control('reset') }} />
     </View>
-    <View className={`relative overflow-hidden ${full ? 'min-h-0 flex-1' : ''}`}
-      style={full ? { padding: richSpace.md } : { height: INLINE_HEIGHT }}>
-      <MermaidDiagram ref={full ? controlRef : undefined} source={source} full={full} visible={view === 'preview'}
-        onError={onError} onStatus={full ? onStatus : undefined} />
-      {view === 'code' ? <View className="absolute inset-0 bg-card" style={full ? { padding: richSpace.md } : undefined}>
+    <View className="relative min-h-0 flex-1 overflow-hidden" style={{ padding: richSpace.md }}>
+      <MermaidDiagram ref={controlRef} source={source} full visible={view === 'preview'} onError={onError} onStatus={onStatus} />
+      {view === 'code' ? <View className="absolute inset-0 bg-card" style={{ padding: richSpace.md }}>
         {error ? <Text className="text-destructive" style={{ ...richType.subtle, marginBottom: richSpace.sm }} accessibilityRole="alert">{t(error)}</Text> : null}
-        <ScrollView className="min-h-0 flex-1 bg-muted" style={{ borderRadius: richRadius.small }} testID={full ? 'media-viewer-source' : 'rich-mermaid-source'}>
+        <ScrollView className="min-h-0 flex-1 bg-muted" style={{ borderRadius: richRadius.small }} testID="media-viewer-source">
           <Text selectable className="font-mono" style={{ ...richType.caption, padding: richSpace.md }}>{source}</Text>
         </ScrollView>
-      </View> : full ? <View className="absolute flex-row border border-border bg-card" style={{ bottom: richSpace.xl, right: richSpace.xl, gap: richSpace.xs, borderRadius: richRadius.full }}>
+      </View> : <View className="absolute flex-row border border-border bg-card" style={{ bottom: richSpace.xl, right: richSpace.xl, gap: richSpace.xs, borderRadius: richRadius.full }}>
         <Button variant="ghost" size="icon" testID="mermaid-full-zoom-out" style={{ width: richGeometry.touch, height: richGeometry.touch, borderRadius: richRadius.full }}
           accessibilityLabel={t('缩小流程图')} disabled={!ready || zoom <= 1} onPress={() => control('out')}>
           <Icon as={Minus} className="size-4" /></Button>
         <Button variant="ghost" size="icon" testID="mermaid-full-zoom-in" style={{ width: richGeometry.touch, height: richGeometry.touch, borderRadius: richRadius.full }}
           accessibilityLabel={t('放大流程图')} disabled={!ready || zoom >= 32} onPress={() => control('in')}>
           <Icon as={Plus} className="size-4" /></Button>
-      </View> : onOpen ? <PreviewOpen onOpen={onOpen} /> : null}
+      </View>}
     </View>
   </View>;
+}
+
+/**
+ * Inline chat preview (`Mermaid.waiting` / `.fit` / `.tall` / `.code` / `.error`). The viewport height follows the
+ * rendered diagram (cached size first, 160 while unknown) up to 320; taller diagrams show a hint to open them.
+ * Code view and the error source are in-flow, content-high and scroll inside 320. The diagram stays mounted (hidden)
+ * in code / error view so its renderer state and the error report persist.
+ */
+function InlineMermaid({ source, title, onOpen, view, error, onViewChange, onError }: {
+  source: string; title?: string; onOpen?: () => void; view: 'code' | 'preview'; error: string | null;
+  onViewChange: (view: 'code' | 'preview') => void; onError: (message: string | null) => void;
+}) {
+  const { t } = useTranslation();
+  const computerId = useSession()?.api.config.computerId ?? 'offline';
+  const [boxWidth, setBoxWidth] = useState(0);
+  const [rendered, setRendered] = useState<{ key: string; size: MermaidNaturalSize }>();
+  const [sourceOpen, setSourceOpen] = useState(false);
+  const width = Math.floor(boxWidth);
+  const key = JSON.stringify([source, width]);
+  // The cache key includes the UTC day of the render; read it once rather than on every render.
+  const [day] = useState(() => new Date().toISOString().slice(0, 10));
+  const cached = width > 0 ? mermaidCache.get({ source, width, full: false, day }, computerId) : undefined;
+  const natural = rendered?.key === key ? rendered.size : cached ? { width: cached.width, height: cached.height } : undefined;
+  const { height, tall } = mermaidInlineHeight(natural, boxWidth);
+  const onRendered = useCallback((size: MermaidNaturalSize) => setRendered({ key, size }), [key]);
+  const preview = view === 'preview' && !error;
+  return <View style={{ gap: richSpace.sm }} onLayout={event => setBoxWidth(event.nativeEvent.layout.width)}>
+    <View className="flex-row items-center" style={{ gap: richSpace.sm }}>
+      <View className="min-w-0 flex-1"><RichText style={richType.title}>{title || t('流程图')}</RichText></View>
+      {error ? null : <MermaidToolbar full={false} view={view} onViewChange={onViewChange} canPreview />}
+    </View>
+    <View className="relative overflow-hidden" style={{ height, display: preview ? 'flex' : 'none' }}>
+      <MermaidDiagram source={source} visible={preview} height={height} onError={onError} onRendered={onRendered} />
+      {preview && onOpen ? <PreviewOpen onOpen={onOpen} pill={!tall} /> : null}
+    </View>
+    {preview && tall ? <Text testID="mermaid-tall-hint" className="text-muted-foreground" style={richType.subtle}>{t('点开查看完整流程')}</Text> : null}
+    {error ? <View style={{ gap: richSpace.xs }} testID="rich-mermaid-error">
+      <Text className="text-muted-foreground" style={richType.subtle} accessibilityRole="alert">{t('流程图无法显示')}</Text>
+      <Pressable accessibilityRole="button" accessibilityState={{ expanded: sourceOpen }} onPress={() => setSourceOpen(!sourceOpen)}
+        className="flex-row items-center self-start" style={{ minHeight: richGeometry.touch, gap: richSpace.xs }} testID="mermaid-error-source-toggle">
+        <Text className="text-foreground" style={richType.subtle}>{sourceOpen ? t('收起源码') : t('查看源码')}</Text>
+        <Icon as={sourceOpen ? ChevronUp : ChevronDown} size={14} className="text-muted-foreground" />
+      </Pressable>
+      {sourceOpen ? <MermaidSource source={source} /> : null}
+    </View> : view === 'code' ? <MermaidSource source={source} /> : null}
+  </View>;
+}
+
+/** `Mermaid.code`: monospace source, content-high, scrolling inside 320. */
+function MermaidSource({ source }: { source: string }) {
+  return <ScrollView nestedScrollEnabled className="bg-muted" style={{ maxHeight: MERMAID_INLINE_MAX, flexGrow: 0, borderRadius: richRadius.small }} testID="rich-mermaid-source">
+    <Text selectable className="font-mono" style={{ ...richType.caption, padding: richSpace.md }}>{source}</Text>
+  </ScrollView>;
 }
 
 export function MermaidPicture({ title, source, location }: { title?: string; source: string; location?: MediaLocation }) {
@@ -340,7 +395,8 @@ export function MermaidPicture({ title, source, location }: { title?: string; so
     router.push({ pathname: '/media-viewer', params: { id: location.conversationId, seq: String(location.messageSeq),
       block: String(location.block), element: location.element, index: String(location.index), alt: title ?? t('流程图') } });
   } : undefined;
-  return <View className="border border-border bg-card" style={{ borderRadius: richRadius.large, padding: richSpace.md }} testID="rich-mermaid">
+  // A+ read-only content: no frame (user chose frameless on the chat comparison, 2026-11-01).
+  return <View testID="rich-mermaid">
     <MermaidViewer source={source} title={title} onOpen={open} />
   </View>;
 }

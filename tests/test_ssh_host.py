@@ -18,6 +18,7 @@ from unittest.mock import patch
 from wandrun.integrations import remote_session, ssh_backend
 from wandrun.integrations.browser_dev import ChromeDev
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
+from wandrun.integrations.instabox import InstaboxBackend
 from wandrun.integrations.shell_backend import CleanupUnconfirmedError
 from wandrun.integrations.ssh_backend import SESSION_HASH, SSHBackend, SessionChannel
 from wandrun.metrics import RunMetrics
@@ -141,13 +142,39 @@ class HostWithLocalSessionTests(unittest.IsolatedAsyncioTestCase):
         )
         responses = [call("env", "execute", {"command": command}), answer("checked")]
         bodies = []
+        owners = []
 
         async def model(_, body):
             bodies.append(body)
             yield responses[min(len(bodies), len(responses)) - 1]
 
         async def environments(config, workspace, stack, opened, *, include_default=False, builtin_source=None):
-            remote = Environment("ssh", self.backend, str(workspace.skills_dir), str(workspace.root / "artifacts"))
+            process = self.process
+
+            class Connection:
+                def is_closed(self):
+                    return process.returncode is not None
+
+                def close(self):
+                    process.stdin.close()
+
+                async def wait_closed(self):
+                    await process.wait()
+
+                def abort(self):
+                    if process.returncode is None:
+                        process.kill()
+
+            owner = InstaboxBackend("m_" + "a" * 26, workdir=self.directory.name)
+            owner._backend = self.backend
+            owner._sessions.append(self.backend)
+            owner._connection = Connection()
+            owner._connections.append(owner._connection)
+            stack.push_async_callback(owner.aclose)
+            owners.append(owner)
+            remote = Environment(
+                "ssh", owner, str(workspace.skills_dir), str(workspace.root / "artifacts"), type="instabox",
+            )
             opened.append(remote)
             return {"remote": remote}
 
@@ -160,7 +187,8 @@ class HostWithLocalSessionTests(unittest.IsolatedAsyncioTestCase):
             workspace.environments_config.write_text(
                 'default="local"\n[environments.local]\ntype="local"\n'
                 f'[environments.local.browser]\ncdp_url="{chrome.cdp_url}"\n'
-                '[environments.ssh]\ntype="ssh"\nhost="test-session"\n'
+                '[environments.ssh]\ntype="instabox"\n'
+                f'machine_id="m_{"a" * 26}"\n'
                 f'workdir="{self.directory.name}"\n',
             )
             with (
@@ -177,7 +205,10 @@ class HostWithLocalSessionTests(unittest.IsolatedAsyncioTestCase):
                     outputs = [item["output"] for item in bodies[1]["input"]
                                if item.get("type") == "function_call_output"]
                     self.assertIn("cdp=<unset> session=<unset>", "\n".join(outputs))
-                    self.assertEqual(runtime.browser.list_tasks(), [])
+                    self.assertEqual(runtime.browsers["local"].list_tasks(), [])
+            self.assertIsNotNone(owners[0]._recovery_feedback)
+            self.assertTrue(owners[0]._closed)
+            self.assertTrue(owners[0]._connection.is_closed())
 
     async def test_managed_memory_file_and_code_mode_share_host_content(self):
         from types import SimpleNamespace

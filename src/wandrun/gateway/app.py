@@ -38,6 +38,8 @@ from wandrun.metrics import RunMetrics
 from wandrun.runtime.session import open_runtime
 from wandrun.runtime.communication.workers import SchedulerFailure
 from wandrun.runtime.execution.workspace import Workspace
+from wandrun.gateway.stream_config import load_stream_config
+from wandrun.gateway.video_stream import VideoStreams
 
 
 def _is_loopback(host: str) -> bool:
@@ -210,7 +212,7 @@ def ensure_agents(
 ) -> None:
     """首次启动校验并原子导入 Agent 与连接器；之后不再读取这两个 TOML。
 
-    环境仍来自指定文件。校验或事务失败不留导入标记，修好文件后可重新启动。
+    环境首次同时保存可信绑定，后续文件可声明新环境但不能重新解释已持久化的机器身份。
     """
     if store.has_imported_agents():
         return
@@ -223,7 +225,7 @@ def ensure_agents(
         }
         for identity, connection in config.mcp_servers.items()
     }
-    store.import_agents(config.catalog, connectors)
+    store.import_agents(config.catalog, connectors, config.environments)
 
 
 async def serve(
@@ -235,6 +237,7 @@ async def serve(
     agents_config: Path | None = None,
     mcps_config: Path | None = None,
     environments_config: Path | None = None,
+    stream_config: Path | None = None,
     codex_client_version: str = "0.163.0",
     codex_home: Path | None = None,
     allow_shared_codex_home: bool = False,
@@ -248,6 +251,7 @@ async def serve(
                 or parsed.query or parsed.fragment or public_url.endswith("/oauth/callback")):
             raise ValueError("--public-url 必须是无查询、片段或凭据的 HTTPS 网关地址")
     workspace = Workspace(workspace)
+    streams_config = load_stream_config(stream_config)
     if not _is_loopback(host):
         print("提示：非回环监听；公网访问必须通过 HTTPS 反向代理或加密隧道。")
     if workspace.ensure_config():
@@ -262,6 +266,7 @@ async def serve(
         gateway = Gateway(store, subscription, oauth_port=port, public_url=public_url)
         gateway.skills_dir = workspace.skills_dir
         gateway.workspace_root = workspace.root
+        gateway.video_streams = VideoStreams(streams_config)
         loop = asyncio.get_running_loop()
         loop_thread = threading.get_ident()
 
@@ -338,7 +343,9 @@ async def serve(
                     if definition.get("auth_type") == "oauth"
                 },
                 environments_config=environments_config,
+                environment_definitions=store.environment_definitions(),
             ) as runtime:
+                gateway._persist(store.save_environment_definitions, runtime.environment_definitions)
                 gateway.attach(runtime.workers, runtime.checkpointer, runtime=runtime)
                 gateway.enable_uploads(max_upload_size)
                 try:
@@ -381,12 +388,15 @@ async def serve(
                             print(f"调度存储失败，停止网关：{failure}：{failure.__cause__}")
                 finally:
                     try:
-                        await gateway.stop_schedules()
+                        await gateway.video_streams.aclose()
                     finally:
                         try:
-                            await gateway.drain_deletions()
+                            await gateway.stop_schedules()
                         finally:
-                            await gateway.oauth.aclose()
+                            try:
+                                await gateway.drain_deletions()
+                            finally:
+                                await gateway.oauth.aclose()
     finally:
         try:
             if gateway is not None and gateway.image_proxy is not None:
@@ -428,6 +438,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--agents-config", type=Path, help="仅库里还没有 Agent 的首次启动时导入；之后以数据库为准")
     parser.add_argument("--mcps-config", type=Path)
     parser.add_argument("--environments-config", type=Path)
+    parser.add_argument("--stream-config", type=Path, help="浏览器画面方式与视频参数 TOML")
     parser.add_argument(
         "--codex-home", type=Path, default=os.environ.get("WANDRUN_CODEX_HOME"),
         help="网关专属 Codex 凭据目录，默认 ~/.local/share/wandrun/codex-home；不读取 CODEX_HOME",
@@ -461,6 +472,7 @@ def main(argv: list[str] | None = None) -> None:
             agents_config=args.agents_config,
             mcps_config=args.mcps_config,
             environments_config=args.environments_config,
+            stream_config=args.stream_config,
             codex_client_version=args.codex_client_version,
             codex_home=args.codex_home,
             allow_shared_codex_home=args.allow_shared_codex_home,

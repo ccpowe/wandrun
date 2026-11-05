@@ -476,6 +476,10 @@ class ProcessTable:
         """是否还有待交付结果的执行（运行中或收尾中）。"""
         return any(item.state != "settled" for item in self._executions.values())
 
+    def pending_owners(self) -> set[str]:
+        """Owners whose execution or unreleased resources still belong to this table."""
+        return {item.owner for item in self._executions.values()}
+
     async def stop_owners(self, owners: set[str]) -> list[str]:
         """停止这些 owner 名下的全部执行，等待它们结算（不等待未释放的资源）。
 

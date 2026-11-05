@@ -36,7 +36,7 @@ for (const platform of ["android", "ios", "web"]) {
     const session = new ChatSession({ baseUrl: "http://fallback.test", token: "private" }, async (input) => {
       const path = new URL(String(input)).pathname;
       if (path === "/conversations") return Response.json({ conversations: [], as_of_seq: 0 });
-      if (path === "/agents") return Response.json({ agents: [], as_of_seq: 0 });
+      if (path === "/agents") return Response.json({ agents: [], as_of_seq: 0, order_revision: 1 });
       if (path === "/browser-tasks") return Response.json({ browser_tasks: [], as_of_seq: 0 });
       assert.equal(path, "/events");
       attempts++;

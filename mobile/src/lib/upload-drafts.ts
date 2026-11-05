@@ -4,6 +4,8 @@ import * as tus from "tus-js-client";
 import type { GatewayApi } from "../gateway/api.ts";
 import { UPLOAD_CHUNK_BYTES, boundedReadRange, latestDraft, mimeForFile, restoreDraft, type UploadDraft, type UploadItem, uploadMetadata } from "./upload-draft-state.ts";
 import { assertUploadEndpoint, assertUploadLocation, isUnauthorizedUpload, LocalUploadError, uploadErrorMessage } from "./upload-error.ts";
+import type { NewChatAttempt } from "./new-conversation.ts";
+import type { ChatSession } from "../gateway/session.ts";
 
 export type PickedUpload = { uri: string; name: string; mimeType?: string | null; size?: number };
 
@@ -13,6 +15,23 @@ const pendingStops = new Map<string, Set<Promise<void>>>();
 function draftDirectory(computerId: string, conversationId: string, rootId = conversationId): Directory {
   const root = new Directory(Paths.document, "upload-drafts", encodeURIComponent(computerId), encodeURIComponent(rootId));
   return rootId === conversationId ? root : new Directory(root, "tasks", encodeURIComponent(conversationId));
+}
+function readDraft(directory: Directory): { generation: number; draft: UploadDraft } {
+  return latestDraft(["draft-a.json", "draft-b.json"].map((name) => {
+    const file = new File(directory, name);
+    if (!file.exists) return null;
+    try { return file.textSync(); } catch { return "invalid"; }
+  }));
+}
+
+function writeDraft(directory: Directory, generation: number, draft: UploadDraft): number {
+  directory.create({ intermediates: true, idempotent: true });
+  const next = generation + 1;
+  const temp = new File(directory, "draft.tmp");
+  temp.write(JSON.stringify({ generation: next, draft }));
+  // SDK 57 overwrite unlinks its destination; the other slot remains committed.
+  temp.moveSync(new File(directory, next % 2 ? "draft-a.json" : "draft-b.json"), { overwrite: true });
+  return next;
 }
 
 
@@ -73,12 +92,17 @@ export class UploadDraftController {
   private readonly onApiClosed = () => { void this.suspend().catch(() => {}); };
 
   get items(): UploadItem[] {
-    return [...this.draft.items, ...this.pendingCopies.values()];
+    return [
+      ...this.draft.items.map((item) => item.mediaType.startsWith("image/")
+        ? { ...item, previewUri: new File(this.directory, `${item.id}.bin`).uri }
+        : item),
+      ...this.pendingCopies.values(),
+    ];
   }
 
   constructor(api: GatewayApi, conversationId: string, rootId = conversationId) {
     const computerId = api.config.computerId;
-    if (!computerId || api.signal.aborted) throw new Error("上传需要有效的电脑连接");
+    if (!computerId || api.signal.aborted) throw new Error("上传需要有效的服务器连接");
     this.api = api;
     this.connectionUrl = new URL(api.config.baseUrl);
     this.conversationId = conversationId;
@@ -100,12 +124,7 @@ export class UploadDraftController {
   }
   initialize(): void {
     try {
-      const snapshots = ["draft-a.json", "draft-b.json"].map((name) => {
-        const file = new File(this.directory, name);
-        if (!file.exists) return null;
-        try { return file.textSync(); } catch { return "invalid"; }
-      });
-      const saved = latestDraft(snapshots);
+      const saved = readDraft(this.directory);
       this.generation = saved.generation;
       this.draft = restoreDraft(saved.draft);
       this.ready = true;
@@ -119,21 +138,11 @@ export class UploadDraftController {
     }
   }
 
-  private persist(): void {
-    this.directory.create({ intermediates: true, idempotent: true });
-    const next = this.generation + 1;
-    const temp = new File(this.directory, "draft.tmp");
-    temp.write(JSON.stringify({ generation: next, draft: this.draft }));
-    // SDK 57 iOS overwrite unlinks destination before moving. The OTHER slot always
-    // remains a recoverable committed snapshot until this move has succeeded.
-    temp.moveSync(new File(this.directory, next % 2 ? "draft-a.json" : "draft-b.json"), { overwrite: true });
-    this.generation = next;
-  }
 
   private commit(next: UploadDraft): void {
     const previous = this.draft;
     this.draft = next;
-    try { this.persist(); }
+    try { this.generation = writeDraft(this.directory, this.generation, this.draft); }
     catch (error) { this.draft = previous; throw new LocalUploadError("draft-write", error); }
     this.changed();
   }
@@ -345,12 +354,62 @@ export class UploadDraftController {
     this.pump();
   }
 
+  /** Persist first binding only; the real screen's normal acquisition starts uploads after navigation. */
+  adoptNewConversation(attempt: NewChatAttempt): void {
+    if (!this.ready || this.disposed || this.error) throw new Error("无法读取草稿");
+    if (this.draft.adoptedFrom === attempt.clientId) return;
+    if (this.draft.text || this.items.length || this.draft.firstSend) throw new Error("对话已有草稿，原草稿仍在");
+    this.directory.create({ intermediates: true, idempotent: true });
+    for (const item of attempt.files) {
+      const destination = new File(this.directory, `${item.id}.bin`);
+      if (!destination.exists) new File(item.uri).moveSync(destination);
+      if (destination.size !== item.size) throw new Error("本地附件不可读取");
+    }
+    this.commit({ text: attempt.text, adoptedFrom: attempt.clientId, firstMessageId: attempt.messageClientId, items: attempt.files.map(item => ({
+      id: item.id, name: item.name, mediaType: item.mediaType, size: item.size,
+      uploadUrl: null, fileId: null, progress: 0, error: null,
+    })) });
+  }
+
+  /** A retry keeps the unconsumed first intent until its following draft is durable too. */
+  handoffNewConversation(attempt: NewChatAttempt, followingText?: string): {
+    transferred: boolean;
+    message: UploadDraft["firstSend"] | null;
+  } {
+    const fresh = this.draft.adoptedFrom !== attempt.clientId;
+    this.adoptNewConversation(attempt);
+    const unconsumed = this.draft.firstMessageId === attempt.messageClientId;
+    const transferred = followingText !== undefined && (fresh || unconsumed);
+    if (attempt.kind === "attachments") {
+      if (transferred && this.draft.text !== followingText) this.commit({ ...this.draft, text: followingText });
+      return { transferred, message: null };
+    }
+    const message = this.draft.firstSend ?? (unconsumed ? (() => {
+      const consumed = this.consume(attempt.messageClientId, undefined, transferred ? followingText : "");
+      if (!consumed) throw new Error("无法取出草稿");
+      return { clientId: attempt.messageClientId, ...consumed };
+    })() : null);
+    return { transferred, message };
+  }
+
+  acknowledgeFirstSend(clientId: string): void {
+    if (this.draft.firstSend?.clientId !== clientId) return;
+    const { firstSend: _, ...rest } = this.draft;
+    this.commit(rest);
+  }
+
+
   /** The send command has captured the immutable attachment IDs; no retry needs staged bytes. */
-  consume(): { text: string; files: { id: string; name: string; media_type: string; size: number }[] } | null {
+  consume(firstClientId = this.draft.firstMessageId, messageText?: string, followingText = ""): { text: string; files: { id: string; name: string; media_type: string; size: number }[] } | null {
     if (this.disposed || this.pendingCopies.size || this.error || !this.ready || this.draft.items.some((item) => !item.fileId || item.error)) return null;
-    const { text, items } = this.draft;
-    if (!text.trim() && !items.length) return null;
-    this.commit({ text: "", items: [] });
+    const { items } = this.draft;
+    const body = this.draft.text.trim();
+    const text = messageText ?? body;
+    if (!items.length && (!body || messageText !== undefined && !messageText.trim())) return null;
+    const files = items.map(item => ({ id: item.fileId!, name: item.name, media_type: item.mediaType, size: item.size }));
+    const firstSend = firstClientId ? { clientId: firstClientId, text, files } : this.draft.firstSend;
+    const { firstMessageId: _, ...rest } = this.draft;
+    this.commit({ ...rest, text: followingText, items: [], ...(firstSend ? { firstSend } : {}) });
     for (const item of items) {
       // The server copy is already durable; a failed local deletion must not prevent send.
       try {
@@ -360,8 +419,11 @@ export class UploadDraftController {
         console.warn("Could not remove staged attachment", error);
       }
     }
-    return { text: text.trim(), files: items.map((item) => ({ id: item.fileId!, name: item.name, media_type: item.mediaType, size: item.size })) };
+    return { text, files };
   }
+
+  /** An acquisition can attach to an already-ready controller whose staged files have not started yet. */
+  resumeUploads(): void { this.pump(); }
 
   /** Stop this API's transfers without deleting durable snapshots or staged bytes. */
   suspend(): Promise<void> {
@@ -408,7 +470,7 @@ export class UploadDraftController {
 export function acquireUploadDraft(api: GatewayApi, conversationId: string, changed: (controller: UploadDraftController) => void, rootId = conversationId): {
   controller: UploadDraftController; release(): void;
 } {
-  if (!api.config.computerId || api.signal.aborted) throw new Error("上传需要有效的电脑连接");
+  if (!api.config.computerId || api.signal.aborted) throw new Error("上传需要有效的服务器连接");
   const key = draftDirectory(api.config.computerId, conversationId, rootId).uri;
   let controller = controllers.get(key);
   if (!controller) {
@@ -417,6 +479,7 @@ export function acquireUploadDraft(api: GatewayApi, conversationId: string, chan
   }
   const unsubscribe = controller.subscribe(changed);
   if (!controller.ready && !controller.error) controller.initialize();
+  else if (controller.ready) controller.resumeUploads();
   let released = false;
   return {
     controller,
@@ -424,6 +487,35 @@ export function acquireUploadDraft(api: GatewayApi, conversationId: string, chan
       if (released) return;
       released = true;
       unsubscribe();
+    },
+  };
+}
+
+/** What a screen renders: the shared controller plus a fresh object per controller notification. */
+export type UploadDraftSnapshot = Readonly<{ controller: UploadDraftController }>;
+export type UploadDraftAccess = Readonly<{
+  subscribe(changed: () => void): () => void;
+  getSnapshot(): UploadDraftSnapshot | null;
+}>;
+
+/** `useSyncExternalStore` adapter for one screen's access to a conversation draft.
+ * Subscribing is the acquisition and unsubscribing releases only that acquisition; the
+ * controller remains the single owner of text, staged bytes, progress and fileIds.
+ * An already acquired handoff controller seeds the same snapshot before its new screen subscribes,
+ * so first binding cannot briefly blank/disable the input. This does not acquire a second owner. */
+export function uploadDraftAccess(api: GatewayApi, conversationId: string, rootId = conversationId, initial?: UploadDraftController): UploadDraftAccess {
+  let snapshot: UploadDraftSnapshot | null = initial ? { controller: initial } : null;
+  return {
+    getSnapshot: () => snapshot,
+    subscribe(changed) {
+      const access = acquireUploadDraft(api, conversationId, (controller) => {
+        snapshot = { controller };
+        changed();
+      }, rootId);
+      return () => {
+        access.release();
+        snapshot = null;
+      };
     },
   };
 }
@@ -444,13 +536,32 @@ export function discardConversationDraft(computerId: string, conversationId: str
   if (directory.exists) directory.delete();
 }
 
-/** A fresh full conversation list catches deletions that happened while the app was not running. */
-export function pruneConversationDrafts(computerId: string, existing: Set<string>): void {
+/** Reconcile one computer after its full list loads, without acquiring controllers or resuming uploads. */
+export function reconcileConversationDrafts(computerId: string, session: ChatSession): void {
   const root = new Directory(Paths.document, "upload-drafts", encodeURIComponent(computerId));
   if (!root.exists) return;
   for (const entry of root.list()) {
-    if (entry instanceof Directory && !existing.has(decodeURIComponent(entry.name))) {
-      discardConversationDraft(computerId, decodeURIComponent(entry.name));
+    if (!(entry instanceof Directory)) continue;
+    const id = decodeURIComponent(entry.name);
+    if (!session.conversations.has(id)) {
+      discardConversationDraft(computerId, id);
+      continue;
     }
+    const pending = (controllers.get(entry.uri)?.draft ?? readDraft(entry).draft).firstSend;
+    if (!pending) continue;
+    if (session.timelines.get(id)?.events.some(event => event.client_id === pending.clientId)) {
+      acknowledgeFirstSendDraft(computerId, id, pending.clientId);
+    } else session.restoreFirstSend(id, pending.clientId, pending.text, pending.files);
   }
+}
+
+/** Confirmation can arrive while the originating page and its upload controller are absent. */
+export function acknowledgeFirstSendDraft(computerId: string, id: string, clientId: string): void {
+  const directory = draftDirectory(computerId, id);
+  const controller = controllers.get(directory.uri);
+  if (controller) { controller.acknowledgeFirstSend(clientId); return; }
+  const saved = readDraft(directory);
+  if (saved.draft.firstSend?.clientId !== clientId) return;
+  const { firstSend: _, ...rest } = saved.draft;
+  writeDraft(directory, saved.generation, rest);
 }

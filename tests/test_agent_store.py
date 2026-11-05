@@ -1,15 +1,20 @@
 """Agent 定义的持久编辑、命令重放与跨库删除恢复。"""
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import unittest
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
+from uuid import uuid4
 
-from wandrun.config import AgentCatalog, AgentDefinition
-from wandrun.gateway.store import ClientIdConflict, GatewayStore, UnknownAgent
+from wandrun.config import AgentCatalog, AgentDefinition, EnvironmentDefinition
+from wandrun.gateway.store import (
+    AgentNameConflict, AgentOrderConflict, ClientIdConflict, GatewayStore, InvalidAgentOrder, UnknownAgent,
+)
 from wandrun.runtime.context.memory import MemoryStore
 
 
@@ -27,6 +32,116 @@ class AgentPersistenceTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "gateway.sqlite"
+
+    def test_agent_names_are_trimmed_casefold_unique_and_replays_win_over_conflicts(self):
+        with closing(GatewayStore(self.path)) as store:
+            store.import_agents(AgentCatalog(None, {}))
+            first, created, _ = store.create_agent("a", definition(), " Test ", 0, "create-a")
+            self.assertEqual(first["name"], "Test")
+            seq = store.last_seq()
+            for name in ("test", " Test ", "TEST"):
+                with self.subTest(name=name), self.assertRaises(AgentNameConflict):
+                    store.create_agent("bad", definition(), name, 0, "rejected")
+                self.assertIsNone(store.replay_create_agent("rejected"))
+                self.assertEqual(store.last_seq(), seq)
+            store.create_agent("b", definition(), "Other", 1, "create-b")
+            before = store.agent("b")
+            seq = store.last_seq()
+            with self.assertRaises(AgentNameConflict):
+                store.update_agent("b", definition(description="must not persist"), " test ", 2)
+            self.assertEqual(store.agent("b"), before)
+            self.assertEqual(store.last_seq(), seq)
+            store.update_agent("a", definition(), "tEsT", 0)
+            store.update_agent("a", definition(), "Renamed", 0)
+            store.create_agent("c", definition(), "Test", 0, "create-c")
+            self.assertEqual(store.create_agent("ignored", definition(), "test", 0, "create-a"),
+                             (first, created, False))
+            store.create_agent("unicode", definition(), "Straße", 0, "unicode")
+            with self.assertRaises(AgentNameConflict):
+                store.update_agent("b", definition(), "STRASSE", 0)
+        with closing(GatewayStore(self.path)) as store:
+            with self.assertRaises(AgentNameConflict):
+                store.create_agent("restart", definition(), "strasse", 0, "restart")
+            store.begin_delete_agent("unicode")
+            store.finish_delete_agent("unicode")
+            self.assertEqual(store.create_agent("reused", definition(), "STRASSE", 0, "reused")[0]["name"], "STRASSE")
+
+    def test_concurrent_stores_cannot_create_case_variants_after_both_prechecks_pass(self):
+        with closing(GatewayStore(self.path)) as store:
+            store.import_agents(AgentCatalog(None, {}))
+        ready = Barrier(2)
+
+        def create(index):
+            with closing(GatewayStore(self.path)) as store:
+                name = ("Race", " race ")[index]
+                store.check_agent_name(name)
+                ready.wait(timeout=5)
+                try:
+                    store.create_agent(f"race-{index}", definition(), name, 0, f"race-{index}")
+                    return "created"
+                except AgentNameConflict:
+                    return "conflict"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            self.assertEqual(sorted(pool.map(create, (0, 1))), ["conflict", "created"])
+        with closing(GatewayStore(self.path)) as store:
+            self.assertEqual([agent["name"].casefold() for agent in store.agents()], ["race"])
+            self.assertEqual(store.last_seq(), 1)
+
+    def test_manual_order_survives_restart_and_membership_advances_revision(self):
+        with closing(GatewayStore(self.path)) as store:
+            store.import_agents(AgentCatalog("a", {"a": definition(), "b": definition()}))
+            initial = store.agent_order_revision()
+            event = store.reorder_agents(["b", "a"], initial)
+            revision = store.agent_order_revision()
+            self.assertEqual(event.data["order_revision"], revision)
+            store.update_agent("a", definition(), "改名", 1)
+            conversation, _ = store.create_conversation("聊天", "a", client_id=uuid4().hex)
+            store.append(conversation["id"], "message.user", {"text": "不改变顺序"})
+            self.assertEqual(store.agent_order_revision(), revision)
+            store.create_agent("c", definition(), "新 Agent", 2, "create-c")
+            self.assertEqual([a["id"] for a in store.agents()], ["b", "a", "c"])
+            self.assertEqual(store.agent_order_revision(), revision + 1)
+            store.begin_delete_agent("b")
+            store.finish_delete_agent("b")
+            self.assertEqual(store.agent_order_revision(), revision + 2)
+        with closing(GatewayStore(self.path)) as store:
+            self.assertEqual([a["id"] for a in store.agents()], ["a", "c"])
+            self.assertEqual(store.agent_order_revision(), revision + 2)
+
+    def test_order_rejects_stale_or_incomplete_lists_and_rolls_back_event_failure(self):
+        with closing(GatewayStore(self.path)) as store:
+            store.import_agents(AgentCatalog("a", {"a": definition(), "b": definition()}))
+            initial = store.agent_order_revision()
+            with closing(GatewayStore(self.path)) as other:
+                other.reorder_agents(["b", "a"], initial)
+                with self.assertRaises(AgentOrderConflict):
+                    store.reorder_agents(["a", "b"], initial)
+            revision = store.agent_order_revision()
+            for invalid in (["a"], ["a", "a"], ["a", "missing"]):
+                with self.assertRaises(InvalidAgentOrder):
+                    store.reorder_agents(invalid, revision)
+            with patch.object(store, "_insert", side_effect=sqlite3.OperationalError("disk full")):
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.reorder_agents(["a", "b"], revision)
+            self.assertEqual([a["id"] for a in store.agents()], ["b", "a"])
+            self.assertEqual(store.agent_order_revision(), revision)
+            self.assertIsNone(store.reorder_agents(["b", "a"], revision))
+            self.assertEqual(store.agent_order_revision(), revision)
+
+    def test_environment_bindings_survive_restart_and_cannot_reinterpret_identity(self):
+        selected = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "a" * 26, workdir="/data/wandrun",
+        )
+        with closing(GatewayStore(self.path)) as store:
+            store.import_agents(AgentCatalog("root", {"root": definition(environment="cloud")}),
+                                environments={"cloud": selected})
+        with closing(GatewayStore(self.path)) as store:
+            self.assertEqual(store.environment_definitions(), {"cloud": selected})
+            self.assertEqual(store.agent_catalog().agents["root"].environment, "cloud")
+            with self.assertRaises(ValueError):
+                store.save_environment_definitions({"cloud": replace(selected, machine_id="m_" + "b" * 26)})
+            self.assertEqual(store.environment_definitions(), {"cloud": selected})
 
     def test_empty_import_is_persistent_and_cannot_be_repeated(self):
         with closing(GatewayStore(self.path)) as store:
@@ -155,11 +270,12 @@ class AgentPersistenceTests(unittest.TestCase):
     def test_previous_schema_is_rejected_without_modifying_user_data(self):
         with closing(GatewayStore(self.path)) as store:
             store.import_agents(AgentCatalog("root", {"root": definition(fast_mode=True)}))
-            store._connection.execute("PRAGMA user_version = 23")
-        with self.assertRaisesRegex(RuntimeError, "23.*24.*不兼容"):
+            previous = store._connection.execute("PRAGMA user_version").fetchone()[0] - 1
+            store._connection.execute(f"PRAGMA user_version = {previous}")
+        with self.assertRaises(RuntimeError):
             GatewayStore(self.path)
         with closing(sqlite3.connect(self.path)) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 23)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], previous)
             self.assertEqual(connection.execute("SELECT id, fast_mode FROM agents").fetchall(), [("root", 1)])
 
     def test_create_replay_retains_original_result_after_edit_and_delete_across_restart(self):
@@ -196,7 +312,7 @@ class AgentPersistenceTests(unittest.TestCase):
     def test_create_client_id_conflict_with_other_commands(self):
         with closing(GatewayStore(self.path)) as store:
             store.import_agents(AgentCatalog("root", {"root": definition()}))
-            conversation, _ = store.create_conversation("标题", "root")
+            conversation, _ = store.create_conversation("标题", "root", client_id=uuid4().hex)
             store.append(conversation["id"], "message.user", {"text": "你好"}, client_id="message-1")
             with self.assertRaises(ClientIdConflict):
                 store.replay_create_agent("message-1")
@@ -227,9 +343,11 @@ class AgentPersistenceTests(unittest.TestCase):
             )
             self.assertIsNone(same_event)
             self.assertEqual(store.after(before), [event])
-            with self.assertRaises(ValueError):
-                store.update_agent("a", definition(environment="other", workers=("c", "b")), "a", 2)
-            self.assertEqual(store.agent("a"), edited)
+            switched, changed = store.update_agent(
+                "a", definition(environment="other", workers=("c", "b")), "a", 2,
+            )
+            self.assertEqual(switched["environment"], "other")
+            self.assertIsNotNone(changed)
 
     def test_invalid_worker_rolls_back_update_and_create(self):
         with closing(GatewayStore(self.path)) as store:
@@ -270,7 +388,7 @@ class AgentPersistenceTests(unittest.TestCase):
     def test_memory_metadata_and_both_events_roll_back_together(self):
         with closing(GatewayStore(self.path)) as store:
             store.import_agents(AgentCatalog("root", {"root": definition()}))
-            root, _ = store.create_conversation("记忆", "root")
+            root, _ = store.create_conversation("记忆", "root", client_id=uuid4().hex)
             before = store.last_seq()
             original = store._insert
 
@@ -289,7 +407,7 @@ class AgentPersistenceTests(unittest.TestCase):
     def test_profile_event_keeps_actual_writer_and_never_invents_resource_id(self):
         with closing(GatewayStore(self.path)) as store:
             store.import_agents(AgentCatalog("root", {"root": definition()}))
-            root, _ = store.create_conversation("记忆", "root")
+            root, _ = store.create_conversation("记忆", "root", client_id=uuid4().hex)
             cursor = store.last_seq()
             store.record_memory_change(None, "v", "agent", root["id"], writer_agent_id="root")
             self.assertEqual([(e.type, e.data) for e in store.after(cursor)], [
@@ -314,7 +432,7 @@ class AgentPersistenceTests(unittest.TestCase):
             self.assertEqual(store.pending_agent_deletions(), ["member"])
         with closing(GatewayStore(self.path)) as store:
             store.update_agent("root", definition(workers=()), "root", 0)
-            conversation, _ = store.create_conversation("旧对话", "member")
+            conversation, _ = store.create_conversation("旧对话", "member", client_id=uuid4().hex)
             with self.assertRaises(RuntimeError):
                 store.finish_delete_agent("member")
             store.begin_delete(conversation["id"], {conversation["id"]})

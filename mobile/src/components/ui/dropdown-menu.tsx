@@ -1,10 +1,12 @@
 import { Icon } from '@/components/ui/icon.tsx';
 import { NativeOnlyAnimatedView } from '@/components/ui/native-only-animated-view.tsx';
 import { TextClassContext } from '@/components/ui/text.tsx';
+import { SurfacePressable } from '@/components/ui/surface-pressable';
 import { cn } from '@/lib/utils.ts';
 import { placeMenu } from '@/components/ui/menu-position.ts';
+import { easing, presetFade, reduceMotion } from '@/lib/motion.ts';
 import * as DropdownMenuPrimitive from '@rn-primitives/dropdown-menu';
-import { Check, ChevronDown, ChevronRight, ChevronUp } from 'lucide-react-native';
+import { Check, ChevronDown, ChevronRight, ChevronUp, type LucideIcon } from 'lucide-react-native';
 import * as React from 'react';
 import {
   Platform,
@@ -15,7 +17,7 @@ import {
   View,
   type ViewStyle,
 } from 'react-native';
-import { FadeIn, ReduceMotion } from 'react-native-reanimated';
+import { FadeIn } from 'react-native-reanimated';
 import { FullWindowOverlay as RNFullWindowOverlay } from 'react-native-screens';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useKeyboardState } from 'react-native-keyboard-controller';
@@ -31,6 +33,9 @@ const DropdownMenuPortal = DropdownMenuPrimitive.Portal;
 const DropdownMenuSub = DropdownMenuPrimitive.Sub;
 
 const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup;
+
+const filledMenuClass = 'rounded-lg border-0 bg-card p-1.5 shadow-sm shadow-foreground/5';
+const menuSurfaces = { filled: filledMenuClass };
 
 /** Opens at a gesture's page coordinates, without measuring a placeholder in the document flow. */
 function DropdownMenuAnchor({ point }: { point: { pageX: number; pageY: number } }) {
@@ -94,10 +99,10 @@ function DropdownMenuSubContent({
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.SubContent>) {
   return (
-    <NativeOnlyAnimatedView entering={FadeIn.reduceMotion(ReduceMotion.System)}>
+    <NativeOnlyAnimatedView entering={FadeIn.duration(presetFade).easing(easing.standard).reduceMotion(reduceMotion)}>
       <DropdownMenuPrimitive.SubContent
         className={cn(
-          'bg-popover border-border overflow-hidden rounded-md border p-1 shadow-lg shadow-black/5',
+          cn('min-w-[8rem] overflow-hidden', filledMenuClass),
           Platform.select({
             web: 'animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 fade-in-0 data-[state=closed]:zoom-out-95 zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 origin-(--radix-context-menu-content-transform-origin) z-50 min-w-[8rem]',
           }),
@@ -115,6 +120,7 @@ type MenuContentProps = React.ComponentProps<typeof DropdownMenuPrimitive.Conten
   overlayClassName?: string;
   overlayTestID?: string;
   portalHost?: string;
+  surface?: 'filled';
 };
 
 function NativeDropdownMenuContent({
@@ -130,6 +136,7 @@ function NativeDropdownMenuContent({
   insets,
   style,
   children,
+  surface = 'filled',
   ...props
 }: MenuContentProps) {
   const { triggerPosition, contentLayout } = DropdownMenuPrimitive.useRootContext();
@@ -169,7 +176,7 @@ function NativeDropdownMenuContent({
         });
       }}
       asChild>
-      <NativeOnlyAnimatedView entering={FadeIn.reduceMotion(ReduceMotion.System)} as="Pressable">
+      <NativeOnlyAnimatedView entering={FadeIn.duration(presetFade).easing(easing.standard).reduceMotion(reduceMotion)} as="Pressable">
         <TextClassContext.Provider value="text-popover-foreground">
           <DropdownMenuPrimitive.Content
             disablePositioningStyle
@@ -179,7 +186,7 @@ function NativeDropdownMenuContent({
             alignOffset={alignOffset}
             avoidCollisions={avoidCollisions}
             insets={insets ?? safeArea}
-            className={cn('bg-popover border-border min-w-[8rem] overflow-hidden rounded-md border p-1 shadow-lg shadow-black/5', className)}
+            className={cn('min-w-[8rem] overflow-hidden', menuSurfaces[surface], className)}
             style={{ ...placement, ...style }}
             {...props}>
             {typeof children === 'function'
@@ -198,6 +205,8 @@ function DropdownMenuContent({
   overlayStyle,
   overlayTestID = 'menu-backdrop',
   portalHost,
+  children,
+  surface = 'filled',
   ...props
 }: MenuContentProps) {
   if (Platform.OS !== 'web') {
@@ -205,11 +214,12 @@ function DropdownMenuContent({
       <FullWindowOverlay>
         <NativeDropdownMenuContent
           className={className}
+          surface={surface}
           overlayClassName={overlayClassName}
           overlayStyle={overlayStyle}
           overlayTestID={overlayTestID}
           {...props}
-        />
+        >{children}</NativeDropdownMenuContent>
       </FullWindowOverlay>
     </DropdownMenuPrimitive.Portal>;
   }
@@ -222,14 +232,16 @@ function DropdownMenuContent({
         <TextClassContext.Provider value="text-popover-foreground">
           <DropdownMenuPrimitive.Content
             className={cn(
-              'bg-popover border-border min-w-[8rem] overflow-hidden rounded-md border p-1 shadow-lg shadow-black/5',
+              'min-w-[8rem] overflow-hidden',
               'animate-in fade-in-0 zoom-in-95 max-h-(--radix-context-menu-content-available-height) origin-(--radix-context-menu-content-transform-origin) z-50 cursor-default',
               props.side === 'bottom' && 'slide-in-from-top-2',
               props.side === 'top' && 'slide-in-from-bottom-2',
+              menuSurfaces[surface],
               className
             )}
             {...props}
-          />
+          >{children}
+          </DropdownMenuPrimitive.Content>
         </TextClassContext.Provider>
       </DropdownMenuPrimitive.Overlay>
     </DropdownMenuPrimitive.Portal>
@@ -240,36 +252,23 @@ function DropdownMenuItem({
   className,
   inset,
   variant,
+  icon,
+  children,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Item> & {
     className?: string;
     inset?: boolean;
     variant?: 'default' | 'destructive';
+    icon?: LucideIcon;
   }) {
-  return (
-    <TextClassContext.Provider
-      value={cn(
-        'select-none text-sm text-popover-foreground group-active:text-popover-foreground',
-        variant === 'destructive' && 'text-destructive group-active:text-destructive'
-      )}>
-      <DropdownMenuPrimitive.Item
-        className={cn(
-          'active:bg-accent group relative flex flex-row items-center gap-2 rounded-sm px-2 py-2 sm:py-1.5',
-          Platform.select({
-            web: cn(
-              'focus:bg-accent focus:text-accent-foreground cursor-default outline-none data-[disabled]:pointer-events-none',
-              variant === 'destructive' && 'focus:bg-destructive/10 dark:focus:bg-destructive/20'
-            ),
-          }),
-          variant === 'destructive' && 'active:bg-destructive/10 dark:active:bg-destructive/20',
-          props.disabled && 'opacity-50',
-          inset && 'pl-8',
-          className
-        )}
-        {...props}
-      />
-    </TextClassContext.Provider>
-  );
+    return <TextClassContext.Provider value={cn('text-body font-normal text-card-foreground', variant === 'destructive' && 'text-destructive')}>
+      <DropdownMenuPrimitive.Item {...props} asChild disabled={props.disabled}>
+        <SurfacePressable className={cn('min-h-[52px] flex-row items-center gap-3 rounded-md px-3', props.disabled && 'opacity-50', inset && 'pl-8', className)}>
+          {icon ? <Icon as={icon} className="size-5 text-muted-foreground" strokeWidth={1.5} /> : null}
+          {children as React.ReactNode}
+        </SurfacePressable>
+      </DropdownMenuPrimitive.Item>
+    </TextClassContext.Provider>;
 }
 
 function DropdownMenuCheckboxItem({

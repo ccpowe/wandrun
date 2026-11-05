@@ -1,154 +1,120 @@
-import { Redirect, router, Stack } from "expo-router";
-import { ChevronLeft, ChevronRight } from "lucide-react-native";
-import { useEffect, useState } from "react";
-import { BackHandler, Pressable, ScrollView, View } from "react-native";
+import { Redirect, router, Stack, useFocusEffect } from "expo-router";
+import { CircleAlert } from "lucide-react-native";
+import { useCallback, useReducer, useSyncExternalStore, type ReactNode } from "react";
+import { BackHandler } from "react-native";
 
-import { ListGroup } from "@/components/list-group.tsx";
+import { useEditorLeave } from "@/components/editor-leave-sheet.tsx";
 import { ModelPicker } from "@/components/model-picker.tsx";
-import { ModelSubscription } from "@/components/model-subscription.tsx";
-import { ScreenBar } from "@/components/screen-bar.tsx";
-import { Button } from "@/components/ui/button.tsx";
-import { Icon } from "@/components/ui/icon.tsx";
-import { Text } from "@/components/ui/text.tsx";
-import { WandrunAvatar } from "@/components/wandrun-avatar.tsx";
-import type { AgentUsage, AgentUsageReport, ModelSettings } from "@/gateway/api.ts";
-import type { ChatSession } from "@/gateway/session.ts";
+import { SettingsModelsView } from "@/components/settings-models-view.tsx";
+import { StatusBanner } from "@/components/status-banner.tsx";
+import { newClientId, type ChatSession } from "@/gateway/session.ts";
 import { agentUsageView } from "@/lib/agent-usage-view.ts";
-import { useModelCatalog } from "@/lib/model-catalog.ts";
+import { useConnectionLabel } from "@/lib/connection-banner.tsx";
+import { agentUsageOptions, settingsOptions, subscriptionOptions } from "@/lib/gateway-queries.ts";
 import { useTranslation } from "@/lib/i18n.ts";
+import { useModelCatalog } from "@/lib/model-catalog.ts";
 import { modelName, reasoningOptions, selectedModel } from "@/lib/model-selection.ts";
-import { agentTokens, formatTokens, lastSubscriptionUsage, loadSubscriptionUsage } from "@/lib/model-usage.ts";
+import { subscriptionView } from "@/lib/model-usage.ts";
 import { useSession } from "@/lib/session-context.tsx";
+import { modelSettingsOperationKey, modelSettingsReducer, selectModelSettings, type ModelSettingsSelection } from "@/lib/settings-models.ts";
+import { useFocusedVisit } from "@/lib/use-focused-visit.ts";
+import { useGatewayQuery } from "@/lib/use-gateway-query.ts";
 import { useMinuteClock } from "@/lib/use-minute-clock.ts";
+import { userErrorMessage } from "@/lib/user-error.ts";
+import { useDelayedNotice } from "@/lib/use-delayed-notice.ts";
 
 export default function SettingsModels() {
   const session = useSession();
   if (!session) return <Redirect href="/settings" />;
-  return <ModelsScreen key={JSON.stringify(session.api.config)} session={session} />;
+  return <ModelsScreen key={session.queryIdentity} session={session} />;
 }
 
 function ModelsScreen({ session }: { session: ChatSession }) {
-  const { t } = useTranslation();
-  const api = session.api;
+  const { t, language } = useTranslation();
+  useSyncExternalStore(session.subscribe, session.getVersion);
+  const [state, dispatch] = useReducer(modelSettingsReducer, { status: "overview" });
+  const captureVisit = useFocusedVisit();
   const now = useMinuteClock();
-  const { catalog } = useModelCatalog(api, false);
-  const [subscription, setSubscription] = useState(() => lastSubscriptionUsage(api));
-  const [agentUsage, setAgentUsage] = useState<AgentUsageReport | null>(null);
-  const [usageError, setUsageError] = useState(false);
-  const [settings, setSettings] = useState<ModelSettings | null>(null);
-  const [settingsError, setSettingsError] = useState("");
-  const [saveError, setSaveError] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [selecting, setSelecting] = useState(false);
-  const [draft, setDraft] = useState<ModelSettings | null>(null);
-  const [retry, setRetry] = useState(0);
+  const connectionLabel = useConnectionLabel(session);
+  const outcome = session.editorOperations.get(modelSettingsOperationKey);
+  const offline = session.connection !== "open";
+  const selection = selectModelSettings(state, offline, outcome);
+  const read = useGatewayQuery(settingsOptions(session));
+  const settingsReady = read.data !== undefined && read.isFetchedAfterMount && read.isSuccess;
+  const subscription = useGatewayQuery(subscriptionOptions(session));
+  const usage = useGatewayQuery(agentUsageOptions(session));
+  const { catalog, error: catalogError } = useModelCatalog(session);
+  if (selection.adoption) dispatch(selection.adoption);
 
-  useEffect(() => {
-    let active = true;
-    // Authentication and quota have separate freshness; a stale quota cannot authenticate this session.
-    void loadSubscriptionUsage(api, true).then((value) => { if (active) setSubscription(value); });
-    void api.getAgentUsage(7).then(
-      (value) => { if (active) { setAgentUsage(value); setUsageError(false); } },
-      () => { if (active) setUsageError(true); },
-    );
-    void api.getSettings().then(
-      (value) => { if (active) { setSettings(value); setSettingsError(""); } },
-      () => { if (active) setSettingsError("暂时无法获取默认模型"); },
-    );
-    return () => { active = false; };
-  }, [api, retry]);
-
-  useEffect(() => {
-    if (!selecting) return;
-    const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      if (!saving) setSelecting(false);
-      return true;
-    });
-    return () => subscription.remove();
-  }, [selecting, saving]);
-
-  const onSave = async () => {
-    if (!draft?.default_model || saving) return;
-    setSaving(true);
-    setSaveError("");
-    try {
-      const updated = await api.updateSettings(draft);
-      setSettings(updated);
-      setSelecting(false);
-    } catch (error) {
-      setSaveError(error instanceof Error ? error.message : "保存失败，请重试");
-    } finally {
-      setSaving(false);
+  const currentSelection = () => selectModelSettings(state, session.connection !== "open", session.editorOperations.get(modelSettingsOperationKey));
+  async function save(): Promise<boolean> {
+    const current = currentSelection();
+    if (current.unknown || !current.dirty) return !current.busy;
+    if (state.status !== "editing" || !current.canEdit) return false;
+    if (session.connection !== "open" || !state.draft.default_model) {
+      dispatch({ type: "rejected", message: session.connection !== "open" ? "网络连接失败，未保存" : "请选择默认模型" });
+      return false;
     }
-  };
-
-  const usageView = agentUsageView(session.agents.loaded, session.agents.agents, agentUsage, usageError);
-  let maximum = 1;
-  if (usageView.kind === "rows") {
-    for (const { item } of usageView.rows) maximum = Math.max(maximum, agentTokens(item));
+    const operationId = newClientId();
+    const stillHere = captureVisit();
+    dispatch({ type: "save-started", operationId });
+    try {
+      const result = await session.editorOperations.run(modelSettingsOperationKey, { operationId, resource: "settings", action: "save", fields: state.draft, baseline: state.original }, () => session.api.updateSettings(state.draft));
+      if (!result) { dispatch({ type: "save-failed", operationId, message: "保存未完成" }); return false; }
+      dispatch({ type: "save-succeeded", operationId, current: result });
+      void read.refresh();
+      return stillHere();
+    } catch (error) {
+      const settled = session.editorOperations.get(modelSettingsOperationKey);
+      if (settled?.operationId === operationId && (settled.status === "unknown" || settled.reconciled)) return false;
+      dispatch({ type: "save-failed", operationId, message: userErrorMessage(error, "保存未完成") });
+      return false;
+    }
   }
-  const defaultModel = selectedModel(catalog?.models ?? [], settings?.default_model ?? "");
-  const defaultEffort = settings?.default_reasoning_effort ?? defaultModel?.default_reasoning_effort;
-  const effortLabel = reasoningOptions(defaultModel).find(({ value }) => value === defaultEffort)?.label ?? defaultEffort;
-
-  return (
-    <View className="flex-1 bg-background">
-      <Stack.Screen options={{ headerShown: false }} />
-      <ScreenBar
-        title={selecting ? t("默认模型") : t("模型")}
-        left={<Button testID={selecting ? "settings-model-back" : "settings-models-back"} variant="ghost" size="icon" className="bg-transparent" aria-label={t("返回")} onPress={() => selecting ? setSelecting(false) : router.back()}><Icon as={ChevronLeft} className="size-[22px]" /></Button>}
-        right={selecting ? <Button testID="settings-model-save" size="sm" variant="outline" className="border-foreground" disabled={!draft?.default_model || saving} onPress={() => void onSave()}><Text>{t("完成")}</Text></Button> : undefined}
-      />
-      {selecting && draft ? (
-        <>
-          {saveError ? <Text className="mx-5 mb-2 text-sm text-destructive">{t(saveError)}</Text> : null}
-          <ModelPicker
-            api={api}
-            model={draft.default_model ?? ""}
-            reasoningEffort={draft.default_reasoning_effort}
-            onChange={({ model, reasoning_effort }) => { setDraft({ default_model: model, default_reasoning_effort: reasoning_effort }); setSaveError(""); }}
-            disabled={saving}
-          />
-        </>
-      ) : (
-        <ScrollView contentContainerClassName="pb-10">
-          <ModelSubscription view={subscription} nowSeconds={now.getTime() / 1000} />
-          <View className="h-3" />
-          <ListGroup>
-            <Pressable testID="settings-model-default" disabled={!settings} onPress={() => { setDraft(settings); setSaveError(""); setSelecting(true); }} className="min-h-[60px] flex-row items-center gap-2 px-4 active:bg-accent">
-              <Text className="min-w-0 flex-1 text-[15px]">{t("新建 Agent 默认模型")}</Text>
-              <Text className="max-w-[48%] text-[13px] text-muted-foreground" numberOfLines={1}>{settings ? `${settings.default_model ? modelName(catalog?.models ?? [], settings.default_model) : t("未设置")}${effortLabel ? ` · ${t(effortLabel)}` : ""}` : settingsError ? t(settingsError) : t("正在加载…")}</Text>
-              <Icon as={ChevronRight} className="size-4 text-muted-foreground" />
-            </Pressable>
-          </ListGroup>
-          {settingsError ? <Button variant="ghost" size="sm" className="self-center" onPress={() => setRetry((n) => n + 1)}><Text>{t("重试")}</Text></Button> : null}
-          <View testID="settings-usage">
-            <Text className="px-8 pb-2 pt-5 text-[13px] leading-[18px] text-muted-foreground">{t("最近 7 天用量（按 Agent）")}</Text>
-            <View className="mx-4 overflow-hidden rounded-md border border-border bg-card">
-              {usageView.kind === "rows" ? usageView.rows.map(({ item, agent }, index) =>
-                <AgentUsageRow key={item.agent_id} item={item} name={agent.name} avatar={agent.avatar} percent={agentTokens(item) / maximum * 100} first={index === 0} />
-              ) : <Text className="px-4 py-4 text-[13px] text-muted-foreground">{
-                usageView.kind === "loading-agents" ? t("正在加载 Agent 列表…")
-                  : usageView.kind === "no-agents" ? t("还没有 Agent")
-                    : usageView.kind === "no-usage" ? t("最近 7 天暂无用量")
-                      : usageView.kind === "usage-error" ? t("暂时无法获取最近 7 天用量")
-                        : t("正在加载用量…")
-              }</Text>}
-            </View>
-          </View>
-        </ScrollView>
-      )}
-    </View>
-  );
+  const readFailures = [subscription.error ? t("登录状态") : "", read.error ? t("默认模型") : "",
+    usage.error || session.agents.error ? t("用量") : "", catalogError ? t("模型目录") : ""].filter(Boolean);
+  const readFailure = readFailures.length ? t("无法加载{items}，正在重试…", { items: readFailures.join(language === "en" ? ", " : "、") }) : "";
+  const notice = selection.unknown ? t("结果未确认，恢复连接后会核对") : selection.notice ? t("已核对服务器上的当前内容，请检查后再保存。") : "";
+  const readErrorIdentity = [subscription.error && "subscription", read.error && "settings", usage.error && "usage",
+    session.agents.error && "agents", catalogError && "catalog"].filter(Boolean).join("|");
+  const showReadError = useDelayedNotice(readErrorIdentity || null);
+  const showUnknown = useDelayedNotice(selection.unknown ? "model-save" : null);
+  const feedback = connectionLabel || (selection.unknown ? showUnknown ? notice : "" : readFailure ? showReadError ? readFailure : "" : notice);
+  const stale = !!read.data || !!usage.data || !!subscription.data?.usage || !!catalog;
+  const description = connectionLabel ? t("内容可能不是最新的") : selection.unknown ? t("可以直接离开，不会自动再次提交。") : readFailure && stale ? t("内容可能不是最新的") : undefined;
+  const banner = feedback ? <StatusBanner icon={CircleAlert} accessibilityRole="alert" title={feedback} description={description} /> : null;
+  const model = selectedModel(catalog?.models ?? [], read.data?.default_model ?? "");
+  const effort = read.data?.default_reasoning_effort ?? model?.default_reasoning_effort;
+  const effortLabel = reasoningOptions(model).find(option => option.value === effort)?.label ?? effort;
+  const defaultLabel = read.data ? `${read.data.default_model ? modelName(catalog?.models ?? [], read.data.default_model) : t("未设置")}${effortLabel ? ` · ${t(effortLabel)}` : ""}` : read.error ? t("暂不可用") : undefined;
+  const close = () => {
+    if (state.status === "saving" && currentSelection().unknown && outcome) dispatch({ type: "unknown-left", operationId: outcome.operationId });
+    else dispatch({ type: "closed" });
+  };
+  const render = (back: () => void, submit: () => void) => <SettingsModelsView selection={selection} offline={offline} banner={banner}
+    picker={selection.draft ? <ModelPicker session={session} model={selection.draft.default_model ?? ""} reasoningEffort={selection.draft.default_reasoning_effort}
+      disabled={!selection.canEdit} onChange={({ model, reasoning_effort }) => { if (currentSelection().canEdit) dispatch({ type: "changed", fields: { default_model: model, default_reasoning_effort: reasoning_effort } }); }} /> : null}
+    subscription={subscriptionView(subscription.data, offline || subscription.fetchStatus === "paused" || !!subscription.error)} subscriptionLoaded={subscription.data !== undefined || !!subscription.error} nowSeconds={now.getTime() / 1000}
+    defaultLabel={defaultLabel} settingsLoaded={settingsReady} settingsPending={read.fetchStatus === "fetching" && !read.error}
+    usage={agentUsageView(session.agents.loaded, session.agents.agents, usage.data ?? null, !!usage.error)}
+    onBack={back} onSave={submit} onOpen={() => { if (settingsReady && read.data) dispatch({ type: "opened", current: read.data, seenRecoveryId: outcome?.reconciled ? outcome.operationId : undefined }); }} />;
+  return <>
+    <Stack.Screen options={{ headerShown: false }} />
+    {selection.panel ? <DefaultModelNavigation selection={selection} save={save} onClose={close}>{render}</DefaultModelNavigation>
+      : render(() => router.back(), () => { void save(); })}
+  </>;
 }
 
-function AgentUsageRow({ item, name, avatar, percent, first }: { item: AgentUsage; name: string; avatar: number; percent: number; first: boolean }) {
-  return <View testID={`settings-usage-${item.agent_id}`} className={`px-4 py-3 ${first ? "" : "border-t border-border"}`}>
-    <View className="flex-row items-center gap-2.5">
-      <WandrunAvatar index={avatar} alt={name} size={28} className="border border-border" />
-      <Text className="min-w-0 flex-1 text-[15px]" numberOfLines={1}>{name}</Text>
-      <Text className="text-[13px] text-muted-foreground">{formatTokens(agentTokens(item))} tokens</Text>
-    </View>
-    <View className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted"><View className="h-full rounded-full bg-foreground" style={{ width: `${percent}%` }} /></View>
-  </View>;
+/** Uses the existing autosave/native-removal boundary; no page-owned navigation or operation refs. */
+function DefaultModelNavigation({ selection, save, onClose, children }: {
+  selection: ModelSettingsSelection; save: () => Promise<boolean>; onClose(): void;
+  children: (back: () => void, submit: () => void) => ReactNode;
+}) {
+  const leave = useEditorLeave(selection.dirty, selection.busy, onClose, selection.unknown, save, true);
+  const back = () => leave.requestLocal(onClose);
+  useFocusEffect(useCallback(() => {
+    const listener = BackHandler.addEventListener("hardwareBackPress", () => { leave.requestLocal(onClose); return true; });
+    return () => listener.remove();
+  }, [leave, onClose]));
+  return children(back, () => { if (selection.canSave) leave.requestLocal(onClose); });
 }

@@ -137,7 +137,7 @@ async def run_case(
             title = "LongMemEval query" if is_query else f"LongMemEval history {session_id}"
             turn_started = monotonic()
             async with asyncio.timeout(timeout):
-                created = await _post(client, "/conversations", {"title": title, "agent_id": agent_id})
+                created = await _post(client, "/conversations", {"title": title, "agent_id": agent_id, "client_id": uuid4().hex})
                 active_id = created["id"]
                 if active_id in result["ingestion_ids"]:
                     raise ValueError("gateway reused a historical conversation")

@@ -12,6 +12,7 @@ import pydantic_monty as pm
 from deepagents.backends import LocalShellBackend
 from langchain.messages import SystemMessage, ToolMessage
 from langchain.tools import tool
+from langchain_core.callbacks import AsyncCallbackHandler
 from langgraph.checkpoint.memory import InMemorySaver
 
 from wandrun.config import AgentDefinition
@@ -25,7 +26,7 @@ from wandrun.runtime.context.compaction import message_groups
 from wandrun.runtime.context.compaction_summary import SUMMARY_INSTRUCTION
 from wandrun.runtime.agent.conversations import conversation_config
 from wandrun.runtime.execution.environments import Environment
-from wandrun.runtime.execution.files import TaskFiles, _current_task
+from wandrun.runtime.execution.files import TaskBackend, TaskFiles, _current_task
 from wandrun.runtime.context.memory import MemoryStore
 from wandrun.runtime.context.memory_runtime import WORK_MEMORY_PATH
 from wandrun.runtime.communication.workers import WorkerManager
@@ -48,7 +49,6 @@ class MiddlewareGuidanceTests(unittest.IsolatedAsyncioTestCase):
         self.shown = []
 
         async def run(prompts, task_id):
-            await self.files.prepare(task_id)
             token = _current_task.set(task_id)
             try:
                 return await run_conversation(self.graph, prompts, task_id, "main")
@@ -78,6 +78,141 @@ class MiddlewareGuidanceTests(unittest.IsolatedAsyncioTestCase):
         result = await asyncio.wait_for(self.manager.wait(task_id), 10)
         self.assertEqual(result["status"], "completed", result)
         return (await self.graph.aget_state(conversation_config(task_id))).values
+
+    async def test_official_glob_cancellation_waits_for_pending_directory_preparation(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        cleanup_started, cleanup_release, cleanup_finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        backend = self.backend
+
+        class RemotePreparation:
+            async def aexecute(self, command):
+                entered.set()
+                try:
+                    await release.wait()
+                    return await backend.aexecute(command)
+                finally:
+                    cleanup_started.set()
+                    await cleanup_release.wait()
+                    cleanup_finished.set()
+
+        self.files.remote_backends["main"] = RemotePreparation()
+        self.build()
+
+        async def respond(model, body):
+            yield tool_call("glob", {"pattern": "**/*.txt"}, "glob")
+
+        with patch.object(CodexSubscriptionModel, "_arequest", respond):
+            self.manager.start("find files", "glob-chat")
+            await asyncio.wait_for(entered.wait(), 2)
+            stop = asyncio.create_task(self.manager.cancel("glob-chat"))
+            try:
+                await asyncio.wait_for(cleanup_started.wait(), 2)
+                self.assertFalse(stop.done())
+            finally:
+                cleanup_release.set()
+            result = await asyncio.wait_for(stop, 2)
+            self.assertEqual(result["status"], "cancelled")
+            self.assertTrue(cleanup_finished.is_set())
+            release.set()
+            await asyncio.sleep(0)
+            self.assertFalse((self.root / "conversations/glob-chat").exists())
+
+    async def test_official_glob_timeout_waits_for_cleanup_already_started_in_callback(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        cleanup_started, cleanup_release, cleanup_finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        callback_finished = asyncio.Event()
+        backend = self.backend
+
+        class RemotePreparation:
+            async def aexecute(self, command):
+                entered.set()
+                try:
+                    await release.wait()
+                    return await backend.aexecute(command)
+                finally:
+                    cleanup_started.set()
+                    await cleanup_release.wait()
+                    cleanup_finished.set()
+
+        class YieldAfterGlob(AsyncCallbackHandler):
+            async def on_tool_end(self, output, **kwargs):
+                if isinstance(output, ToolMessage) and output.name == "glob":
+                    await cleanup_started.wait()
+                    callback_finished.set()
+
+        self.files.remote_backends["main"] = RemotePreparation()
+        self.build()
+        self.graph = self.graph.with_config({"callbacks": [YieldAfterGlob()]})
+        calls = [tool_call("glob", {"pattern": "**/*.txt"}, "glob"), answer("done")]
+
+        async def respond(model, body):
+            yield calls.pop(0)
+
+        with (
+            patch.object(CodexSubscriptionModel, "_arequest", respond),
+            patch("deepagents.middleware.filesystem.GLOB_TIMEOUT", 0.01),
+        ):
+            self.manager.start("find files", "glob-timeout")
+            waiter = asyncio.create_task(self.manager.wait("glob-timeout"))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                await asyncio.wait_for(callback_finished.wait(), 2)
+                done, _ = await asyncio.wait({waiter}, timeout=0.05)
+                self.assertFalse(done, "tool must wait for the timeout's pending cleanup")
+                self.assertFalse(cleanup_finished.is_set())
+            finally:
+                cleanup_release.set()
+            result = await asyncio.wait_for(waiter, 2)
+            self.assertEqual(result["status"], "completed", result)
+            self.assertTrue(cleanup_finished.is_set())
+            release.set()
+            await asyncio.sleep(0)
+            self.assertFalse((self.root / "conversations/glob-timeout").exists())
+
+    async def test_official_glob_late_backend_task_cannot_prepare_after_tool_stops(self):
+        entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original = TaskBackend.aglob
+
+        async def delayed(backend, pattern, path=None):
+            entered.set()
+            await release.wait()
+            try:
+                return await original(backend, pattern, path)
+            finally:
+                finished.set()
+
+        self.build()
+
+        async def respond(model, body):
+            yield tool_call("glob", {"pattern": "**/*.txt"}, "glob")
+
+        with patch.object(CodexSubscriptionModel, "_arequest", respond), patch.object(TaskBackend, "aglob", delayed):
+            self.manager.start("find files", "late-glob")
+            await asyncio.wait_for(entered.wait(), 2)
+            try:
+                result = await asyncio.wait_for(self.manager.cancel("late-glob"), 2)
+                self.assertEqual(result["status"], "cancelled")
+            finally:
+                release.set()
+            await asyncio.wait_for(finished.wait(), 2)
+            self.assertFalse((self.root / "conversations/late-glob").exists())
+
+    async def test_official_first_listing_accepts_double_leading_separator(self):
+        directory = self.root / "conversations/double-slash"
+        spelling = "/" + str(directory)
+        calls = [tool_call("ls", {"path": spelling}, "list"), answer("done")]
+
+        async def respond(model, body):
+            yield calls.pop(0)
+
+        self.build()
+        with patch.object(CodexSubscriptionModel, "_arequest", respond):
+            self.manager.start("list the empty cwd", "double-slash")
+            state = await self.finish("double-slash")
+        results = [message for message in state["messages"] if isinstance(message, ToolMessage)]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "success", results[0].content)
+        self.assertTrue(directory.is_dir())
 
     async def test_guidance_stays_request_local_across_turns_and_summary(self):
         skill = self.root / "skills" / "research"

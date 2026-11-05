@@ -16,9 +16,14 @@ const hosts: Record<string, string> = {
     class Value { constructor(value){this.value=value} setValue(value){this.value=value} }
     export const Animated={Value, View:'AnimatedView', timing:(value,options)=>({start:()=>value.setValue(options.toValue)})};`,
   'expo-image': `export const Image='ExpoImage';`,
+  'react-native-reanimated': `export const ReduceMotion={System:0};
+    export const Easing={out:fn=>fn,in:fn=>fn,inOut:fn=>fn,quad:x=>x*x,cubic:x=>x*x*x,linear:x=>x};`,
   'expo-router': `export const router={push:()=>{}};`,
   '@/components/chat/drawer-horizontal-gesture.tsx': `export const DrawerHorizontalGesture='DrawerHorizontalGesture';`,
   '@/components/ui/text.tsx': `export const Text='Text';`,
+  '@/components/ui/button.tsx': `export const Button='Button';`,
+  '@/components/ui/icon.tsx': `export const Icon='Icon';`,
+  'lucide-react-native': `export const ChevronLeft='ChevronLeft', ChevronRight='ChevronRight', ImageOff='ImageOff';`,
   '@/components/rich-message/math.tsx': `export const RichText='Text';`,
   '@/gateway/api.ts': `export class GatewayError extends Error {}`, 
   '@/lib/local-image.ts': `export const loadLocalImage=async(_api,path)=>{

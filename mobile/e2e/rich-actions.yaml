@@ -1,0 +1,17 @@
+# rich actions targeted native subflow; caller owns an isolated real gateway and paired Expo Go.
+# Seed UI_SEND with mobile/test/stub_gateway.py and pass its persisted conversation/source seq.
+# Durable event text/action and restart semantics are independently checked by protocol.l3.ts.
+appId: host.exp.exponent
+---
+- openLink: ${EXPO_URL}/--/chat?id=${CONVERSATION_ID}&message_seq=${MESSAGE_SEQ}
+- extendedWaitUntil:
+    visible: 展开
+    timeout: 60000
+- tapOn: 展开
+- extendedWaitUntil:
+    visible:
+      text: '已发送 · .*'
+    timeout: 15000
+- assertNotVisible: 举例
+- assertVisible: 请继续展开上一条结论。
+- takeScreenshot: ${ARTIFACTS}/rich-action-sent.png

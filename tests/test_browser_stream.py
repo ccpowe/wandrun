@@ -2,7 +2,7 @@
 
 import asyncio
 import base64
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 import json
 import math
 from pathlib import Path
@@ -35,12 +35,16 @@ from wandrun.gateway.store import GatewayStore
 from wandrun.integrations.browser_dev import ChromeDev
 from wandrun.runtime.browser.leases import BrowserLeases
 from wandrun.runtime.browser.cdp import CDPSocket
+from wandrun.runtime.browser.human_input import HumanInputs
 
 
 @asynccontextmanager
 async def stream_server(browser):
     app = Starlette(routes=[WebSocketRoute("/browser-tasks/{browser_task_id}/stream", browser_stream)])
-    app.state.gateway = SimpleNamespace(runtime=SimpleNamespace(browser=browser))
+    from wandrun.runtime.session import Runtime
+    runtime = SimpleNamespace(browsers={"local": browser})
+    runtime.browser_for_lease = lambda identity: Runtime.browser_for_lease(runtime, identity)
+    app.state.gateway = SimpleNamespace(runtime=runtime)
     directory = tempfile.TemporaryDirectory(prefix="browser-stream-auth-")
     store = GatewayStore(Path(directory.name) / "gateway.sqlite")
     app.state.device_auth = DeviceAuth(store, "stream-test-token")
@@ -107,7 +111,8 @@ class Viewer:
         self.next_id += 1
         message = {"t": kind, "id": self.next_id, **fields}
         if frame:
-            message.update(epoch=frame["epoch"], vp=frame["vp"], frame=frame["seq"])
+            message.update(epoch=frame["epoch"], vp=frame["vp"], frame=frame["seq"], page=frame["page"],
+                           ts=time.monotonic() * 1000)
         await self.ws.send(json.dumps(message))
         return await self.until(lambda m: m.get("id") == self.next_id)
 
@@ -139,11 +144,18 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
                     "epoch": 1, "state": "human", "current": "first",
                     "pages": [{"id": "first", "revision": 0, "url": "about:blank"},
                               {"id": "second", "revision": 0, "url": "about:blank"}],
-                    "max_pages": 2,
+                    "environment_id": "local", "environment_name": "Local", "capacity_rejection": None,
+                    "capacity": {"pages_used": 2, "pages_registered": 2, "pages_creating": 0,
+                                 "pages_pending_cleanup": 0, "pages_limit": 2},
                 }
                 self.batch = None
                 self.subscriptions = {}
                 self.capture_calls = []
+                self._inputs = HumanInputs(SimpleNamespace(
+                    lock=asyncio.Lock(), pages={}, mouse={}, keys={}, touching=None))
+
+            def human_inputs(self, lease_id):
+                return self._inputs
 
             def detail(self, lease_id):
                 return self.snapshot
@@ -163,12 +175,18 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
                     self.subscriptions.pop(callback, None)
                 return unsubscribe
 
-            async def human_batch(self, lease_id, target, epoch, commands, *, validate, on_dispatch):
+            async def human_send(self, lease_id, target, epoch, method, params, *, validate, on_dispatch,
+                                 connection="", observer=None, check_admission=None, sequence=None):
+                if check_admission is not None:
+                    check_admission()
                 validate()
                 if self.batch is not None:
-                    return await self.batch(on_dispatch)
-                on_dispatch()
-                return [{} for _ in commands]
+                    await self.batch(on_dispatch)
+                else:
+                    on_dispatch()
+                async def wait():
+                    return {}
+                return SimpleNamespace(wait=wait, outcome="sent")
 
         self.socket = Socket()
         self.browser = Browser()
@@ -176,9 +194,28 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
         await self.stream._sync_pages()
         await self.socket.outgoing.get()  # Initial pages.
 
+    async def test_transport_stop_ends_old_view_before_cleanup_is_confirmed(self):
+        closed = []
+
+        async def close(*, code):
+            closed.append(code)
+
+        self.socket.close = close
+        self.browser.snapshot.update(
+            state="stopping", epoch=2, pages=[], current=None, reason="浏览器连接中断",
+        )
+        try:
+            await self.stream._sync_pages()
+            ended = await self.socket.outgoing.get()
+            self.assertEqual(ended, {"t": "ended", "reason": "浏览器连接中断", "epoch": 2})
+            self.assertEqual(closed, [1000])
+            self.assertTrue(self.stream._closed)
+        finally:
+            await self.stream._cleanup()
+
     async def test_programming_error_rejects_command_but_keeps_receiver_and_cancellation(self):
         receiver = asyncio.create_task(self.stream._receive())
-        async def broken_input(message):
+        async def broken_input(message, **kwargs):
             raise NameError("missing implementation symbol")
         try:
             with patch.object(self.stream, "_input", side_effect=broken_input):
@@ -188,7 +225,7 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(reply, {"t": "reject", "id": 1, "why": "internal-error"})
             await self.socket.incoming.put(json.dumps({"t": "ping", "id": 2}))
             self.assertEqual(await self.socket.outgoing.get(), {"t": "pong", "id": 2})
-            async def cancelled_input(message):
+            async def cancelled_input(message, **kwargs):
                 raise asyncio.CancelledError
             with patch.object(self.stream, "_input", side_effect=cancelled_input):
                 await self.socket.incoming.put(json.dumps({"t": "navigate", "id": 3}))
@@ -225,7 +262,8 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
 
     def credential(self, seq=1):
         self.stream.sent[seq] = (self.browser.snapshot["epoch"], self.stream.vp, self.stream.page)
-        return {"epoch": self.browser.snapshot["epoch"], "vp": self.stream.vp, "frame": seq}
+        return {"epoch": self.browser.snapshot["epoch"], "vp": self.stream.vp, "frame": seq,
+                "page": self.stream.page, "ts": time.monotonic() * 1000}
 
     async def ack(self, seq, displayed=True):
         await self.socket.incoming.put(json.dumps({"t": "ack", "seq": seq, "displayed": displayed}))
@@ -234,6 +272,132 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(2):
             while len(self.stream.outstanding) != count:
                 await asyncio.sleep(0)
+
+    async def test_ack_and_ping_bypass_delayed_input_and_quality_change(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed(mark):
+            mark()
+            entered.set()
+            await release.wait()
+
+        self.browser.batch = delayed
+        self.stream.outstanding[1] = (time.perf_counter(), 4, "initial", "high")
+        self.stream.outstanding[2] = (time.perf_counter(), 4, "initial", "high")
+        receiver = asyncio.create_task(self.stream._receive())
+        try:
+            await self.socket.incoming.put(json.dumps({
+                "t": "pointer", "buttons": 0, "id": 10, "x": 10, "y": 10, **self.credential(),
+            }))
+            await asyncio.wait_for(entered.wait(), 2)
+            # Confirming a quality change must not wait for the input's view lock.
+            self.stream._quality_candidate, self.stream._quality_samples = "medium", 1
+            with patch.object(self.stream.window, "quality", return_value=("medium", "bandwidth")):
+                await self.ack(1)
+                await self.credits(1)
+                await self.ack(2)
+                await self.socket.incoming.put(json.dumps({"t": "ping", "id": 11}))
+                self.assertEqual(await asyncio.wait_for(self.socket.outgoing.get(), .5),
+                                 {"t": "pong", "id": 11})
+                self.assertEqual(self.stream.outstanding, {})
+                self.assertFalse(release.is_set())
+            release.set()
+            reply = await asyncio.wait_for(self.socket.outgoing.get(), 2)
+            self.assertEqual((reply["t"], reply["id"]), ("input_done", 10))
+        finally:
+            release.set()
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+            await self.stream._cleanup()
+
+
+
+    def test_wheel_merge_preserves_each_axis_direction_across_zero_deltas(self):
+        cases = (
+            ([(0, -100), (0, 0), (0, 100)], [((0, -100), [1, 2]), ((0, 100), [3])]),
+            ([(0, 100), (0, 0), (0, -100)], [((0, 100), [1, 2]), ((0, -100), [3])]),
+            ([(-100, 10), (0, 10), (100, 10)], [((-100, 20), [1, 2]), ((100, 10), [3])]),
+            ([(100, 10), (0, 10), (-100, 10)], [((100, 20), [1, 2]), ((-100, 10), [3])]),
+            ([(0, 0), (10, -20), (0, 0), (5, -10)], [((15, -30), [1, 2, 3, 4])]),
+        )
+        for deltas, expected in cases:
+            with self.subTest(deltas=deltas):
+                for input_id, (dx, dy) in enumerate(deltas, 1):
+                    self.stream._commands_pending.append(({
+                        "t": "wheel", "id": input_id, "x": 10, "y": 10,
+                        "dx": dx, "dy": dy, **self.credential(),
+                    }, float(input_id)))
+                actual = []
+                while self.stream._commands_pending:
+                    message, received_at = self.stream._commands_pending.popleft()
+                    receipts = [(message["id"], received_at)]
+                    merged = self.stream._coalesce_wheels(message, receipts)
+                    actual.append(((merged["dx"], merged["dy"]), [ident for ident, _ in receipts]))
+                self.assertEqual(actual, expected)
+
+
+
+
+
+    async def test_read_only_wheels_are_individually_rejected(self):
+        self.stream.control = False
+        receiver = asyncio.create_task(self.stream._receive())
+        try:
+            with self.assertLogs("wandrun.gateway.browser_stream", level="WARNING"):
+                for input_id in (1, 2):
+                    await self.socket.incoming.put(json.dumps({
+                        "t": "wheel", "id": input_id, "x": 10, "y": 10, "dy": 10,
+                        **self.credential(input_id),
+                    }))
+                replies = [await asyncio.wait_for(self.socket.outgoing.get(), 2) for _ in range(2)]
+            self.assertEqual(replies, [{"id": i, "t": "reject", "why": "read-only"} for i in (1, 2)])
+            self.assertEqual(self.stream._applied_dispatches, [])
+        finally:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+            await self.stream._cleanup()
+
+
+
+    async def test_receiver_cancellation_cancels_active_input_and_discards_queue(self):
+        entered, cancelled = asyncio.Event(), asyncio.Event()
+        calls = 0
+
+        async def delayed(mark):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        self.browser.batch = delayed
+        credential = self.credential()
+        receiver = asyncio.create_task(self.stream._receive())
+        try:
+            await self.socket.incoming.put(json.dumps({
+                "t": "pointer", "buttons": 0, "id": 1, "x": 10, "y": 10, **credential,
+            }))
+            await asyncio.wait_for(entered.wait(), 2)
+            await self.socket.incoming.put(json.dumps({
+                "t": "wheel", "id": 2, "x": 10, "y": 10, "dy": 10, **credential,
+            }))
+            await self.socket.incoming.put(json.dumps({"t": "ping", "id": 3}))
+            self.assertEqual(await asyncio.wait_for(self.socket.outgoing.get(), .5),
+                             {"t": "pong", "id": 3})
+            receiver.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(receiver, 2)
+            self.assertTrue(cancelled.is_set())
+            self.assertEqual(calls, 1)
+            self.assertEqual(list(self.stream._commands_pending), [])
+            self.assertFalse(self.stream._view_lock.locked())
+            self.assertTrue(self.socket.outgoing.empty())  # Never claim a cancelled write completed.
+        finally:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+            await self.stream._cleanup()
 
     async def test_pipelined_out_of_order_ack_latest_only_and_input_credentials(self):
         self.stream.control = False
@@ -345,81 +509,39 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
             frames.cancel()
             await asyncio.gather(receiver, frames, return_exceptions=True)
 
-    async def test_dispatch_timestamp_rejects_older_frames_and_pending_inputs(self):
+    async def test_dispatch_timestamp_rejects_frames_older_than_the_actual_send(self):
         self.credential()
         self.offer(99)
         self.assertEqual(self.stream.pending[3], 0)
-        self.assertEqual((await self.stream._input({
-            "t": "down", "id": 1, "x": 20, "y": 20, **self.credential(),
-        }))["t"], "input_pending")
-        self.offer(101)
-        self.assertEqual(self.stream.pending[3], 0)
-        with self.assertRaisesRegex(StreamRejected, "out-of-bounds"):
-            await self.stream._input({"t": "click", "id": 2, "x": -1, "y": 20, **self.credential()})
-        self.assertEqual(self.stream.pending[3], 0)
 
-        async def staged(on_dispatch):
-            self.offer(99)  # Delivered late by CDP, but produced before the write.
-            on_dispatch()
-            self.offer(101)  # Produced after dispatch, before Chrome's reply.
-            return [{}, {}]
+        async def dispatched(mark):
+            self.offer(99)
+            mark()
+            self.offer(101)
 
-        self.browser.batch = staged
+        self.browser.batch = dispatched
         with patch("wandrun.gateway.browser_stream.time.time", return_value=100):
             reply = await self.stream._input({
-                "t": "up", "id": 3, "x": 20, "y": 20, **self.credential(),
-            })
+                "t": "text", "id": 3, "text": "hello", **self.credential()})
         self.assertEqual(reply["t"], "input_done")
-        self.assertEqual(self.stream.pending[3], 3)  # Final phase ID, not the down ID.
+        self.assertEqual(self.stream.pending[3], 3)
         self.offer(99)
         self.assertEqual(self.stream.pending[3], 0)
         self.offer(101)
         self.assertEqual(self.stream.pending[3], 3)
-
-        async def failed(on_dispatch):
-            on_dispatch()
-            self.offer(102)
-            raise RuntimeError("CDP command failed")
-
-        self.browser.batch = failed
-        with patch("wandrun.gateway.browser_stream.time.time", return_value=101.5):
-            with self.assertRaisesRegex(RuntimeError, "CDP command failed"):
-                await self.stream._input({
-                    "t": "click", "id": 4, "x": 20, "y": 20, **self.credential(),
-                })
+        with self.assertRaisesRegex(StreamRejected, "out-of-bounds"):
+            await self.stream._input({"t": "pointer", "buttons": 0, "id": 4,
+                                      "x": -1, "y": 20, **self.credential()})
         self.assertEqual(self.stream.pending[3], 3)
-        self.offer(103)
-        self.assertEqual(self.stream.pending[3], 3)
-        self.assertEqual(len(self.stream._applied_dispatches), 1)
         self.browser.batch = None
         with patch("wandrun.gateway.browser_stream.time.time", return_value=104):
-            await self.stream._input({
-                "t": "text", "id": 6, "text": "new", **self.credential(),
-            })
+            await self.stream._input({"t": "text", "id": 6, "text": "new", **self.credential()})
         self.offer(103)
-        self.assertEqual(self.stream.pending[3], 3)  # Late older frame, not latest global id.
+        self.assertEqual(self.stream.pending[3], 3)
         self.offer(105)
         self.assertEqual(self.stream.pending[3], 6)
         self.offer(None)
         self.assertEqual(self.stream.pending[3], 0)
-        touch = {"x": 20, "y": 20, **self.credential()}
-        self.assertEqual((await self.stream._input({
-            "t": "touch", "id": 7, "phase": "start", **touch,
-        }))["t"], "input_pending")
-        self.assertEqual((await self.stream._input({
-            "t": "touch", "id": 8, "phase": "move", **touch,
-        }))["t"], "input_pending")
-        self.assertEqual(self.stream.pending[3], 0)
-        with patch("wandrun.gateway.browser_stream.time.time", return_value=106):
-            self.assertEqual((await self.stream._input({
-                "t": "touch", "id": 9, "phase": "end", **touch,
-            }))["t"], "input_done")
-        self.offer(107)
-        self.assertEqual(self.stream.pending[3], 9)
-        with self.assertRaisesRegex(StreamRejected, "incomplete-gesture"):
-            await self.stream._input({"t": "touch", "id": 10, "phase": "end", **touch})
-        self.offer(108)
-        self.assertEqual(self.stream.pending[3], 9)
 
     async def test_cdp_dispatch_boundary_is_after_transport_write_before_reply(self):
         cdp = CDPSocket("unused")
@@ -647,7 +769,7 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(second["send_lock_ms"], 40)
             await self.stream._view_lock.acquire()
             await self.socket.incoming.put(json.dumps({
-                "t": "click", "id": 9, "x": 10, "y": 10, **self.credential(second["seq"]),
+                "t": "pointer", "buttons": 0, "id": 9, "x": 10, "y": 10, **self.credential(second["seq"]),
             }))
             await advance(0)
             await advance(.2)
@@ -669,6 +791,78 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
             record = json.loads(logs.output[0].split("[stream-stats] ", 1)[1])
             self.assertEqual(record["segments"]["input_lock_wait_ms"]["n"], 1)
             self.assertAlmostEqual(record["segments"]["input_lock_wait_ms"]["mean_ms"], 200)
+
+    async def _check_coalesced_input_timings(self, kind):
+        if kind == "pointer":
+            for buttons in (0, 1):
+                await self.stream._input({
+                    "t": kind, "id": 0, "x": 1, "y": 10, "buttons": buttons,
+                    **self.credential(),
+                })
+        elif kind == "touch":
+            for touches in ([], [{"id": 1, "x": 1, "y": 10}]):
+                await self.stream._input({
+                    "t": kind, "id": 0, "touches": touches, **self.credential(),
+                })
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_sync = self.stream._sync_pages
+
+        async def delayed_sync(*args):
+            # Page synchronization can yield after _commands records locked_at.
+            entered.set()
+            await release.wait()
+            await original_sync(*args)
+
+        async with self.clocked_stream() as (clock, advance):
+            with patch.object(self.stream, "_sync_pages", side_effect=delayed_sync):
+                await self.stream._view_lock.acquire()
+                for input_id in (1, 2, 3):
+                    fields = ({"touches": [{"id": 1, "x": input_id * 10, "y": 10}]}
+                              if kind == "touch" else
+                              {"x": 10 if kind == "wheel" else input_id * 10, "y": 10,
+                               **({"buttons": 1} if kind == "pointer" else {"dx": 0, "dy": 10})})
+                    await self.socket.incoming.put(json.dumps({
+                        "t": kind, "id": input_id, **fields, **self.credential(),
+                    }))
+                    # A pong is a reader barrier, independent of the held view lock.
+                    await self.socket.incoming.put(json.dumps({"t": "ping", "id": 100 + input_id}))
+                    self.assertEqual(await asyncio.wait_for(self.socket.outgoing.get(), 2),
+                                     {"t": "pong", "id": 100 + input_id})
+                    if input_id == 1:
+                        await advance(.2)
+                        self.stream._view_lock.release()
+                        await asyncio.wait_for(entered.wait(), 2)
+                        await advance(.03)
+                    elif input_id == 2:
+                        await advance(.01)
+                release.set()
+                await advance(.02)
+                replies = [await asyncio.wait_for(self.socket.outgoing.get(), 2) for _ in range(3)]
+                self.assertEqual([reply["id"] for reply in replies], [1, 2, 3])
+                merged = (self.stream._wheel_merged_inputs if kind == "wheel"
+                          else self.stream._move_merged_inputs)
+                self.assertEqual(merged, 2)
+                for reply, lock_wait in zip(replies, (200, 0, 0)):
+                    self.assertEqual((reply["t"], reply["outcome"]), ("input_done", "sent"))
+                    for name in ("input_lock_wait_ms", "input_cdp_ms", "input_dispatch_ms"):
+                        self.assertGreaterEqual(reply[name], 0, (reply["id"], name))
+                    self.assertAlmostEqual(reply["input_lock_wait_ms"], lock_wait)
+                self.assertTrue(self.socket.outgoing.empty())
+                with self.assertLogs("wandrun.gateway.browser_stream", level="INFO") as logs:
+                    self.stream._log_stats()
+                record = json.loads(logs.output[0].split("[stream-stats] ", 1)[1])
+                segment = record["segments"]["input_lock_wait_ms"]
+                self.assertEqual(segment["n"], 3)
+                self.assertAlmostEqual(segment["mean_ms"], 200 / 3)
+
+    async def test_coalesced_pointer_receipts_have_nonnegative_timings(self):
+        await self._check_coalesced_input_timings("pointer")
+
+    async def test_coalesced_wheel_receipts_have_nonnegative_timings(self):
+        await self._check_coalesced_input_timings("wheel")
+
+    async def test_coalesced_touch_receipts_have_nonnegative_timings(self):
+        await self._check_coalesced_input_timings("touch")
 
     async def test_interval_logs_ack_bytes_turnaround_pause_and_connection(self):
         async with self.clocked_stream(fixed=1) as (clock, advance):
@@ -703,33 +897,6 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(record["wall_start_s"], record["wall_end_s"])
             self.assertLess(record["monotonic_start_s"], record["monotonic_end_s"])
 
-
-    async def test_encoder_await_cannot_make_credit_wait_negative(self):
-        async with self.clocked_stream() as (clock, advance):
-            self.stream.window.sample(clock.value, 730)
-            self.stream.quality_tier = "medium"
-            self.stream.window.quality_changed(clock.value - 1, "medium")
-            self.stream.window.observe("medium", 30_000)
-            self.stream.window._rates.append((clock.value, self.stream.fps * 32_048))
-            self.stream.window.delivery_rate = self.stream.fps * 32_048
-            self.stream.window._last_qualified_at = clock.value
-            self.stream._quality_candidate, self.stream._quality_samples = "high", 5
-            self.stream.outstanding[1] = (clock.value - .73, 30_000, "recovered", "medium")
-            original_switch = self.stream._switch_quality
-
-            async def replace_source(tier, reason):
-                await original_switch(tier, reason)
-                await advance(.03)
-                # The producer starts a new credit wait during source replacement,
-                # after the receiver timestamped this ACK.
-                self.stream._credit_wait_started = clock.value
-                await advance(.01)
-
-            self.stream._switch_quality = replace_source
-            await self.ack(1)
-            await self.socket.incoming.put(json.dumps({"t": "ping", "id": 9}))
-            self.assertEqual(await self.socket.outgoing.get(), {"t": "pong", "id": 9})
-            self.assertAlmostEqual(self.stream._credit_wait_ms, 10)
 
     async def test_pong_lock_then_ack_cut_rechecks_credit_before_send(self):
         async with self.clocked_stream() as (clock, advance):
@@ -804,9 +971,10 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
             await self.ack(first["seq"])
             await self.socket.incoming.put(json.dumps({"t": "ping", "id": 1}))
             await advance(0)
-            self.assertEqual((await self.socket.outgoing.get())["t"], "pong")
-            self.assertAlmostEqual(self.stream._credit_wait_ms, 100)
-            self.assertEqual(self.stream.quality_tier, "high")
+            messages = [await asyncio.wait_for(self.socket.outgoing.get(), 2) for _ in range(2)]
+            self.assertIn({"t": "pong", "id": 1}, messages)
+            frame = next(item for item in messages if item["t"] == "frame")
+            self.assertAlmostEqual(frame["credit_wait_ms"], 100)
 
     async def test_final_stats_include_cancelled_send_even_if_cleanup_fails(self):
         entered = asyncio.Event()
@@ -955,7 +1123,6 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
             now = sent + .7
             drain.sample(now, 700)
             drain.delivered(now, sent, 70_000, "high")
-        self.assertLess(drain.delivery_rate, .98 * 24 * 72_048)
         self.assertEqual(drain.quality("high", 70_000),
                          ("high", "steady"), "self-paced drain is not path capacity evidence")
 
@@ -1139,12 +1306,12 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
                              ("low", [800, 600], high1["vp"]))
             self.assertEqual(other.quality_tier, "high")
             with self.assertRaisesRegex(StreamRejected, "out-of-bounds"):
-                await self.stream._input({"t": "click", "id": 9, "x": 800, "y": 599,
-                                          "epoch": low["epoch"], "vp": low["vp"],
-                                          "frame": low["seq"]})
+                await self.stream._input({"t": "pointer", "buttons": 0, "id": 9, "x": 800, "y": 599,
+                                          "epoch": low["epoch"], "vp": low["vp"], "page": self.stream.page,
+                                          "frame": low["seq"], "ts": 1000})
             self.assertEqual((await self.stream._input({
-                "t": "click", "id": 10, "x": 799, "y": 599,
-                "epoch": low["epoch"], "vp": low["vp"], "frame": low["seq"],
+                "t": "pointer", "buttons": 0, "id": 10, "x": 799, "y": 599,
+                "epoch": low["epoch"], "vp": low["vp"], "frame": low["seq"], "page": self.stream.page, "ts": 1000,
             }))["t"], "input_done")
             self.browser.snapshot["pages"][0]["revision"] += 1
             self.stream._changed(self.browser.snapshot)
@@ -1224,6 +1391,172 @@ class StreamMeasurementTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(shutil.which("Xvfb") and shutil.which("google-chrome"), "需要 Xvfb 与 Google Chrome")
 class BrowserStreamTests(unittest.TestCase):
+    def test_state_input_native_text_selection(self):
+        with ChromeDev() as chrome:
+            asyncio.run(self.native_pointer_surface(chrome.cdp_url, "selection"))
+
+    def test_state_input_native_html_drag_and_drop(self):
+        with ChromeDev() as chrome:
+            asyncio.run(self.native_pointer_surface(chrome.cdp_url, "drop"))
+
+    async def native_pointer_surface(self, cdp_url, action):
+        leases = BrowserLeases(BrowserDefinition(cdp_url=cdp_url, idle_timeout=0))
+        await leases.start()
+        try:
+            leases.register("native-input", "root", "worker", "entry")
+            environment = await leases.command_environment("native-input")
+            async with httpx.AsyncClient() as http:
+                endpoint = (await http.get(environment["WANDRUN_BROWSER_CDP"] + "/json/version")).json()[
+                    "webSocketDebuggerUrl"]
+            async with connect(endpoint) as agent:
+                await agent.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                self.assertIn("result", json.loads(await agent.recv()))
+                identity = leases.lease_for_task("native-input")
+                page = leases.detail(identity)["current"]
+                epoch = (await leases.takeover(identity))["epoch"]
+                html = """<p id=words style="font:20px monospace;position:absolute;left:10px;top:10px;margin:0">abcdefghijklmnopqrstuvwxyz</p>
+                    <div id=source draggable=true style="position:absolute;left:10px;top:100px;width:60px;height:60px;background:teal"></div>
+                    <div id=target style="position:absolute;left:300px;top:100px;width:100px;height:100px"></div>
+                    <script>window.dragEvents=[];
+                    source.addEventListener('dragstart',()=>dragEvents.push('dragstart'));
+                    target.addEventListener('dragover',e=>e.preventDefault());
+                    window.dropped=new Promise(resolve=>target.addEventListener('drop',e=>{
+                      e.preventDefault();dragEvents.push('drop');resolve(dragEvents)},{once:true}));
+                    </script>"""
+                await leases.human_call(identity, page, epoch, "Page.navigate", {
+                    "url": "data:text/html;base64," + base64.b64encode(html.encode()).decode()})
+
+                async def evaluate(expression, *, await_promise=False):
+                    return (await leases.page_call(identity, page, "Runtime.evaluate", {
+                        "expression": expression, "returnByValue": True,
+                        "awaitPromise": await_promise}))["result"].get("value")
+
+                async with stream_server(leases) as origin, connect(
+                    f"{origin}/browser-tasks/{identity}/stream?mode=control",
+                    additional_headers={"Authorization": "Bearer stream-test-token"},
+                ) as ws:
+                    viewer = Viewer(ws)
+                    shown = await viewer.frame(epoch)
+
+                    async def pointer(x, y, buttons):
+                        reply = await viewer.command("pointer", shown, x=x, y=y, buttons=buttons)
+                        self.assertEqual((reply["t"], reply["outcome"]), ("input_done", "sent"))
+
+                    if action == "selection":
+                        left, right, y = await evaluate("""(()=>{
+                          const range=document.createRange();range.setStart(words.firstChild,0);
+                          range.setEnd(words.firstChild,14);const box=range.getBoundingClientRect();
+                          return [box.left+1,box.right,(box.top+box.bottom)/2]})()""")
+                        await pointer(left, y, 0)
+                        await pointer(left, y, 1)
+                        for fraction in (.25, .5, .75, 1):
+                            await pointer(left + (right-left)*fraction, y, 1)
+                        await pointer(right, y, 0)
+                        self.assertEqual(await evaluate("getSelection().toString()"), "abcdefghijklmn")
+                    else:
+                        await pointer(30, 120, 0)
+                        await pointer(30, 120, 1)
+                        for x in range(40, 360, 20):
+                            await pointer(x, 140, 1)
+                        await pointer(350, 140, 0)
+                        self.assertIn("dragstart", await evaluate("dragEvents"))
+                        self.assertEqual(await evaluate("dropped", await_promise=True), ["dragstart", "drop"])
+        finally:
+            await leases.aclose()
+
+    def test_state_input_drag_contacts_and_navigation_in_real_chrome(self):
+        with ChromeDev() as chrome:
+            asyncio.run(self.state_input_surface(chrome.cdp_url))
+
+    async def state_input_surface(self, cdp_url):
+        leases = BrowserLeases(BrowserDefinition(cdp_url=cdp_url, idle_timeout=0))
+        await leases.start()
+        try:
+            leases.register("state-input", "root", "worker", "entry")
+            environment = await leases.command_environment("state-input")
+            async with httpx.AsyncClient() as http:
+                endpoint = (await http.get(environment["WANDRUN_BROWSER_CDP"] + "/json/version")).json()[
+                    "webSocketDebuggerUrl"]
+            async with connect(endpoint) as agent:
+                await agent.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                self.assertIn("result", json.loads(await agent.recv()))
+                identity = leases.lease_for_task("state-input")
+                page = leases.detail(identity)["current"]
+                html = """<style>#drag{position:absolute;left:20px;top:100px;width:80px;height:80px;background:teal}</style>
+                    <div id=laneA style="position:absolute;left:300px;top:200px;width:100px;height:100px;overflow:auto"><div style="height:2000px">A</div></div>
+                    <div id=laneB style="position:absolute;left:500px;top:200px;width:100px;height:100px;overflow:auto"><div style="height:2000px">B</div></div>
+                    <div id=drag></div><script>
+                    window.events=[];window.contacts=[];let held=false,dx=0;
+                    document.addEventListener('mousedown',e=>{events.push(['down',e.buttons]);
+                      if(e.target===drag){held=true;dx=e.clientX-drag.offsetLeft}});
+                    document.addEventListener('mousemove',e=>{if(held)drag.style.left=(e.clientX-dx)+'px'});
+                    document.addEventListener('mouseup',e=>{held=false;events.push(['up',e.buttons])});
+                    for(const type of ['touchstart','touchmove','touchend','touchcancel'])
+                      document.addEventListener(type,e=>{e.preventDefault();
+                        contacts.push([type,Array.from(e.touches,t=>t.identifier).sort()])},{passive:false});
+                    window.snapshot=()=>({events,contacts,held,left:drag.offsetLeft});
+                    </script>"""
+                epoch = (await leases.takeover(identity))["epoch"]
+                async def evaluate(expression):
+                    return (await leases.page_call(identity, page, "Runtime.evaluate", {
+                        "expression": expression, "returnByValue": True}))["result"].get("value")
+                async def navigate(content):
+                    await leases.human_call(identity, page, epoch, "Page.navigate", {
+                        "url": "data:text/html;base64," + base64.b64encode(content.encode()).decode()})
+                    async with asyncio.timeout(5):
+                        while not await evaluate('typeof snapshot === "function"'):
+                            await asyncio.sleep(.01)
+                await navigate(html)
+                async with stream_server(leases) as origin, connect(
+                    f"{origin}/browser-tasks/{identity}/stream?mode=control",
+                    additional_headers={"Authorization": "Bearer stream-test-token"},
+                ) as ws:
+                    viewer = Viewer(ws)
+                    shown = await viewer.frame(epoch)
+                    for buttons, x in ((0, 40), (1, 40), (1, 100), (1, 180), (0, 200)):
+                        reply = await viewer.command("pointer", shown, buttons=buttons, x=x, y=120)
+                        self.assertEqual((reply["t"], reply["outcome"]), ("input_done", "sent"))
+                    snapshot = await evaluate("snapshot()")
+                    self.assertEqual((snapshot["left"], snapshot["held"], snapshot["events"]),
+                                     (180, False, [["down", 1], ["up", 0]]))
+                    for lane, x in (("laneA", 320), ("laneB", 520)):
+                        for delta, expected in ((-100, 0), (100, 100), (-40, 60)):
+                            await viewer.command("wheel", shown, x=x, y=220, dx=0, dy=delta)
+                            async with asyncio.timeout(5):
+                                while await evaluate(f"document.querySelector('#{lane}').scrollTop") != expected:
+                                    await asyncio.sleep(.01)
+                    self.assertEqual(await evaluate("[laneA.scrollTop,laneB.scrollTop]"), [60, 60])
+                    await viewer.command("pointer", shown, buttons=1, x=180, y=120)
+                    old_vp = shown["vp"]
+                    await navigate(html + "<title>New document</title>")
+                    shown = await viewer.until(lambda message: message["t"] == "frame" and message["vp"] > old_vp)
+                    await viewer.command("pointer", shown, buttons=1, x=40, y=120)
+                    self.assertFalse(any(event[0] == "down" for event in (await evaluate("snapshot()"))["events"]))
+                    for buttons in (0, 1, 0):
+                        await viewer.command("pointer", shown, buttons=buttons, x=40, y=120)
+                    self.assertEqual((await evaluate("snapshot()"))["events"][-2:], [["down", 1], ["up", 0]])
+                    first, second = {"id": 1, "x": 300, "y": 100}, {"id": 2, "x": 400, "y": 120}
+                    for touches in ([], [first], [first, second], [second], [{**second, "x": 450}], []):
+                        reply = await viewer.command("touch", shown, touches=touches)
+                        self.assertEqual(reply["outcome"], "sent")
+                    events = (await evaluate("snapshot()"))["contacts"]
+                    self.assertEqual([event for event in events if event[0] == "touchend"],
+                                     [["touchend", [2]], ["touchend", []]])
+        finally:
+            await leases.aclose()
+
+
+
+
+
+
+
+
+
+
+
+
+
     def test_address_bar_valid_url_navigates_real_chrome(self):
         with ChromeDev() as chrome:
             asyncio.run(self.address_bar_navigation(chrome.cdp_url))
@@ -1277,301 +1610,17 @@ class BrowserStreamTests(unittest.TestCase):
             http_server.close()
             await http_server.wait_closed()
 
-    def test_known_navigation_rejects_whole_gesture_with_ack_backlog(self):
-        with ChromeDev() as chrome:
-            asyncio.run(self.known_navigation(chrome.cdp_url))
 
-    async def known_navigation(self, cdp_url):
-        leases = BrowserLeases(BrowserDefinition(cdp_url=cdp_url, idle_timeout=0))
-        await leases.start()
-        try:
-            leases.register("queued-frame", "root", "worker", "entry")
-            env = await leases.command_environment("queued-frame")
-            async with httpx.AsyncClient() as http:
-                endpoint = (await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")).json()["webSocketDebuggerUrl"]
-            async with connect(endpoint) as agent:
-                await agent.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
-                self.assertIn("result", json.loads(await agent.recv()))
-                ident = leases.lease_for_task("queued-frame")
-                target = leases.detail(ident)["current"]
-                human = await leases.takeover(ident)
-                navigation = CDPSocket(leases._page_ws(target))
-                await navigation.open()
-                try:
-                    html = '<input id="field" autofocus><script>window.presses=0;onmousedown=()=>presses++;setInterval(()=>document.body.style.background=`rgb(${Date.now()%255},200,200)`,80)</script>'
-                    url = "data:text/html;base64," + base64.b64encode(html.encode()).decode()
-                    await navigation.call("Page.navigate", {"url": url})
-                    async with stream_server(leases) as origin, connect(
-                        f"{origin}/browser-tasks/{ident}/stream?mode=control",
-                        additional_headers={"Authorization": "Bearer stream-test-token"},
-                    ) as ws:
-                        viewer = Viewer(ws)
-                        for barrier in ("lease", "transport"):
-                            with self.subTest(barrier=barrier):
-                                shown = await viewer.frame(human["epoch"])
-                                entered = asyncio.Event()
-                                original = leases.human_batch
-                                async def queued(*args, **kwargs):
-                                    entered.set()
-                                    return await original(*args, **kwargs)
-                                lease = leases._get(ident)
-                                page = lease.pages[target]
-                                lock = lease.lock if barrier == "lease" else page.cdp._send_lock
-                                ack_queued = asyncio.Event()
-                                notify = page.cdp.notify
-                                def acknowledge(method, params):
-                                    notify(method, params)
-                                    if method == "Page.screencastFrameAck":
-                                        ack_queued.set()
-                                with patch.object(leases, "human_batch", side_effect=queued), patch.object(
-                                    page.cdp, "notify", side_effect=acknowledge,
-                                ):
-                                    async with lock:
-                                        command = asyncio.create_task(viewer.command("click", shown, x=20, y=20))
-                                        await asyncio.wait_for(entered.wait(), 3)
-                                        await asyncio.wait_for(ack_queued.wait(), 3)
-                                        revision = lease.pages[target].revision
-                                        await navigation.call("Page.navigate", {"url": url + "#" + barrier})
-                                        # A new document, not merely a fragment change.
-                                        await navigation.call("Page.reload")
-                                        async with asyncio.timeout(3):
-                                            while lease.pages[target].revision == revision:
-                                                await asyncio.sleep(.01)
-                                    rejected = await command
-                                self.assertEqual(rejected["t"], "reject")
-                                self.assertIn(rejected["why"], ("stale-viewport", "stale-frame"))
-                                result = await navigation.call("Runtime.evaluate", {
-                                    "expression": "[field.value, presses]", "returnByValue": True})
-                                self.assertEqual(result["result"]["value"], ["", 0])
-                                self.assertEqual(lease.mouse, {})
-                                fresh = await viewer.frame(human["epoch"])
-                                accepted = await viewer.command("text", fresh, text="FRESH")
-                                self.assertEqual(accepted["t"], "input_done")
-                                result = await navigation.call("Runtime.evaluate", {
-                                    "expression": "field.value", "returnByValue": True})
-                                self.assertEqual(result["result"]["value"], "FRESH")
-                finally:
-                    await navigation.close()
-        finally:
-            await leases.aclose()
 
-    def test_navigation_during_gesture_does_not_split_release(self):
-        with ChromeDev() as chrome:
-            asyncio.run(self.gesture_navigation(chrome.cdp_url))
 
-    async def gesture_navigation(self, cdp_url):
-        leases = BrowserLeases(BrowserDefinition(cdp_url=cdp_url, idle_timeout=0))
-        await leases.start()
-        try:
-            leases.register("gesture", "root", "worker", "entry")
-            env = await leases.command_environment("gesture")
-            async with httpx.AsyncClient() as http:
-                endpoint = (await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")).json()["webSocketDebuggerUrl"]
-            async with connect(endpoint) as agent:
-                await agent.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
-                self.assertIn("result", json.loads(await agent.recv()))
-                ident = leases.lease_for_task("gesture")
-                human = await leases.takeover(ident)
-                lease = leases._get(ident)
-                page = lease.pages[lease.current]
-                navigation = CDPSocket(leases._page_ws(page.id))
-                await navigation.open()
-                try:
-                    url = "data:text/html,<input id=field autofocus>"
-                    await navigation.call("Page.navigate", {"url": url})
-                    async with stream_server(leases) as origin, connect(
-                        f"{origin}/browser-tasks/{ident}/stream?mode=control",
-                        additional_headers={"Authorization": "Bearer stream-test-token"},
-                    ) as ws:
-                        viewer = Viewer(ws)
-                        call = page.cdp.call
-                        for gesture in ("click", "key", "mouse", "touch"):
-                            with self.subTest(gesture=gesture):
-                                shown = await viewer.frame(human["epoch"])
-                                async def navigate_after_press(method, params=None, **kwargs):
-                                    result = await call(method, params, **kwargs)
-                                    if (params or {}).get("type") in ("mousePressed", "rawKeyDown", "touchStart"):
-                                        revision = page.revision
-                                        await navigation.call("Page.reload")
-                                        async with asyncio.timeout(3):
-                                            while page.revision == revision:
-                                                await asyncio.sleep(.01)
-                                        await navigation.call("Runtime.evaluate", {
-                                            "expression": "window.releases=0;onmouseup=onkeyup=ontouchend=()=>releases++;field.focus()"})
-                                    return result
-                                with patch.object(page.cdp, "call", side_effect=navigate_after_press):
-                                    if gesture == "key":
-                                        reply = await viewer.command("key", shown, key="Shift", code="ShiftLeft", vk=16)
-                                    elif gesture in ("mouse", "touch"):
-                                        down = {"x": 20, "y": 20}
-                                        if gesture == "touch":
-                                            down["phase"] = "start"
-                                        pending = await viewer.command("down" if gesture == "mouse" else "touch", shown, **down)
-                                        self.assertEqual(pending["t"], "input_pending")
-                                        self.assertEqual(lease.mouse, {})
-                                        self.assertIsNone(lease.touching)
-                                        if gesture == "touch":
-                                            down["phase"] = "end"
-                                        reply = await viewer.command("up" if gesture == "mouse" else "touch", shown, **down)
-                                    else:
-                                        reply = await viewer.command("click", shown, x=20, y=20)
-                                self.assertEqual(reply["t"], "input_done", reply)
-                                self.assertEqual(lease.mouse, {})
-                                self.assertEqual(lease.keys, {})
-                                self.assertIsNone(lease.touching)
-                                result = await navigation.call("Runtime.evaluate", {
-                                    "expression": "releases", "returnByValue": True})
-                                # Chrome cancels active touch points on navigation;
-                                # mouse/key release still reaches the new document.
-                                if gesture != "touch":
-                                    self.assertEqual(result["result"]["value"], 1)
-                        released_before_handback = result["result"]["value"]
-                        await leases.handback(ident)
-                        result = await navigation.call("Runtime.evaluate", {
-                            "expression": "releases", "returnByValue": True})
-                        self.assertEqual(result["result"]["value"], released_before_handback)
-                finally:
-                    await navigation.close()
-        finally:
-            await leases.aclose()
 
-    def test_staged_gesture_credentials_and_assembly(self):
-        with ChromeDev() as chrome:
-            asyncio.run(self.staged_gestures(chrome.cdp_url))
 
-    async def staged_gestures(self, cdp_url):
-        leases = BrowserLeases(BrowserDefinition(cdp_url=cdp_url, idle_timeout=0))
-        await leases.start()
-        try:
-            leases.register("staged", "root", "worker", "entry")
-            env = await leases.command_environment("staged")
-            async with httpx.AsyncClient() as http:
-                endpoint = (await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")).json()["webSocketDebuggerUrl"]
-            async with connect(endpoint) as agent:
-                await agent.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
-                self.assertIn("result", json.loads(await agent.recv()))
-                ident = leases.lease_for_task("staged")
-                lease = leases._get(ident)
-                page = lease.pages[lease.current]
-                await agent.send(json.dumps({"id": 2, "method": "Target.createTarget",
-                                                 "params": {"url": "about:blank"}}))
-                async with asyncio.timeout(10):
-                    while True:
-                        created = json.loads(await agent.recv())
-                        if created.get("id") == 2:
-                            other_page = created["result"]["targetId"]
-                            break
-                human = await leases.takeover(ident)
-                navigation = CDPSocket(leases._page_ws(page.id))
-                await navigation.open()
-                try:
-                    html = ("""<div id="tick"></div><script>
-                        window.events=[];
-                        for(const type of ['mousedown','mouseup','touchstart','touchend','mousemove'])
-                          document.addEventListener(type,e=>events.push([type,e.button]));
-                        setInterval(()=>tick.textContent=Date.now(),40);
-                        </script>""")
-                    url = "data:text/html;base64," + base64.b64encode(html.encode()).decode()
-                    await navigation.call("Page.navigate", {"url": url})
-                    async with stream_server(leases) as origin, connect(
-                        f"{origin}/browser-tasks/{ident}/stream?mode=control",
-                        additional_headers={"Authorization": "Bearer stream-test-token"},
-                    ) as ws:
-                        viewer = Viewer(ws)
-                        async def events():
-                            result = await navigation.call("Runtime.evaluate", {
-                                "expression": "window.events", "returnByValue": True})
-                            return result["result"]["value"]
-                        async def clear_events():
-                            await navigation.call("Runtime.evaluate", {"expression": "events=[]"})
-                        for family in ("mouse", "touch"):
-                            with self.subTest(evicted_start=family):
-                                await clear_events()
-                                shown = await viewer.frame(human["epoch"])
-                                start = "down" if family == "mouse" else "touch"
-                                end = "up" if family == "mouse" else "touch"
-                                phase = {} if family == "mouse" else {"phase": "start"}
-                                reply = await viewer.command(start, shown, x=20, y=20, **phase)
-                                self.assertEqual(reply["t"], "input_pending")
-                                self.assertEqual(await events(), [])
-                                self.assertEqual(lease.mouse, {})
-                                self.assertIsNone(lease.touching)
-                                latest = shown
-                                for _ in range(35):
-                                    newer = await viewer.frame(human["epoch"])
-                                    self.assertGreater(newer["seq"], latest["seq"])
-                                    latest = newer
-                                self.assertGreaterEqual(latest["seq"] - shown["seq"], 35)
-                                phase = {} if family == "mouse" else {"phase": "end"}
-                                reply = await viewer.command(end, shown, x=20, y=20, **phase)
-                                self.assertEqual(reply["t"], "input_done", reply)
-                                names = [event[0] for event in await events()]
-                                self.assertIn("mousedown" if family == "mouse" else "touchstart", names)
-                                self.assertIn("mouseup" if family == "mouse" else "touchend", names)
-                                self.assertEqual(lease.mouse, {})
-                                self.assertIsNone(lease.touching)
-                                self.assertEqual((await viewer.command(
-                                    start, shown, x=20, y=20,
-                                    **({} if family == "mouse" else {"phase": "start"})))["why"], "stale-frame")
 
-                        await clear_events()
-                        shown = await viewer.frame(human["epoch"])
-                        self.assertEqual((await viewer.command("down", shown, x=20, y=20))["t"], "input_pending")
-                        self.assertEqual((await viewer.command(
-                            "down", shown, x=30, y=30, button="right"))["t"], "input_pending")
-                        self.assertEqual(await events(), [])
-                        self.assertEqual((await viewer.command(
-                            "up", shown, x=30, y=30, button="right"))["t"], "input_done")
-                        self.assertEqual(await events(), [["mousedown", 2], ["mouseup", 2]])
 
-                        await clear_events()
-                        shown = await viewer.frame(human["epoch"])
-                        self.assertEqual((await viewer.command("down", shown, x=20, y=20))["t"], "input_pending")
-                        for _ in range(255):
-                            self.assertEqual((await viewer.command(
-                                "move", shown, x=21, y=21, buttons=1))["t"], "input_pending")
-                        self.assertEqual((await viewer.command(
-                            "up", shown, x=21, y=21))["why"], "invalid-gesture")
-                        self.assertEqual(await events(), [])
-                        self.assertEqual(lease.mouse, {})
 
-                        for change in ("document", "viewport", "page", "epoch"):
-                            with self.subTest(invalidated_start=change):
-                                await clear_events()
-                                shown = await viewer.frame(human["epoch"])
-                                self.assertEqual((await viewer.command(
-                                    "down", shown, x=20, y=20))["t"], "input_pending")
-                                if change == "document":
-                                    revision = page.revision
-                                    await navigation.call("Page.reload")
-                                    async with asyncio.timeout(5):
-                                        while page.revision == revision:
-                                            await asyncio.sleep(.01)
-                                    await viewer.until(
-                                        lambda m: m["t"] == "frame" and m["vp"] != shown["vp"])
-                                elif change == "viewport":
-                                    await navigation.call("Emulation.setDeviceMetricsOverride", {
-                                        "width": shown["css"][0] - 100, "height": shown["css"][1],
-                                        "deviceScaleFactor": 1, "mobile": False})
-                                    await viewer.until(lambda m: m["t"] == "frame" and m["vp"] != shown["vp"])
-                                elif change == "page":
-                                    self.assertEqual((await viewer.command(
-                                        "switch_page", target=other_page))["t"], "page_done")
-                                else:
-                                    await leases.handback(ident)
-                                    human = await leases.takeover(ident)
-                                reply = await viewer.command("up", shown, x=20, y=20)
-                                self.assertEqual(reply["t"], "reject", reply)
-                                self.assertEqual(reply["why"], "stale-epoch" if change == "epoch" else "stale-viewport")
-                                self.assertEqual(await events(), [])
-                                self.assertEqual(lease.mouse, {})
-                                if change == "page":
-                                    self.assertEqual((await viewer.command(
-                                        "switch_page", target=page.id))["t"], "page_done")
-                finally:
-                    await navigation.close()
-        finally:
-            await leases.aclose()
+
+
+
 
     def test_binary_view_control_generations_and_disconnect(self):
         with self.assertNoLogs("uvicorn.error", level="ERROR"), ChromeDev() as chrome:
@@ -1630,7 +1679,7 @@ class BrowserStreamTests(unittest.TestCase):
                     async with connect(path, additional_headers=headers) as view_ws:
                         viewer = Viewer(view_ws)
                         page_list = await viewer.until(lambda message: message["t"] == "pages")
-                        self.assertEqual(page_list["max_pages"], 3)
+                        self.assertEqual(page_list["capacity"]["pages_limit"], 3)
                         before = await viewer.frame()
                         self.assertEqual(before["page"], page)
                         self.assertGreater(before["css"][0], 100)
@@ -1647,7 +1696,7 @@ class BrowserStreamTests(unittest.TestCase):
                             shown = await human.frame(epoch)
                             self.assertEqual((await human.command("text", shown, text="human"))["t"], "input_done")
                             self.assertEqual(await value(), "human")
-                            reply = await human.command("click", shown, x=-1, y=4, button="left")
+                            reply = await human.command("pointer", shown, x=-1, y=4, buttons=0)
                             self.assertEqual(reply["why"], "out-of-bounds")
                             self.assertEqual((await human.command("new_page", epoch=epoch - 1))["why"],
                                              "stale-epoch")
@@ -1702,12 +1751,35 @@ class BrowserStreamTests(unittest.TestCase):
                                                 return json.loads(raw[4:4 + size]), raw[4 + size:]
                                 first_slow, _ = await raw_frame()
                                 await raw_frame()  # Fill the two-credit window without ACKs.
-                                for color in ("blue", "lime"):
-                                    await leases.page_call(lease_id, page, "Runtime.evaluate", {
-                                        "expression": f"document.body.style.background={json.dumps(color)};"
-                                                      "new Promise(r=>setTimeout(r,150))",
-                                        "awaitPromise": True,
-                                    })
+                                # DOM mutation completion is not screencast delivery.
+                                # Wait until this blocked viewer has actually offered
+                                # each color before releasing its one frame credit.
+                                import io
+                                from PIL import Image
+                                offered = asyncio.Event()
+                                expected_color = None
+                                original_offer = BrowserStream._offer
+
+                                def observe_offer(stream, target, params):
+                                    original_offer(stream, target, params)
+                                    if (stream.ws.client.port != slow.local_address[1]
+                                            or stream.pending is None
+                                            or stream.pending[0] is not params):
+                                        return
+                                    with Image.open(io.BytesIO(base64.b64decode(params["data"]))) as image:
+                                        pixel = image.convert("RGB").getpixel((2, 2))
+                                    if all(abs(actual - expected) < 20
+                                           for actual, expected in zip(pixel, expected_color)):
+                                        offered.set()
+
+                                with patch.object(BrowserStream, "_offer", observe_offer):
+                                    for color, rgb in (("blue", (0, 0, 255)), ("lime", (0, 255, 0))):
+                                        expected_color = rgb
+                                        offered.clear()
+                                        await leases.page_call(lease_id, page, "Runtime.evaluate", {
+                                            "expression": f"document.body.style.background={json.dumps(color)}",
+                                        })
+                                        await asyncio.wait_for(offered.wait(), 10)
                                 await slow.send(json.dumps({
                                     "t": "ack", "seq": first_slow["seq"], "displayed": False,
                                 }))
@@ -1730,6 +1802,70 @@ class BrowserStreamTests(unittest.TestCase):
                             self.assertEqual(ended["reason"], "用户关闭")
                 self.assertEqual(leases.detail(lease_id)["state"], "released")
                 self.assertEqual(leases.detail(lease_id)["pages"], [])
+        finally:
+            await leases.aclose()
+
+    def test_environment_capacity_reaches_other_leases_control_stream(self):
+        with ChromeDev() as chrome:
+            asyncio.run(self.shared_capacity_streams(chrome.cdp_url))
+
+    async def shared_capacity_streams(self, cdp_url):
+        leases = BrowserLeases(BrowserDefinition(cdp_url=cdp_url, max_pages=3, idle_timeout=0))
+        await leases.start()
+        try:
+            async with AsyncExitStack() as clients:
+                owners = []
+                for task in ("first", "second"):
+                    leases.register(task, task, task, task)
+                    env = await leases.command_environment(task)
+                    async with httpx.AsyncClient() as http:
+                        endpoint = (await http.get(env["WANDRUN_BROWSER_CDP"] + "/json/version")).json()[
+                            "webSocketDebuggerUrl"]
+                    agent = await clients.enter_async_context(connect(endpoint))
+                    await agent.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                    async with asyncio.timeout(10):
+                        while True:
+                            reply = json.loads(await agent.recv())
+                            if reply.get("id") == 1:
+                                self.assertIn("result", reply)
+                                break
+                    identity = leases.lease_for_task(task)
+                    owners.append((identity, (await leases.takeover(identity))["epoch"]))
+                async with stream_server(leases) as origin, AsyncExitStack() as viewers:
+                    headers = {"Authorization": "Bearer stream-test-token"}
+                    streams = []
+                    for identity, _ in owners:
+                        ws = await viewers.enter_async_context(connect(
+                            f"{origin}/browser-tasks/{identity}/stream?mode=control", additional_headers=headers))
+                        stream = Viewer(ws)
+                        await stream.until(lambda m: m["t"] == "pages")
+                        await stream.frame()
+                        streams.append(stream)
+                    first, second = streams
+                    second_before = leases.detail(owners[1][0])
+                    created = await first.command("new_page", epoch=owners[0][1])
+                    self.assertEqual(created["t"], "page_done")
+                    full = await second.until(lambda m: m["t"] == "pages" and m["capacity"]["pages_used"] == 3)
+                    self.assertEqual((full["current"], full["epoch"], [p["id"] for p in full["pages"]]),
+                                     (second_before["current"], second_before["epoch"],
+                                      [p["id"] for p in second_before["pages"]]))
+                    rejected_id = None
+                    for _ in range(2):
+                        await leases.page_call(owners[1][0], second_before["current"], "Runtime.evaluate", {
+                            "expression": "window.open('about:blank'); void 0", "userGesture": True,
+                        })
+                        rejected = await second.until(lambda m: m["t"] == "pages"
+                            and m["capacity_rejection"] is not None
+                            and m["capacity_rejection"]["id"] != rejected_id)
+                        rejected_id = rejected["capacity_rejection"]["id"]
+                    self.assertEqual((await second.command("new_page", epoch=owners[1][1]))["why"], "page-limit")
+                    await leases.close_page(owners[0][0], created["target"])
+                    await second.until(lambda m: m["t"] == "pages" and m["capacity"]["pages_used"] == 2)
+                    await first.until(lambda m: m["t"] == "pages" and m["capacity"]["pages_used"] == 2)
+                    self.assertEqual((await second.command("new_page", epoch=owners[1][1]))["t"], "page_done")
+                    full = await first.until(lambda m: m["t"] == "pages" and m["capacity"]["pages_used"] == 3)
+                    self.assertEqual(len(full["pages"]), 1)
+                    self.assertEqual(len(leases.detail(owners[1][0])["pages"]), 2)
         finally:
             await leases.aclose()
 
@@ -1786,14 +1922,18 @@ class BrowserStreamTests(unittest.TestCase):
 
 class StreamRevocationCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_reject_invalid_stream_parameters_before_accept(self):
+        from wandrun.runtime.session import Runtime
+        runtime = SimpleNamespace(browsers={})
+        runtime.browser_for_lease = lambda identity: Runtime.browser_for_lease(runtime, identity)
         class Socket:
             app = SimpleNamespace(state=SimpleNamespace(
                 device_auth=SimpleNamespace(identify=lambda token: {"device_id": "viewer"}),
-                gateway=SimpleNamespace(runtime=SimpleNamespace(browser=None)),
+                gateway=SimpleNamespace(runtime=runtime),
             ))
             headers = {"authorization": "Bearer token"}
             close_code = None
             accepted = False
+            path_params = {"browser_task_id": "missing"}
 
             async def accept(self):
                 self.accepted = True
@@ -1812,6 +1952,14 @@ class StreamRevocationCleanupTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(fps=value):
                 ws = Socket()
                 ws.query_params = {"fps": value}
+                await browser_stream(ws)
+                self.assertEqual(ws.close_code, 4400)
+                self.assertFalse(ws.accepted)
+        for query in ("transport=jpeg", "transport=video", "input_mode=streaming", "input_mode=grouped",
+                      "video_player=true", "video_player=", "video_player=1&video_player=0"):
+            with self.subTest(query=query):
+                ws = Socket()
+                ws.query_params = QueryParams(query)
                 await browser_stream(ws)
                 self.assertEqual(ws.close_code, 4400)
                 self.assertFalse(ws.accepted)
@@ -1872,7 +2020,10 @@ class StreamRevocationCleanupTests(unittest.IsolatedAsyncioTestCase):
                 self.viewers = set()
 
             def detail(self, identity):
-                return {"state": "agent", "epoch": 1, "current": "page", "max_pages": 3,
+                return {"state": "agent", "epoch": 1, "current": "page",
+                        "environment_id": "local", "environment_name": "Local", "capacity_rejection": None,
+                        "capacity": {"pages_used": 1, "pages_registered": 1, "pages_creating": 0,
+                                     "pages_pending_cleanup": 0, "pages_limit": 3},
                         "pages": [{"id": "page", "url": "about:blank", "revision": 0}]}
 
             def subscribe(self, identity, callback):
@@ -1896,7 +2047,9 @@ class StreamRevocationCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         class Socket:
             app = SimpleNamespace(state=SimpleNamespace(
-                device_auth=auth, gateway=SimpleNamespace(runtime=SimpleNamespace(browser=browser)),
+                device_auth=auth, gateway=SimpleNamespace(runtime=SimpleNamespace(
+                    browser_for_lease=lambda identity: browser,
+                )),
             ))
             headers = {"authorization": f"Bearer {paired['token']}"}
             query_params = {"max_in_flight": "4"}

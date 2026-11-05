@@ -1,0 +1,114 @@
+diff --git a/lib/commonjs/components/VideoTrack.js b/lib/commonjs/components/VideoTrack.js
+index d6614b48ff16de0054384f3b5308c5dc0899f55d..2eab02e3a73cad165132ef356d960f33632f31e9 100644
+--- a/lib/commonjs/components/VideoTrack.js
++++ b/lib/commonjs/components/VideoTrack.js
+@@ -34,7 +34,10 @@ const VideoTrack = exports.VideoTrack = /*#__PURE__*/(0, _react.forwardRef)(({
+   objectFit = 'cover',
+   zOrder,
+   mirror,
+-  iosPIP
++  iosPIP,
++  retainLastFrame,
++  frameContext,
++  onFrameRendered
+ }, ref) => {
+   const [elementInfo] = (0, _react.useState)(() => {
+     let info = new VideoTrackElementInfo();
+@@ -82,9 +85,10 @@ const VideoTrack = exports.VideoTrack = /*#__PURE__*/(0, _react.forwardRef)(({
+       streamURL: mediaStream?.toURL() ?? '',
+       objectFit: objectFit,
+       zOrder: zOrder,
+-      mirror: mirror
+-      // @ts-ignore
+-      ,
++      mirror: mirror,
++      retainLastFrame: retainLastFrame,
++      frameContext: frameContext,
++      onFrameRendered: onFrameRendered,
+       ref: ref
+     });
+   } else {
+diff --git a/lib/module/components/VideoTrack.js b/lib/module/components/VideoTrack.js
+index bb3960ceec485d940c232bff721490ee339aeccd..a3585a2bb0d78e5ca3730f995d39a54af543b3a1 100644
+--- a/lib/module/components/VideoTrack.js
++++ b/lib/module/components/VideoTrack.js
+@@ -30,7 +30,10 @@ export const VideoTrack = /*#__PURE__*/forwardRef(({
+   objectFit = 'cover',
+   zOrder,
+   mirror,
+-  iosPIP
++  iosPIP,
++  retainLastFrame,
++  frameContext,
++  onFrameRendered
+ }, ref) => {
+   const [elementInfo] = useState(() => {
+     let info = new VideoTrackElementInfo();
+@@ -78,9 +81,10 @@ export const VideoTrack = /*#__PURE__*/forwardRef(({
+       streamURL: mediaStream?.toURL() ?? '',
+       objectFit: objectFit,
+       zOrder: zOrder,
+-      mirror: mirror
+-      // @ts-ignore
+-      ,
++      mirror: mirror,
++      retainLastFrame: retainLastFrame,
++      frameContext: frameContext,
++      onFrameRendered: onFrameRendered,
+       ref: ref
+     });
+   } else {
+diff --git a/lib/typescript/src/components/VideoTrack.d.ts b/lib/typescript/src/components/VideoTrack.d.ts
+index c5f20da97919ec76bada910d6b97134725927044..cddb25833c38ceff9646f2dbb635051db591c65f 100644
+--- a/lib/typescript/src/components/VideoTrack.d.ts
++++ b/lib/typescript/src/components/VideoTrack.d.ts
+@@ -93,6 +93,12 @@ export type VideoTrackProps = {
+         };
+         fallbackView?: ReactNode;
+     };
++    /** Wandrun Android extension; remove after upstream supports retained rendering/events. */
++    retainLastFrame?: boolean;
++    frameContext?: string;
++    onFrameRendered?: (event: { nativeEvent: {
++        source: string; context: string; width: number; height: number; at_ms: number;
++    } }) => void;
+ };
+ /**
+  * @inline
+diff --git a/src/components/VideoTrack.tsx b/src/components/VideoTrack.tsx
+index 7f310afb1f41477b9cbf7d98c38721a32342cdbf..2335592816ef6d27a4b3f3a07c520e2b32622f19 100644
+--- a/src/components/VideoTrack.tsx
++++ b/src/components/VideoTrack.tsx
+@@ -122,6 +122,12 @@ export type VideoTrackProps = {
+     };
+     fallbackView?: ReactNode;
+   };
++  /** Wandrun Android extension; remove when upstream offers retained rendering/events. */
++  retainLastFrame?: boolean;
++  frameContext?: string;
++  onFrameRendered?: (event: { nativeEvent: {
++    source: string; context: string; width: number; height: number; at_ms: number;
++  } }) => void;
+ };
+ 
+ /**
+@@ -148,6 +154,9 @@ export const VideoTrack: ForwardRefExoticComponent<
+       zOrder,
+       mirror,
+       iosPIP,
++      retainLastFrame,
++      frameContext,
++      onFrameRendered,
+     }: VideoTrackProps,
+     ref
+   ) => {
+@@ -218,6 +227,9 @@ export const VideoTrack: ForwardRefExoticComponent<
+           objectFit={objectFit}
+           zOrder={zOrder}
+           mirror={mirror}
++          retainLastFrame={retainLastFrame}
++          frameContext={frameContext}
++          onFrameRendered={onFrameRendered}
+           // @ts-ignore
+           ref={ref}
+         />

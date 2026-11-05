@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { AgentMemory, GatewayEvent } from "../src/gateway/api.ts";
-import { beginMemoryDraft, conflictMemory, detailBytes, managedMemorySlug, memoryLength, newDetailIndex, normalizeMemory, observeMemory, reloadMemoryBase, withoutDetailLink } from "../src/lib/agent-memory.ts";
-import { buildItems } from "../src/lib/chat-timeline.ts";
+import { conflictMemory, detailBytes, managedMemorySlug, memoryLength, newDetailIndex, normalizeMemory, withoutDetailLink } from "../src/lib/agent-memory.ts";
+import { projectChatRows } from "../src/lib/chat-timeline.ts";
+import { memoryEntryCount, memoryIndexEntries } from "../src/lib/memory-index.ts";
 
 const SHA = "a".repeat(64);
 const PATH = `/.wandrun/memory/profile/details/topic/${SHA}.md`;
@@ -31,21 +32,21 @@ test("scope-matching active canonical links alone become internal navigation; re
   assert.equal(newDetailIndex("# Start", "profile", "topic"), "# Start\n- [topic](/.wandrun/memory/profile/details/topic.md)\n");
   assert.equal(withoutDetailLink(`Before [Topic](${PATH}) after\n- [Topic](${PATH})\nNext`, PATH), "Before Topic after\nNext");
 });
-test("profile and work drafts never adopt remote changes as a save baseline until explicit reload", () => {
+test("memory index counts list entries or prose; headings alone are empty", () => {
+  assert.equal(memoryEntryCount("## Heading\n\n- One\n- Two\n\nAfter prose"), 2);
+  assert.equal(memoryEntryCount("## Heading\n\nFirst paragraph\n\nSecond paragraph"), 2);
+  assert.equal(memoryEntryCount("## Heading\n"), 0);
+});
+test("only active parsed Markdown links reference a detail; code and plain paths do not hide entries", () => {
+  const path = (slug: string) => `/.wandrun/memory/profile/details/${slug}/${SHA}.md`;
+  const details = Object.fromEntries(["inline", "reference", "plain", "code"].map(slug => [slug, { path: path(slug), sha256: SHA }]));
+  const memory = { ...snapshot("", "v1", "profile"), details };
+  const content = `- [Visible](${path("inline")} "title")\n- [Referenced][ref]\n\n[ref]: ${path("reference")} "title"\n\n${path("plain")}\n\n\`[Code](${path("code")})\`\n`;
+  assert.deepEqual(memoryIndexEntries(content, memory), [{ slug: "inline", title: "Visible" }, { slug: "reference", title: "Referenced" }]);
+});
+test("conflict snapshots must match scope and Agent identity before displaying remote content", () => {
   for (const scope of ["profile", "work"] as const) {
-    const first = snapshot("# 初稿", "v1", scope);
     const changed = snapshot("# 远程修订", "v2", scope);
-    const local = { ...beginMemoryDraft(first), content: "# 我的草稿\n😀" };
-    const conflicted = observeMemory(local, changed);
-    assert.equal(conflicted.base.version, "v1");
-    assert.equal(conflicted.remote?.content, "# 远程修订");
-    assert.equal(conflicted.content, local.content);
-    const reloaded = reloadMemoryBase(conflicted, changed);
-    assert.equal(reloaded.base.version, "v2");
-    assert.equal(reloaded.content, local.content);
-    assert.equal(reloaded.remote, null);
-    assert.equal(observeMemory(reloaded, changed).content, local.content);
-    assert.equal(observeMemory(null, changed).content, "# 远程修订");
     assert.equal(conflictMemory({ current: changed }, scope, "helper")?.version, "v2");
     assert.equal(conflictMemory({ current: { ...changed, content: 5 } }, scope, "helper"), null);
     assert.equal(conflictMemory({ current: changed }, scope === "work" ? "profile" : "work", "helper"), null);
@@ -62,7 +63,7 @@ test("work and profile memory events retain root timeline links; resource change
     { seq: 4, type: "memory.updated", conversation_id: "root", at: 4,
       data: { scope: "work", agent_id: "helper", version: "v3", summary: "已记住" } },
   ];
-  assert.deepEqual(buildItems(events, []).map((item) => [item.event?.seq, item.event?.data.scope]), [
+  assert.deepEqual(projectChatRows({ events: events, pending: [] }).rows.map((item) => [item.event?.seq, item.event?.data.scope]), [
     [1, undefined], [3, "profile"], [4, "work"],
   ]);
 });

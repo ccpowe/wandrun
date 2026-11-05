@@ -1,18 +1,23 @@
-"""ADR-0012：工作区默认配置与本机执行环境。"""
+"""Workspace defaults and local/Instabox execution boundaries."""
 
-import shutil
+import asyncio
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
+
+import asyncssh
 
 from wandrun.config import load_config
 from wandrun.gateway.skills import inspect_skill
-from wandrun.runtime.execution.environments import open_environments, open_ssh
+from wandrun.integrations import remote_session
+from wandrun.integrations.instabox import InstaboxBackend
+from wandrun.integrations.ssh_backend import SSHBackend, SessionChannel
+from wandrun.runtime.execution.environments import open_environments, open_instabox
 from wandrun.runtime.execution.workspace import Workspace
 
 
@@ -64,42 +69,119 @@ class WorkspaceConfigTests(unittest.TestCase):
                 load_config(workspace.agents_config)
 
 
-class SSHOpeningFailureTests(unittest.IsolatedAsyncioTestCase):
-    async def test_failure_while_opening_keeps_the_original_error(self):
-        from contextlib import asynccontextmanager
-        from unittest.mock import patch
+class _LoopbackServer(asyncssh.SSHServer):
+    def __init__(self, public_key: bytes):
+        self._public_key = public_key
 
-        from wandrun.config import EnvironmentDefinition
-        from wandrun.integrations.shell_backend import CleanupUnconfirmedError
-        from wandrun.runtime.execution import environments
+    def begin_auth(self, username):
+        return True
 
-        class Connection:
-            def get_extra_info(self, name):
-                return "user"
+    def public_key_auth_supported(self):
+        return True
 
-        @asynccontextmanager
-        async def connect(*args, **kwargs):
-            yield Connection()
+    def validate_public_key(self, username, key):
+        return username == "test" and key.export_public_key() == self._public_key
 
-        class Backend:
-            async def aclose(self):
-                raise CleanupUnconfirmedError("unconfirmed: call-1")
 
-        async def start(*args, **kwargs):
-            return Backend()
+@asynccontextmanager
+async def loopback_instabox():
+    """Replace only provider preparation: real local session protocol and loopback SFTP.
 
-        async def sync(*args):
-            raise ValueError("skills sync failed")
+    Production Instabox ownership, lazy readiness, process table, skill publication and
+    shutdown remain in use. This fixture does not exercise the Instabox platform API.
+    """
+    prepared = []
+    processes = []
+    transfer_processes = []
 
-        definition = EnvironmentDefinition(type="ssh", host="example", workdir="/w")
-        with tempfile.TemporaryDirectory() as directory, \
-                patch.object(environments.asyncssh, "connect", connect), \
-                patch.object(environments.SSHBackend, "start", start), \
-                patch.object(environments, "_sync_skills", sync):
-            with self.assertRaisesRegex(ValueError, "skills sync failed") as raised:
-                async with environments.open_ssh("vps", definition, Workspace(Path(directory)), set()):
-                    self.fail("opening must fail")
-        self.assertTrue(any("call-1" in note for note in raised.exception.__notes__))
+    async def pump(reader, writer, *, eof=False):
+        try:
+            while chunk := await reader.read(65536):
+                writer.write(chunk)
+                await writer.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            if eof:
+                try:
+                    writer.write_eof()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+    async def transfer(process):
+        child = await asyncio.create_subprocess_shell(
+            process.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        transfer_processes.append(child)
+        incoming = asyncio.create_task(pump(process.stdin, child.stdin, eof=True))
+        outgoing = [asyncio.create_task(pump(child.stdout, process.stdout)),
+                    asyncio.create_task(pump(child.stderr, process.stderr))]
+        try:
+            result = await child.wait()
+            await asyncio.gather(*outgoing)
+            process.exit(result)
+        finally:
+            incoming.cancel()
+            await asyncio.gather(incoming, return_exceptions=True)
+            if child.returncode is None:
+                child.terminate()
+                await child.wait()
+
+    client_key = asyncssh.generate_private_key("ssh-ed25519")
+    listener = await asyncssh.listen(
+        "127.0.0.1", 0, server_factory=lambda: _LoopbackServer(client_key.export_public_key()),
+        server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+        sftp_factory=asyncssh.SFTPServer, process_factory=transfer, encoding=None,
+    )
+
+    async def prepare(owner):
+        Path(owner._workdir).mkdir(parents=True, exist_ok=True)
+        connection = await asyncssh.connect(
+            "127.0.0.1", port=listener.get_port(), username="test", known_hosts=None,
+            client_keys=[client_key], agent_path=None, config=None,
+        )
+        owner._connections.append(connection)
+        owner._connection = connection
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, remote_session.__file__, owner._workdir, repr(owner._termination_grace),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            env={key: value for key, value in os.environ.items()
+                 if key not in ("WANDRUN_BROWSER_CDP", "AGENT_BROWSER_SESSION")},
+        )
+        processes.append(process)
+        channel = SessionChannel(process.stdout, process.stdin)
+        await channel.open(owner._termination_grace)
+        backend = SSHBackend(
+            channel, connection=connection, label=owner.id, workdir=owner._workdir,
+            timeout=owner._timeout, termination_grace=owner._termination_grace,
+        )
+        owner._sessions.append(backend)
+        owner._backend = backend
+        owner._ever_connected = True
+        prepared.append(owner)
+        return backend, False
+
+    try:
+        with patch.object(InstaboxBackend, "_prepare", prepare):
+            yield prepared
+    finally:
+        for process in processes:
+            if process.returncode is None:
+                try:
+                    await asyncio.wait_for(process.wait(), 5)
+                except TimeoutError:
+                    process.terminate()
+                    await process.wait()
+        listener.close()
+        await listener.wait_closed()
+        for process in transfer_processes:
+            if process.returncode is None:
+                process.stdin.close()
+                try:
+                    await asyncio.wait_for(process.wait(), 5)
+                except TimeoutError:
+                    process.terminate()
+                    await process.wait()
 
 
 class LocalEnvironmentTests(unittest.IsolatedAsyncioTestCase):
@@ -166,44 +248,37 @@ class LocalEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("hello", environment.backend.execute("cat note.txt").output)
 
 
-class SSHBuiltinEnvironmentTests(unittest.IsolatedAsyncioTestCase):
-    async def test_remote_builtin_source_is_separate_and_is_a_startup_snapshot(self):
+class InstaboxBuiltinEnvironmentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loopback_fixture_rejects_untrusted_clients(self):
         from wandrun.config import EnvironmentDefinition
-        from wandrun.integrations.shell_backend import ManagedShellBackend
-        from wandrun.integrations.ssh_backend import _PREPARE, remote_script
-        from wandrun.runtime.execution import environments
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = Workspace(root)
+            proof = root / "authorized-only.txt"
+            proof.write_bytes(b"private fixture content")
+            definition = EnvironmentDefinition(
+                type="instabox", machine_id="m_" + "a" * 26, workdir=str(root / "remote"),
+            )
+            async with loopback_instabox(), open_instabox(
+                "remote", definition, workspace,
+            ) as environment:
+                received = (await environment.backend.adownload_files([str(proof)]))[0]
+                self.assertIsNone(received.error)
+                self.assertEqual(received.content, b"private fixture content")
+                host, port = environment.backend._connection.get_extra_info("peername")[:2]
+                for keys in ([], [asyncssh.generate_private_key("ssh-ed25519")]):
+                    with self.subTest(credentials="absent" if not keys else "untrusted"):
+                        with self.assertRaises(asyncssh.PermissionDenied):
+                            async with asyncssh.connect(
+                                host, port=port, username="test", known_hosts=None,
+                                client_keys=keys, agent_path=None, config=None,
+                            ):
+                                self.fail("untrusted client gained filesystem access")
+
+    async def test_builtin_packages_override_reserved_user_names_without_mutating_users(self):
+        from wandrun.config import EnvironmentDefinition
         from wandrun.runtime.agent.agents import _ConfiguredSkillsMiddleware
-
-        class Connection:
-            def get_extra_info(self, name):
-                return "test-user"
-
-            async def run(self, command, *, check):
-                result = subprocess.run(command, shell=True, text=True, capture_output=True, check=False)
-                return SimpleNamespace(exit_status=result.returncode, stderr=result.stderr)
-
-        @asynccontextmanager
-        async def connect(*args, **kwargs):
-            yield Connection()
-
-        class Backend(ManagedShellBackend):
-            async def aclose(self):
-                self.close()
-
-        async def start(connection, *, workdir, **kwargs):
-            result = await connection.run(remote_script(_PREPARE, workdir), check=False)
-            if result.exit_status:
-                raise RuntimeError(result.stderr)
-            return Backend(root_dir=Path(workdir), virtual_mode=False)
-
-        class SFTP:
-            async def put(self, sources, target, *, recurse, preserve):
-                for source in sources:
-                    shutil.copytree(source, Path(target) / Path(source).name)
-
-        @asynccontextmanager
-        async def sftp_client(connection):
-            yield SFTP()
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -222,55 +297,58 @@ class SSHBuiltinEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 "---\nname: wandrun-ui\ndescription: Remote builtin\n---\nBuiltin text.\n",
                 encoding="utf-8",
             )
-            (builtin / "display.md").write_text("snapshot-731\n", encoding="utf-8")
-            remote_root = root / "remote"
-            definition = EnvironmentDefinition(type="ssh", host="fake", workdir=str(remote_root))
-            with patch.object(environments.asyncssh, "connect", connect), \
-                    patch.object(environments.SSHBackend, "start", start), \
-                    patch.object(environments, "sftp_client", sftp_client):
-                async with open_ssh("remote", definition, workspace, {"wandrun-ui"}, builtin_source) as environment:
+            resource = builtin / "display.md"
+            resource.write_text("package-731\n", encoding="utf-8")
+            definition = EnvironmentDefinition(
+                type="instabox", machine_id="m_" + "a" * 26, workdir=str(root / "remote"),
+            )
+            async with loopback_instabox() as prepared:
+                async with open_instabox("remote", definition, workspace, builtin_source) as environment:
                     self.assertNotEqual(environment.skills_source, environment.builtin_skills_source)
-                    self.assertEqual(environment.synced_skills, frozenset({"wandrun-ui"}))
                     selected = _ConfiguredSkillsMiddleware(
                         environment.backend, ("wandrun-ui",), environment.skills_source,
                         builtin_source=environment.builtin_skills_source,
                         builtin_names=environment.builtin_skills,
+                        skill_packages=environment.skill_packages,
                     )
                     metadata = await selected.abefore_agent({}, None, {})
-                    self.assertEqual(metadata["skills_metadata"][0]["description"], "Remote builtin")
-                    self.assertEqual(
-                        metadata["skills_metadata"][0]["path"],
-                        f"{environment.builtin_skills_source}/wandrun-ui/SKILL.md",
-                    )
-                    detail = environment.backend.read(
-                        f"{environment.builtin_skills_source}/wandrun-ui/display.md",
+                    self.assertEqual(prepared, [])  # Metadata never opens a remote session.
+                    skill, = metadata["skills_metadata"]
+                    self.assertEqual(skill["description"], "Remote builtin")
+                    self.assertTrue(skill["path"].startswith(environment.builtin_skills_source + "/"))
+                    resource.write_text("changed on gateway\n", encoding="utf-8")
+                    detail = await environment.backend.aread(
+                        str(Path(skill["path"]).with_name("display.md")),
                     )
                     self.assertIsNone(detail.error)
-                    self.assertIn("snapshot-731", detail.file_data["content"])
-                    (builtin / "display.md").write_text("changed on host\n", encoding="utf-8")
-                    self.assertIn(
-                        "snapshot-731", environment.backend.read(
-                            f"{environment.builtin_skills_source}/wandrun-ui/display.md",
-                        ).file_data["content"],
+                    self.assertIn("package-731", detail.file_data["content"])
+                    updated = await selected.abefore_agent(metadata, None, {})
+                    updated_skill, = updated["skills_metadata"]
+                    self.assertNotEqual(updated_skill["path"], skill["path"])
+                    changed = await environment.backend.aread(
+                        str(Path(updated_skill["path"]).with_name("display.md")),
                     )
-                    self.assertIn(
-                        "User text.", environment.backend.read(
-                            f"{environment.skills_source}/wandrun-ui/SKILL.md",
-                        ).file_data["content"],
-                    )
-            self.assertIn("User text.", user.read_text())
-            with patch.object(environments.asyncssh, "connect", connect), \
-                    patch.object(environments.SSHBackend, "start", start), \
-                    patch.object(environments, "sftp_client", sftp_client):
-                async with open_ssh("remote", definition, workspace, {"wandrun-ui"}) as environment:
+                    self.assertIsNone(changed.error)
+                    self.assertIn("changed on gateway", changed.file_data["content"])
+                    original = await environment.backend.aread(str(Path(skill["path"]).with_name("display.md")))
+                    self.assertIn("package-731", original.file_data["content"])
+                self.assertEqual(len(prepared), 1)
+                self.assertTrue(prepared[0]._closed)
+                # A later graph without the builtin may select the same user's name.
+                async with open_instabox("remote", definition, workspace) as environment:
                     self.assertIsNone(environment.builtin_skills_source)
                     self.assertEqual(environment.builtin_skills, frozenset())
-                    self.assertFalse((remote_root / ".wandrun" / "builtin-skills" / "wandrun-ui").exists())
-                    self.assertIn(
-                        "User text.", environment.backend.read(
-                            f"{environment.skills_source}/wandrun-ui/SKILL.md",
-                        ).file_data["content"],
+                    selected = _ConfiguredSkillsMiddleware(
+                        environment.backend, ("wandrun-ui",), environment.skills_source,
+                        skill_packages=environment.skill_packages,
                     )
+                    metadata = await selected.abefore_agent({}, None, {})
+                    skill, = metadata["skills_metadata"]
+                    self.assertEqual(skill["description"], "User description")
+                    detail = await environment.backend.aread(skill["path"])
+                    self.assertIsNone(detail.error)
+                    self.assertIn("User text.", detail.file_data["content"])
+            self.assertIn("User text.", user.read_text())
 
 if __name__ == "__main__":
     unittest.main()

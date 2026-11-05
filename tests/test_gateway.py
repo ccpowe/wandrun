@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from unittest.mock import patch
 from pathlib import Path
 from typing import TypedDict
 from types import SimpleNamespace
+from uuid import uuid4
 
 import httpx
 from langchain.messages import AIMessage
@@ -24,6 +26,8 @@ from wandrun.runtime.communication.scheduler_store import SchedulerStore
 from wandrun.runtime.session import Runtime
 from wandrun.runtime.communication.workers import WorkerManager
 from wandrun.runtime.execution.workspace import Workspace
+from wandrun.runtime.execution.files import TaskFiles
+from deepagents.backends.protocol import ExecuteResponse
 
 from test_gateway_models import subscription_fixture
 from codex_test_home import isolate_codex_home
@@ -82,9 +86,47 @@ class GatewayStoreTests(unittest.TestCase):
     def setUp(self):
         self.store = open_store(self, temp_dir(self) / "gateway.sqlite")
 
+    def test_conversation_creation_receipt_survives_restart_and_resource_deletion(self):
+        path = temp_dir(self) / "creation.sqlite"
+        with closing(GatewayStore(path)) as store:
+            store.import_agents(sample_catalog())
+            original, event = store.create_conversation("新对话", "main", "create-once")
+            self.assertEqual(event.client_id, "create-once")
+            store.rename_conversation(original["id"], "之后改名")
+            store.begin_delete(original["id"], {original["id"]})
+            store.finish_delete(original["id"])
+        with closing(GatewayStore(path)) as store:
+            replayed, event = store.create_conversation("新对话", "main", "create-once")
+            self.assertEqual(replayed, original)
+            self.assertIsNone(event)
+            self.assertIsNone(store.conversation(original["id"]))
+            with self.assertRaises(ClientIdConflict):
+                store.by_client_id("create-once")
+            with self.assertRaises(ClientIdConflict):
+                store.create_conversation("不同标题", "main", "create-once")
+
+    def test_conversation_creation_rolls_back_all_rows_before_retry(self):
+        insert = self.store._insert_conversation
+
+        def interrupted(*args, **kwargs):
+            insert(*args, **kwargs)
+            raise OSError("interrupted transaction")
+
+        with patch.object(self.store, "_insert_conversation", interrupted):
+            with self.assertRaises(OSError):
+                self.store.create_conversation("新对话", "main", "atomic-create")
+        self.assertEqual(self.store.conversations(), [])
+        self.assertIsNone(self.store.by_client_id("atomic-create"))
+        conversation, event = self.store.create_conversation("新对话", "main", "atomic-create")
+        self.assertEqual(event.conversation_id, conversation["id"])
+        self.assertEqual(
+            [item.client_id for item in self.store.after(0) if item.type == "conversation.created"],
+            ["atomic-create"],
+        )
+
     def test_seq_is_global_and_history_pages_backwards(self):
-        first, _ = self.store.create_conversation("一", "main")
-        second, _ = self.store.create_conversation("二", "main")
+        first, _ = self.store.create_conversation("一", "main", client_id=uuid4().hex)
+        second, _ = self.store.create_conversation("二", "main", client_id=uuid4().hex)
         for index in range(3):
             self.store.append(first["id"], "message.user", {"text": f"a{index}"})
         self.store.append(second["id"], "message.user", {"text": "b"})
@@ -97,7 +139,7 @@ class GatewayStoreTests(unittest.TestCase):
         self.assertEqual([e.data.get("text") for e in older], [None, "a0"])
 
     def test_client_id_replays_and_rejects_reuse(self):
-        conversation, _ = self.store.create_conversation("新对话", "main")
+        conversation, _ = self.store.create_conversation("新对话", "main", client_id=uuid4().hex)
         event, created = self.store.append(conversation["id"], "message.user", {"text": "hi"}, client_id="c1")
         again, created_again = self.store.append(conversation["id"], "message.user", {"text": "x"}, client_id="c1")
         self.assertTrue(created)
@@ -107,7 +149,7 @@ class GatewayStoreTests(unittest.TestCase):
             self.store.append(conversation["id"], "turn.stopped", {}, client_id="c1")
 
     def test_read_position_moves_forward_within_existing_events(self):
-        conversation, _ = self.store.create_conversation("新对话", "main")
+        conversation, _ = self.store.create_conversation("新对话", "main", client_id=uuid4().hex)
         reply, _ = self.store.append(conversation["id"], "message.agent", {"text": "完成了"})
         self.assertTrue(self.store.conversation(conversation["id"])["unread"])
         with self.assertRaises(InvalidReadPosition):
@@ -119,8 +161,8 @@ class GatewayStoreTests(unittest.TestCase):
         self.assertTrue(self.store.conversation(conversation["id"])["unread"])
 
     def test_last_agent_seq_tracks_only_this_root_timeline_and_survives_reads(self):
-        first, _ = self.store.create_conversation("一", "main")
-        second, _ = self.store.create_conversation("二", "main")
+        first, _ = self.store.create_conversation("一", "main", client_id=uuid4().hex)
+        second, _ = self.store.create_conversation("二", "main", client_id=uuid4().hex)
         self.assertEqual(first["last_agent_seq"], 0)
         reply, _ = self.store.append(first["id"], "message.agent", {"text": "根回复"})
         self.store.append(second["id"], "message.agent", {"text": "另一对话"})
@@ -140,7 +182,7 @@ class GatewayStoreTests(unittest.TestCase):
         )
 
     def test_status_column_and_event_change_together(self):
-        conversation, _ = self.store.create_conversation("新对话", "main")
+        conversation, _ = self.store.create_conversation("新对话", "main", client_id=uuid4().hex)
         self.assertEqual(conversation["status"], "idle")
         self.assertIsNone(self.store.set_status(conversation["id"], "idle"))
         event = self.store.set_status(conversation["id"], "working")
@@ -200,10 +242,10 @@ class AgentStoreTests(unittest.TestCase):
     def test_conversation_needs_an_existing_entry_agent_and_filters_by_it(self):
         store = open_store(self, temp_dir(self) / "gateway.sqlite")
         with self.assertRaises(UnknownAgent):
-            store.create_conversation("x", "nobody")
+            store.create_conversation("x", "nobody", client_id=uuid4().hex)
         self.assertEqual(store.after(0), [])  # 拒绝时不留事件
-        in_a, created = store.create_conversation("甲", "a")
-        in_c, _ = store.create_conversation("乙", "c")
+        in_a, created = store.create_conversation("甲", "a", client_id=uuid4().hex)
+        in_c, _ = store.create_conversation("乙", "c", client_id=uuid4().hex)
         self.assertEqual(in_a["agent_id"], "a")
         self.assertEqual(created.data["agent_id"], "a")
         self.assertEqual([c["id"] for c in store.conversations("c")], [in_c["id"]])
@@ -259,6 +301,26 @@ class EnsureAgentsTests(unittest.TestCase):
         self.workspace.agents_config.unlink()
         ensure_agents(self.store, *self.paths)
         self.assertEqual(len(self.store.agents()), 5)
+
+    def test_reserved_local_cloud_binding_fails_before_first_import_and_can_be_corrected(self):
+        self.write_agents()
+        self.workspace.environments_config.write_text(
+            'default = "local"\n[environments.local]\ntype = "instabox"\n'
+            f'machine_id = "m_{"a" * 26}"\nworkdir = "/data/home/wandrun"\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError):
+            ensure_agents(self.store, *self.paths)
+        self.assertFalse(self.store.has_imported_agents())
+        self.assertFalse(self.store.has_agents())
+        self.assertEqual(self.store.environment_definitions(), {})
+        self.workspace.environments_config.write_text(
+            'default = "local"\n[environments.local]\ntype = "local"\n', encoding="utf-8",
+        )
+        ensure_agents(self.store, *self.paths)
+        self.assertTrue(self.store.has_imported_agents())
+        self.assertEqual(self.store.agent_catalog().agents["main"].environment, "local")
+        self.assertEqual(self.store.environment_definitions()["local"].type, "local")
 
     def test_invalid_config_fails_startup_and_leaves_library_empty(self):
         self.write_agents('[agents.d2]\ndescription = "x"\nsystem_prompt = "p"\nmodel = "m"\nworkers = ["ghost"]\n')
@@ -316,6 +378,33 @@ class ServeStartupTests(unittest.IsolatedAsyncioTestCase):
         finally:
             store.close()
 
+    async def test_invalid_machine_identity_never_imports_and_fixed_config_starts_lazily(self):
+        self.workspace.agents_config.write_text(
+            'main_agent = "main"\n[agents.main]\ndescription = "d"\nsystem_prompt = "p"\nmodel = "offline"\n',
+            encoding="utf-8",
+        )
+        remote = self.workspace.root / "remote"
+        bad_environment = (
+            'default = "cloud"\n[environments.cloud]\ntype = "instabox"\n'
+            f'machine_id = "m_existing"\nworkdir = {json.dumps(str(remote))}\n'
+        )
+        self.workspace.environments_config.write_text(bad_environment, encoding="utf-8")
+        with self.assertRaises(ValueError):
+            await self.serve()
+        with closing(GatewayStore(self.workspace.state_dir / "gateway.sqlite")) as store:
+            self.assertFalse(store.has_imported_agents())
+            self.assertFalse(store.has_agents())
+            self.assertEqual(store.environment_definitions(), {})
+        machine = "m_" + "a" * 26
+        self.workspace.environments_config.write_text(
+            bad_environment.replace("m_existing", machine), encoding="utf-8",
+        )
+        await self.serve()
+        with closing(GatewayStore(self.workspace.state_dir / "gateway.sqlite")) as store:
+            self.assertTrue(store.has_imported_agents())
+            self.assertEqual(store.environment_definitions()["cloud"].machine_id, machine)
+        self.assertFalse(remote.exists())
+
     async def test_external_agents_config_is_checked_against_the_workspace_environments(self):
         # 外部 agents.toml 引用了只存在于它旁边 environments.toml 的环境：
         # 导入校验不能因为“同目录”而放行，否则装配时才失败并留下坏定义。
@@ -336,15 +425,16 @@ class ServeStartupTests(unittest.IsolatedAsyncioTestCase):
             environments_config=self.external / "environments.toml",
         )
 
-    async def test_imported_definitions_stay_when_assembly_later_fails(self):
+    async def test_imported_environment_bindings_survive_missing_deployment_alias_on_restart(self):
         await self.serve(
             agents_config=self.external / "agents.toml",
             mcps_config=self.external / "mcps.toml",
             environments_config=self.external / "environments.toml",
         )
-        # 之后环境文件被改坏：装配失败，但库是 Agent 的唯一来源，已导入的定义不回滚。
-        with self.assertRaisesRegex(ValueError, "external"):
-            await self.serve()
+        # 已持久化的可信绑定不依赖静态别名继续存在，也不会改写环境文件。
+        before = self.workspace.environments_config.read_bytes()
+        await self.serve()
+        self.assertEqual(self.workspace.environments_config.read_bytes(), before)
         self.assertTrue(self.stored_agents())
 
     async def test_cancelled_startup_waits_for_deletion_before_closing_runtime(self):
@@ -357,7 +447,7 @@ class ServeStartupTests(unittest.IsolatedAsyncioTestCase):
         path = self.workspace.state_dir / "gateway.sqlite"
         with closing(GatewayStore(path)) as store:
             store.import_agents(sample_catalog())
-            identity = store.create_conversation("待续删", "main")[0]["id"]
+            identity = store.create_conversation("待续删", "main", client_id=uuid4().hex)[0]["id"]
             store.begin_delete(identity, {identity})
 
         entered, release, draining = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -451,7 +541,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.manager = gateway_manager(self.gateway, run)
         self.addAsyncCleanup(self.manager.close)
         self.addCleanup(self.gateway.end_streams)
-        self.conversation = self.gateway.create_conversation("测试", "main")["id"]
+        self.conversation = self.gateway.create_conversation("测试", "main", client_id=uuid4().hex)[0]["id"]
 
     def statuses(self) -> list[str]:
         return [e.data["status"] for e in self.store.history(self.conversation, limit=100) if e.type == "conversation.status"]
@@ -547,7 +637,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             return await cancel(task_id)
 
         self.manager.cancel = slow_cancel
-        other = self.gateway.create_conversation("另一个", "main")["id"]
+        other = self.gateway.create_conversation("另一个", "main", client_id=uuid4().hex)[0]["id"]
         self.block = True
         self.gateway.send_message(self.conversation, "m1", "长任务")
         await asyncio.wait_for(self.entered.wait(), 2)
@@ -736,7 +826,7 @@ class EntryAgentTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.gateway.end_streams)
 
     async def converse(self, agent_id: str, text: str, client_id: str) -> str:
-        identity = self.gateway.create_conversation("t", agent_id)["id"]
+        identity = self.gateway.create_conversation("t", agent_id, client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(identity, client_id, text)
         await self.manager.wait(identity)
         return identity
@@ -769,7 +859,7 @@ class EntryAgentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_entry_agent_is_rejected_without_a_failure(self):
         with self.assertRaises(UnknownAgent):
-            self.gateway.create_conversation("t", "nobody")
+            self.gateway.create_conversation("t", "nobody", client_id=uuid4().hex)[0]
         self.assertIsNone(self.gateway.failure)  # 预期的拒绝不是网关致命失败
         self.assertEqual(self.store.conversations(), [])
 
@@ -826,7 +916,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
 
     async def test_send_replay_history_and_listing_with_status(self):
-        created = await self.client.post("/conversations", json={"title": "新对话", "agent_id": "main"})
+        created = await self.client.post("/conversations", json={"client_id": uuid4().hex, "title": "新对话", "agent_id": "main"})
         self.assertEqual(created.status_code, 201)
         identity = created.json()["id"]
         self.assertEqual(created.json()["status"], "idle")
@@ -852,7 +942,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status_code, 404)
         invalid = await self.client.post("/conversations", content=b"[1]")
         self.assertEqual(invalid.json()["error"]["code"], "invalid_json")
-        identity = (await self.client.post("/conversations", json={"agent_id": "main"})).json()["id"]
+        identity = (await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "main"})).json()["id"]
         empty = await self.client.post(f"/conversations/{identity}/messages", json={"client_id": "x", "text": " "})
         self.assertEqual(empty.status_code, 400)
         future = await self.client.post(f"/conversations/{identity}/read", json={"seq": 10**6})
@@ -869,16 +959,51 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不支持", wrong_method.json()["error"]["message"])
 
     async def test_conversation_requires_an_existing_agent_and_reports_it(self):
-        missing = await self.client.post("/conversations", json={"title": "x"})
+        missing = await self.client.post("/conversations", json={"client_id": uuid4().hex, "title": "x"})
         self.assertEqual((missing.status_code, missing.json()["error"]["code"]), (400, "invalid_request"))
-        unknown = await self.client.post("/conversations", json={"agent_id": "nobody"})
+        unknown = await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "nobody"})
         self.assertEqual((unknown.status_code, unknown.json()["error"]["code"]), (404, "not_found"))
-        created = await self.client.post("/conversations", json={"agent_id": "c"})
+        created = await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "c"})
         self.assertEqual((created.status_code, created.json()["agent_id"]), (201, "c"))
         self.assertEqual(len((await self.client.get("/conversations")).json()["conversations"]), 1)
 
+    async def test_conversation_creation_replays_same_intent_and_rejects_conflicting_parameters(self):
+        body = {"client_id": "create-intent", "agent_id": "main"}
+        first, duplicate = await asyncio.gather(
+            self.client.post("/conversations", json=body),
+            self.client.post("/conversations", json={**body, "title": " 新对话 "}),
+        )
+        self.assertEqual(sorted([first.status_code, duplicate.status_code]), [200, 201])
+        self.assertEqual(first.json(), duplicate.json())
+        identity = first.json()["id"]
+        await self.client.patch(f"/conversations/{identity}", json={"title": "新名字"})
+        replay = await self.client.post("/conversations", json=body)
+        self.assertEqual((replay.status_code, replay.json()), (200, first.json()))
+        for changes in ({"title": "其他"}, {"agent_id": "a"}):
+            rejected = await self.client.post("/conversations", json={**body, **changes})
+            self.assertEqual((rejected.status_code, rejected.json()["error"]["code"]), (409, "client_id_reused"))
+        events = [event for event in self.gateway.store.after(0) if event.type == "conversation.created"]
+        self.assertEqual([(event.conversation_id, event.client_id) for event in events], [(identity, "create-intent")])
+        self.assertEqual(len(self.gateway.store.conversations()), 1)
+
+    async def test_conversation_creation_requires_key_and_never_claims_a_message_key(self):
+        missing = await self.client.post("/conversations", json={"agent_id": "main"})
+        self.assertEqual((missing.status_code, missing.json()["error"]["code"]), (400, "invalid_request"))
+        body = {"client_id": "same-intent", "agent_id": "nobody"}
+        self.assertEqual((await self.client.post("/conversations", json=body)).status_code, 404)
+        created = await self.client.post("/conversations", json={**body, "agent_id": "main"})
+        self.assertEqual(created.status_code, 201)
+        identity = created.json()["id"]
+        message = await self.client.post(
+            f"/conversations/{identity}/messages", json={"client_id": "same-intent", "text": "hello"},
+        )
+        self.assertEqual((message.status_code, message.json()["error"]["code"]), (409, "client_id_reused"))
+        self.gateway.store.append(identity, "message.user", {"text": "stored"}, client_id="message-key")
+        rejected = await self.client.post("/conversations", json={"client_id": "message-key", "agent_id": "main"})
+        self.assertEqual((rejected.status_code, rejected.json()["error"]["code"]), (409, "client_id_reused"))
+
     async def test_rename_validates_trims_emits_once_and_preserves_user_choice(self):
-        identity = (await self.client.post("/conversations", json={"agent_id": "main"})).json()["id"]
+        identity = (await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "main"})).json()["id"]
         url = f"/conversations/{identity}"
         for title, status in (("  ", 400), ("a" * 201, 413), (42, 400)):
             self.assertEqual((await self.client.patch(url, json={"title": title})).status_code, status)
@@ -894,11 +1019,9 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.patch("/conversations/missing", json={"title": "x"})).status_code, 404)
 
     async def test_auto_title_only_first_accepted_message_and_explicit_default_rename_blocks_it(self):
-        auto = (await self.client.post("/conversations", json={"agent_id": "main"})).json()["id"]
-        renamed_default = (await self.client.post("/conversations", json={"agent_id": "main"})).json()["id"]
-        custom = (await self.client.post(
-            "/conversations", json={"agent_id": "main", "title": "自定标题"}
-        )).json()["id"]
+        auto = (await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "main"})).json()["id"]
+        renamed_default = (await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "main"})).json()["id"]
+        custom = (await self.client.post("/conversations", json={"client_id": uuid4().hex, **{"agent_id": "main", "title": "自定标题"}})).json()["id"]
         same = await self.client.patch(f"/conversations/{renamed_default}", json={"title": " 新对话 "})
         self.assertIsNone(same.json()["event"])
         text = " \n 你好\n第二行 " + "🍋" * 30
@@ -927,7 +1050,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_conversations_filter_by_agent(self):
         for agent_id in ("a", "c", "c"):
-            await self.client.post("/conversations", json={"agent_id": agent_id})
+            await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": agent_id})
         in_c = (await self.client.get("/conversations", params={"agent_id": "c"})).json()
         self.assertEqual([c["agent_id"] for c in in_c["conversations"]], ["c", "c"])
         self.assertEqual((await self.client.get("/conversations", params={"agent_id": "b"})).json()["conversations"], [])
@@ -947,13 +1070,13 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         missing = await self.client.get("/agents/nobody")
         self.assertEqual((missing.status_code, missing.json()["error"]["code"]), (404, "not_found"))
 
-    # ---- 首页：GET /agents 的派生视图与移出首页 ----
+    # ---- Agent 列表：持久顺序与对话摘要 ----
 
     async def agents_by_id(self) -> dict:
         return {item["id"]: item for item in (await self.client.get("/agents")).json()["agents"]}
 
     async def new_conversation(self, agent_id: str, title: str = "新对话") -> str:
-        response = await self.client.post("/conversations", json={"agent_id": agent_id, "title": title})
+        response = await self.client.post("/conversations", json={"client_id": uuid4().hex, **{"agent_id": agent_id, "title": title}})
         return response.json()["id"]
 
     async def say(self, conversation_id: str, text: str, client_id: str) -> None:
@@ -964,22 +1087,19 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.wait(conversation_id)
         await asyncio.sleep(0)
 
-    async def on_home(self, agent_id: str) -> bool:
-        return (await self.agents_by_id())[agent_id]["home"]
-
-    async def test_home_item_summarizes_latest_conversation_and_sorts_by_activity(self):
+    async def test_agent_activity_updates_summary_without_reordering_agents(self):
         fresh = await self.agents_by_id()
         self.assertEqual(list(fresh), ["main", "a", "b", "c", "d"])  # 都没对话：保持导入顺序
-        self.assertTrue(all(i["home"] and i["latest_conversation"] is None and not i["unread"] for i in fresh.values()))
+        self.assertTrue(all(i["latest_conversation"] is None and not i["unread"] for i in fresh.values()))
         in_c = await self.new_conversation("c", "乙")
         in_a = await self.new_conversation("a", "甲")
         await self.say(in_a, "你好", "m1")
         self.gateway.on_human(in_a, "收到", [])
         listing = (await self.client.get("/agents")).json()["agents"]
-        # 有活动的在前；c 只有还没发消息的空对话，和没对话的一起按导入顺序排在后面。
-        self.assertEqual([i["id"] for i in listing], ["a", "main", "b", "c", "d"])
+        # 聊天活动不改变已确认的手排顺序。
+        self.assertEqual([i["id"] for i in listing], list(fresh))
         self.assertEqual(next(i for i in listing if i["id"] == "c")["latest_conversation"]["id"], in_c)
-        a = listing[0]
+        a = next(i for i in listing if i["id"] == "a")
         self.assertEqual(a["latest_conversation"]["id"], in_a)
         self.assertEqual(
             (a["latest_conversation"]["title"], a["latest_conversation"]["last_text"], a["latest_conversation"]["status"]),
@@ -989,7 +1109,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(a["unread"])
         self.assertFalse(next(i for i in listing if i["id"] == "c")["unread"])  # c 的对话还没有 Agent 消息
         await self.say(in_c, "轮到 c", "m2")
-        self.assertEqual([i["id"] for i in (await self.client.get("/agents")).json()["agents"]][:2], ["c", "a"])
+        self.assertEqual([i["id"] for i in (await self.client.get("/agents")).json()["agents"]], list(fresh))
         # 已读后红点消失（沿用对话的未读口径）
         await self.client.post(f"/conversations/{in_a}/read", json={"seq": self.gateway.store.last_seq()})
         self.assertFalse((await self.agents_by_id())["a"]["unread"])
@@ -1002,7 +1122,6 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         await self.say(new_a, "新消息", "m2")
         await self.say(await self.new_conversation("c", "乙"), "乙的消息", "m3")
         before = (await self.client.get("/agents")).json()["agents"]
-        self.assertEqual([i["id"] for i in before[:2]], ["c", "a"])
         self.assertEqual(before[1]["latest_conversation"]["id"], new_a)
         # 仅旧对话的状态变化（以及已读）：顺序、摘要的对话、时间都不变，状态字段照实反映。
         store.set_status(old_a, "working")
@@ -1023,10 +1142,16 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         stale = (await self.agents_by_id())["a"]["latest_conversation"]
         self.assertEqual((stale["id"], stale["last_activity_seq"], stale["last_activity_at"]), (old, first.seq, 200))
         with patch("wandrun.gateway.store.time.time", return_value=199):
-            later, _ = store.append(new, "message.agent", {"text": "新回复"})
+            later, _ = store.append(new, "message.user", {"text": "新消息"})
+        # AI 回复不是活动：不改 seq / 时间，但仍是对话最后一条文字。
+        with patch("wandrun.gateway.store.time.time", return_value=250):
+            store.append(new, "message.agent", {"text": "新回复"})
         store.set_status(new, "working")
         store.mark_read(new, store.last_seq())
-        await self.new_conversation("a", "空对话")
+        empty = await self.new_conversation("a", "空对话")
+        other = await self.new_conversation("c", "另一个 Agent 的空对话")
+        with patch("wandrun.gateway.store.time.time", return_value=300):
+            store.rename_conversation(old, "只改名，不算活动")
         listing = await self.agents_by_id()
         self.assertEqual(listing["a"], store.agent_item("a"))
         self.assertEqual(listing["a"]["latest_conversation"], {
@@ -1036,6 +1161,56 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(later.seq, first.seq)
         self.assertLess(later.seq, store.last_seq())
         self.assertFalse(listing["a"]["unread"])
+        conversations = {
+            item["id"]: item for item in (await self.client.get("/conversations")).json()["conversations"]
+        }
+        self.assertEqual(set(conversations), {old, new, empty, other})
+        self.assertEqual(
+            (conversations[old]["last_activity_seq"], conversations[old]["last_activity_at"]),
+            (first.seq, 200),
+        )
+        self.assertEqual(
+            (conversations[new]["last_activity_seq"], conversations[new]["last_activity_at"]),
+            (later.seq, 199),
+        )
+        self.assertEqual(
+            (conversations[empty]["last_activity_seq"], conversations[empty]["last_activity_at"]),
+            (None, None),
+        )
+
+    async def test_ai_reply_is_unread_but_not_activity_and_schedule_and_task_user_message_are(self):
+        store = self.gateway.store
+        first = await self.new_conversation("a", "先")
+        second = await self.new_conversation("a", "后")
+        sent, _ = store.append(first, "message.user", {"text": "我先发"})
+        store.append(second, "message.user", {"text": "我后发"})
+        reply, _ = store.append(first, "message.agent", {"text": "AI 回复"})
+        by_id = {c["id"]: c for c in store.conversations()}
+        # first 有未读回复，但活动仍是用户发送；second 更新，所以仍在最上。
+        self.assertEqual((by_id[first]["last_activity_seq"], by_id[first]["unread"]), (sent.seq, True))
+        self.assertGreater(by_id[second]["last_activity_seq"], by_id[first]["last_activity_seq"])
+        self.assertEqual(by_id[first]["last_agent_seq"], reply.seq)
+        # 定时触发推进（它是用户设置的任务）。
+        trigger, _ = store.append(first, "schedule.triggered", {"schedule_id": "s", "run_id": "r", "name": "n"})
+        self.assertEqual(store.conversation(first)["last_activity_seq"], trigger.seq)
+        # 浏览器请求接管不推进，只有 requested 红点由 App 另算。
+        store.append(second, "browser_task.updated", {"state": "requested", "entered_requested": True})
+        self.assertLess(store.conversation(second)["last_activity_seq"], trigger.seq)
+        # 成员之间的消息与成员 Agent 回复（带 timeline_ids）不推进；用户在子对话里的插话推进根。
+        before = store.conversation(second)["last_activity_seq"]
+        store.append(second, "message.task", {"task_id": "t", "timeline_ids": ["t"], "text": "内部"})
+        store.append(second, "message.agent", {"task_id": "t", "timeline_ids": ["t"], "text": "成员回复"})
+        self.assertEqual(store.conversation(second)["last_activity_seq"], before)
+        interject, _ = store.append(second, "message.user", {"task_id": "t", "timeline_ids": ["t"], "text": "插话"})
+        self.assertEqual(store.conversation(second)["last_activity_seq"], interject.seq)
+
+    async def test_root_with_only_ai_reply_has_no_activity_but_is_unread(self):
+        store = self.gateway.store
+        only_reply = await self.new_conversation("a", "只有回复")
+        store.append(only_reply, "message.agent", {"text": "你好"})
+        row = store.conversation(only_reply)
+        self.assertEqual((row["last_activity_seq"], row["last_activity_at"], row["unread"], row["last_text"]),
+                         (None, None, True, "你好"))
 
     async def test_empty_new_conversation_does_not_change_ranking_or_summary(self):
         in_a = await self.new_conversation("a", "有内容")
@@ -1043,9 +1218,9 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         await self.say(await self.new_conversation("c", "乙"), "更新", "m2")
         await self.new_conversation("a", "空的")  # a 下新建、还没发消息
         listing = (await self.client.get("/agents")).json()["agents"]
-        self.assertEqual([i["id"] for i in listing[:2]], ["c", "a"])  # 排序不变
+        self.assertEqual([i["id"] for i in listing], ["main", "a", "b", "c", "d"])
         self.assertEqual(listing[1]["latest_conversation"]["id"], in_a)  # 有活动的对话才是摘要
-        # 只有空对话的 Agent：摘要指向最新创建的空对话，没有活动时间，排在没有活动的一组里（导入顺序）。
+        # 只有空对话时摘要指向最新创建的空对话，没有产品活动时间。
         empty = await self.new_conversation("b", "只有空的")
         by_id = await self.agents_by_id()
         self.assertEqual(by_id["b"]["latest_conversation"]["id"], empty)
@@ -1053,96 +1228,66 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(by_id["b"]["latest_conversation"]["last_activity_seq"])
         self.assertIsNone(by_id["b"]["latest_conversation"]["last_text"])
         order = [i["id"] for i in (await self.client.get("/agents")).json()["agents"]]
-        self.assertEqual(order, ["c", "a", "main", "b", "d"])
-        await self.say(empty, "b 的第一条", "m3")  # 发了消息才有活动
-        self.assertEqual([i["id"] for i in (await self.client.get("/agents")).json()["agents"]][0], "b")
+        self.assertEqual(order, ["main", "a", "b", "c", "d"])
+        await self.say(empty, "b 的第一条", "m3")
+        self.assertEqual([i["id"] for i in (await self.client.get("/agents")).json()["agents"]], order)
 
-    async def test_hide_returns_to_home_only_on_new_messages_in_its_own_conversations(self):
-        in_a = await self.new_conversation("a")
-        hidden = await self.client.post("/agents/a/hide")
-        self.assertEqual((hidden.status_code, hidden.json()["home"]), (200, False))
-        self.assertFalse(await self.on_home("a"))
-        # 查看、已读、状态变化、新建对话都不是新事件。
-        self.gateway.on_human(in_a, "移出之后的新回复", [])  # 新的 Agent 消息：回到首页
-        self.assertTrue(await self.on_home("a"))
-        await self.client.post("/agents/a/hide")
-        self.assertFalse(await self.on_home("a"))
-        await self.client.post(f"/conversations/{in_a}/read", json={"seq": self.gateway.store.last_seq()})
-        self.gateway.store.set_status(in_a, "working")
-        self.gateway.store.set_status(in_a, "idle")
-        await self.new_conversation("a")  # 新建了对话但还没发消息
-        self.assertFalse(await self.on_home("a"))
-        newest = (await self.client.get("/conversations", params={"agent_id": "a"})).json()["conversations"][0]["id"]
-        await self.say(newest, "第一条消息", "m1")  # 发了第一条消息才回首页
-        self.assertTrue(await self.on_home("a"))
-
-    async def test_hide_then_agent_reply_returns_to_home(self):
-        in_a = await self.new_conversation("a")
-        await self.client.post("/agents/a/hide")
-        self.gateway.on_human(in_a, "Agent 的回复", [])
-        self.assertTrue(await self.on_home("a"))
-        self.assertTrue(await self.on_home("c"))  # 没动过的 Agent 一直在首页
-
-    async def test_work_delegated_to_a_member_does_not_bring_it_home(self):
+    async def test_member_work_does_not_become_its_root_conversation_summary(self):
         in_c = await self.new_conversation("c")
-        await self.client.post("/agents/a/hide")
         await self.say(in_c, "给 a 做", "m1")
         member = self.manager.start("请 a 处理", sender_id=in_c, agent_name="a")["task_id"]
         await self.manager.wait(member)
+        root_history = self.gateway.store.history(in_c, limit=100)
+        root_summary = self.gateway.store.conversation(in_c)
         self.gateway.on_human(member, "a 作为成员的回复", [])
         events = [e for e in self.gateway.store.task_history(member) if e.type == "message.agent"]
         self.assertEqual([e.data["agent"] for e in events], ["a"])
-        previews = [e for e in self.gateway.store.history(in_c, limit=100) if e.type == "message.task_preview"]
-        self.assertEqual([e.data["task_id"] for e in previews], [member])
-        self.assertFalse(await self.on_home("a"))
+        self.assertEqual(self.gateway.store.history(in_c, limit=100), root_history)
+        self.assertEqual(self.gateway.store.conversation(in_c), root_summary)
         self.assertIsNone((await self.agents_by_id())["a"]["latest_conversation"])
-        self.assertTrue(await self.on_home("c"))
 
-    async def test_hide_and_unhide_are_idempotent(self):
-        seq = self.gateway.store.last_seq()
-        first = await self.client.post("/agents/b/hide")
-        again = await self.client.post("/agents/b/hide")
-        self.assertEqual((first.status_code, again.status_code), (200, 200))
-        self.assertEqual(self.gateway.store.last_seq(), seq + 1)  # 重复移出不再产生事件
-        self.assertFalse(again.json()["home"])
-        back = await self.client.post("/agents/b/unhide")
-        self.assertTrue(back.json()["home"])
-        self.assertEqual(self.gateway.store.last_seq(), seq + 2)
-        await self.client.post("/agents/b/unhide")
-        await self.client.post("/agents/main/unhide")  # 从没移出过
-        self.assertEqual(self.gateway.store.last_seq(), seq + 2)
-        for path in ("/agents/nobody/hide", "/agents/nobody/unhide"):
-            response = await self.client.post(path)
-            self.assertEqual((response.status_code, response.json()["error"]["code"]), (404, "not_found"))
-
-    async def test_hide_events_are_resumable_and_belong_to_no_conversation(self):
+    async def test_atomic_order_conflict_invalid_members_and_resumable_list_event(self):
+        snapshot = (await self.client.get("/agents")).json()
+        original = [item["id"] for item in snapshot["agents"]]
+        order = list(reversed(original))
         in_a = await self.new_conversation("a")
         after = self.gateway.store.last_seq()
-        await self.client.post("/agents/a/hide")
-        await self.client.post("/agents/a/unhide")
-        stream = self.gateway.stream(after, heartbeat=60)  # 断线重连：从上次的 seq 补
+        saved = await self.client.put("/agents/order", json={
+            "agent_ids": order, "expected_revision": snapshot["order_revision"],
+        })
+        self.assertEqual(saved.status_code, 200)
+        current = saved.json()
+        self.assertEqual([item["id"] for item in current["agents"]], order)
+        self.assertGreater(current["order_revision"], snapshot["order_revision"])
+        conflict = await self.client.put("/agents/order", json={
+            "agent_ids": original, "expected_revision": snapshot["order_revision"],
+        })
+        self.assertEqual((conflict.status_code, conflict.json()["error"]["code"]),
+                         (409, "agent_order_conflict"))
+        for invalid in (order[:-1], order + [order[0]], ["unknown", *order[1:]]):
+            rejected = await self.client.put("/agents/order", json={
+                "agent_ids": invalid, "expected_revision": current["order_revision"],
+            })
+            self.assertEqual(rejected.status_code, 400)
+        self.assertEqual((await self.client.get("/agents")).json(), current)
+        stream = self.gateway.stream(after, heartbeat=60)
         await anext(stream)
-        received = [payload async for kind, payload in self._take(stream, 2)]
-        self.assertEqual([e["type"] for e in received], ["resource.changed"] * 2)
-        self.assertEqual([e["data"] for e in received], [
-            {"kind": "agent", "id": "a", "op": "hidden"}, {"kind": "agent", "id": "a", "op": "unhidden"},
-        ])
-        self.assertTrue(all("conversation_id" not in e for e in received))
+        kind, event = await asyncio.wait_for(anext(stream), 2)
+        await stream.aclose()
+        self.assertEqual(event["data"], {
+            "kind": "agent_order", "op": "updated", "order_revision": current["order_revision"],
+        })
+        self.assertNotIn("conversation_id", event)
         self.assertEqual([e.type for e in self.gateway.store.history(in_a)], ["conversation.created"])
 
-    @staticmethod
-    async def _take(stream, count):
-        for _ in range(count):
-            yield await asyncio.wait_for(anext(stream), 2)
-
     async def test_commands_after_runtime_closed_are_unavailable(self):
-        identity = (await self.client.post("/conversations", json={"agent_id": "main"})).json()["id"]
+        identity = (await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "main"})).json()["id"]
         await self.manager.close()
         response = await self.client.post(f"/conversations/{identity}/messages", json={"client_id": "x", "text": "y"})
         self.assertEqual((response.status_code, response.json()["error"]["code"]), (503, "unavailable"))
 
     async def test_state_write_failure_at_settlement_is_fatal_for_the_gateway(self):
-        identity = (await self.client.post("/conversations", json={"agent_id": "main"})).json()["id"]
+        identity = (await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "main"})).json()["id"]
         set_status = self.gateway.store.set_status
 
         def failing(conversation_id, status):
@@ -1169,12 +1314,12 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(drain(), 2)
         for path, payload in ((f"/conversations/{identity}/messages", {"client_id": "m2", "text": "再来"}),
                               (f"/conversations/{identity}/stop", {"client_id": "s1"}),
-                              ("/conversations", {"agent_id": "main"})):
+                              ("/conversations", {"client_id": uuid4().hex, "agent_id": "main"})):
             response = await self.client.post(path, json=payload)
             self.assertEqual((response.status_code, response.json()["error"]["code"]), (503, "unavailable"))
 
     async def test_integer_beyond_sqlite_range_is_a_request_error(self):
-        identity = (await self.client.post("/conversations", json={"agent_id": "main"})).json()["id"]
+        identity = (await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "main"})).json()["id"]
         response = await self.client.get(f"/conversations/{identity}/events", params={"before": 2**63})
         self.assertEqual((response.status_code, response.json()["error"]["code"]), (400, "invalid_request"))
         ok = await self.client.get(f"/conversations/{identity}/events", params={"before": 2**63 - 1})
@@ -1216,6 +1361,25 @@ class GatewayErrorProjectionTests(unittest.TestCase):
                 self.assertIn(expected, public)
                 self.assertNotIn("private", public)
 
+    def test_credential_failures_distinguish_missing_expired_and_unavailable_login(self):
+        from wandrun.gateway.error_messages import task_failure
+        from wandrun.integrations.codex_credentials import CredentialError
+
+        for detail, category in (
+            ("Codex file login required", "尚未登录"),
+            ("Codex login must be renewed", "已失效"),
+            ("Codex credential rotation uncertain; stop the gateway and log in again", "停止网关"),
+            ("Codex credential refresh temporarily unavailable", "暂不可用"),
+            ("Codex credential file unavailable", "暂不可用"),
+            ("private diagnostic /home/private/auth.json", "暂不可用"),
+        ):
+            with self.subTest(detail=detail):
+                error = CredentialError(detail)
+                public = task_failure(f"{type(error).__name__}: {error}")
+                self.assertIn(category, public)
+                self.assertNotIn(detail, public)
+                self.assertNotIn("private", public)
+
     def test_subscription_adapter_errors_keep_actionable_status_without_response_body(self):
         from wandrun.gateway.error_messages import task_failure
         from wandrun.integrations.codex_subscription import CodexSubscriptionHTTPError, CodexSubscriptionStreamError
@@ -1250,9 +1414,9 @@ class AgentIdBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(client.aclose)
         for identity in ids:
             self.assertEqual((await client.get(f"/agents/{identity}")).status_code, 200)
-            created = await client.post("/conversations", json={"agent_id": identity})
+            created = await client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": identity})
             self.assertEqual((created.status_code, created.json()["agent_id"]), (201, identity))
-        too_long = await client.post("/conversations", json={"agent_id": "x" * 65})
+        too_long = await client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "x" * 65})
         self.assertEqual(too_long.status_code, 413)  # 超出规则上限的 id 不可能存在
 
 
@@ -1402,7 +1566,7 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(await self.checkpointer.aget_tuple(config))
 
     async def test_compaction_history_root_and_member_persists_without_waking_parent(self):
-        root = self.gateway.create_conversation("压缩", "c")["id"]
+        root = self.gateway.create_conversation("压缩", "c", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "first", "开始")
         await self.manager.wait(root)
         child = self.manager.start("成员处理", sender_id=root, agent_name="a")["task_id"]
@@ -1448,7 +1612,7 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
                              [item.data for item in rows])
 
     async def test_startup_reconciles_checkpoint_compaction_events_and_deletion_blocks_replay(self):
-        root = self.gateway.create_conversation("恢复", "c")["id"]
+        root = self.gateway.create_conversation("恢复", "c", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "first", "开始")
         await self.manager.wait(root)
         child = self.manager.start("成员处理", sender_id=root, agent_name="a")["task_id"]
@@ -1465,7 +1629,7 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
             {"configurable": {"thread_id": child}},
             durability="sync",
         )
-        empty = self.gateway.create_conversation("尚未发送消息", "c")["id"]
+        empty = self.gateway.create_conversation("尚未发送消息", "c", client_id=uuid4().hex)[0]["id"]
         self.assertEqual(self.manager.get(empty)["status"], "not_found")
         self.assertEqual(self.manager.branch_threads(empty), {empty})
         self.assertFalse(any(item.type == "context.compacted" for item in self.store.history(root)))
@@ -1487,7 +1651,7 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.history(root), [])
 
     async def test_startup_reconciliation_skips_tasks_whose_agent_was_removed(self):
-        root = self.gateway.create_conversation("保留的对话", "c")["id"]
+        root = self.gateway.create_conversation("保留的对话", "c", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "first", "开始")
         await self.manager.wait(root)
         child = self.manager.start("成员处理", sender_id=root, agent_name="a")["task_id"]
@@ -1507,7 +1671,7 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(item.type == "context.compacted" for item in self.store.history(root)))
 
     async def test_startup_reconciles_sqlite_pending_compaction_write(self):
-        root = self.gateway.create_conversation("恢复待合并写入", "c")["id"]
+        root = self.gateway.create_conversation("恢复待合并写入", "c", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "first", "开始")
         await self.manager.wait(root)
         child = self.manager.start("成员处理", sender_id=root, agent_name="a")["task_id"]
@@ -1547,16 +1711,14 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(self.scheduler_path)) as db:
             return {row[0] for row in db.execute("SELECT task_id FROM tasks")}
 
-    async def test_idle_and_empty_delete_replays_recomputes_home_and_stream(self):
-        first = self.gateway.create_conversation("旧", "a")["id"]
-        second = self.gateway.create_conversation("新", "a")["id"]
+    async def test_idle_and_empty_delete_replays_recomputes_summary_and_stream(self):
+        first = self.gateway.create_conversation("旧", "a", client_id=uuid4().hex)[0]["id"]
+        second = self.gateway.create_conversation("新", "a", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(first, "old", "旧消息")
         await self.manager.wait(first)
         self.gateway.send_message(second, "new", "新消息")
         await self.manager.wait(second)
         await self.checkpoint(second)
-        self.gateway.set_agent_on_home("a", False)
-        self.assertFalse(self.store.agent_item("a")["home"])
         cursor = self.store.last_seq()
         response = await self.client.delete(f"/conversations/{second}")
         event = response.json()["event"]
@@ -1568,18 +1730,17 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.checkpointer.aget_tuple({"configurable": {"thread_id": second}}))
         self.assertEqual(self.scheduler_ids(), {first})
         self.assertEqual(self.store.agent_item("a")["latest_conversation"]["id"], first)
-        self.assertFalse(self.store.agent_item("a")["home"])  # 全局墓碑不算带回首页的产品活动
         self.assertFalse(self.store.history(second))
         stream = self.gateway.stream(cursor, heartbeat=60)
         await anext(stream)
         self.assertEqual(await anext(stream), ("event", event))
         await stream.aclose()
-        empty = self.gateway.create_conversation("空的", "c")["id"]
+        empty = self.gateway.create_conversation("空的", "c", client_id=uuid4().hex)[0]["id"]
         self.assertEqual((await self.client.delete(f"/conversations/{empty}")).status_code, 200)
         self.assertIsNone(self.store.agent_item("c")["latest_conversation"])
 
     async def test_running_descendants_and_stop_race_cleanup_before_forget(self):
-        root = self.gateway.create_conversation("工作", "c")["id"]
+        root = self.gateway.create_conversation("工作", "c", client_id=uuid4().hex)[0]["id"]
         self.block = True
         self.gateway.send_message(root, "m", "开始")
         await self.entered.wait()
@@ -1606,8 +1767,116 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.store.conversation(root))
         self.assertEqual(self.store.after(0)[-1].type, "conversation.deleted")
 
+    async def test_delete_after_stop_browser_failure_keeps_serving_and_deletes_locally(self):
+        from wandrun.runtime.browser.leases import BrowserRejected
+        root = self.gateway.create_conversation("先停止再删除", "main", client_id=uuid4().hex)[0]["id"]
+        self.gateway.send_message(root, "run", "开始")
+        await self.manager.wait(root)
+        await self.checkpoint(root)
+        started, release, deleting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def close(scope):
+            if root in scope:
+                started.set()
+                await release.wait()
+                raise BrowserRejected("Chrome unavailable")
+
+        begin = self.store.begin_delete
+        def begin_delete(identity, threads):
+            begin(identity, threads)
+            deleting.set()
+
+        self.manager.add_cancel_hook(close)
+        self.store.begin_delete = begin_delete
+        stopping = asyncio.create_task(self.gateway.stop(root, "stop-before-delete"))
+        await asyncio.wait_for(started.wait(), 2)
+        deletion = asyncio.create_task(self.client.delete(f"/conversations/{root}"))
+        await asyncio.wait_for(deleting.wait(), 2)
+        release.set()
+        with self.assertRaises(BrowserRejected):
+            await stopping
+        response = await asyncio.wait_for(deletion, 2)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["event"]["data"]["cleanup_unconfirmed"])
+        self.assertIsNone(self.gateway.failure)
+        self.assertIsNone(self.store.conversation(root))
+        self.assertEqual(self.store.history(root), [])
+        self.assertEqual(self.store.pending_deletions(), [])
+        self.assertNotIn(root, self.scheduler_ids())
+        self.assertIsNone(await self.checkpointer.aget_tuple({"configurable": {"thread_id": root}}))
+        other = self.gateway.create_conversation("继续服务", "main", client_id=uuid4().hex)[0]["id"]
+        self.gateway.send_message(other, "other", "仍可运行")
+        await self.manager.wait(other)
+        self.assertEqual(self.store.conversation(other)["status"], "idle")
+
+    async def delete_during_stop(self, root, *, stop_error=None):
+        started, release, deleting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        first = True
+
+        async def cleanup(scope):
+            nonlocal first
+            if not first:
+                return []
+            first = False
+            started.set()
+            await release.wait()
+            if stop_error is not None:
+                raise stop_error
+            return ["memory:unconfirmed-staging"]
+
+        begin = self.store.begin_delete
+        def begin_delete(identity, threads):
+            begin(identity, threads)
+            deleting.set()
+
+        self.manager.add_stop_hook(cleanup)
+        self.store.begin_delete = begin_delete
+        stopping = asyncio.create_task(self.gateway.stop(root, "stop-before-delete"))
+        await asyncio.wait_for(started.wait(), 2)
+        deletion = asyncio.create_task(self.client.delete(f"/conversations/{root}"))
+        await asyncio.wait_for(deleting.wait(), 2)
+        release.set()
+        return await asyncio.gather(stopping, deletion, return_exceptions=True)
+
+    async def test_existing_stop_report_is_preserved_when_delete_cleanup_later_succeeds(self):
+        root = self.gateway.create_conversation("停止回执未确认", "main", client_id=uuid4().hex)[0]["id"]
+        stopped, response = await self.delete_during_stop(root)
+        self.assertEqual(stopped[0].data["cleanup_unconfirmed"], ["memory:unconfirmed-staging"])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["event"]["data"]["cleanup_unconfirmed"], [
+            {"stage": "branch", "task_id": root, "error": "CleanupUnconfirmed"},
+        ])
+        self.assertIsNone(self.gateway.failure)
+
+    async def test_existing_stop_mixed_internal_error_still_fails_delete(self):
+        from wandrun.runtime.browser.leases import BrowserRejected
+        root = self.gateway.create_conversation("混合故障", "main", client_id=uuid4().hex)[0]["id"]
+        stopped, response = await self.delete_during_stop(root, stop_error=ExceptionGroup(
+            "resource and internal", [BrowserRejected("Chrome unavailable"), ValueError("internal invariant")],
+        ))
+        self.assertIsInstance(stopped, ExceptionGroup)
+        self.assertEqual(response.status_code, 503)
+        self.assertIsInstance(self.gateway.failure, GatewayFailure)
+        self.assertIsNotNone(self.store.conversation(root))
+        self.assertEqual(self.store.pending_deletions(), [root])
+
+    async def test_existing_stop_local_event_write_failure_still_fails_delete(self):
+        root = self.gateway.create_conversation("本地写失败", "main", client_id=uuid4().hex)[0]["id"]
+        append = self.store.append
+        def fail_stopped(identity, type, *args, **kwargs):
+            if type == "turn.stopped":
+                raise OSError("local event write failed")
+            return append(identity, type, *args, **kwargs)
+        self.store.append = fail_stopped
+        stopped, response = await self.delete_during_stop(root)
+        self.assertIsInstance(stopped, GatewayFailure)
+        self.assertEqual(response.status_code, 503)
+        self.assertIsInstance(self.gateway.failure.__cause__, OSError)
+        self.assertIsNotNone(self.store.conversation(root))
+        self.assertEqual(self.store.pending_deletions(), [root])
+
     async def test_new_descendant_after_intent_is_added_before_checkpoint_deletion(self):
-        root = self.gateway.create_conversation("竞争", "c")["id"]
+        root = self.gateway.create_conversation("竞争", "c", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "m", "任务")
         await self.manager.wait(root)
         await self.checkpoint("late-child")
@@ -1624,7 +1893,7 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.scheduler_ids(), set())
 
     async def test_deleting_rejects_commands_and_shared_waiters_survive_cancellation(self):
-        root = self.gateway.create_conversation("并发", "main")["id"]
+        root = self.gateway.create_conversation("并发", "main", client_id=uuid4().hex)[0]["id"]
         self.block = True
         self.gateway.send_message(root, "m", "长任务")
         await self.entered.wait()
@@ -1659,32 +1928,88 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.type, "conversation.deleted")
         self.assertIsNone(self.store.conversation(root))
 
-    async def test_unconfirmed_cleanup_is_fatal_and_durable_for_restart(self):
-        root = self.gateway.create_conversation("未确认", "main")["id"]
+    async def test_remote_directory_cleanup_failure_deletes_locally_without_stopping_gateway(self):
+        for failure in (OSError("SSH channel closed"), TimeoutError("remote timeout"),
+                        ExecuteResponse(output="Instabox [recovery]: channel rebuilt", exit_code=1)):
+            with self.subTest(failure=failure):
+                root = self.gateway.create_conversation("远端未确认", "main", client_id=uuid4().hex)[0]["id"]
+                self.gateway.send_message(root, uuid4().hex, "任务")
+                await self.manager.wait(root)
+                await self.checkpoint(root)
+
+                async def execute(command):
+                    if isinstance(failure, Exception):
+                        raise failure
+                    return failure
+
+                self.gateway.runtime.files = TaskFiles(
+                    self.directory, self.manager, {"main": ("cloud", "/remote")},
+                    conversation_workdirs=True, remote_backends={"main": SimpleNamespace(aexecute=execute)},
+                )
+                response = await self.client.delete(f"/conversations/{root}")
+                self.assertEqual(response.status_code, 200, response.text)
+                event = response.json()["event"]
+                self.assertTrue(event["data"]["cleanup_unconfirmed"])
+                self.assertEqual(event["data"]["cleanup_unconfirmed"][0]["environment"], "cloud")
+                self.assertIsNone(self.gateway.failure)
+                self.assertIsNone(self.store.conversation(root))
+                self.assertNotIn(root, self.scheduler_ids())
+                self.assertIsNone(await self.checkpointer.aget_tuple({"configurable": {"thread_id": root}}))
+                self.assertEqual((await self.client.delete(f"/conversations/{root}")).json()["event"], event)
+                with closing(GatewayStore(self.directory / "gateway.sqlite")) as reopened:
+                    self.assertEqual(reopened.deleted_event(root).to_dict(), event)
+                other = self.gateway.create_conversation("继续服务", "main", client_id=uuid4().hex)[0]["id"]
+                self.gateway.send_message(other, uuid4().hex, "仍可运行")
+                await self.manager.wait(other)
+                self.assertEqual(self.store.conversation(other)["status"], "idle")
+
+    async def test_startup_finishes_pending_delete_with_unconfirmed_branch_cleanup(self):
+        root = self.gateway.create_conversation("未确认", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "m", "任务")
         await self.manager.wait(root)
         await self.checkpoint(root)
+        self.store.begin_delete(root, {root})
 
         async def unconfirmed(scope):
             return ["remote process could not be confirmed"]
 
         self.manager.add_stop_hook(unconfirmed)
-        with self.assertRaises(GatewayFailure):
-            await self.gateway.delete_conversation(root)
-        self.assertIsNotNone(self.store.conversation(root))
-        self.assertEqual(self.store.deletion_threads(root), [root])
-        self.assertIsNotNone(await self.checkpointer.aget_tuple({"configurable": {"thread_id": root}}))
-        self.assertEqual(self.scheduler_ids(), {root})
-        await self.manager.close()
-        restarted_store = open_store(self, self.directory / "gateway.sqlite", seeded=False)
-        restarted = Gateway(restarted_store)
-        self.open_manager(restarted)
-        await restarted.resume_deletions()
-        self.assertIsNone(restarted_store.conversation(root))
+        await self.gateway.resume_deletions()
+        event = self.store.deleted_event(root)
+        self.assertEqual(event.data["cleanup_unconfirmed"][0]["stage"], "branch")
+        self.assertIsNone(self.gateway.failure)
+        self.assertIsNone(self.store.conversation(root))
+        self.assertEqual(self.store.pending_deletions(), [])
+        self.assertIsNone(await self.checkpointer.aget_tuple({"configurable": {"thread_id": root}}))
         self.assertEqual(self.scheduler_ids(), set())
+        self.assertEqual(await self.gateway.delete_conversation(root), event)
+
+    async def test_browser_close_failure_still_settles_workers_and_deletes_branch(self):
+        from wandrun.runtime.browser.leases import BrowserRejected
+        root = self.gateway.create_conversation("浏览器未确认", "main", client_id=uuid4().hex)[0]["id"]
+        self.block = True
+        self.gateway.send_message(root, "run", "运行中")
+        await self.entered.wait()
+        await self.checkpoint(root)
+
+        async def close(*args, **kwargs):
+            raise BrowserRejected("Chrome unavailable")
+
+        class Browser:
+            list_tasks = lambda _: [{"root_id": root, "task_id": root, "state": "agent"}]
+            close_task = staticmethod(close)
+
+        self.gateway.runtime.browsers = {"main": Browser()}
+        self.manager.add_cancel_hook(close)
+        event = await self.gateway.delete_conversation(root)
+        self.assertEqual([item["stage"] for item in event.data["cleanup_unconfirmed"]], ["browser", "branch"])
+        self.assertIsNone(self.gateway.failure)
+        self.assertEqual(self.manager.get(root)["status"], "not_found")
+        self.assertEqual(self.scheduler_ids(), set())
+        self.assertIsNone(self.store.conversation(root))
 
     async def test_checkpoint_delete_failure_preserves_branch_until_recovery(self):
-        root = self.gateway.create_conversation("检查点故障", "main")["id"]
+        root = self.gateway.create_conversation("检查点故障", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "m", "任务")
         await self.manager.wait(root)
         await self.checkpoint(root)
@@ -1710,7 +2035,7 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.checkpointer.aget_tuple({"configurable": {"thread_id": root}}))
 
     async def test_failure_keeps_intent_and_restart_finishes_without_duplicate_event(self):
-        root = self.gateway.create_conversation("故障", "main")["id"]
+        root = self.gateway.create_conversation("故障", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "first", "开始")
         await self.manager.wait(root)
         await self.checkpoint(root)

@@ -1,6 +1,7 @@
 import type { FileRecord, SearchResult } from "../gateway/api.ts";
 import { assertNotAborted } from "./abort.ts";
 import { UserFacingError } from "./user-error.ts";
+import { chatLocation } from "./chat-route.ts";
 
 /** Only passive image formats and ordinary text are rendered inside the app. */
 export function previewKind(file: Pick<FileRecord, "media_type">): "image" | "text" | "other" {
@@ -172,12 +173,12 @@ export class DeliveryCache {
 
 export function searchDestination(result: SearchResult):
   | { pathname: "/agents/[id]"; params: { id: string } }
-  | { pathname: "/c/[id]"; params: { id: string; message_seq?: string } }
+  | ReturnType<typeof chatLocation>
   | { pathname: "/files/[id]"; params: { id: string } } {
   switch (result.kind) {
     case "agent": return { pathname: "/agents/[id]", params: { id: result.id } };
-    case "conversation": return { pathname: "/c/[id]", params: { id: result.id } };
-    case "message": return { pathname: "/c/[id]", params: { id: result.task_id ?? result.conversation_id, message_seq: String(result.seq) } };
+    case "conversation": return chatLocation(result.id);
+    case "message": return chatLocation(result.task_id ?? result.conversation_id, result.seq);
     case "file": return { pathname: "/files/[id]", params: { id: result.id } };
   }
 }

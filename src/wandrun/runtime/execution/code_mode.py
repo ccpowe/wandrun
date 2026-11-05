@@ -26,6 +26,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.errors import GraphBubbleUp
 
 from wandrun.runtime.agent.tool_search import SEARCH_LIMIT, ToolNamespace, relevance, search_terms
+from wandrun.runtime.execution.files import _current_task
 
 CODE_TOOL = "run_code"
 DEFAULT_TIMEOUT = 60
@@ -148,6 +149,7 @@ class _Execution:
     def __init__(self, timeout: float, trace_context: dict | None = None):
         self.timeout = timeout
         self.trace_context = trace_context
+        self.task_id = _current_task.get()
         self.calls: set[asyncio.Task] = set()
         self.records: list[dict] = []
         self.dropped_records = 0
@@ -167,6 +169,7 @@ class _Execution:
             self.dropped_records += 1
         task = asyncio.current_task()
         self.calls.add(task)
+        token = _current_task.set(self.task_id) if self.task_id is not None else None
         try:
             if self.trace_context is None or span_inputs is None:
                 result = await operation()
@@ -198,6 +201,8 @@ class _Execution:
             return result
         finally:
             self.calls.discard(task)
+            if token is not None:
+                _current_task.reset(token)
 
     async def close(self) -> None:
         """拒绝新调用，取消并等待未完成的调用；收尾期间再次取消不截断，等收尾结束后再传播。"""

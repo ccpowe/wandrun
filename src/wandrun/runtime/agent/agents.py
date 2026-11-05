@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 from typing import Annotated, NotRequired
 
 from deepagents.backends import CompositeBackend
-from deepagents.backends.protocol import LsResult
+from deepagents.backends.protocol import FileDownloadResponse, LsResult
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import (
     SKILLS_SYSTEM_PROMPT, SkillsMiddleware, _skill_metadata_from_response,
@@ -44,11 +44,13 @@ from wandrun.runtime.execution.files import TaskBackend, TaskFiles, TaskPathMidd
 from wandrun.runtime.execution.process_tools import CommandMiddleware
 from wandrun.runtime.execution.code_mode import CodeModeCatalog, CodeModeMiddleware
 from wandrun.runtime.execution.environments import Environment
+from wandrun.runtime.execution.skills import SkillPackages
 from wandrun.runtime.context.compaction import CompactionMiddleware, CompactionState
 from wandrun.runtime.context.compaction_archive import CompactionArchive
 from wandrun.runtime.agent.tool_search import ToolNamespace, ToolSearchMiddleware
 from wandrun.runtime.context.memory import MemoryStore
 from wandrun.runtime.context.memory_runtime import MemoryMiddleware
+from wandrun.runtime.context.environment_runtime import ObservedEnvironmentMiddleware
 from wandrun.runtime.communication.workers import CommunicationMiddleware, current_execution_generation
 from wandrun.runtime.browser.leases import BrowserLeases
 from wandrun.runtime.browser.tools import BrowserTakeoverMiddleware
@@ -69,7 +71,11 @@ COMMUNICATION = """
 - 以运行时注入的身份为准，回信使用来信中的 to 和 task_id。被委派的任务完成、受阻
   或需要决定时，用结构化消息回复创建者；只结束本轮（done）不会通知对方。
 - attachments 是交付的原文件路径数组，无附件时为 []；不列草稿，相对路径基于发送任务
-  工作目录。同环境成员可共享文件；SSH 与本机 human 跨环境不能通过路径传文件，不会自动复制。
+  工作目录。同一物理环境的成员共享原文件；不同环境由系统将原文件复制到接收方 Backend，
+  来信包含接收方可读路径。发给 human 的远端文件完整取回网关，之后预览、下载不依赖远端在线。
+  普通正文里的文件路径不代表已交付；文件须通过 attachments 取得逐项回执。
+- 用户上传引用先保存在网关；需要时用 fetch_upload(upload_id) 显式获取到自己的执行环境，
+  再使用返回路径。获取不接受其他环境、URL 或宿主文件路径，同名文件不覆盖。
 - 回执分别报告文字投递和逐附件结果；accepted 只表示运行时接收、投递的结果：
   true 接收、false 拒绝、null 未知，不表示工作完成。null 时不要自动重发，先按回执提示判断。
   已成功的消息或附件不要重发，部分失败只纠正失败项。无消息时 messages 为 []。
@@ -170,14 +176,22 @@ class _ConfiguredSkillsMiddleware(SkillsMiddleware):
     Selection precedence changes only discovery, not the user's files or configuration.
     Fingerprints include environment paths because local builtin directories change on restart;
     identical bytes must not retain a checkpoint's now-deleted SKILL.md path.
+    Instabox metadata uses gateway-owned complete snapshots without touching its backend.
     """
 
     def __init__(
         self, backend, names: tuple[str, ...], source: str, *,
         builtin_source: str | None = None, builtin_names: Collection[str] = (),
+        skill_packages: SkillPackages | None = None,
     ):
+        self._packages = skill_packages
+        if skill_packages is not None:
+            source = skill_packages.skills_source
+            builtin_source = skill_packages.builtin_skills_source
         reserved = set(builtin_names) if builtin_source is not None else set()
         self._sources = {source: tuple(name for name in names if name not in reserved)}
+        self._package_names = self._sources[source]
+        self._builtin_names = tuple(sorted(reserved))
         if builtin_source is not None and reserved:
             self._sources[builtin_source] = tuple(sorted(reserved))
         self._selection = [name for selected in self._sources.values() for name in selected]
@@ -188,21 +202,38 @@ class _ConfiguredSkillsMiddleware(SkillsMiddleware):
         )
 
     async def abefore_agent(self, state, runtime, config):
-        # Read through the environment backend: SSH skills remain the startup snapshot until
-        # the environment is reopened, even if the host's source files have changed.
-        paths = [
-            str(PurePosixPath(source) / name / "SKILL.md")
-            for source, names in self._sources.items() for name in names
-        ]
-        responses = await self._backend.adownload_files(paths) if paths else []
-        # A new runtime may stage identical content at a different local path. Refresh the
-        # persisted metadata in that case, but keep SSH paths tied to their startup snapshot.
-        fingerprints = [
-            f"{path}:sha256:{sha256(response.content).hexdigest()}"
-            if response.error is None and response.content is not None
-            else f"{path}:error:{response.error or 'missing_content'}"
-            for path, response in zip(paths, responses, strict=True)
-        ]
+        package_errors = []
+        if self._packages is not None:
+            try:
+                snapshots = self._packages.snapshot(self._package_names, builtin_names=self._builtin_names)
+            except (OSError, ValueError) as error:
+                snapshots = ()
+                package_errors.append(
+                    f"Cannot load configured gateway skill packages ({type(error).__name__}); "
+                    "请在网关检查所选技能的文件、权限和符号链接；未发布不完整的技能包。"
+                )
+            paths = [snapshot.path for snapshot in snapshots]
+            responses = [
+                FileDownloadResponse(path=snapshot.path, content=snapshot.document)
+                for snapshot in snapshots
+            ]
+            fingerprints = [f"{snapshot.path}:sha256:{snapshot.version}" for snapshot in snapshots]
+            if package_errors:
+                fingerprints.append(f"package-error:{package_errors[0]}")
+        else:
+            # Local skills are discovered through the bound filesystem backend.
+            paths = [
+                str(PurePosixPath(source) / name / "SKILL.md")
+                for source, names in self._sources.items() for name in names
+            ]
+            responses = await self._backend.adownload_files(paths) if paths else []
+            # Local builtin staging paths can change across runtime restarts.
+            fingerprints = [
+                f"{path}:sha256:{sha256(response.content).hexdigest()}"
+                if response.error is None and response.content is not None
+                else f"{path}:error:{response.error or 'missing_content'}"
+                for path, response in zip(paths, responses, strict=True)
+            ]
         if (
             state.get("skills_selection") == self._selection
             and state.get("skills_fingerprints") == fingerprints
@@ -218,18 +249,18 @@ class _ConfiguredSkillsMiddleware(SkillsMiddleware):
         # bulk loader lets YAML RecursionError escape and abort otherwise valid skills.
         # Keep its metadata parser, but turn this file-level failure into a model warning.
         skills = {}
-        errors = []
+        errors = list(package_errors)
         listings = {}
-        for source, names in self._sources.items():
-            if not names:
-                continue
-            listing = await self._backend.als(source)
-            listings[source] = listing
-            if listing.error:
-                errors.append(f"Cannot load skills from '{source}': {listing.error}")
+        if self._packages is None:
+            for source, names in self._sources.items():
+                if not names:
+                    continue
+                listing = await self._backend.als(source)
+                listings[source] = listing
+                if listing.error:
+                    errors.append(f"Cannot load skills from '{source}': {listing.error}")
         for path, response in zip(paths, responses, strict=True):
-            source = str(PurePosixPath(path).parent.parent)
-            if listings[source].entries is None:
+            if self._packages is None and listings[str(PurePosixPath(path).parent.parent)].entries is None:
                 continue
             try:
                 skill = _skill_metadata_from_response(response, str(PurePosixPath(path).parent), path)
@@ -352,6 +383,7 @@ class ConversationState(CompactionState):
     skills_fingerprints: NotRequired[Annotated[list[str], PrivateStateAttr]]
     memory_versions: NotRequired[Annotated[dict[str, str], PrivateStateAttr]]
     memory_permissions: NotRequired[Annotated[dict[str, str], PrivateStateAttr]]
+    observed_environment: NotRequired[Annotated[dict, PrivateStateAttr]]
 
 
 @wrap_model_call
@@ -391,8 +423,7 @@ def build_agents(
     code_pool=None,
     memory: MemoryStore | None = None,
     files: TaskFiles | None = None,
-    browser: BrowserLeases | None = None,
-    browser_environments: Collection[str] = (),
+    browsers: Mapping[str, BrowserLeases] | None = None,
     model_context_windows: Mapping[str, int] | None = None,
     on_compaction: Callable[[str, dict], None] | None = None,
 ) -> dict[str, AgentAssembly]:
@@ -407,8 +438,8 @@ def build_agents(
     model_context_windows 是可见模型目录的当前窗口；角色显式窗口覆盖目录，同名模型切换随图重建解析。
     缺可信窗口时仅禁用压缩，不禁用对话。on_compaction 在失败时由中间件报告。
     每个初建/候选图只解析一次条件；未重建的角色由调用方复用原装配。
-    browser 与 browser_environments 分别提供原资源 owner 和配置了浏览器的环境名称；
-    角色的技能选择在解析时决定，工具、backend 和执行前注册共用该结果。
+    browsers 按配置环境名称提供共享 owner；图只保留所选环境的实例，
+    工具、backend 和执行前注册共用该不可变绑定。
     """
     if model_max_retries < 0:
         raise ValueError("model_max_retries 不能小于 0")
@@ -421,7 +452,8 @@ def build_agents(
         namespaces = (searchable or {}).get(name, ())
         capabilities = resolve_capabilities(
             definition, environment, memory=memory, files=files, searchable=namespaces,
-            browser=browser, browser_environments=browser_environments,
+            browser=(browsers or {}).get(definition.environment),
+            browser_environments=(environment.name,) if (browsers or {}).get(definition.environment) else (),
             entry_capabilities=entry_capabilities,
         )
         role_browser = capabilities.browser
@@ -431,7 +463,7 @@ def build_agents(
             backend = memory_middleware.wrap_backend(backend)
         if capabilities.enabled("task_path"):
             backend = TaskBackend(
-                backend, lambda task_id, role=name: files.directory(task_id, role), browser=role_browser,
+                backend, files, browser=role_browser,
             )
         # 无路由的组合 backend 只用来指定内部产物根目录；文件操作和 execute 原样交给环境 backend。
         filesystem = FilesystemMiddleware(
@@ -451,11 +483,14 @@ def build_agents(
 
         if memory_middleware is not None:
             install("memory", memory_middleware)
-        middleware.extend([CommunicationMiddleware(manager), thread_cache_key])
+        middleware.extend([
+            CommunicationMiddleware(manager), ObservedEnvironmentMiddleware(environment), thread_cache_key,
+        ])
         middleware.append(_ConfiguredSkillsMiddleware(
             backend, tuple(skill for skill in definition.skills if skill not in environment.builtin_skills),
             environment.skills_source,
             builtin_source=environment.builtin_skills_source,
+            skill_packages=environment.skill_packages,
             builtin_names={
                 skill for capability in entry_capabilities if capabilities.enabled(capability.id)
                 for skill in capability.builtin_skills
@@ -537,11 +572,7 @@ def build_agents(
         graph = create_agent(
             model=models[name],
             tools=role_tools,
-            system_prompt="\n\n".join(
-                part for part in (
-                    _system_prompt(name, definitions), environment.description,
-                ) if part
-            ),
+            system_prompt=_system_prompt(name, definitions),
             response_format=ProviderStrategy(
                 AgentOutput.model_json_schema(), strict=True
             ),

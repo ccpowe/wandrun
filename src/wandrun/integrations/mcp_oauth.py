@@ -12,9 +12,10 @@ import math
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
 import httpx2
 from pydantic import PrivateAttr
@@ -124,6 +125,9 @@ class _Pending:
     callback: asyncio.Future
     task: asyncio.Task | None = None
     error: OAuthIssue | None = None
+    return_url: str | None = None
+    # Public correlation only: never expose the SDK state or a provider's device_code.
+    transaction_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 @dataclass
@@ -135,6 +139,7 @@ class _DevicePending:
     published: asyncio.Future
     expires_at: float = 0
     task: asyncio.Task | None = None
+    transaction_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 class _Storage:
@@ -245,7 +250,7 @@ class ConnectorOAuth:
 
     def status(self, identity: str, auth_type: str) -> dict:
         if auth_type != "oauth":
-            return {"status": "not_required", "authorizing": False, "scopes": []}
+            return {"status": "not_required", "authorizing": False, "transaction_id": None, "scopes": []}
         generation, record = self.store.oauth_record(identity)
         pending = self._pending.get(identity)
         if pending is not None and (pending.expires_at <= time.time() or pending.task and pending.task.done()):
@@ -256,9 +261,10 @@ class ConnectorOAuth:
         status = record.get("status", "unauthorized") if record else "unauthorized"
         if record and not self._matches_redirect(record) and status == "authorized":
             status, token = "reauthorization_required", None
-        result = {"status": status, "authorizing": pending is not None or (
-                      device is not None and not device.stop.is_set()),
-                  "scopes": (token.get("scope") or "").split() if token else []}
+        transaction_id = (pending.transaction_id if pending is not None else
+                          device.transaction_id if device is not None and not device.stop.is_set() else None)
+        result = {"status": status, "authorizing": transaction_id is not None,
+                  "transaction_id": transaction_id, "scopes": (token.get("scope") or "").split() if token else []}
         error = self._device_errors.get(identity)
         if error is not None and error[0] == generation:
             result["error"] = {"code": error[1].code, "message": str(error[1])}
@@ -275,15 +281,17 @@ class ConnectorOAuth:
             and record.get("tokens") and self._matches_redirect(record)
             and record.get("url") == resource_url
         )
-    async def _discover(self, url: str) -> dict:
+    async def discover(self, url: str, *, response=None, require_dcr: bool = True) -> dict:
+        """Discover without credentials or registration; probes may inspect non-DCR servers."""
         if not _safe_url(url):
             raise OAuthIssue("unsupported_oauth", "OAuth 服务必须使用 HTTPS", 400)
         try:
             async with httpx2.AsyncClient(timeout=10, follow_redirects=False) as client:
-                response = await client.get(url, headers={"Accept": "application/json, text/event-stream"})
+                if response is None:
+                    response = await client.get(url, headers={"Accept": "application/json, text/event-stream"})
                 if response.status_code == 429 or response.status_code >= 500:
                     raise OAuthIssue("oauth_unavailable", "OAuth 服务暂时不可用", 503)
-                if response.status_code != 401:
+                if response.status_code not in (401, 403):
                     raise OAuthIssue("unsupported_oauth", "远端未提供 OAuth 挑战")
                 challenge = extract_resource_metadata_from_www_auth(response)
                 candidates = build_protected_resource_metadata_discovery_urls(challenge, url)
@@ -304,7 +312,13 @@ class ConnectorOAuth:
                         break
                 if prm is None and transient:
                     raise OAuthIssue("oauth_unavailable", "资源元数据服务暂时不可用", 503)
-                if prm is None or not check_resource_allowed(url, str(prm.resource)):
+                if prm is None:
+                    parts = urlsplit(url)
+                    prm_url = candidates[0]
+                    prm = ProtectedResourceMetadata(
+                        resource=url, authorization_servers=[f"{parts.scheme}://{parts.netloc}"],
+                    )
+                if not check_resource_allowed(url, str(prm.resource)):
                     raise OAuthIssue("unsupported_oauth", "受保护资源元数据不匹配")
                 if not prm.authorization_servers:
                     raise OAuthIssue("unsupported_oauth", "资源未声明授权服务器")
@@ -329,12 +343,12 @@ class ConnectorOAuth:
                     raise OAuthIssue("oauth_unavailable", "授权元数据服务暂时不可用", 503)
                 if asm is None or str(asm.issuer) != issuer:
                     raise OAuthIssue("unsupported_oauth", "授权服务器 issuer 不匹配")
-                if not asm.registration_endpoint or "S256" not in (asm.code_challenge_methods_supported or []):
+                if require_dcr and (not asm.registration_endpoint or "S256" not in (asm.code_challenge_methods_supported or [])):
                     raise OAuthIssue("unsupported_oauth", "该服务暂不支持 DCR 与 PKCE S256 接入")
                 endpoints = [asm.authorization_endpoint, asm.token_endpoint, asm.registration_endpoint]
                 if asm.revocation_endpoint:
                     endpoints.append(asm.revocation_endpoint)
-                if any(not _safe_url(str(endpoint), origin=issuer) for endpoint in endpoints):
+                if any(not _safe_url(str(endpoint), origin=issuer) for endpoint in endpoints if endpoint):
                     raise OAuthIssue("unsupported_oauth", "授权服务器端点不安全")
                 scope = response.headers.get("www-authenticate", "")
                 import re
@@ -350,19 +364,20 @@ class ConnectorOAuth:
         except (httpx2.HTTPError, ValueError, KeyError) as error:
             raise OAuthIssue("oauth_unavailable", "无法安全发现 OAuth 服务", 503) from None
 
-    async def start(self, identity: str, url: str) -> dict:
+    async def start(self, identity: str, url: str, *, return_url: str | None = None) -> dict:
         if self._closing:
             raise OAuthIssue("oauth_unavailable", "授权服务正在关闭", 503)
         self.cancel(identity)
         self._device_attempts[identity] = self._device_attempts.get(identity, 0) + 1
         self._device_errors.pop(identity, None)
-        metadata = await self._discover(url)
+        metadata = await self.discover(url)
         if self._closing:
             raise OAuthIssue("oauth_unavailable", "授权服务正在关闭", 503)
         generation, _ = self.store.oauth_record(identity)
         loop = asyncio.get_running_loop()
         pending = _Pending(identity, generation, "", metadata["issuer"], self.redirect,
                            time.time() + 600, loop.create_future(), loop.create_future())
+        pending.return_url = return_url
         self._pending[identity] = pending
         self.store.connector_status_changed(identity)
         if self.on_change:
@@ -456,7 +471,8 @@ class ConnectorOAuth:
                     if pending.stop.is_set() or self._device_attempts.get(identity) != pending.attempt:
                         return
                     pending.published.set_result({
-                        "flow": "device_code", "authorization_url": _GITHUB_DEVICE_URL,
+                        "flow": "device_code", "transaction_id": pending.transaction_id,
+                        "authorization_url": _GITHUB_DEVICE_URL,
                         "user_code": user_code, "expires_at": pending.expires_at,
                     })
                     while time.time() < pending.expires_at:
@@ -554,7 +570,7 @@ class ConnectorOAuth:
                 raise OAuthIssue("unsupported_oauth", "授权参数与资源元数据不匹配")
             pending.state = query["state"][0]
             if not pending.published.done():
-                pending.published.set_result({"flow": "authorization_code",
+                pending.published.set_result({"flow": "authorization_code", "transaction_id": pending.transaction_id,
                                               "authorization_url": url, "expires_at": pending.expires_at,
                                               "redirect_uri": self.redirect, "manual_callback": self.manual_callback})
 
@@ -607,8 +623,12 @@ class ConnectorOAuth:
                 async with asyncio.timeout(max(0, pending.expires_at - time.time())):
                     async with httpx2.AsyncClient(auth=provider, timeout=15, follow_redirects=False,
                                                   event_hooks={"request": [guard], "response": [classify_response]}) as client:
-                        async with client.stream("GET", metadata["url"],
-                                                 headers={"Accept": "application/json, text/event-stream"}):
+                        # SDK 2.1.1 uses the request's advertised MCP version to include
+                        # RFC 8707 resource even for legacy servers without a PRM.
+                        async with client.stream("GET", metadata["url"], headers={
+                            "Accept": "application/json, text/event-stream",
+                            "MCP-Protocol-Version": "2025-06-18",
+                        }):
                             pass  # A live MCP SSE GET must not delay authorization completion.
             if self._pending.get(pending.identity) is pending:
                 self._pending.pop(pending.identity, None)
@@ -656,6 +676,20 @@ class ConnectorOAuth:
             if self.on_change:
                 self.on_change()
 
+
+    def callback_target(self, url: str) -> tuple[str, str] | None:
+        """Only the live transaction selected by a single matching state may return to App."""
+        try:
+            states = parse_qs(urlsplit(url).query, strict_parsing=True).get("state", [])
+        except ValueError:
+            return None
+        if len(states) != 1 or not states[0].isascii():
+            return None
+        pending = next((p for p in self._pending.values() if p.state and
+                        hmac.compare_digest(states[0], p.state)), None)
+        if pending is None or pending.expires_at <= time.time() or not pending.return_url:
+            return None
+        return pending.identity, pending.return_url
     async def callback(self, url: str, identity: str | None = None) -> str:
         """Validate a full URL locally; never fetch a user-supplied callback URL."""
         if len(url) > 8192 or url != url.strip() or any(ord(char) < 32 for char in url):

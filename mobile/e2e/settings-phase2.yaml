@@ -1,0 +1,105 @@
+# Storybook surface QA, not a new release/core E2E group. No model or user credentials.
+appId: host.exp.exponent
+---
+- stopApp
+- launchApp
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings--journey
+- extendedWaitUntil:
+    visible: { id: settings-connection }
+    timeout: 60000
+- takeScreenshot: ${ARTIFACTS}/01-settings-light.png
+- tapOn: { id: settings-models }
+- extendedWaitUntil:
+    visible: { id: settings-model-default }
+    timeout: 15000
+- takeScreenshot: ${ARTIFACTS}/02-models-light.png
+- tapOn: { id: settings-model-default }
+- assertVisible: { id: model-row-offline }
+- tapOn: { id: settings-model-back }
+- tapOn: { id: settings-models-back }
+- tapOn: { id: settings-skills }
+- tapOn: { id: builtin-skill-browser }
+- extendedWaitUntil:
+    visible: { id: builtin-skill-content }
+    timeout: 15000
+- takeScreenshot: ${ARTIFACTS}/03-builtin-detail.png
+- tapOn: { id: builtin-detail-back }
+- tapOn: { id: skill-skill-1 }
+- extendedWaitUntil:
+    visible: { id: skill-content }
+    timeout: 15000
+- takeScreenshot: ${ARTIFACTS}/04-skill-detail.png
+- tapOn: { id: skill-back }
+- tapOn: { id: skills-back }
+- tapOn: { id: settings-about-you }
+- extendedWaitUntil:
+    visible: ".*喜欢简洁的中文.*"
+    timeout: 15000
+- takeScreenshot: ${ARTIFACTS}/05-about-you.png
+- tapOn: { id: about-you-back }
+- scrollUntilVisible:
+    element: { id: settings-appearance }
+    direction: DOWN
+- tapOn: { id: settings-appearance }
+- assertVisible: { id: appearance-theme-system }
+- takeScreenshot: ${ARTIFACTS}/06-appearance-light.png
+- tapOn: { id: appearance-back }
+- scrollUntilVisible:
+    element: { id: settings-connection }
+    direction: UP
+- tapOn: { id: settings-connection }
+- tapOn: { id: connection-rename }
+- tapOn: { id: connection-local-name }
+- inputText: B1 Research Server
+- takeScreenshot: ${ARTIFACTS}/07-rename-keyboard.png
+- tapOn: { id: connection-rename-confirm }
+- extendedWaitUntil:
+    visible: B1 Research Server
+    timeout: 10000
+- tapOn: { id: gateway-back }
+- assertVisible: B1 Research Server
+- takeScreenshot: ${ARTIFACTS}/08-renamed-home.png
+- tapOn: { id: settings-back }
+- tapOn: { id: chat-open-drawer }
+- tapOn: { id: drawer-computer }
+- extendedWaitUntil:
+    visible: { id: settings-computer-cpu }
+    timeout: 15000
+- takeScreenshot: ${ARTIFACTS}/09-server-resources.png
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings--single-server
+- extendedWaitUntil:
+    visible: { id: settings-connection }
+    timeout: 30000
+- takeScreenshot: ${ARTIFACTS}/10-single-server.png
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings--journey-dark
+- extendedWaitUntil:
+    visible: { id: settings-connection }
+    timeout: 30000
+- takeScreenshot: ${ARTIFACTS}/11-settings-dark.png
+- tapOn: { id: settings-models }
+- extendedWaitUntil:
+    visible: { id: settings-model-default }
+    timeout: 15000
+- takeScreenshot: ${ARTIFACTS}/12-models-dark.png
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings--c-2
+- extendedWaitUntil:
+    visible: { id: connection-address }
+    timeout: 30000
+- takeScreenshot: ${ARTIFACTS}/13-connection-dark.png
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=settings-skills--c-4-many
+- extendedWaitUntil:
+    visible: { id: skill-notes }
+    timeout: 30000
+- tapOn: { id: skill-notes }
+- tapOn: { id: skill-users-summary }
+- assertVisible: { id: skill-users-sheet }
+- takeScreenshot: ${ARTIFACTS}/14-skill-users-bottom.png
+- back
+- assertNotVisible: { id: skill-users-sheet }
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=foundation-dialog--bottom-dark
+- extendedWaitUntil:
+    visible: { id: foundation-dialog-content }
+    timeout: 30000
+- takeScreenshot: ${ARTIFACTS}/15-bottom-dark.png
+- back
+- assertNotVisible: { id: foundation-dialog-content }

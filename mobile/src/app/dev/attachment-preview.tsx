@@ -1,5 +1,5 @@
 import { Redirect } from "expo-router";
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Uniwind, useUniwind } from "uniwind";
@@ -11,6 +11,7 @@ import type { FilePreview } from "@/gateway/api.ts";
 import type { ChatSession } from "@/gateway/session.ts";
 import type { AttachmentFile } from "@/lib/attachment-grid.ts";
 import type { PreviewOverrides } from "@/components/chat/attachment-media.tsx";
+import { useMountEffect } from "@/lib/use-mount-effect.ts";
 
 const previewSession = { api: undefined } as unknown as ChatSession;
 
@@ -30,6 +31,9 @@ const scenarios = [
   { id: "video-mix", title: "视频 + 图片", files: [image(1), video(1), image(2), video(2)] },
   { id: "audio", title: "音频", files: [{ id: "attachment-preview-audio", name: "meeting.m4a", size: 3 * 1024 * 1024, media_type: "audio/mp4" }] },
   { id: "pdf", title: "PDF", files: [{ id: "attachment-preview-pdf", name: "brief.pdf", size: 820 * 1024, media_type: "application/pdf" }] },
+  { id: "files", title: "5 个文件", files: Array.from({ length: 5 }, (_, index) => ({
+    id: `attachment-preview-file-${index + 1}`, name: `report-${index + 1}.txt`, size: 1024, media_type: "text/plain",
+  })) },
 ] satisfies { id: string; title: string; files: AttachmentFile[] }[];
 
 const mixedFiles: AttachmentFile[] = [
@@ -57,12 +61,11 @@ export default function AttachmentPreviewRoute() {
 function AttachmentPreviewDev() {
   const insets = useSafeAreaInsets();
   const { theme, hasAdaptiveThemes } = useUniwind();
-  const previousTheme = useRef<"light" | "dark" | "system">(hasAdaptiveThemes ? "system" : theme);
+  const [restore] = useState(() => hasAdaptiveThemes ? "system" as const : theme);
   const [selected, setSelected] = useState("5");
-  useEffect(() => {
-    const restore = previousTheme.current;
+  useMountEffect(() => {
     return () => Uniwind.setTheme(restore);
-  }, []);
+  });
   const scenario = scenarios.find((item) => item.id === selected);
   const files = selected === "mixed" ? mixedFiles : scenario?.files ?? scenarios[0].files;
 
@@ -70,17 +73,16 @@ function AttachmentPreviewDev() {
     <View className="gap-2 border-b border-border px-4 py-3">
       <View className="flex-row items-center justify-between gap-3">
         <Text className="text-lg font-semibold">附件宫格预览</Text>
-        <Button size="sm" variant="outline" accessibilityLabel="切换预览主题"
+        <Button size="sm" intent="soft" accessibilityLabel="切换预览主题"
           onPress={() => Uniwind.setTheme(theme === "dark" ? "light" : "dark")}>
           <Text>{theme === "dark" ? "浅色" : "深色"}</Text>
         </Button>
       </View>
       <Text className="text-xs text-muted-foreground">仅开发预览 · 缩略图/预览为本地 mock；无网关不可播放</Text>
       <View className="flex-row flex-wrap gap-2">
-        {scenarios.map((item) => <Button key={item.id} size="sm" variant="outline"
-          className={selected === item.id ? "border-foreground bg-muted" : "border-border"}
+        {scenarios.map((item) => <Button key={item.id} size="sm" intent={selected === item.id ? "primary" : "soft"}
           accessibilityLabel={`预览${item.title}`} onPress={() => setSelected(item.id)}><Text>{item.title}</Text></Button>)}
-        <Button size="sm" variant="outline" className={selected === "mixed" ? "border-foreground bg-muted" : "border-border"}
+        <Button size="sm" intent={selected === "mixed" ? "primary" : "soft"}
           accessibilityLabel="预览混合文件" onPress={() => setSelected("mixed")}><Text>混合文件</Text></Button>
       </View>
     </View>

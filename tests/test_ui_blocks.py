@@ -18,6 +18,8 @@ PROPS = {
     "Badge": {"text": "运行中", "tone": "active"},
     "Status": {"title": "计划", "badge": {"text": "进行中", "tone": "active"}, "progress": 20, "caption": "详情"},
     "Metrics": {"items": [{"label": "费用", "value": "100", "hint": "月"}]},
+    "StatCard": {"icon": "activity", "badge": {"text": "稳定", "tone": "success"}, "label": "完成", "value": "28", "description": "本周"},
+    "Field": {"label": "字段", "value": "固定说明"}, "ButtonRow": {}, "ScrollRow": {},
     "KeyValue": {"items": [{"label": "状态", "value": "正常"}]},
     "Steps": {"items": [{"label": "准备", "state": "done", "note": "已完成"}]},
     "Progress": {"value": 100, "caption": "已完成"},
@@ -31,7 +33,7 @@ PROPS = {
     "TextInput": {"stateKey": "choice", "label": "备注", "multiline": True},
     "DateInput": {"stateKey": "choice", "label": "日期"},
     "LineChart": {"xLabels": ["一", "二"], "series": [{"name": "完成", "values": [1, 2]}]},
-    "BarChart": {"labels": ["一"], "values": [0]},
+    "BarChart": {"labels": ["一"], "series": [{"name": "数值", "values": [0]}]},
     "PieChart": {"items": [{"label": "一", "value": 1}, {"label": "二", "value": 2}]},
     "Tabs": {"tabs": [{"label": "一"}, {"label": "二"}]},
     "Accordion": {"title": "细节"},
@@ -49,6 +51,8 @@ PROPS = {
     "Gallery": {"items": [{"url": "https://example.org/photo.png", "alt": "照片"}]},
     "Mermaid": {"source": "flowchart LR\n A --> B"},
     "Submit": {"label": "提交"},
+    "Copy": {"label": "复制", "text": "复制内容"},
+    "FollowUps": {"items": [{"label": "展开", "text": "请展开说明"}, {"label": "示例", "text": "请举例"}]},
 }
 INITIAL = {
     "ChoiceGroup": "", "Select": "", "Segmented": "", "MultiSelect": [],
@@ -68,6 +72,12 @@ def spec_for(kind: str):
         elements["root"]["children"].append("submit")
         elements["submit"] = {"type": "Submit", "props": {"label": "发送"}, "children": []}
         state["choice"] = INITIAL[kind]
+    if kind in {"Field", "ButtonRow"}:
+        elements["field"] = {"type": "TextInput", "props": deepcopy(PROPS["TextInput"]), "children": []}
+        elements["submit"] = {"type": "Submit", "props": {"label": "提交"}, "children": []}
+        elements["item"]["children"] = ["field" if kind == "Field" else "submit"]
+        elements["root"]["children"].append("submit" if kind == "Field" else "field")
+        state["choice"] = ""
     return {"root": "root", "elements": elements, "state": state}
 
 
@@ -80,6 +90,70 @@ def parse(spec):
 
 
 class CatalogTests(unittest.TestCase):
+    def test_bound_values_are_allowlisted_and_reference_existing_state(self):
+        for kind, prop in (("Text", "text"), ("Heading", "text"), ("StatCard", "value"), ("Field", "value"), ("KeyValue", "value")):
+            with self.subTest(kind=kind):
+                spec = spec_for("TextInput")
+                spec["elements"]["root"]["children"].insert(0, "bound")
+                props = deepcopy(PROPS[kind])
+                if kind == "KeyValue":
+                    props["items"][0]["value"] = {"$state": "/choice"}
+                else:
+                    props[prop] = {"$state": "/choice"}
+                if kind == "Field":
+                    spec["elements"]["root"]["children"].remove("item")
+                spec["elements"]["bound"] = {"type": kind, "props": props,
+                                              "children": ["item"] if kind == "Field" else []}
+                self.assertIsNone(parse(spec).error)
+                binding = props["items"][0]["value"] if kind == "KeyValue" else props[prop]
+                binding["$state"] = "/missing"
+                self.assertIn("$state", parse(spec).error)
+        spec = spec_for("Badge")
+        spec["elements"]["item"]["props"]["text"] = {"$state": "/choice"}
+        self.assertIsNotNone(parse(spec).error)
+
+    def test_visible_single_condition_and_action_groups(self):
+        for condition in ({"$state": "/choice"}, {"$state": "/choice", "eq": "a"},
+                          {"$state": "/choice", "neq": "", "not": True}):
+            spec = spec_for("TextInput")
+            spec["elements"]["item"]["visible"] = condition
+            self.assertIsNone(parse(spec).error)
+        for condition in (True, [{"$state": "/choice"}], {"$state": "/missing"},
+                          {"$state": "/choice", "eq": "", "neq": "a"},
+                          {"$state": "/choice", "gt": 1}, {"$state": "/choice", "eq": {"$state": "/choice"}}):
+            spec = spec_for("TextInput")
+            spec["elements"]["item"]["visible"] = condition
+            self.assertIsNotNone(parse(spec).error)
+        spec = spec_for("StatCard")
+        spec["elements"]["item"]["props"]["send"] = {"text": "第一张"}
+        spec["elements"]["second"] = deepcopy(spec["elements"]["item"])
+        spec["elements"]["second"]["props"]["send"]["text"] = "第二张"
+        spec["elements"]["root"]["children"].append("second")
+        self.assertIsNone(parse(spec).error)
+        spec["elements"]["second"] = {"type": "FollowUps", "props": deepcopy(PROPS["FollowUps"]), "children": []}
+        self.assertIsNotNone(parse(spec).error)
+        spec = spec_for("FollowUps")
+        spec["elements"]["other"] = deepcopy(spec["elements"]["item"])
+        spec["elements"]["root"]["children"].append("other")
+        self.assertIsNotNone(parse(spec).error)
+        spec = spec_for("TextInput")
+        spec["elements"]["submit"]["props"]["send"] = {"text": "不能混用"}
+        self.assertIsNotNone(parse(spec).error)
+        spec = spec_for("Submit")
+        spec["elements"]["item"]["props"]["send"] = {"text": "固定发送"}
+        self.assertIsNone(parse(spec).error)
+        spec["elements"]["item"]["props"]["send"]["text"] = " \n "
+        self.assertIsNotNone(parse(spec).error)
+
+    def test_chart_empty_single_signed_grouped_contract(self):
+        cases = json.loads((Path(__file__).parent / "fixtures/ui_charts.json").read_text(encoding="utf-8"))
+        for case in cases:
+            with self.subTest(name=case["name"]):
+                spec = {"root": "chart", "elements": {"chart": {
+                    "type": case["type"], "props": case["props"], "children": [],
+                }}, "state": {}}
+                self.assertEqual(parse(spec).spec is not None, case["valid"], parse(spec).error)
+
     def test_shared_raw_numbers_are_finite_javascript_numbers(self):
         cases = json.loads(
             (Path(__file__).parent / "fixtures/ui_numbers.json").read_text(encoding="utf-8")
@@ -101,22 +175,50 @@ class CatalogTests(unittest.TestCase):
                 else:
                     self.assertIn("Submit", CATALOG["components"])
 
-    def test_stack_justify_uses_catalog_enum_and_defaults_to_start(self):
-        self.assertEqual(CATALOG["components"]["Stack"]["props"]["properties"]["justify"]["enum"],
-                         ["start", "between"])
-        for props in ({}, {"justify": "start"}, {"justify": "between",
-                                                "direction": "horizontal", "gap": "sm"}):
-            with self.subTest(props=props):
+    def test_l3_layout_protocol_limits_and_child_ownership(self):
+        for gap in ("none", "sm", "md", "lg"):
+            for justify in ("start", "center", "end", "between"):
                 spec = spec_for("Text")
-                spec["elements"]["root"]["props"] = props
-                block = parse(spec)
-                self.assertIsNone(block.error)
-                self.assertEqual(block.spec["elements"]["root"]["props"], props)
-        for justify in ("end", "space-between", 1, None):
-            with self.subTest(justify=justify):
+                spec["elements"]["root"]["props"] = {
+                    "gap": gap, "justify": justify, "align": "stretch", "wrap": False,
+                }
+                self.assertIsNone(parse(spec).error)
+        for parent in ("Stack", "Grid", "ScrollRow"):
+            for width in ("1/2", "1/3", "2/3", "auto"):
                 spec = spec_for("Text")
-                spec["elements"]["root"]["props"]["justify"] = justify
-                self.assertIn("$.elements.root.props.justify", parse(spec).error)
+                spec["elements"]["root"].update(type=parent, props={"columns": 2} if parent == "Grid" else {})
+                spec["elements"]["item"]["width"] = width
+                self.assertIsNone(parse(spec).error)
+        for width in ("100", "1/4", 0.5, None, {"value": "1/2"}):
+            spec = spec_for("Text")
+            spec["elements"]["item"]["width"] = width
+            self.assertIn("$.elements.item.width", parse(spec).error)
+        for parent in ("Card", "Accordion"):
+            spec = spec_for("Text")
+            spec["elements"]["root"].update(type=parent, props={"title": "组"})
+            spec["elements"]["item"]["width"] = "1/2"
+            self.assertIn("$.elements.item.width", parse(spec).error)
+        spec = spec_for("Text")
+        spec["elements"]["root"]["width"] = "1/2"
+        self.assertIn("$.elements.root.width", parse(spec).error)
+        spec = spec_for("Text")
+        spec["elements"]["item"]["props"]["width"] = "1/2"
+        self.assertIn("$.elements.item.props.width", parse(spec).error)
+
+    def test_field_and_button_row_require_their_real_child(self):
+        for kind in ("Field", "ButtonRow"):
+            spec = spec_for(kind)
+            self.assertIsNone(parse(spec).error)
+            child = spec["elements"]["item"]["children"][0]
+            spec["elements"][child] = {"type": "Text", "props": {"text": "占位"}, "children": []}
+            self.assertIn("$.elements.item.children[0]", parse(spec).error)
+            spec = spec_for(kind)
+            spec["elements"]["item"]["children"] = []
+            self.assertIn("$.elements.item.children", parse(spec).error)
+        spec = spec_for("StatCard")
+        spec["elements"]["item"]["props"]["icon"] = "not-an-icon"
+        self.assertIn("$.elements.item.props.icon", parse(spec).error)
+
 
     def test_every_component_rejects_extra_prop_and_bad_shape(self):
         for kind in PROPS:
@@ -149,10 +251,10 @@ class CatalogTests(unittest.TestCase):
             ("Slider", "step", 0, "props.step"),
             ("TextInput", "placeholder", "x" * 501, "props.placeholder"),
             ("DateInput", "label", "x" * 81, "props.label"),
-            ("LineChart", "xLabels", ["a"], "props.xLabels"),
-            ("LineChart", "series", [], "props.series"),
-            ("BarChart", "values", [-1], "props.values[0]"),
-            ("PieChart", "items", [{"label": "a", "value": 0}, {"label": "b", "value": 1}], "props.items[0].value"),
+            ("LineChart", "xLabels", ["a"] * 25, "props.xLabels"),
+            ("LineChart", "series", [{"name": "a", "values": [1, 2]}] * 4, "props.series"),
+            ("BarChart", "series", [{"name": "a", "values": ["bad"]}], "props.series[0].values[0]"),
+            ("PieChart", "items", [{"label": "a", "value": -1}, {"label": "b", "value": 1}], "props.items[0].value"),
             ("Tabs", "tabs", [{"label": "一"}], "props.tabs"),
             ("Accordion", "defaultOpen", 1, "props.defaultOpen"),
             ("Image", "alt", "x" * 201, "props.alt"),
@@ -232,12 +334,14 @@ class CatalogTests(unittest.TestCase):
 
         bar = spec_for("BarChart")
         bar_props = bar["elements"]["item"]["props"]
-        bar_props.update(labels=[str(n) for n in range(12)], values=[0] * 12)
+        bar_props.update(labels=[str(n) for n in range(12)],
+                         series=[{"name": name, "values": [0] * 12} for name in ("a", "b", "c")],
+                         horizontal=True)
         self.assertIsNone(parse(bar).error)
-        bar_props["values"].pop()
-        self.assertIn("$.elements.item.props.values", parse(bar).error)
-        bar_props["values"].append(-1)
-        self.assertIn("$.elements.item.props.values[11]", parse(bar).error)
+        bar_props["series"][2]["values"].pop()
+        self.assertIn("$.elements.item.props.series[2].values", parse(bar).error)
+        bar_props["series"][2]["values"].append(-1)
+        self.assertIsNone(parse(bar).error)
         bar_props["labels"].append("extra")
         self.assertIn("$.elements.item.props.labels", parse(bar).error)
 
@@ -345,7 +449,7 @@ class CatalogTests(unittest.TestCase):
         display = spec_for("Text")
         display["elements"]["root"]["children"].append("submit")
         display["elements"]["submit"] = {"type": "Submit", "props": {"label": "提交"}, "children": []}
-        self.assertIn("纯展示块不得有 Submit", parse(display).error)
+        self.assertIsNone(parse(display).spec)
 
     def test_initial_values_and_submitted_values(self):
         submitted = {"ChoiceGroup": "b", "Select": "b", "Segmented": "a", "MultiSelect": ["a", "b"],

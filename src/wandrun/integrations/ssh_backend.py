@@ -18,7 +18,7 @@ import hashlib
 import json
 import posixpath
 import shlex
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -104,6 +104,7 @@ class _Call:
     id: str
     sent: bool = False  # run 已进入写缓冲：远端可能收到
     result: dict | None = None  # 收到的 result 消息
+    on_event: Callable[[dict], None] | None = None
     arrived: asyncio.Event = field(default_factory=asyncio.Event)  # result 到达或通道断开
 
     @property
@@ -126,6 +127,7 @@ class SessionChannel:
         self.calls: dict[str, _Call] = {}
         self.closed: asyncio.Future = asyncio.get_running_loop().create_future()
         self.broken = False
+        self.accepting = True
         self._reading: asyncio.Task | None = None
 
     async def open(self, termination_grace: float) -> None:
@@ -154,6 +156,10 @@ class SessionChannel:
                     if call is not None and call.result is None:
                         call.result = message
                         call.arrived.set()
+                elif message["type"] in ("output", "log_error", "finalizing"):
+                    call = self.calls.get(message["id"])
+                    if call is not None and call.on_event is not None:
+                        call.on_event(message)
                 elif message["type"] == "closed" and not self.closed.done():
                     self.closed.set_result(message)
         except Exception as error:  # 协议损坏与断开同样处理：不再有结果会到达
@@ -168,19 +174,34 @@ class SessionChannel:
             self.closed.set_exception(failure)
             self.closed.exception()  # 标记已取回：没有等待者时不报警告
 
-    def register(self) -> _Call:
-        call = _Call(uuid4().hex)
+    def register(self, on_event=None) -> _Call:
+        call = _Call(uuid4().hex, on_event=on_event)
         if self.broken:
             call.arrived.set()
         self.calls[call.id] = call
         return call
 
-    async def send(self, message: dict, call: _Call | None = None) -> None:
-        """写出一条消息；传输异常统一为 ChannelClosed。写入缓冲之后（远端可能收到）才把 run 记为已写出。"""
+    def seal(self) -> None:
+        """Reject unsent commands while still allowing cancel/shutdown and terminal replies."""
+        self.accepting = False
+
+    async def send(
+        self, message: dict, call: _Call | None = None, *,
+        can_send: Callable[[], bool] | None = None,
+    ) -> None:
+        """Serialize writes; check an optional submission barrier under the same lock as write().
+
+        Rejected submissions leave call.sent false. Once write() accepts bytes, cancellation
+        cannot retract them and callers must retain the original call's cleanup responsibility.
+        """
         data = (json.dumps(message, ensure_ascii=False) + "\n").encode()
         async with self._lock:
             if self.broken:
                 raise ChannelClosed("远端会话通道已断开")
+            if call is not None and not self.accepting:
+                return
+            if can_send is not None and not can_send():
+                return
             try:
                 self._writer.write(data)
             except Exception as error:  # 没有进入缓冲，远端不会收到
@@ -245,6 +266,8 @@ class SSHBackend(BaseSandbox):
         self._max_output_bytes = max_output_bytes
         self._loop = asyncio.get_running_loop()
         self._unconfirmed: dict[str, str] = {}  # 调用 id → 无法确认的原因；运行时退出时汇总报告
+        self._transfers: set[asyncio.Task] = set()
+        self._transfer_owners: dict[str, str | None] = {}
         self._closed = False
 
     @classmethod
@@ -265,8 +288,18 @@ class SSHBackend(BaseSandbox):
         async with sftp_client(connection) as sftp:
             if not await sftp.exists(script):
                 temporary = f"{script}.{uuid4().hex}.tmp"
-                await sftp.put(str(SESSION_SOURCE), temporary)
-                await sftp.posix_rename(temporary, script)
+                try:
+                    await sftp.put(str(SESSION_SOURCE), temporary)
+                    await sftp.posix_rename(temporary, script)
+                except BaseException:
+                    try:
+                        async with asyncio.timeout(NETWORK_SLACK):
+                            await sftp.remove(temporary)
+                    except (asyncssh.SFTPNoSuchFile, asyncssh.SFTPNoSuchPath):
+                        pass
+                    except Exception:
+                        raise CleanupUnconfirmedError("远端会话脚本暂存文件清理未确认") from None
+                    raise
         process = await connection.create_process(
             f"cd {shlex.quote(workdir)} && exec python3 "
             + " ".join(shlex.quote(item) for item in (script, workdir, repr(termination_grace))),
@@ -310,15 +343,16 @@ class SSHBackend(BaseSandbox):
             self._unconfirmed.setdefault(call.id, why)
 
     async def aexecute(
-        self, command: str, *, timeout: int | None = None  # noqa: ASYNC109
+        self, command: str, *, timeout: int | None = None, env: dict[str, str] | None = None  # noqa: ASYNC109
     ) -> ExecuteResponse:
-        return await self._execute(command, timeout, _FILE_OPERATION.get())
+        return await self._execute(command, timeout, _FILE_OPERATION.get(), env)
 
-    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+    def execute(self, command: str, *, timeout: int | None = None, env: dict[str, str] | None = None) -> ExecuteResponse:
         # 协程会在事件循环线程的上下文中运行，文件操作标记要在调用线程里读出后显式传入。
-        return self._blocking(self._execute(command, timeout, _FILE_OPERATION.get()))
+        return self._blocking(self._execute(command, timeout, _FILE_OPERATION.get(), env))
 
-    async def _execute(self, command: str, timeout: int | None, file_operation: bool) -> ExecuteResponse:
+    async def _execute(self, command: str, timeout: int | None, file_operation: bool,
+                       env: dict[str, str] | None = None) -> ExecuteResponse:
         if not command or not isinstance(command, str):
             return invalid_command_response()
         if self._closed:
@@ -333,15 +367,18 @@ class SSHBackend(BaseSandbox):
                     try:
                         await self._channel.send(
                             {"type": "run", "id": call.id, "command": command, "timeout": effective,
-                             "max_output": self._max_output_bytes},
-                            call,
+                             "max_output": self._max_output_bytes, "env": dict(env or {})},
+                            call, can_send=lambda: not self._closed,
                         )
                     except ChannelClosed as error:
                         why = str(error)
                         if not call.sent:
                             raise
                         # 已写出：发送失败不决定结论，结果可能仍在路上；等记录落定（结果到达或通道断开）。
-                    await self._channel.wait(call)
+                    if call.sent:
+                        await self._channel.wait(call)
+                    else:
+                        why = "执行环境已关闭，本次命令未提交"
             except TimeoutError:
                 why = "等待结果超时"
             except ChannelClosed as error:  # 没有写出
@@ -437,6 +474,69 @@ class SSHBackend(BaseSandbox):
                 except asyncssh.SFTPError as error:
                     responses.append(FileUploadResponse(path=path, error=_sftp_error(error)))
         return responses
+
+    async def aretrieve_attachment(
+        self, path: str, root: str, destination: Path, *, owner: str | None = None,
+    ) -> dict:
+        """Stream a verified remote snapshot into the gateway, without retaining file bytes."""
+        from wandrun.integrations.file_transfer import download_snapshot
+
+        return await download_snapshot(
+            self._connection, path, root, destination,
+            debts=self._unconfirmed, pending=self._transfers, owners=self._transfer_owners, owner=owner,
+        )
+
+    async def aimport_file(
+        self, source_fd: int, directory: str, identity: str, name: str, *, owner: str | None = None,
+    ) -> dict:
+        """Publish a complete gateway-held source in this environment without overwriting files."""
+        from wandrun.integrations.file_transfer import upload_snapshot
+
+        return await upload_snapshot(
+            self._connection, source_fd, directory, identity, name,
+            debts=self._unconfirmed, pending=self._transfers, owners=self._transfer_owners, owner=owner,
+        )
+
+    async def aprepare_file_output(self, directory: str, *, owner: str | None = None) -> None:
+        from wandrun.integrations.file_transfer import prepare_file_output
+
+        await prepare_file_output(
+            self._connection, directory, debts=self._unconfirmed, pending=self._transfers,
+            owners=self._transfer_owners, owner=owner,
+        )
+
+    async def aread_task_file(
+        self, path: str, directory: str, *, max_bytes: int, owner: str | None = None,
+    ) -> bytes:
+        from wandrun.integrations.file_transfer import read_task_file
+
+        return await read_task_file(
+            self._connection, path, directory, max_bytes=max_bytes,
+            debts=self._unconfirmed, pending=self._transfers, owners=self._transfer_owners, owner=owner,
+        )
+
+    async def asave_task_file(
+        self, directory: str, filename: str, content: bytes, *, owner: str | None = None,
+    ) -> str:
+        from wandrun.integrations.file_transfer import upload_snapshot
+
+        result = await upload_snapshot(
+            self._connection, content, directory, "output", filename,
+            debts=self._unconfirmed, pending=self._transfers, owners=self._transfer_owners, owner=owner,
+        )
+        return result["path"]
+
+    def pending_transfer_owners(self) -> set[str | None]:
+        """Retain trusted task owners until transfer cleanup, including terminal unknown debts.
+
+        Legacy/internal SSH cleanup without task attribution is represented by
+        None, not a fabricated task id. Shared-environment callers must treat
+        that uncertainty conservatively.
+        """
+        owners = set(self._transfer_owners.values())
+        if self._unconfirmed.keys() - self._transfer_owners.keys():
+            owners.add(None)
+        return owners
 
     async def apublish_artifact(self, path: str, content: bytes) -> None:
         """Publish an immutable artifact without replacing an existing name.
@@ -546,7 +646,12 @@ class SSHBackend(BaseSandbox):
         if self._closed:
             return
         self._closed = True
+        self._channel.seal()
         problems = []
+        if self._transfers:
+            _, pending = await asyncio.wait(self._transfers, timeout=self._stop_limit)
+            if pending:
+                problems.append("文件传输通道仍在收尾，保留未确认清理记录")
         try:
             async with asyncio.timeout(self._stop_limit):
                 await self._channel.send({"type": "shutdown"})

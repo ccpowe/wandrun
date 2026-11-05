@@ -50,7 +50,9 @@ _VALUE_VALIDATORS = {
     for name, component in _COMPONENTS.items() if "input" in component
 }
 _IDENTIFIER_VALIDATOR = Draft202012Validator(_CATALOG["$defs"]["identifier"])
+_WIDTH_VALIDATOR = Draft202012Validator(_CATALOG["$defs"]["childWidth"])
 _IDENTIFIER_RE = re.compile(_CATALOG["$defs"]["identifier"]["pattern"])
+_CONDITION_VALIDATOR = Draft202012Validator(_CATALOG["$defs"]["condition"])
 _IDENTIFIER_REASON = "ID 须为 1～64 位 ASCII 字母/数字/下划线，以字母或下划线开头，且不能使用保留名称"
 _FENCE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<tail>[^\r\n]*)$")
 _LINE_END = re.compile(r"(?:\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029])$")
@@ -141,6 +143,7 @@ def _special_prop_errors(component: str, props: Any, path: str, errors: list[str
         if isinstance(value, str) and not safe_web_url(value):
             _error(errors, f"{path}.props.{name}", "须为无凭据的绝对 HTTP(S) URL")
     icons = ([("name", props.get("name"))] if component == "Icon" else
+             [("icon", props["icon"])] if component == "StatCard" and "icon" in props else
              [(f"items[{index}].icon", item["icon"]) for index, item in enumerate(props.get("items", []))
               if isinstance(item, dict) and "icon" in item]
              if component == "List" and isinstance(props.get("items"), list) else [])
@@ -209,7 +212,7 @@ def _schema_reason(error: Any) -> tuple[list[str | int], str]:
     if kind == "pattern":
         return path, "日期格式应为 YYYY-MM-DD 或空字符串"
     if kind == "oneOf":
-        return path, "应为字符串或 {\"badge\":{\"text\":...,\"tone\":...}}"
+        return path, "不符合允许的属性格式"
     return path, "不符合组件属性约束"
 
 
@@ -388,6 +391,7 @@ def _validate_spec(spec: Any) -> list[str]:
     edges: dict[str, list[str]] = {}
     parents: dict[str, int] = {}
     submit_count = 0
+    send_groups: set[str] = set()
     input_count = 0
     for node_id, node in elements.items():
         path = _path("$.elements", node_id)
@@ -396,11 +400,22 @@ def _validate_spec(spec: Any) -> list[str]:
             _error(errors, path, "节点应为对象")
             continue
         for key in node:
-            if key not in {"type", "props", "children"}:
+            if key not in {"type", "props", "children", "width", "visible"}:
                 _error(errors, _path(path, key), "不允许的字段")
         for key in ("type", "props", "children"):
             if key not in node:
                 _error(errors, _path(path, key), "缺少必填字段")
+        if "width" in node:
+            _schema_errors(_WIDTH_VALIDATOR, node["width"], _path(path, "width"), errors)
+            if node_id == root:
+                _error(errors, _path(path, "width"), "根节点不能指定子项宽度")
+        if "visible" in node:
+            condition = node["visible"]
+            _schema_errors(_CONDITION_VALIDATOR, condition, _path(path, "visible"), errors)
+            if isinstance(condition, dict) and isinstance(condition.get("$state"), str):
+                key = condition["$state"][1:]
+                if key not in state or not _IDENTIFIER_VALIDATOR.is_valid(key):
+                    _error(errors, _path(path, "visible"), "$state 路径必须引用本块已有状态")
         component, props, children = node.get("type"), node.get("props"), node.get("children")
         definition = _COMPONENTS.get(component) if isinstance(component, str) else None
         if definition is None:
@@ -422,8 +437,18 @@ def _validate_spec(spec: Any) -> list[str]:
                                 _error(errors, _path(_path(_path(path, "props"), "options"), index) + ".value",
                                        "选项 value 不能重复")
                             seen.add(option_value)
-            if component == "Submit":
+            if component == "Submit" and isinstance(props, dict) and "send" not in props:
                 submit_count += 1
+            if component == "FollowUps":
+                send_groups.add(node_id)
+            elif component in {"StatCard", "Submit"} and isinstance(props, dict) and "send" in props:
+                send_groups.add("$statcards" if component == "StatCard" else node_id)
+            if isinstance(props, dict):
+                texts = ([item.get("text") for item in props.get("items", []) if isinstance(item, dict)]
+                         if component == "FollowUps" and isinstance(props.get("items"), list) else
+                         [props["send"].get("text")] if isinstance(props.get("send"), dict) else [])
+                if any(isinstance(text, str) and not text.strip() for text in texts):
+                    _error(errors, _path(path, "props"), "send 文本不得为空白")
             if "input" in definition:
                 input_count += 1
                 if isinstance(props, dict) and isinstance(props.get("stateKey"), str):
@@ -434,6 +459,18 @@ def _validate_spec(spec: Any) -> list[str]:
                         inputs[key] = (component, props)
             _relation_errors(definition, props, children, path, errors)
             _special_prop_errors(component, props, path, errors)
+            if isinstance(props, dict):
+                bound_values = (
+                    [item.get("value") for item in props.get("items", []) if isinstance(item, dict)]
+                    if component == "KeyValue" and isinstance(props.get("items"), list) else
+                    [props.get("text")] if component in {"Text", "Heading", "Copy"} else
+                    [props.get("value")] if component in {"StatCard", "Field"} else []
+                )
+                for value in bound_values:
+                    if isinstance(value, dict) and isinstance(value.get("$state"), str):
+                        key = value["$state"][1:]
+                        if key not in state or not _IDENTIFIER_VALIDATOR.is_valid(key):
+                            _error(errors, _path(path, "props"), "$state 路径必须引用本块已有状态")
             if component == "FileTree":
                 _file_tree_errors(props, path, errors)
             if component == "Slider" and isinstance(props, dict):
@@ -446,6 +483,12 @@ def _validate_spec(spec: Any) -> list[str]:
             continue
         if definition is not None and not definition["container"] and children:
             _error(errors, _path(path, "children"), "叶子组件不得包含子节点")
+        if component == "ButtonRow":
+            if sum(isinstance(elements.get(child), dict) and elements[child].get("type") == "Submit"
+                   for child in children if isinstance(child, str)) != 1:
+                _error(errors, _path(path, "children"), "ButtonRow 必须恰好有一个 Submit，可带任意个 Copy")
+        if definition is not None and "childCount" in definition and len(children) != definition["childCount"]:
+            _error(errors, _path(path, "children"), f"须恰好有 {definition['childCount']} 个子节点")
         edges[node_id] = []
         for index, child in enumerate(children):
             child_path = _path(_path(path, "children"), index)
@@ -456,6 +499,12 @@ def _validate_spec(spec: Any) -> list[str]:
             if child not in elements:
                 _error(errors, child_path, "子节点须引用存在的节点 ID")
                 continue
+            child_node = elements[child]
+            if isinstance(child_node, dict):
+                if "width" in child_node and component not in _CATALOG["widthContainers"]:
+                    _error(errors, _path(_path("$.elements", child), "width"), "只有 Stack / Grid / ScrollRow 的直接子项可指定宽度")
+                if definition is not None and "childTypes" in definition and child_node.get("type") not in definition["childTypes"]:
+                    _error(errors, child_path, f"只允许子组件 {', '.join(definition['childTypes'])}")
             edges[node_id].append(child)
             parents[child] = parents.get(child, 0) + 1
             if parents[child] > 1:
@@ -463,8 +512,8 @@ def _validate_spec(spec: Any) -> list[str]:
             if child == root:
                 _error(errors, child_path, "根节点不能作为子节点")
 
-    if submit_count != (1 if input_count else 0):
-        _error(errors, "$.elements", "含表单控件的块必须恰好一个 Submit；纯展示块不得有 Submit")
+    if submit_count != (1 if input_count else 0) or submit_count + len(send_groups) > 1 or input_count and send_groups:
+        _error(errors, "$.elements", "含表单控件必须恰好一个 Submit；每块至多一个提交类动作：Submit、FollowUps 或一组可点 StatCard，不能混用")
     if isinstance(root, str) and root in elements:
         reached: set[str] = set()
         pending = [(root, 1)]
@@ -835,6 +884,22 @@ def submission_text(spec: dict[str, Any], values: dict[str, Any], message_seq: i
     return summary, prompt
 
 
+def send_actions(spec: dict[str, Any]) -> dict[str, str]:
+    """Action identity selects immutable spec text, never a caller-supplied message.
+
+    StatCard/Submit use the element ID; FollowUps append a zero-based item index.
+    The validated block owns one submission slot regardless of the selected action.
+    """
+    actions: dict[str, str] = {}
+    for node_id, node in spec["elements"].items():
+        props = node["props"]
+        if node["type"] == "FollowUps":
+            actions.update((f"{node_id}/{index}", item["text"]) for index, item in enumerate(props["items"]))
+        elif node["type"] in {"StatCard", "Submit"} and "send" in props:
+            actions[node_id] = props["send"]["text"]
+    return actions
+
+
 def _shape(schema: dict[str, Any], definitions: dict[str, Any] | None = None) -> str:
     definitions = {**(definitions or {}), **schema.get("$defs", {})}
     if "$ref" in schema:
@@ -873,14 +938,14 @@ def _shape(schema: dict[str, Any], definitions: dict[str, Any] | None = None) ->
 # Explicit membership makes a new catalog component a deliberate design decision.
 _CHAPTER_COMPONENTS = {
     "display.md": (
-        "Stack", "Card", "Divider", "Heading", "Text", "Badge", "Status", "Metrics",
+        "Stack", "ScrollRow", "Card", "Divider", "Heading", "Text", "Badge", "Status", "Metrics", "StatCard",
         "KeyValue", "Steps", "Progress", "Table", "Tabs", "Accordion", "Grid",
         "Source", "LinkCard", "FileTree", "Icon", "List", "Callout", "Quote", "Math",
     ),
     "charts.md": ("LineChart", "BarChart", "PieChart"),
     "forms.md": (
         "ChoiceGroup", "Select", "Segmented", "MultiSelect", "Switch", "Slider",
-        "TextInput", "DateInput", "Submit",
+        "TextInput", "DateInput", "Field", "ButtonRow", "Submit", "Copy", "FollowUps",
     ),
     "media.md": ("Image", "MediaCard", "Gallery", "Mermaid"),
 }
@@ -941,8 +1006,10 @@ def skill_files() -> dict[str, str]:
             "",
             "## 消息和 Spec",
             "",
-            "在 Markdown 中穿插独占行的 wandrun-ui 代码围栏（例如后续示例），内部是完整 JSON，不是补丁/JSX。顶层恰含 `root`、`elements`、`state`；每个元素恰含 `type`、`props`、`children`。root 指向已有节点；单棵树不得循环、共享或孤立，最多 60 节点、8 层。仅目录中标记为容器的组件可有子节点，其他组件 `children:[]`；Tabs 子节点数须等于 tabs 数。Tabs 切换及 Accordion 展开只在本地，不进入 state。",
+            "在 Markdown 中穿插独占行的 wandrun-ui 代码围栏（例如后续示例），内部是完整 JSON，不是补丁/JSX。顶层恰含 `root`、`elements`、`state`；每个元素必含 `type`、`props`、`children`，仅 Stack / Grid / ScrollRow 的直接子项可另带元素级 `width`（不是 props）："
+            + _shape(_CATALOG["$defs"]["childWidth"]) + "。分数宽扣除间距；Grid 最小可读宽优先，auto 跟随默认列；Stack auto 视同未声明，保留原生排布；ScrollRow 保留右侧 16 预览宽后计算分数宽，auto 约 4/5 容器宽。root 指向已有节点；单棵树不得循环、共享或孤立，最多 60 节点、8 层。仅目录中标记为容器的组件可有子节点，其他组件 `children:[]`；Tabs 子节点数须等于 tabs 数。Tabs 切换及 Accordion 展开只在本地，不进入 state。",
             "元素 id 与 stateKey 符合 `^[A-Za-z_][A-Za-z0-9_]{0,63}$`，不得是 constructor/prototype/__proto__；stateKey 块内唯一。只用目录组件和属性；可选属性标 `?`，数组括号是数量范围，长度按 Unicode 码点，数字须有限。受控图标名见 display.md。",
+            "展示绑定只允许 Text.text、Heading.text、StatCard.value、Field.value、KeyValue.items[].value 写 {\"$state\":\"/已有stateKey\"}；Copy.text 也可绑定。选择类显示 label，空值显示 —。元素可带 visible 单条件：{\"$state\":\"/key\"} 或再带 eq / neq 之一，可加 not:true；空数组、false、0、空串隐藏，比较按 JSON 值，不支持表达式、and/or、数值比较、repeat 或通用 on。",
             "围栏行首只许 0～3 个 ASCII 空格，至少三个同字符反引号或波浪号；info 去掉 ASCII 空格/制表符后恰为 wandrun-ui；关闭同字符且不少于开启长度，后面只许 ASCII 空格/制表符。普通代码围栏内不可嵌套 UI。",
             "表单规则见 forms.md；图片和链接规则见 media.md、display.md。提交只回传本块 state 的值，不执行任意操作。校验拒绝时按错误路径修正整条被拒绝的消息，不重发已成功消息；不确定先读对应章节，无法读取则用 Markdown。",
         ]),
@@ -963,7 +1030,7 @@ def skill_files() -> dict[str, str]:
             "# 图表",
             "",
             "趋势用 LineChart，分类量用 BarChart，正值占比用 PieChart；有多项分类或趋势数据时主动用图表，单一事实用文字。 手机优先显示少量有意义的刻度（通常 4～8 个）、短标签，多个图竖排，结论不要在图前后重复。保留真实符号和尺度，不为美观改数值；不得暗示未经证实的因果。",
-            "LineChart 每条 series.values 与 xLabels 等长；BarChart values 与 labels 等长，值非负；PieChart 每项为正数。签名中的最大点数是合法上限，不是推荐填满。",
+            "LineChart 每条 series.values 与 xLabels 等长；BarChart 每条 series.values 与 labels 等长，可含负值，horizontal=true 为横向；PieChart 每项为非负数。三者均允许空数据，LineChart 允许单点、PieChart 允许单项。签名中的最大点数是合法上限，不是推荐填满。",
             "",
             "## 组件（签名由目录生成）",
             _component_reference(_CHAPTER_COMPONENTS["charts.md"]),
@@ -974,7 +1041,7 @@ def skill_files() -> dict[str, str]:
         "forms.md": "\n".join([
             "# 表单",
             "",
-            "只在需要收集用户输入时使用控件；不能为了 Submit 凭空要求用户选择。state 恰含所有控件 stateKey 的初值；有控件恰好一个 Submit，提交全部 state；纯展示不得放 Submit。提交只产生值，不代表执行、授权或完成操作。",
+            "只在需要收集用户输入时使用控件；不能为了 Submit 凭空要求用户选择。state 恰含所有控件 stateKey 的初值；有控件恰好一个不带 send 的 Submit，提交全部 state。无输入可用 Submit.send:{text}、一组 FollowUps 或一组带 send:{text} 的 StatCard 发送 spec 声明的固定文本；每块至多一种提交类动作，不可混用；一组只成功发送一项。Copy 是纯本地动作，可放任意个；ButtonRow 恰含一个 Submit 与若干 Copy。提交或发送只产生用户消息，不代表执行、授权或完成操作。",
             "ChoiceGroup/Select/Segmented 的值为稳定 option.value 或空串（未选）；option.value 非空且在该控件内唯一。disabled 选项可保留初值提交，但不能新选。MultiSelect 为无重复的选项 value 数组，Switch 为布尔；Slider 在 min..max 内按 min + 整数 × step 的十进制网格取值；TextInput ≤2000 码点；DateInput 为真实 YYYY-MM-DD 或空串。",
             "",
             "## 组件（签名由目录生成）",

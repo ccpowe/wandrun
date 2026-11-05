@@ -20,6 +20,7 @@ import posixpath
 from uuid import uuid4
 
 from wandrun.integrations.ssh_backend import SSHBackend
+from wandrun.integrations.instabox import InstaboxBackend
 
 
 _EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
@@ -96,8 +97,8 @@ def _publish_local(path: str, content: bytes) -> None:
 class CompactionArchive:
     """Write only a newly covered raw-message range; no checkpoint mutation.
 
-    The role's Environment determines both the artifact root and backend. SSH writes
-    use the same SFTP connection as its file tools, never a host-side mirror.
+    The role's Environment determines both the artifact root and backend. Remote writes
+    use that environment's publication boundary, never a host-side mirror.
     """
 
     def __init__(self, artifacts_root: str, backend):
@@ -109,7 +110,7 @@ class CompactionArchive:
         return posixpath.join(self.root, sha256(task_id.encode()).hexdigest())
 
     async def _publish(self, path: str, content: bytes) -> None:
-        if isinstance(self.backend, SSHBackend):
+        if isinstance(self.backend, (SSHBackend, InstaboxBackend)):
             await self.backend.apublish_artifact(path, content)
         else:
             await asyncio.to_thread(_publish_local, path, content)

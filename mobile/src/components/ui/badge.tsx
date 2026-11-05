@@ -15,15 +15,15 @@ const badgeVariants = cva(
     variants: {
       variant: {
         default: cn(
-          'bg-primary border-transparent',
+          'bg-primary border-background/0',
           Platform.select({ web: '[a&]:hover:bg-primary/90' })
         ),
         secondary: cn(
-          'bg-secondary border-transparent',
+          'bg-secondary border-background/0',
           Platform.select({ web: '[a&]:hover:bg-secondary/90' })
         ),
         destructive: cn(
-          'bg-destructive border-transparent',
+          'bg-destructive border-background/0',
           Platform.select({ web: '[a&]:hover:bg-destructive/90' })
         ),
         outline: Platform.select({ web: '[a&]:hover:bg-accent [a&]:hover:text-accent-foreground' }),
@@ -40,7 +40,7 @@ const badgeTextVariants = cva('text-xs font-medium', {
     variant: {
       default: 'text-primary-foreground',
       secondary: 'text-secondary-foreground',
-      destructive: 'text-white',
+      destructive: 'text-destructive-foreground',
       outline: 'text-foreground',
     },
   },

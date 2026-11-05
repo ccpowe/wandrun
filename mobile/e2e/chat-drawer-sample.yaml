@@ -1,0 +1,57 @@
+# G2 standalone native drawer regression; deterministic Storybook peer, no model calls.
+# Run with the assigned device lock and METRO_PORT / ARTIFACTS, see e2e/README.md.
+appId: host.exp.exponent
+---
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=conversation-drawer--e-3
+- extendedWaitUntil:
+    visible: { id: conversation-recent }
+    timeout: 60000
+- takeScreenshot: ${ARTIFACTS}/01-drawer-light.png
+- longPressOn: { id: conversation-recent }
+- assertVisible: { id: conversation-menu-rename }
+- assertVisible: { id: conversation-menu-delete }
+- takeScreenshot: ${ARTIFACTS}/02-long-press-menu.png
+- tapOn: { id: conversation-menu-rename }
+- extendedWaitUntil:
+    visible: { id: conversation-rename-input }
+    timeout: 15000
+- tapOn: { id: conversation-rename-input }
+- inputText: G2 Native Saved
+- assertVisible: { id: conversation-rename-confirm }
+- takeScreenshot: ${ARTIFACTS}/03-rename-real-ime.png
+- tapOn: { id: conversation-rename-confirm }
+- extendedWaitUntil:
+    visible: G2 Native Saved
+    timeout: 15000
+- assertNotVisible: { id: conversation-rename-input }
+- longPressOn: { id: conversation-recent }
+- tapOn: { id: conversation-menu-rename }
+- tapOn: { id: conversation-rename-input }
+- inputText: G2 Cancelled
+- back
+- assertVisible: { id: conversation-rename-input }
+- tapOn: { id: conversation-rename-cancel }
+- assertVisible: G2 Native Saved
+- assertNotVisible: G2 Cancelled
+- back
+- extendedWaitUntil:
+    visible: { id: chat-agent-profile }
+    timeout: 15000
+- assertNotVisible: { id: drawer-agents }
+- tapOn: { id: chat-open-drawer }
+- assertVisible: { id: conversation-recent }
+- openLink: exp://127.0.0.1:${METRO_PORT}/--/?STORYBOOK_STORY_ID=conversation-drawer--e-3-dark
+- extendedWaitUntil:
+    visible: { id: conversation-recent }
+    timeout: 30000
+- takeScreenshot: ${ARTIFACTS}/04-drawer-dark.png
+- longPressOn: { id: conversation-recent }
+- tapOn: { id: conversation-menu-rename }
+- tapOn: { id: conversation-rename-input }
+- takeScreenshot: ${ARTIFACTS}/05-rename-dark-ime.png
+- back
+- tapOn: { id: conversation-rename-cancel }
+- extendedWaitUntil:
+    notVisible: { id: conversation-rename-input }
+    timeout: 15000
+- assertVisible: { id: conversation-recent }

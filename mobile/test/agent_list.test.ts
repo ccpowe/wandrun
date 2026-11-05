@@ -1,14 +1,14 @@
-// 首页 / 全部 Agent：何时重拉、重拉合并与不丢触发、失败保留旧列表，以及分组 / 文案 / 时间的纯逻辑。
+// Agent directory: read generations, retry recovery, retained summaries and activity labels.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { affectsAgentList, AgentList } from "../src/gateway/agents.ts";
-import type { AgentSummary, GatewayEvent } from "../src/gateway/api.ts";
-import { formatActivityTime, groupAgents, homeAgents, homeRowText } from "../src/lib/agent-list.ts";
+import { type AgentSummary, type GatewayEvent } from "../src/gateway/api.ts";
+import { formatActivityTime } from "../src/lib/agent-list.ts";
 
 function agent(id: string, over: Partial<AgentSummary> = {}): AgentSummary {
-  return { id, name: id, avatar: 1, description: "", workers: [], home: true, latest_conversation: null, unread: false, ...over };
+  return { id, name: id, avatar: 1, description: "", workers: [], environment: "local", latest_conversation: null, unread: false, ...over }
 }
 
 function event(type: string, data: Record<string, any> = {}, conversation_id?: string): GatewayEvent {
@@ -26,15 +26,17 @@ async function waitFor(check: () => boolean, timeout = 1000): Promise<void> {
   }
 }
 
-test("只有会改变首页的事件触发重拉", () => {
+test("目录、排序与对话摘要的事件触发重拉", () => {
   assert.equal(affectsAgentList(event("resource.changed", { kind: "agent" })), true);
+  assert.equal(affectsAgentList(event("resource.changed", { kind: "agent_order" })), true);
   assert.equal(affectsAgentList(event("resource.changed", { kind: "skill" })), false);
   for (const type of ["conversation.created", "conversation.updated", "conversation.deleted", "conversation.status", "conversation.read", "message.user", "message.agent", "schedule.triggered"]) {
     assert.equal(affectsAgentList(event(type, {}, "c")), true, type);
   }
-  assert.equal(affectsAgentList(event("browser_task.updated", { state: "requested", entered_requested: true }, "c")), true);
-  assert.equal(affectsAgentList(event("browser_task.updated", { state: "requested", entered_requested: false }, "c")), false);
-  assert.equal(affectsAgentList(event("browser_task.updated", { state: "human" }, "c")), false);
+  // 浏览器请求不再是排序活动，不触发重拉；子对话里的用户插话推进根，成员 Agent 回复不影响。
+  assert.equal(affectsAgentList(event("browser_task.updated", { state: "requested" }, "c")), false);
+  assert.equal(affectsAgentList(event("message.user", { timeline_ids: ["t"] }, "c")), true);
+  assert.equal(affectsAgentList(event("message.agent", { timeline_ids: ["t"] }, "c")), false);
   assert.equal(affectsAgentList(event("turn.failed", {}, "c")), false);
   assert.equal(affectsAgentList(event("turn.stopped", {}, "c")), false);
 });
@@ -149,9 +151,7 @@ test("较新 Agent 列表快照不被迟到的旧标题事件回滚", async (t) 
     id: "c", title: "新标题", last_text: "消息", last_activity_seq: 50, last_activity_at: 50, status: "idle",
   } });
   const api = {
-    listAgents: async () => ({ agents: [current], as_of_seq: 50 }),
-    hideAgent: async () => current,
-    unhideAgent: async () => current,
+    listAgents: async () => ({ agents: [current], as_of_seq: 50, order_revision: 1 }),
   };
   const list = new AgentList(api, () => {}, { debounceMs: 5 });
   t.after(() => list.close());
@@ -169,18 +169,16 @@ test("先到的列表快照覆盖 created / updated / deleted，迟到资源事�
   ];
   for (const { op, id, before, after } of cases) {
     await t.test(op, async (t) => {
-      let snapshot = { agents: before, as_of_seq: 1 };
+      let snapshot = { agents: before, as_of_seq: 1, order_revision: 1 }
       let calls = 0;
       const api = {
         listAgents: async () => { calls++; return snapshot; },
-        hideAgent: async (agentId: string) => agent(agentId),
-        unhideAgent: async (agentId: string) => agent(agentId),
       };
       const list = new AgentList(api, () => {}, { debounceMs: 0 });
       t.after(() => list.close());
       list.refresh();
       await waitFor(() => list.loaded);
-      snapshot = { agents: after, as_of_seq: 2 };
+      snapshot = { agents: after, as_of_seq: 2, order_revision: 1 };
       list.refresh();
       await waitFor(() => calls === 2 && list.agents === after);
       assert.equal(list.deletedIds.has(id), op === "deleted", "重连快照可确认消失，但新增或编辑不算删除");
@@ -198,9 +196,7 @@ test("先到的列表快照覆盖 created / updated / deleted，迟到资源事�
 
 test("乱序 Agent 事件按各自资源去重，不让旧删除回滚同一 Agent，也不漏另一个 Agent 的详情失效", async (t) => {
   const list = new AgentList({
-    listAgents: async () => ({ agents: [agent("a"), agent("b")], as_of_seq: 1 }),
-    hideAgent: async (id) => agent(id),
-    unhideAgent: async (id) => agent(id),
+    listAgents: async () => ({ agents: [agent("a"), agent("b")], as_of_seq: 1, order_revision: 1 }),
   }, () => {}, { debounceMs: 0 });
   t.after(() => list.close());
   list.refresh();
@@ -221,9 +217,7 @@ function fakeApi(responses: (() => Promise<AgentSummary[]>)[]) {
     get calls() {
       return calls;
     },
-    listAgents: async () => ({ agents: await responses[Math.min(calls++, responses.length - 1)](), as_of_seq: 0 }),
-    hideAgent: async (id: string) => agent(id, { home: false }),
-    unhideAgent: async (id: string) => agent(id, { home: true }),
+    listAgents: async () => ({ agents: await responses[Math.min(calls++, responses.length - 1)](), as_of_seq: 0, order_revision: 1 }),
   };
 }
 
@@ -305,7 +299,7 @@ test("首次加载失败：loaded 保持 false 并持续重试，一次性故障
   assert.equal(list.error, null);
 });
 
-test("用户点重试：不等退避，立即重拉", async (t) => {
+test("重连 / 聚焦刷新不等退避，立即重拉", async (t) => {
   let fail = true;
   const api = fakeApi([
     async () => {
@@ -336,7 +330,6 @@ test("关闭后不再请求、不再通知，也不写入在途的列表和命�
   await sleep(20); // 列表请求在途
   list.close();
   release([agent("zzz")]);
-  await list.hide("a"); // 命令响应在关闭后到达
   await sleep(40);
   assert.deepEqual(list.agents, []);
   assert.equal(list.loaded, false);
@@ -344,114 +337,6 @@ test("关闭后不再请求、不再通知，也不写入在途的列表和命�
   assert.equal(api.calls, 1);
 });
 
-test("在途的旧快照晚于 hide 返回：丢弃它，补拉未完成期间不倒退，补拉到达后收敛", async (t) => {
-  let releaseOld!: () => void;
-  let releaseRefetch!: () => void;
-  const oldGate = new Promise<void>((resolve) => (releaseOld = resolve));
-  const refetchGate = new Promise<void>((resolve) => (releaseRefetch = resolve));
-  let started = 0;
-  const api = fakeApi([
-    async () => {
-      started++;
-      await oldGate;
-      return [agent("a"), agent("b")]; // hide 之前的旧快照：a 还在首页
-    },
-    async () => {
-      started++;
-      await refetchGate;
-      return [agent("b"), agent("a", { home: false })];
-    },
-  ]);
-  const list = new AgentList(api, () => {}, { debounceMs: 5, retryDelays: [10] });
-  t.after(() => list.close());
-  list.agents = [agent("a"), agent("b")];
-  list.loaded = true;
-  list.refresh();
-  await waitFor(() => started === 1); // 旧请求在途
-  await list.hide("a");
-  releaseOld();
-  await waitFor(() => started === 2); // 旧快照已处理（被丢弃），补拉已发出但仍阻塞
-  assert.equal(list.agents.find((a) => a.id === "a")!.home, false, "补拉未到时不能倒退成旧快照");
-  releaseRefetch();
-  await waitFor(() => list.agents[0].id === "b");
-  assert.equal(api.calls, 2);
-  assert.equal(list.agents.find((a) => a.id === "a")!.home, false);
-});
-
-test("旧快照被丢弃后补拉也失败：停在已确认的结果上，而不是旧快照", async (t) => {
-  let releaseOld!: () => void;
-  const oldGate = new Promise<void>((resolve) => (releaseOld = resolve));
-  let started = 0;
-  const api = fakeApi([
-    async () => {
-      started++;
-      await oldGate;
-      return [agent("a")];
-    },
-    async () => {
-      started++;
-      throw new Error("503");
-    },
-  ]);
-  const list = new AgentList(api, () => {}, { debounceMs: 5, retryDelays: [10_000] });
-  t.after(() => list.close());
-  list.agents = [agent("a")];
-  list.loaded = true;
-  list.refresh();
-  await waitFor(() => started === 1);
-  await list.hide("a");
-  releaseOld();
-  await waitFor(() => list.error !== null);
-  assert.equal(list.agents[0].home, false);
-  assert.match(list.error ?? "", /503/);
-});
-
-test("移出首页：先用返回的一行更新本地，再重拉得到网关排序", async (t) => {
-  const api = fakeApi([async () => [agent("a", { home: false }), agent("b")]]);
-  const list = new AgentList(api, () => {}, { debounceMs: 5, retryDelays: [20] });
-  t.after(() => list.close()); // 断言失败时也要清掉计时器，否则进程不退出
-  list.agents = [agent("a"), agent("b")];
-  list.loaded = true;
-  await list.hide("a");
-  assert.deepEqual(homeAgents(list.agents).map((a) => a.id), ["b"]);
-  await sleep(40);
-  assert.equal(api.calls, 1);
-});
-
-test("分组：按名字过滤，保持顺序，首页只含 home", () => {
-  const all = [agent("Alpha"), agent("beta", { home: false }), agent("alphabet", { home: false })];
-  assert.deepEqual(homeAgents(all).map((a) => a.id), ["Alpha"]);
-  const grouped = groupAgents(all, " ALPHA ");
-  assert.deepEqual(grouped.onHome.map((a) => a.id), ["Alpha"]);
-  assert.deepEqual(grouped.hidden.map((a) => a.id), ["alphabet"]);
-  assert.equal(groupAgents(all, "").hidden.length, 2);
-});
-
-test("行文字：工作中 / 失败优先，其次最后一句，再退回说明和占位", () => {
-  const latest = (over: object) => ({ id: "c", title: "t", last_text: "你好", last_activity_seq: 1, last_activity_at: 1, status: "idle" as const, ...over });
-  assert.deepEqual(homeRowText(agent("a", { latest_conversation: latest({ status: "working" }) }), "正在运行命令"), {
-    kind: "working",
-    text: "工作中 · 正在运行命令",
-  });
-  assert.deepEqual(homeRowText(agent("a", { latest_conversation: latest({ status: "working" }) }), null), { kind: "working", text: "工作中" });
-  assert.equal(homeRowText(agent("a", { latest_conversation: latest({ status: "failed" }) }), null).kind, "failed");
-  assert.deepEqual(homeRowText(agent("a", { latest_conversation: latest({}) }), null), { kind: "plain", text: "你好" });
-  assert.deepEqual(homeRowText(agent("a", { description: "读代码", latest_conversation: latest({ last_text: null }) }), null), {
-    kind: "plain",
-    text: "读代码",
-  });
-  assert.deepEqual(homeRowText(agent("a"), null), { kind: "plain", text: "还没有对话" });
-});
-
-test("离线时缓存的“工作中”显示为状态未知，失败状态不受影响", () => {
-  const working = agent("a", {
-    latest_conversation: { id: "c", title: "t", last_text: "x", last_activity_seq: 1, last_activity_at: 1, status: "working" },
-  });
-  assert.equal(homeRowText(working, "运行命令", true).kind, "plain");
-  assert.equal(homeRowText(working, "运行命令", false).kind, "working");
-  const failed = agent("a", { latest_conversation: { ...working.latest_conversation!, status: "failed" } });
-  assert.equal(homeRowText(failed, null, true).kind, "failed");
-});
 
 test("时间格式：刚刚 / 分钟前 / 今天时刻 / 昨天 / 周X / 日期", () => {
   const now = new Date(2026, 9, 9, 15, 30); // 2026-10-09 周五
@@ -465,3 +350,4 @@ test("时间格式：刚刚 / 分钟前 / 今天时刻 / 昨天 / 周X / 日期"
   assert.equal(formatActivityTime(at(2026, 8, 20, 10), now), "9月20日");
   assert.equal(formatActivityTime(at(2025, 11, 31, 10), now), "2025/12/31");
 });
+

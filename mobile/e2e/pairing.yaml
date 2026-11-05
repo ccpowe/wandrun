@@ -1,136 +1,56 @@
-# agent-device 0.21.16 Maestro subset; run only through run.py on an isolated gateway.
-# Manual scan acceptance (not automated on a real camera): issue a fresh code with
-# `python -m wandrun.gateway pair --url <phone-reachable-url>`; open the camera,
-# scan its wandrun://pair?url=…&code=… QR; verify automatic pairing reaches home,
-# then 关于与连接 shows 扫码 and a pairing time. Repeat after denying
-# camera permission (manual input remains usable) and after code expiry/reuse
-# (explicit regenerate-code guidance). Verify HTTPS for any public URL.
+# Camera/permission is an explicit, timed human subscene; the private bridge observes the App's token.
 appId: host.exp.exponent
 ---
-- tapOn: 设置
+# @phase pairing-connection
+# @open-settings
 - tapOn:
     id: settings-about-connection
-- assertVisible:
-    id: connection-method
-    text: '.*开发连接.*'
-- assertVisible:
-    id: connection-address
-    text: '.*${DEV_URL}.*'
 # @pairing-original-dev
-# Keep the pre-existing development computer paired throughout this flow.
 - tapOn:
     id: connection-add
 - extendedWaitUntil:
     visible:
-      id: pairing-manual
+      id: pairing-scan
     timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/01-entry-light.png
-# @dark-mode
-- takeScreenshot: ${ARTIFACTS}/01-entry-dark.png
-# @light-mode
-# @known-dev-overlay
-- tapOn:
-    id: pairing-manual
-- assertVisible:
-    id: pairing-address
-- takeScreenshot: ${ARTIFACTS}/01-manual-light.png
-# @dark-mode
-- takeScreenshot: ${ARTIFACTS}/01-manual-dark.png
-# @light-mode
-- tapOn:
-    id: pairing-address
-- inputText: ${PAIRING_URL}
-- back
-# @pairing-issue
-- tapOn:
-    id: pairing-code
-# The runner substitutes the code in a 0600 TMPDIR step (not --env/fixture/log).
-- inputText: ${PAIR_CODE}
-- back
-- tapOn:
-    id: pairing-submit
+# @pairing-camera
 - extendedWaitUntil:
-    visible: 设置
+    visible:
+      id: composer-input
     timeout: 10000
+# @phase pairing-token-install
 # @pairing-exchanged
-- takeScreenshot: ${ARTIFACTS}/02-paired-home-light.png
-- tapOn: 设置
+- takeScreenshot: ${ARTIFACTS}/01-scanned-chat.png
+# @open-settings
 - tapOn:
     id: settings-about-connection
-- assertVisible:
-    id: connection-name
-- assertVisible: ${PAIR_COMPUTER_NAME}
-- assertVisible:
-    id: connection-address
-    text: '.*${PAIRING_URL}.*'
-- assertVisible:
-    id: connection-method
-    text: '.*手动输入.*'
-- assertVisible:
-    id: connection-app-version
-- assertVisible:
-    id: connection-gateway-version
 # @pairing-fixture-current
-- takeScreenshot: ${ARTIFACTS}/03-about-paired-light.png
-# @dark-mode
-- takeScreenshot: ${ARTIFACTS}/03-about-paired-dark.png
-# @light-mode
+# Exactly one explicit switch, leaving the original computer intact.
 - tapOn:
-    id: connection-rename
-- tapOn:
-    id: connection-local-name
-- inputText: E2E paired computer
-- tapOn:
-    id: connection-rename-confirm
-- assertVisible: E2E paired computer
-- tapOn: ${DEV_URL}
-# @pairing-dev-selected
-- assertVisible:
-    id: connection-switch
+    id: ${PAIRING_DEV_ROW}
 - tapOn:
     id: connection-switch
 - extendedWaitUntil:
-    visible: 设置
+    visible:
+      id: composer-input
     timeout: 10000
-- tapOn: 设置
+# @phase pairing-revoke
+# @open-settings
 - tapOn:
     id: settings-about-connection
-- assertVisible:
-    id: connection-method
-    text: '.*开发连接.*'
-- assertVisible:
-    id: connection-address
-    text: '.*${DEV_URL}.*'
 # @pairing-dev-current
-- tapOn: E2E paired computer
+- tapOn:
+    id: ${PAIRING_FIXTURE_ROW}
 # @pairing-fixture-selected
-- tapOn:
-    id: connection-switch
-- extendedWaitUntil:
-    visible: 设置
-    timeout: 10000
-- tapOn: 设置
-- tapOn:
-    id: settings-about-connection
-- assertVisible: E2E paired computer
-# @pairing-fixture-current
 - tapOn:
     id: connection-disconnect
 - tapOn:
     id: connection-disconnect-confirm
 - extendedWaitUntil:
-    visible: 设置
+    notVisible:
+      id: connection-disconnect-confirm
     timeout: 10000
+# Local completion is the row disappearing; remote best-effort revocation has its own bound.
+# @pairing-local-disconnected
 # @pairing-revoked
 # @pairing-restore-dev
-- takeScreenshot: ${ARTIFACTS}/04-restored-home-light.png
-- tapOn: 设置
-- tapOn:
-    id: settings-about-connection
-- assertVisible:
-    id: connection-method
-    text: '.*开发连接.*'
-- assertVisible:
-    id: connection-address
-    text: '.*${DEV_URL}.*'
-# @pairing-dev-restored
+- takeScreenshot: ${ARTIFACTS}/02-restored-development.png

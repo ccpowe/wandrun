@@ -1,6 +1,6 @@
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { Bot, FileText, MessageSquare, MessagesSquare } from "lucide-react-native";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { ActivityIndicator, Keyboard, Pressable, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -9,13 +9,14 @@ import { Button } from "@/components/ui/button.tsx";
 import { Icon } from "@/components/ui/icon.tsx";
 import { Input } from "@/components/ui/input.tsx";
 import { Text } from "@/components/ui/text.tsx";
-import type { SearchResult } from "@/gateway/api.ts";
 import { liveSearchDestination } from "@/lib/conversation-navigation.ts";
 import { useTranslation } from "@/lib/i18n.ts";
 import { useSession } from "@/lib/session-context.tsx";
 import { messagePreview } from "@/lib/message-preview.ts";
+import { searchOptions } from "@/lib/gateway-queries.ts";
+import { useGatewayInfiniteQuery } from "@/lib/use-gateway-query.ts";
+import type { ChatSession } from "@/gateway/session.ts";
 
-const PAGE = 30;
 const GROUPS = [
   { kind: "agent", title: "Agent", icon: Bot },
   { kind: "conversation", title: "对话", icon: MessagesSquare },
@@ -24,50 +25,17 @@ const GROUPS = [
 ] as const;
 
 export default function SearchScreen() {
+  const session = useSession();
+  return <SearchPage session={session} />;
+}
+
+export function SearchPage({ session }: { session: ChatSession | null }) {
   const { t } = useTranslation();
   const { agent_id } = useLocalSearchParams<{ agent_id?: string }>();
   const insets = useSafeAreaInsets();
-  const session = useSession();
   const [query, setQuery] = useState("");
-  const [searchState, setSearchState] = useState<{
-    scopeKey: string; requestKey: string; results: SearchResult[]; total: number; error: string | null;
-  } | null>(null);
-  const [page, setPage] = useState(0);
-  const [revision, retry] = useState(0);
   const scopeName = session?.agents.agents.find((agent) => agent.id === agent_id)?.name;
   const search = query.trim();
-  const scopeKey = `${agent_id ?? ""}\u0000${search}`;
-  const requestKey = `${scopeKey}\u0000${page}\u0000${revision}`;
-  const current = searchState?.scopeKey === scopeKey ? searchState : null;
-  const results = current?.results ?? [];
-  const visibleResults = results.filter((result) => liveSearchDestination(result, session) !== null);
-  const total = current?.total ?? 0;
-  const error = current?.requestKey === requestKey ? current.error : null;
-  const loading = Boolean(search && session && current?.requestKey !== requestKey);
-
-  useEffect(() => {
-    if (!search || !session) return;
-    let active = true;
-    const timer = setTimeout(() => {
-      void session.api.search(search, agent_id, PAGE, page * PAGE).then((response) => {
-        if (!active) return;
-        setSearchState((previous) => ({
-          scopeKey, requestKey,
-          results: page === 0 ? response.results : [...(previous?.scopeKey === scopeKey ? previous.results : []), ...response.results],
-          total: response.total, error: null,
-        }));
-      }).catch((cause: unknown) => {
-        if (!active) return;
-        setSearchState((previous) => ({
-          scopeKey, requestKey,
-          results: previous?.scopeKey === scopeKey ? previous.results : [],
-          total: previous?.scopeKey === scopeKey ? previous.total : 0,
-          error: cause instanceof Error ? cause.message : "搜索失败",
-        }));
-      });
-    }, page === 0 ? 250 : 0);
-    return () => { active = false; clearTimeout(timer); };
-  }, [search, agent_id, session, page, scopeKey, requestKey]);
 
   return (
     <View className="flex-1 bg-background">
@@ -75,11 +43,25 @@ export default function SearchScreen() {
       <View className="flex-row items-center gap-2 px-4 pb-3" style={{ paddingTop: insets.top + 12 }}>
         <View className="min-w-0 flex-1">
           <Input testID="search-input" autoFocus placeholder={agent_id ? t("搜索 {name}", { name: scopeName ?? t("此 Agent") }) : t("搜索 Agent、对话、消息、文件")}
-            value={query} onChangeText={(value) => { setQuery(value); setPage(0); }} returnKeyType="search" onSubmitEditing={() => Keyboard.dismiss()} />
+            value={query} onChangeText={setQuery} returnKeyType="search" onSubmitEditing={() => Keyboard.dismiss()} />
         </View>
-        <Button testID="search-cancel" variant="ghost" onPress={() => router.back()}><Text>{t("取消")}</Text></Button>
+        <Button testID="search-cancel" intent="quiet" onPress={() => router.back()}><Text>{t("取消")}</Text></Button>
       </View>
       {agent_id && <Text className="px-5 pb-2 text-xs text-muted-foreground">{t("仅搜索 {name} 的内容", { name: scopeName ?? t("当前 Agent") })}</Text>}
+      {session && search && <SearchResults key={`${session.queryIdentity}:${agent_id ?? ""}:${search}`} session={session} search={search} agentId={agent_id} />}
+    </View>
+  );
+}
+
+function SearchResults({ session, search, agentId }: { session: ChatSession; search: string; agentId?: string }) {
+  const { t } = useTranslation();
+  const read = useGatewayInfiniteQuery(searchOptions(session, search, agentId));
+  const results = read.data?.pages.flatMap(page => page.results) ?? [];
+  const visibleResults = results.filter(result => liveSearchDestination(result, session) !== null);
+  const total = read.data?.pages.at(-1)?.total ?? 0;
+  const loading = read.fetchStatus === "fetching";
+  const error = read.error instanceof Error ? read.error.message : null;
+  return (
       <ScrollView keyboardShouldPersistTaps="handled" contentContainerClassName="px-4 pb-10">
         {GROUPS.map(({ kind, title, icon }) => {
           const group = visibleResults.filter((result) => result.kind === kind);
@@ -94,7 +76,7 @@ export default function SearchScreen() {
                 }}
                 className={`flex-row items-center gap-3 px-4 py-3 active:bg-muted ${index ? "border-t border-border" : ""}`}>
                 {result.kind === "file"
-                  ? <FileTypeIcon mediaType={result.file.media_type} className="size-5 text-muted-foreground" />
+                  ? <FileTypeIcon mediaType={result.file.media_type} name={result.title} className="size-5 text-muted-foreground" />
                   : <Icon as={icon} className="size-5 text-muted-foreground" />}
                 <View className="min-w-0 flex-1">
                   <Text numberOfLines={1} className="font-medium">{result.title}</Text>
@@ -108,10 +90,9 @@ export default function SearchScreen() {
           </View>;
         })}
         {loading && <ActivityIndicator className="py-6" />}
-        {error && <View className="items-center gap-2 py-8"><Text className="text-destructive">{t(error)}</Text><Button variant="outline" onPress={() => retry((value) => value + 1)}><Text>{t("重试")}</Text></Button></View>}
-        {!loading && !error && query.trim() && visibleResults.length === 0 && results.length >= total && <Text className="py-16 text-center text-muted-foreground">{t("没有找到相关内容")}</Text>}
-        {!loading && !error && results.length < total && <Button testID="search-more" variant="outline" className="mt-5" onPress={() => setPage((value) => value + 1)}><Text>{t("加载更多")}</Text></Button>}
+        {error && <View className="items-center gap-2 py-8"><Text className="text-destructive">{t(error)}</Text><Button intent="soft" onPress={() => { void (read.hasNextPage ? read.fetchNextPage({ cancelRefetch: false }) : read.retry()); }}><Text>{t("重试")}</Text></Button></View>}
+        {!loading && !error && read.fetchStatus !== "paused" && visibleResults.length === 0 && results.length >= total && <Text className="py-16 text-center text-muted-foreground">{t("没有找到相关内容")}</Text>}
+        {!loading && !error && read.hasNextPage && <Button testID="search-more" intent="soft" className="mt-5" onPress={() => { void read.fetchNextPage({ cancelRefetch: false }); }}><Text>{t("加载更多")}</Text></Button>}
       </ScrollView>
-    </View>
   );
 }

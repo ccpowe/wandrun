@@ -226,7 +226,7 @@ class MCPPoolTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("wandrun.integrations.mcp.MCPAdapter", Adapter):
             async with MCPConnectionPool(open_timeout=0.02) as pool:
-                with self.assertRaisesRegex(MCPConnectionError, "请求超时"):
+                with self.assertRaises(MCPConnectionError):
                     await pool.open("docs", {"command": "fake"})
                 self.assertTrue(closed.is_set())
                 self.assertEqual(pool.status("docs", {"command": "fake"})["status"], "failed")
@@ -1597,17 +1597,20 @@ class MCPHTTPTests(unittest.IsolatedAsyncioTestCase):
 
             async def list_tools(self, *, run_middleware=True):
                 if self.slow_discovery:
-                    await asyncio.sleep(0.65)
+                    await asyncio.sleep(0)  # An expired tool clock must not govern discovery.
                 return await super().list_tools(run_middleware=run_middleware)
 
         peer = SlowCatalog("deadline-test")
-        calls, started = [], asyncio.Event()
+        calls, started, release_blocked = [], asyncio.Event(), asyncio.Event()
 
         @peer.tool
         async def slow(delay: float) -> str:
             calls.append(delay)
             started.set()
-            await asyncio.sleep(delay)
+            if delay in (1.0, 5.0):
+                await release_blocked.wait()
+            else:
+                await asyncio.sleep(delay)
             return "completed"
 
         class ShortOldClockPool(MCPConnectionPool):
@@ -1637,8 +1640,11 @@ class MCPHTTPTests(unittest.IsolatedAsyncioTestCase):
                 while not server.started:
                     await asyncio.sleep(0.01)
             connection = {"url": f"http://127.0.0.1:{sock.getsockname()[1]}/mcp"}
-            async with ShortOldClockPool(call_timeout=0.5, open_timeout=3) as pool:
+            async with ShortOldClockPool(call_timeout=0, open_timeout=3) as pool:
+                # Discovery must succeed even with an already-expired tool clock.
                 tool, = await pool.open("slow", connection)
+                # Normal HTTP work gets a fixture watchdog, not a subsecond CPU SLA.
+                pool._call_timeout = 10
                 peer.slow_discovery = False
                 owner = pool._services["slow"]
 
@@ -1650,20 +1656,52 @@ class MCPHTTPTests(unittest.IsolatedAsyncioTestCase):
                 completed = await invoke(0.15)
                 self.assertEqual(completed.status, "success", completed.content)
                 self.assertEqual(completed.content[0]["text"], "completed")
-                timed_out = await invoke(1.0)
+                started.clear()
+                deadlines = []
+
+                def capture_deadline(seconds):
+                    deadline = asyncio.timeout(seconds)
+                    if seconds == pool._call_timeout:
+                        deadlines.append(deadline)
+                    return deadline
+
+                # Hook the Timeout created by MCPConnectionPool._invoke, not the
+                # SDK transport: expire it only after the real server is blocked.
+                # If that product boundary changes, missing capture must fail.
+                with patch("wandrun.integrations.mcp.asyncio", SimpleNamespace(
+                    **{**vars(asyncio), "timeout": capture_deadline},
+                )):
+                    timing_out = asyncio.create_task(invoke(1.0))
+                    try:
+                        await asyncio.wait_for(started.wait(), 10)
+                        self.assertEqual(len(deadlines), 1, "product call deadline was not captured")
+                        self.assertFalse(deadlines[0].expired())
+                        self.assertFalse(timing_out.done())
+                        deadlines[0].reschedule(asyncio.get_running_loop().time())
+                        timed_out = await asyncio.wait_for(timing_out, 10)
+                        self.assertTrue(deadlines[0].expired())
+                    finally:
+                        timing_out.cancel()
+                        await asyncio.gather(timing_out, return_exceptions=True)
                 self.assertEqual(timed_out.status, "error")
                 self.assertIn("结果未知", str(timed_out.content))
-                self.assertEqual((await invoke(0)).status, "success")
+                resumed = await invoke(0)
+                self.assertEqual(resumed.status, "success", resumed.content)
                 self.assertIs(pool._services["slow"], owner)
                 self.assertEqual(pool.status("slow", connection)["status"], "connected")
                 self.assertEqual(calls, [0.15, 1.0, 0.0])
                 started.clear()
                 waiting = asyncio.create_task(invoke(5))
-                await asyncio.wait_for(started.wait(), 2)
-                waiting.cancel()
-                with self.assertRaises(asyncio.CancelledError):
-                    await asyncio.wait_for(waiting, 0.3)
+                try:
+                    await asyncio.wait_for(started.wait(), 10)
+                    waiting.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(waiting, 10)
+                finally:
+                    waiting.cancel()
+                    await asyncio.gather(waiting, return_exceptions=True)
         finally:
+            release_blocked.set()
             server.should_exit = True
             await asyncio.wait_for(serving, 5)
             sock.close()

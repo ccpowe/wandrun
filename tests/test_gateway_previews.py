@@ -3,6 +3,7 @@
 import asyncio
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 import httpx
 
@@ -30,7 +31,7 @@ class GatewayPreviewTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager = gateway_manager(self.gateway, run)
         self.addAsyncCleanup(self.manager.close)
-        self.root = self.gateway.create_conversation("stream", "c")["id"]
+        self.root = self.gateway.create_conversation("stream", "c", client_id=uuid4().hex)[0]["id"]
         self.manager.start("root", self.root, agent_name="c")
         self.member = self.manager.start("member", sender_id=self.root, agent_name="a")["task_id"]
         self.executions = {

@@ -21,7 +21,7 @@ from fastmcp import Client as FastMCPClient
 from fastmcp.client.transports.http import StreamableHttpTransport
 from fastmcp.client.transports.sse import SSETransport
 from fastmcp.client.transports.stdio import StdioTransport
-from langchain.mcp import MCPAdapter
+from langchain.mcp import MCPAdapter, as_langchain_tool
 from langchain.tools import BaseTool
 from langchain_core.tools import ToolException
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -94,14 +94,26 @@ def _connection_secrets(connection: Mapping) -> tuple[str, ...]:
 
 def _safe_reason(error: Exception) -> str:
     """Public errors classify SDK failures; exception text is not a trusted channel."""
-    if isinstance(error, (TimeoutError, httpx2.TimeoutException)) or (
-        isinstance(error, MCPError) and error.code == REQUEST_TIMEOUT
-    ):
-        return "请求超时"
-    if isinstance(error, (ConnectionError, OSError, httpx2.HTTPError)) or (
-        isinstance(error, MCPError) and error.code == CONNECTION_CLOSED
-    ):
-        return "连接请求失败"
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, httpx2.TimeoutException)) or (
+            isinstance(current, MCPError) and current.code == REQUEST_TIMEOUT
+        ):
+            return "请求超时"
+        if isinstance(current, (ConnectionError, OSError, httpx2.HTTPError)) or (
+            isinstance(current, MCPError) and current.code == CONNECTION_CLOSED
+        ):
+            return "连接请求失败"
+        # FastMCP's exception groups can refer back to their raised leaf.
+        pending.extend(getattr(current, "exceptions", ()))
+        cause = current.__cause__ or current.__context__
+        if cause is not None:
+            pending.append(cause)
     return "远端请求失败"
 
 
@@ -121,6 +133,11 @@ def _transport_failed(error: Exception, client: object) -> bool:
 
 class MCPConnectionError(ValueError):
     """Safe-to-display connection/discovery failure; credentials and SDK errors stay private."""
+
+    def __init__(self, message: str, *, challenge: httpx2.Response | None = None):
+        super().__init__(message)
+        # Only status/challenge headers survive, never the credentialed request.
+        self.challenge = challenge
 
 
 
@@ -143,6 +160,17 @@ class _Service:
     released: bool = False
     generation: int | None = None
     oauth_issue: OAuthIssue | None = None
+    metadata: dict = field(default_factory=dict)
+    challenge: httpx2.Response | None = None
+    key_auth_failed: bool = False
+
+
+def _connection_failure(state: _Service, error: Exception) -> str:
+    if state.key_auth_failed:
+        return "Key 无效或已失效，请检查后重新填写"
+    if _safe_reason(error) in ("连接请求失败", "请求超时"):
+        return "无法连接服务，请稍后重试"
+    return "连接未完成，请检查连接参数后重试"
 
 
 class MCPConnectionPool:
@@ -192,7 +220,7 @@ class MCPConnectionPool:
         if server in self._connections:
             return self._connections[server]
         if fallback is None:
-            raise MCPConnectionError(f"MCP 服务 {self._safe_server(server)} 不存在")
+            raise MCPConnectionError("连接服务不存在")
         return fallback
 
     async def open(self, server: str, connection: dict) -> list[BaseTool]:
@@ -216,6 +244,11 @@ class MCPConnectionPool:
             "pending_restart": server in self._connections and self._connections[server] != connection,
         }
 
+    def metadata(self, server: str) -> dict:
+        """Negotiated identity/instructions and first-discovered tool display metadata."""
+        state = self._services.get(server)
+        return dict(state.metadata) if state is not None else {}
+
     async def probe(self, server: str, connection: dict) -> list[BaseTool]:
         """Probe the original connection, bypassing discovery cache without publishing it."""
         if self._closed:
@@ -229,6 +262,7 @@ class MCPConnectionPool:
         ) if state.generation is not None else None
         try:
             await self._authorize(server, state)
+            state.key_auth_failed = False
             try:
                 async with asyncio.timeout(self._open_timeout):
                     await state.client.list_tools(cache_mode="bypass")
@@ -238,8 +272,7 @@ class MCPConnectionPool:
                 if _transport_failed(error, state.client):
                     state.suspect = True
                 raise MCPConnectionError(
-                    f"MCP 服务 {_redact(server, _connection_secrets(state.connection))} "
-                    f"工具发现失败：{_safe_reason(error)}"
+                    _connection_failure(state, error)
                 ) from None
             return state.tools
         finally:
@@ -273,7 +306,7 @@ class MCPConnectionPool:
             except asyncio.CancelledError:
                 if self._closed or not asyncio.current_task().cancelling():
                     raise MCPConnectionError(
-                        f"MCP 服务 {self._safe_server(server)} 已关闭"
+                        "连接已关闭"
                     ) from None
                 raise
             finally:
@@ -359,7 +392,7 @@ class MCPConnectionPool:
         if self.oauth is not None and server in self.oauth_connectors:
             new.generation = self.oauth.generation(server)
             if not self.oauth.authorized(server, new.generation, desired["url"]):
-                raise MCPConnectionError(f"MCP 服务 {self._safe_server(server)} 需要重新授权")
+                raise MCPConnectionError("需要重新授权")
         self._services[server] = new
         new.task = asyncio.create_task(self._serve(server, new))
         try:
@@ -368,7 +401,7 @@ class MCPConnectionPool:
             if not new.ready.is_set():
                 new.status = "failed"
                 new.error = MCPConnectionError(
-                    f"MCP 服务 {self._safe_server(server)} 打开与清理超时，资源释放未确认"
+                    "连接打开与清理超时，资源释放未确认"
                 )
                 new.ready.set()
                 new.task.cancel()
@@ -401,7 +434,7 @@ class MCPConnectionPool:
         state.status = "failed"
         state.suspect = False
         state.error = MCPConnectionError(
-            f"MCP 服务 {_redact(server, _connection_secrets(state.connection))} 连接已失效：{reason}"
+            f"连接已失效：{reason}"
         )
         logging.getLogger(__name__).warning(
             "MCP 服务 %s 连接失效：%s", _redact(server, _connection_secrets(state.connection)), reason,
@@ -427,6 +460,29 @@ class MCPConnectionPool:
                 request.extensions["timeout"]["read"] = self._call_timeout
 
         async def session_rejected(response: httpx2.Response) -> None:
+            if response.status_code in (401, 403):
+                state.key_auth_failed = "_key_auth_failures" in state.connection
+                state.challenge = httpx2.Response(
+                    response.status_code,
+                    headers={"WWW-Authenticate": response.headers.get("WWW-Authenticate", "")},
+                )
+            elif 200 <= response.status_code < 300:
+                state.challenge = None
+                state.key_auth_failed = False
+            patterns = state.connection.get("_key_auth_failures", [])
+            if patterns and response.headers.get("content-type", "").split(";")[0].strip() == "application/json":
+                # Only catalog-declared non-MCP rejection bodies are inspected.
+                # Reading buffers this JSON for the SDK; SSE streams stay untouched.
+                await response.aread()
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = None
+                if isinstance(body, dict) and any(
+                    all(body.get(key) == value for key, value in pattern.items())
+                    for pattern in patterns
+                ):
+                    state.key_auth_failed = True
             if (response.status_code == 404 and response.request.method in {"GET", "POST"}
                     and response.request.headers.get("mcp-session-id")):
                 # MCP 2.1.1 can return INVALID_REQUEST while keeping its owner alive.
@@ -440,7 +496,6 @@ class MCPConnectionPool:
 
     async def _serve(self, server: str, state: _Service) -> None:
         secrets = _connection_secrets(state.connection)
-        safe_server = _redact(server, secrets)
         token = _secrets.set(secrets)
         oauth_scope = _secret_source.set(
             lambda: self.oauth.secret_values(server),
@@ -450,7 +505,9 @@ class MCPConnectionPool:
         try:
             try:
                 if state.generation is None:
-                    client = FastMCPClient({"mcpServers": {server: state.connection}})
+                    connection = {key: value for key, value in state.connection.items()
+                                  if key != "_key_auth_failures"}
+                    client = FastMCPClient({"mcpServers": {server: connection}})
                     # FastMCP 4.0.3's one-server MCPConfigTransport exposes
                     # its selected transport at .transport. SSE has a separate
                     # stream read clock beyond the HTTP client's request timeout.
@@ -514,8 +571,20 @@ class MCPConnectionPool:
                     stack.push_async_callback(close_client)
                     async with asyncio.timeout(self._open_timeout):
                         await stack.enter_async_context(adapter)
-                        raw = await adapter.list_tools()
+                        # The adapter discards top-level Tool.title. Read the wire catalog
+                        # once, retain display metadata, then use its public conversion.
+                        catalog = await adapter.client.list_tools()
+                        raw = [tool if isinstance(tool, BaseTool) else await as_langchain_tool(tool, adapter.client)
+                               for tool in catalog]
                         state.raw_tools = {tool.name: tool for tool in raw}
+                        info = getattr(adapter.client, "server_info", None)
+                        state.metadata = {
+                            "serverInfo": info.model_dump(mode="json") if info is not None else {},
+                            "instructions": getattr(adapter.client, "instructions", None),
+                            "tools": [{"name": tool.name, "title": getattr(tool, "title", None),
+                                       "description": getattr(tool, "description", None)}
+                                      for tool in catalog],
+                        }
                         state.tools = self._catalogs.get(server)
                         if state.tools is None:
                             state.tools = [
@@ -533,7 +602,7 @@ class MCPConnectionPool:
                         except Exception:
                             callback_failed = True
                             state.status = "failed"
-                            state.error = MCPConnectionError(f"MCP 服务 {safe_server} 状态发布失败")
+                            state.error = MCPConnectionError("连接状态更新失败")
                             raise
                     state.ready.set()
                     # FastMCP 4.0.3 exposes the live session task privately;
@@ -548,8 +617,8 @@ class MCPConnectionPool:
             except asyncio.CancelledError:
                 if state.error is None or state.released:
                     state.error = MCPConnectionError(
-                        f"MCP 服务 {safe_server} 已关闭" if state.released or state.client is None else
-                        f"MCP 服务 {safe_server} 关闭中断，资源释放未确认"
+                        "连接已关闭" if state.released or state.client is None else
+                        "连接关闭中断，资源释放未确认"
                     )
                 state.status = "failed"
                 raise
@@ -559,9 +628,10 @@ class MCPConnectionPool:
                 elif state.status != "connected":
                     if state.error is None:
                         state.error = MCPConnectionError(
-                            f"MCP 服务 {safe_server} 连接或工具发现失败：{_safe_reason(error)}"
+                            _connection_failure(state, error)
                             if state.released or state.client is None else
-                            f"MCP 服务 {safe_server} 连接或工具发现失败，资源释放未确认"
+                            "连接未完成，资源释放未确认",
+                            challenge=state.challenge,
                         )
                     state.status = "failed"
                     if self.on_change is not None and not callback_failed:
@@ -569,12 +639,12 @@ class MCPConnectionPool:
                             self.on_change(server)
                         except Exception:
                             state.error = MCPConnectionError(
-                                f"MCP 服务 {safe_server} 状态发布失败"
+                                "连接状态更新失败"
                             )
                 elif not state.released:
                     state.status = "failed"
                     state.error = MCPConnectionError(
-                        f"MCP 服务 {safe_server} 关闭失败：{_safe_reason(error)}"
+                        f"连接关闭失败：{_safe_reason(error)}"
                     )
                     raise state.error from None
             finally:
@@ -660,7 +730,7 @@ class MCPConnectionPool:
             raise MCPConnectionError(str(error)) from None
         if (self._services.get(server) is not state or state.stop.is_set()
                 or not self.oauth.authorized(server, state.generation, state.connection["url"])):
-            raise MCPConnectionError(f"MCP 服务 {self._safe_server(server)} 需要重新授权")
+            raise MCPConnectionError("需要重新授权")
 
     async def _invoke(self, server: str, name: str, generation: int | None,
                       original_url: str | None, arguments: dict) -> object:

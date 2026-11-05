@@ -18,9 +18,12 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const platform: Record<string, string> = {
   "react-native": `export const View='View', Text='Text', TextInput='TextInput', ScrollView='ScrollView', Pressable='Pressable';
     export const Platform={OS:'web'};`,
-  "lucide-react-native": "export const ArrowUp='ArrowUp',Quote='Quote',RotateCw='RotateCw',X='X';",
+  "lucide-react-native": "export const AlertCircle='AlertCircle',ArrowUp='ArrowUp',Plus='Plus',Check='Check',Quote='Quote',RotateCw='RotateCw',X='X';",
   "@/components/chat/attachment-picker-menu.tsx": "export const AttachmentPickerMenu='AttachmentPickerMenu';",
   "@/components/file-type-icon.tsx": "export const FileTypeIcon='FileTypeIcon';",
+  "expo-image": "export const Image='Image';",
+  "@/components/ui/badge.tsx": "export const Badge='Badge';",
+  "@/components/ui/card.tsx": "export const Card='Card';",
   "@/components/ui/button.tsx": "export const Button='Button';",
   "@/components/ui/icon.tsx": "export const Icon='Icon';",
   "@/components/ui/text.tsx": "export const Text='UiText';",
@@ -87,21 +90,37 @@ test("only the draft grows and shrinks with wrapping, preserves trailing blank l
     await act(async () => root.render(createElement(Composer, { ...composerProps, draft: "One\ntwo\n" })));
     assert.equal(hints(root).length, 0);
     assert.equal(probe(root).props.children, "One\ntwo\n\u200b");
-    await act(async () => probe(root).props.onLayout({ nativeEvent: { layout: { height: 48 } } }));
-    assert.equal(node(root, "TextInput").props.style.height, 64);
+    // Body 15/20 lines plus 10 above and below (composer.tsx INPUT_PADDING).
+    await act(async () => probe(root).props.onLayout({ nativeEvent: { layout: { height: 40 } } }));
+    assert.equal(node(root, "TextInput").props.style.height, 60);
     // Width changes reflow real input without requiring a draft change.
-    await act(async () => probe(root).props.onLayout({ nativeEvent: { layout: { height: 72 } } }));
-    assert.equal(node(root, "TextInput").props.style.height, 88);
+    await act(async () => probe(root).props.onLayout({ nativeEvent: { layout: { height: 60 } } }));
+    assert.equal(node(root, "TextInput").props.style.height, 80);
     await act(async () => probe(root).props.onLayout({ nativeEvent: { layout: { height: 192 } } }));
     assert.equal(node(root, "TextInput").props.style.height, 120);
     await act(async () => root.render(createElement(Composer, { ...composerProps, draft: "Short", working: false })));
-    await act(async () => probe(root).props.onLayout({ nativeEvent: { layout: { height: 24 } } }));
+    await act(async () => probe(root).props.onLayout({ nativeEvent: { layout: { height: 20 } } }));
     assert.equal(node(root, "TextInput").props.style.height, 40);
     await act(async () => probe(root).props.onLayout({ nativeEvent: { layout: { height: 72 } } }));
     await act(async () => root.render(createElement(Composer, composerProps)));
     // Clearing cannot wait for another native layout callback.
     assert.equal(node(root, "TextInput").props.style.height, 40);
     assert.equal(hints(root).length, 1);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test("an unreadable local image keeps the uploaded attachment available in the composer", async () => {
+  const root = createRoot({ textComponentTypes: ["Text", "UiText"] });
+  const image: UploadItem = { id: "photo", name: "photo.jpg", mediaType: "image/jpeg", size: 12,
+    uploadUrl: null, fileId: "file-photo", progress: 12, error: null, previewUri: "file:///missing-photo.bin" };
+  try {
+    await act(async () => root.render(createElement(Composer, { ...composerProps, working: false, attachments: [image] })));
+    const picture = root.container.queryAll((entry) => entry.type === "Image")[0];
+    await act(async () => picture.props.onError());
+    assert.equal(root.container.queryAll((entry) => entry.type === "Image").length, 0);
+    assert.equal(root.container.queryAll((entry) => entry.props.accessibilityRole === "image" && entry.props.accessibilityLabel === image.name).length, 1);
+    assert.equal(root.container.queryAll((entry) => entry.props.testID === "upload-ready-photo.jpg").length, 1);
+    assert.equal(root.container.queryAll((entry) => entry.props.testID === "upload-remove-photo").length, 1);
   } finally { await act(async () => root.unmount()); }
 });
 

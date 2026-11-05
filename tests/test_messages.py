@@ -105,6 +105,78 @@ class MessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(feedback["deliveries"], receipts)
         self.assertEqual(shown, ["visible"])
 
+    async def test_feedback_admission_filters_merged_queues_before_model_injection(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        checked = []
+
+        async def run(prompts, task_id):
+            entered.set()
+            await release.wait()
+            return output(next="wait")
+
+        def accept(task_id, message):
+            checked.append((task_id, message.id))
+            return "obsolete" not in message.content
+
+        manager = WorkerManager(run, accept_feedback=accept)
+        self.addAsyncCleanup(manager.close)
+        manager.start("initial user input", "root")
+        await entered.wait()
+        manager.add_feedback("root", {"obsolete": "feedback"})
+        manager.add_feedback("root", {"deliveries": [{"accepted": True}]})
+        manager.notify("root", {"obsolete": "inbox"})
+        manager.start("fresh collaboration", "root", sender_id="colleague")
+        injected = await CommunicationMiddleware(manager).abefore_model(
+            {}, SimpleNamespace(context={"task_id": "root"}),
+        )
+        pending = injected["messages"]
+        self.assertEqual(len(pending), 2)
+        self.assertIn('"deliveries"', pending[0].content)
+        self.assertTrue(pending[1].content.endswith("fresh collaboration"))
+        self.assertEqual(pending[1].additional_kwargs["sender_id"], "colleague")
+        self.assertFalse(any("obsolete" in message.content for message in manager._inflight["root"]))
+        self.assertTrue(all(task_id == "root" for task_id, _ in checked))
+        self.assertEqual(len(checked), 5)  # Initial input plus both feedback and inbox batches.
+        self.assertEqual(manager.take_messages("root"), [])
+        release.set()
+        await manager.wait("root")
+
+    async def test_feedback_admission_revalidates_inflight_retries_and_consumes_rejections(self):
+        entered = asyncio.Event()
+        received = []
+        applicable = True
+
+        async def run(prompts, task_id):
+            received.append(prompts)
+            if len(received) == 2:
+                entered.set()
+                await asyncio.Future()
+            return output(next="wait")
+
+        manager = WorkerManager(
+            run, accept_feedback=lambda task_id, message: applicable or "obsolete" not in message.content,
+        )
+        self.addAsyncCleanup(manager.close)
+        manager.start("initial user input", "root")
+        await manager.wait("root")
+        manager.add_feedback("root", {"obsolete": "previously applicable"})
+        manager.start("first explicit input", "root")
+        await entered.wait()
+        self.assertTrue(any("obsolete" in message.content for message in received[1]))
+        await manager.cancel("root")
+        applicable = False
+        manager.start("new explicit input", "root")
+        await manager.wait("root")
+        self.assertFalse(any("obsolete" in message.content for message in received[2]))
+        self.assertEqual(
+            [message.content for message in received[2]],
+            ["first explicit input", "new explicit input"],
+        )
+        applicable = True
+        manager.start("later explicit input", "root")
+        await manager.wait("root")
+        self.assertEqual([message.content for message in received[3]], ["later explicit input"])
+
     async def test_failure_notifies_original_caller_only(self):
         entered, release, notified = asyncio.Event(), asyncio.Event(), asyncio.Event()
         received = {}
@@ -455,7 +527,7 @@ class MessageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([[item.name for item in attached] for _, attached in shown],
                              [["ok.txt"], ["missing.txt"]])
 
-    async def test_distinct_local_execution_environments_reject_path_but_deliver_text(self):
+    async def test_aliases_of_same_local_machine_share_verified_path_and_deliver_text(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             seen = []
@@ -477,15 +549,16 @@ class MessageTests(unittest.IsolatedAsyncioTestCase):
             manager.start("begin", "root")
             await manager.wait("root")
             await files.prepare("root")
-            (Path(files.directory("root")) / "same.txt").write_text("not shared by environment")
+            (Path(files.directory("root")) / "same.txt").write_text("same physical local file")
             receipt = manager.dispatch(output(SendMessage(
                 to="other", task_id=None, message="text still arrives", attachments=["same.txt"],
             )), "root")[0]
             self.assertTrue(receipt["accepted"])
-            self.assertFalse(receipt["attachments"][0]["accepted"])
+            self.assertTrue(receipt["attachments"][0]["accepted"])
             await manager.wait(receipt["task_id"])
             self.assertIn("text still arrives", seen[0].content)
-            self.assertNotIn("attachments", seen[0].additional_kwargs)
+            self.assertEqual(seen[0].additional_kwargs["attachments"][0]["path"],
+                             str(Path(files.directory("root")) / "same.txt"))
 
     async def test_missing_attachment_resolver_rejects_each_path_and_reopens_model(self):
         shown = []

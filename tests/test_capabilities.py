@@ -49,6 +49,8 @@ class OfflineBrowserLeases:
     """Observe registration and takeover without opening Chrome or a device connection."""
 
     def __init__(self, definition, **kwargs):
+        from wandrun.config import BrowserDefinition
+        self.config = definition or BrowserDefinition("http://127.0.0.1:9222")
         self.registrations = []
         self.takeovers = []
         self.closed = []
@@ -344,7 +346,7 @@ class CapabilityRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_browser_each_missing_prerequisite_disables_tool_and_registration(self):
         for missing in ("resource", "environment", "skill"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
-                workspace = workspace_at(Path(directory), browser=True)
+                workspace = workspace_at(Path(directory), browser=missing != "resource")
                 with workspace.environments_config.open("a", encoding="utf-8") as config:
                     config.write('\n[environments.other]\ntype = "local"\n')
                 selected = AgentDefinition(
@@ -359,8 +361,7 @@ class CapabilityRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     requests.append(body)
                     yield answer("done")
 
-                with (patch("wandrun.runtime.session.BrowserLeases",
-                            return_value=None if missing == "resource" else leases),
+                with (patch("wandrun.runtime.session.BrowserLeases", return_value=leases),
                       patch.object(CodexSubscriptionModel, "_arequest", respond)):
                     async with open_runtime(
                         workspace, metrics=RunMetrics(workspace.runs_dir), on_human=lambda *_: None,
@@ -413,7 +414,7 @@ class CapabilityRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 tools={"main": []}, checkpointer=InMemorySaver(),
                 environments={"main": Environment(
                     "no-browser", backend, str(root / "skills"), str(root / "artifacts"),
-                )}, browser=leases, browser_environments=("other-environment",),
+                )}, browsers={"other-environment": leases},
             )["main"]
             store = GatewayStore(root / "gateway.sqlite")
             self.addCleanup(store.close)

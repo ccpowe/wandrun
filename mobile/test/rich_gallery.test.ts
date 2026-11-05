@@ -25,8 +25,13 @@ const hosts: Record<string, string> = {
         React.createElement(React.Fragment,{key:index},renderItem({item,index}))]));
     }`,
   'expo-image': "export const Image='Image';",
+  'react-native-reanimated': `export const ReduceMotion={System:0};
+    export const Easing={out:fn=>fn,in:fn=>fn,inOut:fn=>fn,quad:x=>x*x,cubic:x=>x*x*x,linear:x=>x};`,
   'expo-router': 'export const router={push:route=>globalThis.__galleryNavigation.push(route)};',
   '@/components/ui/text.tsx': "export const Text='Text';",
+  '@/components/ui/button.tsx': "export const Button=({children,...props})=>globalThis.__galleryReact.createElement('Button',props,children);",
+  'lucide-react-native': "export const ChevronLeft='ChevronLeft', ChevronRight='ChevronRight', ImageOff='ImageOff';",
+  '@/components/ui/icon.tsx': "export const Icon='Icon';",
   '@/components/rich-message/math.tsx': "export const RichText='RichText';",
   '@/gateway/api.ts': 'export class GatewayError extends Error {}',
   '@/lib/local-image.ts': 'export const loadLocalImage=async()=>({uri:"file:///image.png",dispose:()=>{}});',
@@ -51,7 +56,7 @@ const { MediaGallery, MediaPicture } = await import('../src/components/rich-mess
 const byId = (root: Root, id: string) => root.container.queryAll(node => node.props.testID === id);
 const items = ['一', '二', '三', '四'].map((alt, index) => ({ alt, caption: `说明${index + 1}`, attachment: `image-${index}` }));
 const measuredWidth = 318;
-const contentWidth = measuredWidth - 2 * richSpace.sm - 2; // The gallery's two borders and horizontal padding.
+const contentWidth = measuredWidth; // A+ galleries have no frame or padding (ADR-0081).
 async function gallery(count: number) {
   const root = createRoot();
   await act(async () => { root.render(createElement(MediaGallery, {
@@ -79,7 +84,7 @@ test('a single gallery image fills the content width', async () => {
   const root = await gallery(1);
   try {
     assert.equal(byId(root, 'media-image')[0].parent?.props.style.width, contentWidth);
-    assert.equal(byId(root, 'media-image')[0].props.style.borderRadius, richRadius.small);
+    assert.equal(byId(root, 'media-image')[0].props.style.borderRadius, richRadius.medium);
   } finally { await act(async () => { root.unmount(); }); }
 });
 
@@ -88,6 +93,22 @@ test('single-picture radius override remains available to embedding callers', as
   try {
     await act(async () => { root.render(createElement(MediaPicture, { alt: '封面', radius: richRadius.large })); });
     assert.equal(byId(root, 'media-image')[0].props.style.borderRadius, richRadius.large);
+  } finally { await act(async () => { root.unmount(); }); }
+});
+
+test('RichImage.error: an unavailable standalone picture collapses to 96 whether or not an API exists', async () => {
+  const api = { config: { computerId: 'test' }, signal: { aborted: false } } as unknown as GatewayApi;
+  const root = createRoot();
+  try {
+    for (const props of [{ alt: '无 API' }, { alt: '有 API 无媒体标识', api }]) {
+      await act(async () => { root.render(createElement(MediaPicture, props)); });
+      const picture = byId(root, 'media-image')[0];
+      assert.equal(picture.props.style.height, 96, props.alt);
+      assert.ok(root.container.queryAll(node => node.type === 'Text' && node.props.children === '图片附件不可用').length, props.alt);
+    }
+    // Fixed-height tiles (gallery 200) keep their size so rows stay aligned.
+    await act(async () => { root.render(createElement(MediaPicture, { alt: '图集格', api, height: richGeometry.galleryHeight })); });
+    assert.equal(byId(root, 'media-image')[0].props.style.height, richGeometry.galleryHeight);
   } finally { await act(async () => { root.unmount(); }); }
 });
 

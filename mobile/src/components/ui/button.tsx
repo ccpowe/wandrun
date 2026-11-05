@@ -1,108 +1,68 @@
+import { IconDisabledContext } from '@/components/ui/icon';
 import { TextClassContext } from '@/components/ui/text.tsx';
+import { SurfacePressable } from '@/components/ui/surface-pressable';
 import { cn } from '@/lib/utils.ts';
 import { cva, type VariantProps } from 'class-variance-authority';
 import { Platform, Pressable } from 'react-native';
 
-const buttonVariants = cva(
-  cn(
-    'group shrink-0 flex-row items-center justify-center gap-2 rounded-full shadow-none',
-    Platform.select({
-      web: "focus-visible:border-ring focus-visible:ring-ring/50 aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive whitespace-nowrap outline-none transition-all focus-visible:ring-[3px] disabled:pointer-events-none [&_svg:not([class*='size-'])]:size-4 [&_svg]:pointer-events-none [&_svg]:shrink-0",
-    })
-  ),
-  {
-    variants: {
-      variant: {
-        default: cn(
-          'bg-primary active:bg-primary/90',
-          Platform.select({ web: 'hover:bg-primary/90' })
-        ),
-        destructive: cn(
-          'bg-destructive active:bg-destructive/90',
-          Platform.select({
-            web: 'hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:focus-visible:ring-destructive/40',
-          })
-        ),
-        outline: cn(
-          'border-border bg-transparent active:bg-accent border',
-          Platform.select({
-            web: 'hover:bg-accent dark:hover:bg-input/50',
-          })
-        ),
-        secondary: cn(
-          'bg-secondary active:bg-secondary/80',
-          Platform.select({ web: 'hover:bg-secondary/80' })
-        ),
-        ghost: cn(
-          'active:bg-accent dark:active:bg-accent/50',
-          Platform.select({ web: 'hover:bg-accent dark:hover:bg-accent/50' })
-        ),
-        link: '',
-      },
-      size: {
-        default: cn('h-12 px-[22px]', Platform.select({ web: 'has-[>svg]:px-3' })),
-        sm: cn('h-9 gap-1.5 px-[14px]', Platform.select({ web: 'has-[>svg]:px-2.5' })),
-        lg: cn('h-14 px-7', Platform.select({ web: 'has-[>svg]:px-4' })),
-        icon: 'h-11 w-11 bg-muted active:bg-muted/70',
-      },
-    },
-    defaultVariants: {
-      variant: 'default',
-      size: 'default',
-    },
-  }
-);
+const softSurface = 'bg-muted dark:bg-secondary';
 
-const buttonTextVariants = cva(
-  cn(
-    'text-foreground text-base font-semibold',
-    Platform.select({ web: 'pointer-events-none transition-colors' })
-  ),
+// Only rich-message still uses outline/ghost; its separate cleanup owns that final cutover.
+const buttonVariants = cva(
+  cn('group min-h-12 shrink-0 flex-row items-center justify-center gap-2 rounded-full border-0 shadow-none',
+    Platform.select({ web: 'focus-visible:ring-ring/50 outline-none focus-visible:ring-[3px] disabled:pointer-events-none' })),
   {
     variants: {
-      variant: {
-        default: 'text-primary-foreground',
-        destructive: 'text-white dark:text-background',
-        outline: cn(
-          'group-active:text-accent-foreground',
-          Platform.select({ web: 'group-hover:text-accent-foreground' })
-        ),
-        secondary: 'text-secondary-foreground',
-        ghost: 'group-active:text-accent-foreground',
-        link: cn(
-          'text-primary group-active:underline',
-          Platform.select({ web: 'underline-offset-4 hover:underline group-hover:underline' })
-        ),
-      },
-      size: {
-        default: '',
-        sm: 'text-sm',
-        lg: '',
-        icon: '',
-      },
+      variant: { default: 'bg-primary', destructive: softSurface, outline: softSurface, secondary: softSurface, ghost: '' },
+      size: { default: 'px-[22px] py-3', sm: 'px-[14px] py-3', lg: 'min-h-14 px-7 py-3', icon: 'size-12 p-0', 'icon-sm': 'size-8 min-h-0 p-0' },
     },
-    defaultVariants: {
-      variant: 'default',
-      size: 'default',
-    },
+    defaultVariants: { variant: 'default', size: 'default' },
   }
 );
+const buttonTextVariants = cva('text-sm font-normal', {
+  variants: {
+    variant: { default: 'text-primary-foreground', destructive: 'text-destructive', outline: 'text-muted-foreground', secondary: 'text-muted-foreground', ghost: 'text-muted-foreground' },
+    size: { default: '', sm: '', lg: '', icon: '', 'icon-sm': '' },
+  },
+  defaultVariants: { variant: 'default', size: 'default' },
+});
+
+type ButtonIntent = 'primary' | 'quiet' | 'soft' | 'destructive';
+const intentVariants = { primary: 'default', quiet: 'ghost', soft: 'secondary', destructive: 'destructive' } as const;
 
 type ButtonProps = React.ComponentProps<typeof Pressable> &
   React.RefAttributes<typeof Pressable> &
-  VariantProps<typeof buttonVariants>;
+  Omit<VariantProps<typeof buttonVariants>, 'variant'> & {
+    intent?: ButtonIntent;
+    variant?: 'outline' | 'ghost';
+    pressedPreview?: boolean;
+  };
 
-function Button({ className, variant, size, ...props }: ButtonProps) {
+/** `icon-sm`：32 视觉的字段内图标按钮（发送 / 停止 / 取消引用等），默认 hitSlop 8 补足 48 触区。 */
+const ICON_SM_HIT_SLOP = 8;
+
+function Button({ className, variant, size, intent, pressedPreview, hitSlop, ...props }: ButtonProps) {
+  const visualVariant = intent ? intentVariants[intent] : variant ?? 'default';
+  const small = size === 'icon-sm';
+  // 图标按钮（icon / icon-sm）的 quiet 禁用只把内容转为淡灰，不叠整体 50% 透明；文字按钮保持原禁用外观。
+  // Icon 读 IconDisabledContext，禁用淡灰覆盖调用方写死的颜色类。
+  const mutedDisabled = (small || size === 'icon') && visualVariant === 'ghost' && !!props.disabled;
+  const textClass = buttonTextVariants({ variant: visualVariant, size });
   return (
-    <TextClassContext.Provider value={buttonTextVariants({ variant, size })}>
-      <Pressable
-        className={cn(props.disabled && 'opacity-50', buttonVariants({ variant, size }), className)}
+    <IconDisabledContext.Provider value={mutedDisabled}>
+    <TextClassContext.Provider value={mutedDisabled ? cn(textClass, 'text-muted-foreground/60') : textClass}>
+      <SurfacePressable
+        className={cn(buttonVariants({ variant: visualVariant, size }), props.disabled && !mutedDisabled && 'opacity-50', className)}
+        overlayClassName={visualVariant === 'default' ? 'bg-primary-foreground/7' : undefined}
+        pressedPreview={pressedPreview}
         role="button"
+        hitSlop={hitSlop ?? (small ? ICON_SM_HIT_SLOP : undefined)}
         {...props}
       />
     </TextClassContext.Provider>
+    </IconDisabledContext.Provider>
   );
 }
 
-export { Button, buttonTextVariants, buttonVariants };
+export { Button };
 export type { ButtonProps };

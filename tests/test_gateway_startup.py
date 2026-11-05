@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -11,18 +12,17 @@ import time
 import unittest
 from unittest.mock import patch
 
+import httpx
 from codex_test_home import isolate_codex_home
 from wandrun.gateway.app import serve
 from wandrun.integrations.codex_credentials import CodexCredentials
 from wandrun.runtime.execution.workspace import Workspace
 
 
-PORT = 8785
-
-
 class GatewayStartupTests(unittest.TestCase):
     def setUp(self):
         isolate_codex_home(self)
+        self._startup_logs = {}
 
     def _command(self, workspace: Path, *args: str) -> list[str]:
         command = [sys.executable, "-m", "wandrun.gateway", *args, "--workspace", str(workspace)]
@@ -33,30 +33,53 @@ class GatewayStartupTests(unittest.TestCase):
             command += ["--codex-home", home]
         return command
 
-    def _start(self, workspace: Path) -> subprocess.Popen:
-        return subprocess.Popen(
-            self._command(workspace, "--port", str(PORT)),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    def _start(self, workspace: Path, port: int) -> subprocess.Popen:
+        log = tempfile.TemporaryFile()
+        self.addCleanup(log.close)
+        process = subprocess.Popen(
+            self._command(workspace, "--port", str(port)),
+            stdout=log, stderr=subprocess.STDOUT,
         )
+        self._startup_logs[process] = log
+        return process
+
+    def _startup_output(self, process: subprocess.Popen) -> str:
+        log = self._startup_logs[process]
+        log.seek(0)
+        return log.read().decode("utf-8", errors="replace")
 
     def _list(self, workspace: Path) -> subprocess.CompletedProcess:
         return subprocess.run(
             self._command(workspace, "pair", "--list"),
-            capture_output=True, text=True, timeout=8,
+            capture_output=True, text=True, timeout=40,
         )
 
     def _wait_ready(self, process: subprocess.Popen, workspace: Path, previous: bytes | None = None) -> bytes:
         credential_path = workspace / ".wandrun" / "state" / "management.json"
         deadline = time.monotonic() + 40
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                self.fail(f"gateway exited before readiness ({process.returncode})")
-            if credential_path.exists():
-                credential = credential_path.read_bytes()
-                if credential != previous and self._list(workspace).returncode == 0:
-                    return credential
-            time.sleep(.1)
-        self.fail("gateway did not accept pair --list before deadline")
+        # Readiness is HTTP state, not the cold-import speed of a fresh CLI.
+        # Keep the original startup budget; exercise the real pair CLI below.
+        with httpx.Client(timeout=.5, trust_env=False) as client:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    self.fail(f"gateway exited before readiness ({process.returncode}):\n"
+                              f"{self._startup_output(process)}")
+                if credential_path.exists():
+                    credential = credential_path.read_bytes()
+                    if credential != previous:
+                        config = json.loads(credential)
+                        try:
+                            response = client.get(
+                                f"http://127.0.0.1:{config['port']}/admin/devices",
+                                headers={"Authorization": f"Bearer {config['token']}"},
+                            )
+                            if response.status_code == 200:
+                                return credential
+                        except httpx.TransportError:
+                            pass
+                time.sleep(.1)
+        self.fail(f"gateway did not accept management HTTP before deadline:\n"
+                  f"{self._startup_output(process)}")
 
     def _stop(self, process: subprocess.Popen) -> None:
         if process.poll() is None:
@@ -84,11 +107,14 @@ class GatewayStartupTests(unittest.TestCase):
                 .replace('skills = ["browser", "skill-installer"]', 'skills = ["skill-installer"]'),
                 encoding="utf-8",
             )
-            first = self._start(workspace)
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            first = self._start(workspace, port)
             try:
                 old = self._wait_ready(first, workspace)
                 duplicate = subprocess.Popen(
-                    self._command(workspace, "--port", str(PORT)),
+                    self._command(workspace, "--port", str(port)),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
                 try:
@@ -105,7 +131,7 @@ class GatewayStartupTests(unittest.TestCase):
             finally:
                 self._stop(first)
 
-            restarted = self._start(workspace)
+            restarted = self._start(workspace, port)
             try:
                 new = self._wait_ready(restarted, workspace, old)
                 self.assertNotEqual(json.loads(old)["token"], json.loads(new)["token"])

@@ -7,7 +7,9 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+
+import manual_checks
 
 
 RUNNER = Path(__file__).with_name("run.py")
@@ -82,7 +84,7 @@ class PairingGuardTests(unittest.TestCase):
         self.logic.update(
             OUT=Path(self.directory.name), selected=["pairing"], START=time.monotonic(),
             LOG=Mock(), require_expo=Mock(), prepare_reverse=setup, restore=cleanup,
-            run_group=run_group, all_home=Mock(), phone_command=Mock(),
+            run_group=run_group, phone_command=Mock(),
             assert_rows=Mock(), api=Mock(), PRESERVE_SYSTEM_THEME=False,
         )
         runner_main(self.logic)
@@ -94,7 +96,6 @@ class PairingGuardTests(unittest.TestCase):
         setup.assert_not_called()
         cleanup.assert_not_called()
         run_group.assert_not_called()
-        self.logic["all_home"].assert_not_called()
         self.logic["phone_command"].assert_not_called()
 
     def test_development_connection_enters_normal_group(self):
@@ -108,7 +109,8 @@ class PairingGuardTests(unittest.TestCase):
     def test_saved_computer_match_uses_exact_url_not_name(self):
         rows = [
             {"id": "connection-computer-user", "label": "Same computer, 当前, http://127.0.0.1:8765/"},
-            {"id": "connection-computer-test", "label": "Same computer, http://127.0.0.1:18785/"},
+            {"id": "connection-computer-old", "label": "Same computer, http://127.0.0.1:18785/"},
+            {"id": "connection-computer-test", "label": "Same computer, 当前, http://127.0.0.1:18785/"},
             {"id": "connection-address", "text": "http://127.0.0.1:8765/"},
         ]
         self.assertEqual(self.logic["pairing_computer_row"](rows, self.logic["GATEWAY"]),
@@ -154,6 +156,21 @@ class PairingGuardTests(unittest.TestCase):
         self.assertEqual(self.logic["overall_status"]([skipped, failure]), "FAIL")
         self.assertEqual(self.logic["overall_status"]([skipped], cleanup_errors=["restore failed"]), "FAIL")
         self.assertEqual(self.logic["overall_status"]([skipped, {"status": "PASS"}]), "PASS")
+
+    def test_missing_manual_coverage_is_partial_not_green_and_failure_still_dominates(self):
+        partial = {"group": "pairing", "status": "PARTIAL"}
+        self.assertEqual(self.logic["overall_status"]([{"status": "PASS"}, partial]), "PARTIAL")
+        self.assertEqual(self.logic["overall_status"]([partial, {"status": "FAIL"}]), "FAIL")
+
+    def test_pregranted_permission_cannot_be_green_from_a_successful_scan_receipt(self):
+        runner = Mock(OUT=Path(self.directory.name), manual_results=[])
+        with patch.dict(os.environ, {
+            "E2E_MANUAL_COMMAND": "", "E2E_CAMERA_PERMISSION_PREGRANTED": "1",
+        }), patch("builtins.input", return_value="通过：真实扫码自动到聊天"):
+            manual_checks.check(runner, "pairing-camera", "检查真实扫码")
+        receipt = json.loads((runner.OUT / "manual-results.json").read_text())[0]
+        self.assertEqual((receipt["status"], receipt["passed"], receipt["uncovered"]),
+                         ("PARTIAL", False, ["camera-permission-denied"]))
 
 
 class KnownOverlayGuardTests(unittest.TestCase):

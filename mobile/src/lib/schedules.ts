@@ -2,11 +2,6 @@ import type { Schedule, ScheduleFields, ScheduleRule, ScheduleRun } from "../gat
 import { getLanguage, getLocale, t } from "./i18n.ts";
 
 export type ScheduleDraft = ScheduleFields;
-export type CreateScheduleCommand = { clientId: string; fields: ScheduleFields };
-
-export function newScheduleDraft(defaultTimezone: string | null): ScheduleDraft {
-  return { name: "", content: "", rule: { kind: "once", local_at: "" }, timezone: defaultTimezone ?? "", enabled: true };
-}
 
 export function editableSchedule(schedule: Schedule): ScheduleDraft {
   return { name: schedule.name, content: schedule.content, rule: schedule.rule, timezone: schedule.timezone, enabled: schedule.enabled };
@@ -23,15 +18,16 @@ export function changedScheduleFields(original: ScheduleDraft, draft: ScheduleDr
   return changes;
 }
 
-export function validateSchedule(draft: ScheduleDraft): string | null {
-  if (!draft.name.trim() || /[\n\r\v\f\u0085\u2028\u2029]/u.test(draft.name) || Array.from(draft.name).length > 64) return t("请填写名称（单行，不超过 64 字）");
-  if (!draft.content.trim() || Array.from(draft.content).length > 20_000) return t("请填写执行内容（不超过 20000 字）");
-  if (!draft.timezone.trim()) return t("请输入 IANA 时区，例如 Asia/Shanghai");
+export type ScheduleValidation = { field: keyof ScheduleDraft; message: string };
+export function validateSchedule(draft: ScheduleDraft): ScheduleValidation | null {
+  if (!draft.name.trim() || /[\n\r\v\f\u0085\u2028\u2029]/u.test(draft.name) || Array.from(draft.name).length > 64) return { field: "name", message: t("请填写名称（单行，不超过 64 字）") };
+  if (!draft.content.trim() || Array.from(draft.content).length > 20_000) return { field: "content", message: t("请填写执行内容（不超过 20000 字）") };
+  if (!draft.timezone.trim()) return { field: "timezone", message: t("请输入 IANA 时区，例如 Asia/Shanghai") };
   const rule = draft.rule;
-  if (rule.kind === "once" && !/^\d{4}-\d\d-\d\dT\d\d:\d\d$/.test(rule.local_at)) return t("请输入日期时间，例如 2026-10-10T08:00");
-  if ((rule.kind === "daily" || rule.kind === "weekly") && !/^([01]\d|2[0-3]):[0-5]\d$/.test(rule.time)) return t("请输入时间，例如 08:00");
-  if (rule.kind === "weekly" && !rule.weekdays.length) return t("请至少选择一天");
-  if (rule.kind === "cron" && !rule.expression.trim()) return t("请输入五段 cron 表达式");
+  if (rule.kind === "once" && !/^\d{4}-\d\d-\d\dT\d\d:\d\d$/.test(rule.local_at)) return { field: "rule", message: t("请输入日期时间，例如 2026-10-10T08:00") };
+  if ((rule.kind === "daily" || rule.kind === "weekly") && !/^([01]\d|2[0-3]):[0-5]\d$/.test(rule.time)) return { field: "rule", message: t("请输入时间，例如 08:00") };
+  if (rule.kind === "weekly" && !rule.weekdays.length) return { field: "rule", message: t("每周重复请至少选择一天") };
+  if (rule.kind === "cron" && !rule.expression.trim()) return { field: "rule", message: t("请输入五段 cron 表达式") };
   return null; // Full time-zone, DST and cron validation belongs to the gateway.
 }
 

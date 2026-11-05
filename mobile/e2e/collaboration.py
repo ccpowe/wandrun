@@ -17,7 +17,7 @@ def prepare(runner, env):
         "Delegate the initial request to your only member, then next=wait. "
         "After its final result arrives, relay the numerical answer to human and finish."
     ))
-    root = runner.api("/conversations", "POST", {"agent_id": parent})["id"]
+    root = runner.api("/conversations", "POST", {"client_id": uuid4().hex, "agent_id": parent})["id"]
     runner.fixtures.append(root)
     env.update(COLLAB_ROOT=root, COLLAB_PARENT=parent, COLLAB_MEMBER=child,
                COLLAB_PARENT_NAME=parent_name, COLLAB_MEMBER_NAME=child_name)
@@ -52,11 +52,13 @@ def action(runner, env, name):
         history = wait_for(lambda: events(runner, child, True),
                            lambda rows: any(e["type"] == "message.agent" and e["data"]["text"] == "COLLAB READY" for e in rows))
         env["COLLAB_INCOMING"] = next(e["seq"] for e in history if e["type"] == "message.task")
-        preview = next(e for e in events(runner, root) if e["type"] == "message.task_preview")
-        env["COLLAB_PREVIEW"] = preview["seq"]
-        env["COLLAB_MESSAGE"] = preview["data"]["message_seq"]
-    elif name in ("corrected", "resumed"):
-        expected = "323" if name == "corrected" else "667"
+        message = next(e for e in history if e["type"] == "message.agent" and e["data"]["text"] == "COLLAB READY")
+        env["COLLAB_MESSAGE"] = message["seq"]
+    elif name == "target":
+        runner.ad("open", runner.EXPO.rstrip("/") + "/--/chat?id="
+                  + env["COLLAB_TASK"] + "&message_seq=" + str(env["COLLAB_MESSAGE"]), "--foreground")
+    elif name == "corrected":
+        expected = "323"
         child = env["COLLAB_TASK"]
         history = wait_for(lambda: events(runner, child, True), lambda rows: any(
             e["type"] == "message.task" and e["data"].get("sender_task_id") == child
@@ -68,13 +70,6 @@ def action(runner, env, name):
         assert all(e["data"].get("task_id") != child for e in root_history if e["type"] == "message.agent")
         assert runner.api("/tasks/" + child)["root_id"] == root
         (runner.OUT / (name + "-events.json")).write_text(json.dumps({"member": history, "root": root_history}, ensure_ascii=False, indent=2))
-    elif name == "delete":
-        runner.api("/conversations/" + root, "DELETE")
-        for path in ("/agents/" + env["COLLAB_PARENT"] + "/collaborations",
-                     "/agents/" + env["COLLAB_MEMBER"] + "/conversations"):
-            assert all(row.get("root_id") != root for row in runner.api(path)["conversations"])
-    elif name == "home":
-        runner.home()
     elif name == "compose":
         runner.dismiss_known_dev_overlay()
     else:

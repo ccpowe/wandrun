@@ -880,15 +880,13 @@ class GraphRestartTests(unittest.IsolatedAsyncioTestCase):
         """图已返回、检查点已提交，但确认 inflight 的事务未提交时崩溃。"""
         state = await self.crash("confirm")
         manager, planner, seen = await self.runtime(state)
-        self.assertEqual([m.content for m in manager._inflight["root"]], ["goal"])
+        (replayed,) = manager._inflight["root"]
         manager.start("继续", "root")
         await manager.wait("root")
         # 重新交付的 goal 按 ID 去重，没有第二次写入历史；但模型确实被再次调用。
-        self.assertEqual(
-            [m.content for m in await self.history(planner) if isinstance(m, HumanMessage)],
-            ["goal", "继续"],
-        )
-        self.assertEqual(len(seen), 1)
+        self.assertEqual(sum(message.id == replayed.id for message in await self.history(planner)), 1)
+        (inputs,) = seen
+        self.assertEqual(sum(message.id == replayed.id for message in inputs), 1)
 
     async def test_unaccepted_delegation_is_reported_once_on_resume(self):
         state = await self.crash("send_intent")

@@ -1,0 +1,76 @@
+# One native path per interaction family. HTTP fixtures only supply long summary content.
+appId: host.exp.exponent
+---
+# @phase native-navigation
+# @core-navigation
+# @phase real-chat
+- tapOn:
+    id: composer-input
+- inputText: 'Reply to human exactly CORE-HELLO, then finish.'
+- tapOn:
+    id: composer-send
+# @core-reply
+# @phase collaboration-model
+# @collaboration-generate
+# @open-root COLLAB_ROOT
+# @phase collaboration-native
+- extendedWaitUntil:
+    visible:
+      id: delegation-${COLLAB_TASK}
+    timeout: 15000
+- tapOn:
+    id: delegation-${COLLAB_TASK}
+- extendedWaitUntil:
+    visible:
+      id: task-message-${COLLAB_INCOMING}
+    timeout: 15000
+- tapOn:
+    id: chat-root-conversation
+- extendedWaitUntil:
+    visible:
+      id: chat-agent-name
+      text: ${COLLAB_PARENT_NAME}
+    timeout: 15000
+- tapOn:
+    id: chat-child-count
+- extendedWaitUntil:
+    visible:
+      id: chat-child-${COLLAB_TASK}
+    timeout: 10000
+- tapOn:
+    id: chat-child-${COLLAB_TASK}
+- extendedWaitUntil:
+    visible: COLLAB READY
+    timeout: 15000
+# @collaboration-target
+- extendedWaitUntil:
+    visible:
+      id: message-target-${COLLAB_MESSAGE}
+    timeout: 15000
+# @collaboration-compose
+- tapOn:
+    id: composer-input
+- inputText: 'Correction: compute 17*19. Send the result to human and your original creator.'
+- tapOn:
+    id: composer-send
+# @dismiss-keyboard
+# @phase collaboration-result
+# @collaboration-corrected
+- takeScreenshot: ${ARTIFACTS}/03-collaboration-corrected.png
+# @phase profile-return
+# @core-profile
+# @phase long-summary
+# @core-summary
+- scrollUntilVisible:
+    element:
+      text: SUMMARY BOTTOM
+    direction: DOWN
+- takeScreenshot: ${ARTIFACTS}/05-summary-bottom.png
+- scrollUntilVisible:
+    element:
+      text: SUMMARY TOP
+    direction: UP
+- back
+- assertVisible:
+    id: context-compacted-${SUMMARY_SEQ}
+# @home

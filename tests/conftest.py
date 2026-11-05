@@ -9,7 +9,7 @@ _start = BrowserLeases.start
 
 
 async def _start_unless_default_chrome(self):
-    if self.config.cdp_url.rstrip("/") == "http://127.0.0.1:9222":
+    if self.transport is None and self.config.cdp_url.rstrip("/") == "http://127.0.0.1:9222":
         raise AssertionError("测试使用了默认 Chrome 地址；改写 environments.toml 去掉浏览器或换用 ChromeDev")
     return await _start(self)
 

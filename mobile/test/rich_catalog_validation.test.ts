@@ -14,6 +14,14 @@ for (const { name, source, valid } of numberCases) {
     assert.equal(parseRichSpec(source) !== null, valid);
   });
 }
+const chartCases = JSON.parse(readFileSync(new URL('../../tests/fixtures/ui_charts.json', import.meta.url), 'utf8')) as {
+  name: string; type: string; props: Record<string, unknown>; valid: boolean;
+}[];
+for (const { name, type, props, valid } of chartCases) {
+  test(`Chart.empty / single / BarChart.multi shared contract: ${name}`, () => {
+    assert.equal(parseRichSpec(JSON.stringify({ root: 'chart', elements: { chart: { type, props, children: [] } }, state: {} })) !== null, valid);
+  });
+}
 const urlCases = JSON.parse(readFileSync(new URL('../../tests/fixtures/ui_urls.json', import.meta.url), 'utf8')) as {
   name: string; url: string; valid: boolean;
 }[];
@@ -61,6 +69,7 @@ type Schema = {
 const catalog = JSON.parse(readFileSync(new URL('../../src/wandrun/gateway/ui_catalog.json', import.meta.url), 'utf8')) as {
   $defs: Record<string, Schema>;
   components: Record<string, { description: string; props: Schema; container: boolean; input?: { kind: string; value: Schema; allowEmpty?: boolean };
+    childTypes?: string[];
     relations?: ({ items: string; member?: string; lengthEquals: string } | { prop: string; lengthEquals: string } | { childrenLengthEquals: string })[] }>;
 };
 const definitions: Record<string, Schema> = { ...catalog.$defs };
@@ -81,6 +90,7 @@ function sample(schema: Schema, path: Path = [], index = 0): unknown {
   if (schema.type === 'string') {
     if (path.at(-1) === 'url' || path.at(-1) === 'image') return 'https://example.com/source';
     if (path.at(-1) === 'icon' || path.length === 1 && path[0] === 'name') return 'circle-check';
+    if (path.at(-1) === '$state') return '/field';
     return path.at(-1) === 'stateKey' ? 'field' : path.at(-1) === 'value' && path.includes('options') ? `option${index}` : 'x';
   }
   if (schema.type === 'number') return schema.exclusiveMinimum !== undefined ? schema.exclusiveMinimum + 1 : schema.minimum ?? 0;
@@ -193,12 +203,15 @@ test('every catalog component prop schema matches defensive App parsing at each 
 
 test('catalog relations and containers match App tree acceptance, including inner array lengths', () => {
   for (const [name, component] of Object.entries(catalog.components)) {
-    if (component.input || name === 'Submit') continue;
+    if (component.input || name === 'Submit' || component.childTypes) continue; // Field/ButtonRow have dedicated real-input cases below.
     const props = sample(component.props) as Record<string, unknown>;
     for (const relation of component.relations ?? []) {
       if ('items' in relation) {
+        // Empty chart collections are legal, but relation probes need actual cells.
+        if (!(props[relation.lengthEquals] as unknown[]).length) props[relation.lengthEquals] = ['first', 'last'];
         const itemSchema = resolve(resolve(component.props).properties![relation.items]).items!;
         const arraySchema = relation.member ? resolve(itemSchema).properties![relation.member] : itemSchema;
+        if (!(props[relation.items] as unknown[]).length) props[relation.items] = [sample(itemSchema)];
         const expected = (props[relation.lengthEquals] as unknown[]).length;
         props[relation.items] = (props[relation.items] as unknown[]).map((item) => {
           const values = Array.from({ length: expected }, (_, index) => sample(resolve(arraySchema).items!, [], index));
@@ -265,19 +278,53 @@ test('catalog relations and containers match App tree acceptance, including inne
   }
 });
 
-test('Stack accepts start and between and rejects unsupported justification values', () => {
-  const stack = (props: Record<string, unknown>) => JSON.stringify({
-    root: 'r', elements: { r: { type: 'Stack', props, children: [] } }, state: {},
-  });
-  for (const props of [{}, { justify: 'start' }, { justify: 'between', direction: 'horizontal', gap: 'sm' }]) {
-    const parsed = parseRichSpec(stack(props));
-    assert.ok(parsed, JSON.stringify(props));
-    assert.deepEqual(parsed.elements.r.props, props);
+test('Stack.layout / Grid.layout / ScrollRow: widths belong only to direct layout children', () => {
+  for (const type of ['Stack', 'Grid', 'ScrollRow']) {
+    const spec = {
+      root: 'r', state: {},
+      elements: { r: { type, props: type === 'Grid' ? { columns: 2 } : {}, children: ['c'] },
+        c: { type: 'StatCard', props: { label: '完成', value: '28', icon: 'activity' }, children: [], width: '1/2' as unknown } },
+    };
+    for (const width of ['1/2', '1/3', '2/3', 'auto']) {
+      spec.elements.c.width = width;
+      assert.ok(parseRichSpec(JSON.stringify(spec)), `${type}/${width}`);
+    }
+    for (const width of ['1/4', 0.5, null, { value: '1/2' }]) {
+      spec.elements.c.width = width;
+      assert.equal(parseRichSpec(JSON.stringify(spec)), null);
+    }
   }
-  for (const justify of ['end', 'space-between', 1, null]) {
-    assert.equal(parseRichSpec(stack({ justify })), null, String(justify));
+  for (const type of ['Card', 'Accordion']) {
+    const spec = { root: 'r', state: {}, elements: {
+      r: { type, props: { title: '组' }, children: ['c'] },
+      c: { type: 'Text', props: { text: '半宽' }, children: [], width: '1/2' },
+    } };
+    assert.equal(parseRichSpec(JSON.stringify(spec)), null);
+  }
+  assert.equal(parseRichSpec(JSON.stringify({ root: 'r', state: {}, elements: {
+    r: { type: 'Stack', props: {}, children: [], width: '1/2' },
+  } })), null);
+});
+
+test('Field.default / ButtonRow.default enforce one real input or Submit rather than placeholders', () => {
+  const spec = { root: 'r', state: { note: '' }, elements: {
+    r: { type: 'Stack', props: {}, children: ['f', 'b'] },
+    f: { type: 'Field', props: { label: '备注', value: '固定说明' }, children: ['i'] },
+    i: { type: 'TextInput', props: { stateKey: 'note', label: '备注输入' }, children: [] },
+    b: { type: 'ButtonRow', props: {}, children: ['s'] },
+    s: { type: 'Submit', props: { label: '提交' }, children: [] },
+  } };
+  assert.ok(parseRichSpec(JSON.stringify(spec)));
+  for (const id of ['f', 'b'] as const) {
+    const invalid = structuredClone(spec);
+    invalid.elements[id].children = [];
+    assert.equal(parseRichSpec(JSON.stringify(invalid)), null);
+    invalid.elements[id].children = ['placeholder'];
+    Object.assign(invalid.elements, { placeholder: { type: 'Text', props: { text: '无动作占位' }, children: [] } });
+    assert.equal(parseRichSpec(JSON.stringify(invalid)), null);
   }
 });
+
 
 test('finite extremes remain legal wire data, while chart relations still reject mismatches', () => {
   const chart = (type: string, props: Record<string, unknown>) => JSON.stringify({
@@ -286,13 +333,13 @@ test('finite extremes remain legal wire data, while chart relations still reject
   assert.ok(parseRichSpec(chart('LineChart', {
     xLabels: ['start', 'end'], series: [{ name: 'range', values: [-1e308, 1e308] }],
   })));
-  assert.ok(parseRichSpec(chart('BarChart', { labels: ['large'], values: [1e308] })));
+  assert.ok(parseRichSpec(chart('BarChart', { labels: ['large'], series: [{ name: '数值', values: [1e308] }] })));
   assert.ok(parseRichSpec(chart('PieChart', {
     items: [{ label: 'first', value: 1e308 }, { label: 'second', value: 1e308 }],
   })));
-  assert.equal(parseRichSpec(chart('PieChart', {
+  assert.ok(parseRichSpec(chart('PieChart', {
     items: [{ label: 'zero', value: 0 }, { label: 'other', value: 1 }],
-  })), null);
+  })));
 });
 
 test('catalog input value schemas match App spec acceptance', () => {

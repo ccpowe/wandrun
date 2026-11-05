@@ -9,6 +9,8 @@ export type UploadItem = {
   fileId: string | null;
   progress: number;
   error: string | null;
+  /** View-only URI of the owned draft copy; never persisted in draft snapshots. */
+  previewUri?: string;
 };
 
 /** A native read is limited independently of the logical file size or a caller's requested end. */
@@ -17,7 +19,8 @@ export function boundedReadRange(size: number, start: number, end: number): { co
   return { count, done: start + count >= size };
 }
 
-export type UploadDraft = { text: string; items: UploadItem[] };
+export type FirstSend = { clientId: string; text: string; files: { id: string; name: string; media_type: string; size: number }[] };
+export type UploadDraft = { text: string; items: UploadItem[]; adoptedFrom?: string; firstMessageId?: string; firstSend?: FirstSend };
 
 /** Alternating snapshots: replacing one slot must never destroy the other committed slot. */
 export function latestDraft(snapshots: (string | null)[]): { generation: number; draft: UploadDraft } {
@@ -58,6 +61,9 @@ export function uploadMetadata(conversationId: string, item: Pick<UploadItem, "n
 /** Local bytes and upload URL survive restart; transient progress is reconciled by tus HEAD. */
 export function restoreDraft(value: UploadDraft): UploadDraft {
   return {
+    ...(value.adoptedFrom ? { adoptedFrom: value.adoptedFrom } : {}),
+    ...(value.firstMessageId ? { firstMessageId: value.firstMessageId } : {}),
+    ...(value.firstSend ? { firstSend: value.firstSend } : {}),
     text: value.text,
     items: value.items.map((item) => ({ ...item, progress: item.fileId ? item.size : 0, error: item.fileId ? null : item.error })),
   };

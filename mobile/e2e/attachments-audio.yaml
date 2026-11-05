@@ -1,0 +1,29 @@
+# Deterministic attachment-native subflow; run.py executes the audio-* native hooks.
+# Run: uv run python mobile/e2e/run.py attachments --attachment-audio-only
+appId: host.exp.exponent
+---
+# @phase attachment-audio-native
+# @audio-open
+- extendedWaitUntil:
+    visible:
+      id: attachment-audio-${AUDIO_FILE_ID}
+    timeout: 30000
+- tapOn: 播放音频 e2e-audio.wav
+- extendedWaitUntil:
+    visible: 暂停音频 e2e-audio.wav
+    timeout: 10000
+- tapOn: 暂停音频 e2e-audio.wav
+# Pause before dragging so elapsed playback cannot masquerade as a successful seek.
+# @audio-seek
+- assertNotVisible: 关闭对话列表
+# Contact starts at the screen edge, outside the Slider's recorded native bounds.
+# @audio-edge
+- extendedWaitUntil:
+    visible: 关闭对话列表
+    timeout: 10000
+# The scrim's AX rect spans the screen but its center is covered by the drawer.
+# Use the existing hardware Back contract, then await the real close transition.
+- back
+- extendedWaitUntil:
+    notVisible: 关闭对话列表
+    timeout: 10000

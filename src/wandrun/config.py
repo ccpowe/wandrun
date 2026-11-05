@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import tomllib
 from urllib.parse import urlsplit
 
 from wandrun.integrations.codex_subscription import ReasoningEffort
+from wandrun.integrations.instabox_identity import validate_machine_id
 
 
 @dataclass(frozen=True)
@@ -38,32 +40,40 @@ class AgentDefinition:
 
 @dataclass(frozen=True)
 class BrowserDefinition:
-    """Local Chrome CDP endpoint and bounded task lease capacity."""
+    """One environment's Chrome endpoint and total outstanding page budget.
 
-    cdp_url: str
-    slots: int = 3
+    Instabox uses sandbox cdp_port/profile_dir; its owner prepares the host transport lazily.
+    Eight pages retains the former max_pages default without multiplying by tasks.
+    """
+
+    cdp_url: str | None = None
     max_pages: int = 8
     idle_timeout: float = 7200
-    queue_timeout: float = 30
+    cdp_port: int | None = None
+    profile_dir: str | None = None
+
+
+def default_instabox_browser() -> BrowserDefinition:
+    """Keep the sandbox profile on persistent storage, not its tmpfs."""
+    return BrowserDefinition(cdp_port=9222, profile_dir="/data/home/wandrun-browser/profile")
 
 
 @dataclass(frozen=True)
 class EnvironmentDefinition:
     """一个执行环境的配置（ADR-0012）。
 
-    local：根目录固定为 workspace。ssh：连接 host 上的 workdir；认证只用宿主机的 ~/.ssh
-    密钥、ssh-agent 与 known_hosts，配置中不写任何秘密。
+    local：根目录固定为 workspace。
+    instabox：绑定已有 machine_id；API 密钥只从宿主 api_key_env 环境变量读取。
     """
 
     type: str
     command_timeout: int = 120
     # 取消、超时或关闭时，SIGTERM 之后等待多久再 SIGKILL（ADR-0011）。
     termination_grace: float = 2.0
-    host: str | None = None
-    port: int | None = None  # 省略时使用 ~/.ssh/config 或 22
-    user: str | None = None  # 省略时使用 ~/.ssh/config 或本机用户名
     workdir: str | None = None
     browser: BrowserDefinition | None = None
+    machine_id: str | None = None
+    api_key_env: str = "INSTABOX_API_KEY"
 
 
 @dataclass(frozen=True)
@@ -161,7 +171,7 @@ def _selection(value: object, location: str) -> tuple[str, ...]:
 
 
 def _skill_names(value: object, location: str) -> tuple[str, ...]:
-    """skill 是 .wandrun/skills 的直接子目录名；路径形式会越出该目录（SSH 环境还会据此上传）。"""
+    """skill 是 .wandrun/skills 的直接子目录名；路径形式会越出发现与分发边界。"""
     names = _selection(value, location)
     for name in names:
         if name in {".", ".."} or "/" in name or "\\" in name:
@@ -190,7 +200,7 @@ def _connection(value: object, name: str) -> dict:
         raise ValueError(f"{location} 必须是表")
     if "url" in value:
         connection = _table(
-            value, location, required={"url"}, allowed={"url", "transport", "headers"}
+            value, location, required={"url"}, allowed={"url", "transport", "headers", "_key_auth_failures"}
         )
         url = _text(connection["url"], f"{location}.url")
         parts = urlsplit(url)
@@ -211,6 +221,14 @@ def _connection(value: object, name: str) -> dict:
             raise ValueError(f"{location}.transport 无效")
         if "headers" in connection:
             _string_table(connection["headers"], f"{location}.headers")
+        if "_key_auth_failures" in connection:
+            patterns = connection["_key_auth_failures"]
+            if not isinstance(patterns, list):
+                raise ValueError(f"{location} 鉴权失败特征必须是列表")
+            for pattern in patterns:
+                _string_table(pattern, f"{location} 鉴权失败特征")
+                if not pattern:
+                    raise ValueError(f"{location} 鉴权失败特征不能为空")
     else:
         connection = _table(
             value, location, required={"command"}, allowed={"command", "args", "env", "transport"}
@@ -245,13 +263,13 @@ def _environments(data: object) -> tuple[str, dict[str, EnvironmentDefinition]]:
         common = {"type", "command_timeout", "termination_grace"}
         if kind == "local":
             definition = _table(raw_definition, location, allowed=common | {"browser"})
-        elif kind == "ssh":
+        elif kind == "instabox":
             definition = _table(
-                raw_definition, location, required={"type", "host", "workdir"},
-                allowed=common | {"host", "port", "user", "workdir"},
+                raw_definition, location, required={"type", "machine_id", "workdir"},
+                allowed=common | {"machine_id", "api_key_env", "workdir", "browser"},
             )
         else:
-            raise ValueError(f"{location}.type 只支持 local 或 ssh")
+            raise ValueError(f"{location}.type 只支持 local 或 instabox")
         timeout = definition.get("command_timeout", 120)
         if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
             raise ValueError(f"{location}.command_timeout 必须是正整数（秒）")
@@ -263,59 +281,80 @@ def _environments(data: object) -> tuple[str, dict[str, EnvironmentDefinition]]:
             # inf 会让忽略 SIGTERM 的命令永远停在宽限期；nan 的比较恒为假，会跳过宽限期。
             raise ValueError(f"{location}.termination_grace 必须是有限正数（秒）")
         remote = {}
-        if kind == "ssh":
-            remote["host"] = _identity(definition["host"], f"{location}.host")
+        if kind == "instabox":
+            machine_id = _identity(definition["machine_id"], f"{location}.machine_id")
+            key_env = _identity(definition.get("api_key_env", "INSTABOX_API_KEY"), f"{location}.api_key_env")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_env):
+                raise ValueError(f"{location}.api_key_env 必须是宿主环境变量名")
             workdir = _identity(definition["workdir"], f"{location}.workdir")
-            if not workdir.startswith("/"):
+            if not workdir.startswith("/") or any(ord(char) < 32 for char in workdir):
                 raise ValueError(f"{location}.workdir 必须是远端绝对路径")
-            remote["workdir"] = workdir.rstrip("/") or "/"
-            if "user" in definition:
-                remote["user"] = _identity(definition["user"], f"{location}.user")
-            if "port" in definition:
-                port = definition["port"]
-                if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
-                    raise ValueError(f"{location}.port 必须是 1～65535 的整数")
-                remote["port"] = port
+            remote.update(machine_id=machine_id, api_key_env=key_env, workdir=workdir.rstrip("/") or "/")
         browser = None
         if "browser" in definition:
             settings = _table(
-                definition["browser"], f"{location}.browser", required={"cdp_url"},
-                allowed={"cdp_url", "slots", "max_pages", "idle_timeout", "queue_timeout"},
+                definition["browser"], f"{location}.browser",
+                required={"cdp_url"} if kind == "local" else set(),
+                allowed={"max_pages", "idle_timeout"} | (
+                    {"cdp_url"} if kind == "local" else {"cdp_port", "profile_dir"}
+                ),
             )
-            endpoint = _text(settings["cdp_url"], f"{location}.browser.cdp_url")
-            parsed = urlsplit(endpoint)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
-                raise ValueError(f"{location}.browser.cdp_url 必须是 HTTP CDP 地址")
-            numbers = {"slots": 3, "max_pages": 8, "idle_timeout": 7200, "queue_timeout": 30}
-            numbers.update({key: value for key, value in settings.items() if key != "cdp_url"})
-            for key in ("slots", "max_pages"):
-                value = numbers[key]
-                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                    raise ValueError(f"{location}.browser.{key} 必须是正整数")
-            for key in ("idle_timeout", "queue_timeout"):
-                value = numbers[key]
-                if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
-                    raise ValueError(f"{location}.browser.{key} 必须是有限数字")
-                if (value < 0 if key == "idle_timeout" else value <= 0):
-                    raise ValueError(f"{location}.browser.{key} 必须{'非负' if key == 'idle_timeout' else '大于零'}")
-            browser = BrowserDefinition(endpoint, **numbers)
+            defaults = default_instabox_browser() if kind == "instabox" else BrowserDefinition()
+            browser = replace(defaults, **settings)
+            _check_browser(browser, kind, f"{location}.browser")
         environments[name] = EnvironmentDefinition(
             type=kind, command_timeout=timeout, termination_grace=float(grace), browser=browser, **remote
         )
-    if sum(bool(item.browser) for item in environments.values()) > 1:
-        raise ValueError("目前只支持一个本机浏览器环境")
+    _check_browser_aliases(environments)
     if default not in environments:
         raise ValueError(f"default 引用了未知环境: {default}")
-    targets: dict[tuple, str] = {}
+    instances: dict[str, tuple[str, EnvironmentDefinition]] = {}
     for name, environment in environments.items():
-        if environment.type != "ssh":
+        if environment.type != "instabox":
             continue
-        # 同一远端目录会被各自清空和同步 skills，互相覆盖；不同超时等设置应放在同一个环境里。
-        target = (environment.host, environment.port, environment.user, environment.workdir)
-        if target in targets:
-            raise ValueError(f"environments.{name} 与 environments.{targets[target]} 指向同一远端工作目录")
-        targets[target] = name
+        previous = instances.get(environment.machine_id)
+        if previous is not None and previous[1] != environment:
+            raise ValueError(f"environments.{name} 与 environments.{previous[0]} 的同一 Instabox 实例配置冲突")
+        instances[environment.machine_id] = (name, environment)
     return default, environments
+
+
+def _check_browser(browser: BrowserDefinition, kind: str, location: str) -> None:
+    """One validation contract for parsed and persisted/typed environment definitions."""
+    if type(browser.max_pages) is not int or browser.max_pages <= 0:
+        raise ValueError(f"{location}.max_pages 必须是正整数")
+    if (isinstance(browser.idle_timeout, bool) or not isinstance(browser.idle_timeout, int | float)
+            or not math.isfinite(browser.idle_timeout) or browser.idle_timeout < 0):
+        raise ValueError(f"{location}.idle_timeout 必须是有限非负数字")
+    if kind == "local":
+        endpoint = _text(browser.cdp_url, f"{location}.cdp_url")
+        parsed = urlsplit(endpoint)
+        if (parsed.scheme not in {"http", "https"} or not parsed.netloc
+                or parsed.username or parsed.password):
+            raise ValueError(f"{location}.cdp_url 必须是 HTTP CDP 地址")
+        if browser.cdp_port is not None or browser.profile_dir is not None:
+            raise ValueError(f"{location} 的 Local 浏览器只接受 cdp_url")
+    else:
+        if browser.cdp_url is not None:
+            raise ValueError(f"{location} 的 Instabox 浏览器不接受宿主 cdp_url")
+        if type(browser.cdp_port) is not int or not 1 <= browser.cdp_port <= 65535:
+            raise ValueError(f"{location}.cdp_port 必须是 1～65535 的整数")
+        profile = _text(browser.profile_dir, f"{location}.profile_dir")
+        if not profile.startswith("/") or any(ord(char) < 32 for char in profile):
+            raise ValueError(f"{location}.profile_dir 必须是 sandbox 内绝对路径")
+
+
+def _check_browser_aliases(environments: Mapping[str, EnvironmentDefinition]) -> None:
+    owners = {}
+    for name, environment in environments.items():
+        if environment.browser is None:
+            continue
+        _check_browser(environment.browser, environment.type, f"environments.{name}.browser")
+        identity = (environment.type, environment.machine_id if environment.type == "instabox" else "local")
+        previous = owners.get(identity)
+        if previous is not None and previous[1] != environment.browser:
+            raise ValueError(f"environments.{name} 与 environments.{previous[0]} 的同一物理机器浏览器配置冲突")
+        owners[identity] = (name, environment.browser)
 
 
 def _resolve_mcp_servers(
@@ -375,9 +414,22 @@ def load_config(
 def load_config_for_catalog(
     catalog: AgentCatalog, mcps_path: Path | None, environments_path: Path,
     *, mcp_servers: dict[str, dict] | None = None, mcp_descriptions: dict[str, str] | None = None,
+    environment_definitions: Mapping[str, EnvironmentDefinition] | None = None,
 ) -> RuntimeConfig:
     """Validate supplied Agent definitions against MCP connections and environment definitions."""
     default_environment, environments = _read_environments(environments_path)
+    # Persisted bindings win: editing deployment aliases cannot reinterpret old attachment sources.
+    environments.update(environment_definitions or {})
+    persisted_machines = {
+        definition.machine_id: definition for definition in (environment_definitions or {}).values()
+        if definition.type == "instabox"
+    }
+    environments = {
+        name: persisted_machines.get(definition.machine_id, definition)
+        if definition.type == "instabox" else definition
+        for name, definition in environments.items()
+    }
+    environments.setdefault("local", EnvironmentDefinition(type="local"))
     return _validated(
         catalog, *_resolve_mcp_servers(mcps_path, mcp_servers, mcp_descriptions),
         environments, default_environment,
@@ -505,6 +557,12 @@ def _validated(
     *, require_main: bool = False,
 ) -> RuntimeConfig:
     """Agent 与 MCP、环境、其他 Agent 之间的引用检查；任何来源的 Agent 都经过这里。"""
+    if "local" in environments and environments["local"].type != "local":
+        raise ValueError("local 执行环境必须为 Local，不能绑定云机器")
+    _check_browser_aliases(environments)
+    for environment in environments.values():
+        if environment.type == "instabox":
+            validate_machine_id(environment.machine_id)
     main_agent = catalog.main_agent
     agents = {
         name: replace(

@@ -1,0 +1,10 @@
+import type { Meta, StoryObj } from '@storybook/react-native';
+import { EmptyState } from './empty-state';
+import { Button } from './ui/button';
+import { Text } from './ui/text';
+import { t } from '../lib/i18n';
+const meta = { title: 'EmptyState', component: EmptyState } satisfies Meta<typeof EmptyState>;
+export default meta;
+type Story = StoryObj<typeof meta>;
+export const Default: Story = { name: 'default', args: { title: t('还没有 Agent') } };
+export const action: Story = { args: { title: t('还没有 Agent'), description: t('到点后会开启新对话。'), children: <Button onPress={() => {}}><Text>{t('创建')}</Text></Button> } };

@@ -2,10 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { sampleHermes, StreamMeter, type ClickEvent } from "../src/browser/measurements.ts";
-import type { Frame, Pages } from "../src/browser/protocol.ts";
+import type { Frame, Hello, Pages } from "../src/browser/protocol.ts";
 
+const pictureProtocol: Pick<Hello, 'protocol' | 'transport' | 'video_support'> = {
+  protocol: 3, transport: 'jpeg', video_support: { available: false, reason: 'environment-unsupported' },
+};
 const pages = (current: string, epoch = 1, vp = 1): Pages => ({
-  t: "pages", current, epoch, vp, state: "human", max_pages: 8, css: [100, 100], dpr: 1,
+  t: "pages", current, epoch, vp, state: "human", environment_id: "local", environment_name: "Local",
+  capacity: { pages_used: 1, pages_registered: 1, pages_creating: 0, pages_pending_cleanup: 0, pages_limit: 8 },
+  capacity_rejection: null, css: [100, 100], dpr: 1,
   pages: [{ id: current, title: current, url: "https://example.test/" }],
 });
 const frame = (seq: number, applied_input_id?: number): Frame => ({
@@ -15,7 +20,7 @@ const frame = (seq: number, applied_input_id?: number): Frame => ({
   frame_age_ms: null, credit_wait_ms: 0, send_lock_ms: null, ack_baseline_ms: null, ack_smoothed_ms: null, queue_delay_ms: null,
   ...(applied_input_id === undefined ? {} : { applied_input_id }),
 });
-const click = { t: "click", x: 1, y: 1, button: "left" } as const;
+const click = {t: "pointer", x: 1, y: 1, buttons: 1} as const;
 const done = (id: number, input_lock_wait_ms = 0, input_dispatch_ms = 0, input_cdp_ms = 0) =>
   ({ t: "input_done", id, input_lock_wait_ms, input_dispatch_ms, input_cdp_ms } as const);
 
@@ -45,12 +50,12 @@ test("trailing five seconds, full binary envelope, last 60 JPEGs and unknown gat
 
 test("gateway window and path diagnostics retain latest frame, input dispatch timings aggregate across all inputs", () => {
   const meter = new StreamMeter();
-  meter.hello({ t: "hello", connection_id: "gateway-1", protocol: 1, ping_supported: true, window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 });
+  meter.hello({ t: "hello", connection_id: "gateway-1", ...pictureProtocol, ping_supported: true, window_mode: "adaptive", max_in_flight: 2, max_in_flight_limit: 32 });
   const first = { ...frame(1), max_in_flight: 6, in_flight: 4, frame_age_ms: 85,
     credit_wait_ms: 15, send_lock_ms: 20, ack_baseline_ms: 700, ack_smoothed_ms: 760, queue_delay_ms: 60 };
   meter.receivedFrame(first, 512, 1);
   meter.reply(done(1, 4, 14, 10));
-  meter.sent(2, { t: "down", x: 1, y: 1, button: "left" }, 2);
+  meter.sent(2, {t: "pointer", x: 1, y: 1, buttons: 1}, 2);
   meter.reply(done(2, 6, 20, 14));
   const stats = meter.snapshot(3);
   assert.deepEqual([stats.windowMode, stats.maxInFlightLimit, stats.maxInFlight, stats.inFlight],
@@ -116,7 +121,6 @@ test("reply ordering, rejects and pending gestures do not invent samples", () =>
   const meter = new StreamMeter();
   meter.select(pages("a"));
   meter.sent(1, click, 10);
-  meter.reply({ t: "input_pending", id: 1 });
   meter.offered(frame(1, 1)); meter.displayed(frame(1, 1), 20);
   assert.equal(meter.snapshot(20).inputSamples, 0);
   meter.reply({ t: "reject", id: 1, why: "stale-frame" });
@@ -125,7 +129,6 @@ test("reply ordering, rejects and pending gestures do not invent samples", () =>
   meter.sent(2, click, 30);
   meter.offered(frame(2)); meter.displayed(frame(2), 35);
   meter.offered(frame(3, 2)); meter.displayed(frame(3, 2), 40);
-  meter.reply({ t: "input_pending", id: 2 });
   assert.equal(meter.snapshot(40).inputSamples, 0);
   meter.reply(done(2));
   assert.equal(meter.snapshot(40).inputMedianMs, 10, "done after display uses stored first commit");
@@ -133,38 +136,7 @@ test("reply ordering, rejects and pending gestures do not invent samples", () =>
   assert.equal(meter.snapshot(50).inputSamples, 1, "later displays cannot re-sample one id");
 });
 
-test("held gestures do not count as clicks; selection invalidates unfinished samples", () => {
-  const meter = new StreamMeter();
-  meter.select(pages("a"));
-  meter.sent(1, { t: "down", x: 1, y: 1, button: "left" }, 10);
-  meter.sent(2, { t: "move", x: 2, y: 2 }, 20);
-  meter.sent(3, { t: "up", x: 2, y: 2, button: "left" }, 30);
-  meter.reply({ t: "input_pending", id: 3 });
-  meter.offered(frame(1, 3)); meter.displayed(frame(1, 3), 40);
-  assert.equal(meter.snapshot(40).inputSamples, 0);
-  meter.reply(done(3));
-  assert.equal(meter.snapshot(40).inputSamples, 0);
-  meter.sent(4, click, 50);
-  meter.select(pages("b", 1, 2));
-  meter.reply(done(4));
-  meter.offered({ ...frame(2, 4), page: "b", vp: 2 });
-  meter.displayed({ ...frame(2, 4), page: "b", vp: 2 }, 80);
-  assert.equal(meter.snapshot(80).inputSamples, 0, "selection invalidates unfinished sample");
-});
 
-test("held releases do not contribute click samples but a later direct click still does", () => {
-  const meter = new StreamMeter();
-  meter.select(pages("a"));
-  meter.sent(1, { t: "down", x: 1, y: 1, button: "left" }, 10);
-  meter.sent(2, { t: "up", x: 1, y: 1, button: "left" }, 30);
-  meter.reply(done(2));
-  meter.offered(frame(1, 2)); meter.displayed(frame(1, 2), 40);
-  assert.equal(meter.snapshot(40).inputSamples, 0);
-  meter.sent(3, click, 50);
-  meter.reply(done(3));
-  meter.offered(frame(2, 3)); meter.displayed(frame(2, 3), 75);
-  assert.deepEqual([meter.snapshot(75).inputSamples, meter.snapshot(75).inputMedianMs], [1, 25]);
-});
 
 test("epoch, viewport and socket close invalidate unfinished input/display matches", () => {
   const meter = new StreamMeter();
@@ -239,7 +211,7 @@ test("entire connection emits each completed click once, distinguishes rejects a
   const outcomes: ClickEvent[] = [];
   const meter = new StreamMeter((sample) => outcomes.push(sample), 0, 10000);
   meter.select(pages("a"));
-  meter.hello({ t: "hello", protocol: 1, ping_supported: true, window_mode: "adaptive",
+  meter.hello({ t: "hello", ...pictureProtocol, ping_supported: true, window_mode: "adaptive",
     max_in_flight: 2, max_in_flight_limit: 32, connection_id: "gw-round" });
   for (let id = 1; id <= 26; id++) {
     meter.sent(id, click, 0);
@@ -289,16 +261,14 @@ test("stalled clicks stay bounded online, while every start and later event rema
     Array.from({ length: 300 }, (_, index) => index + 1));
   assert.deepEqual(events.filter((event) => event.status === "overflow").map((event) => event.id),
     Array.from({ length: 44 }, (_, index) => index + 1));
-  meter.reply({ t: "input_pending", id: 1 }, 301);
   meter.reply(done(1), 302);
   meter.reply(done(299), 303);
   const shown = frame(1, 299);
   meter.offered(shown);
   meter.displayed(shown, 310);
   meter.reply({ t: "reject", id: 2, why: "stale-frame" }, 311);
-  assert.deepEqual(events.filter((event) => event.status === "input_pending" || event.status === "input_done"
+  assert.deepEqual(events.filter((event) => event.status === "input_done"
     || event.status === "displayed" || event.status === "reject"), [
-    { status: "input_pending", id: 1, atMonoMs: 301 },
     { status: "input_done", id: 1, atMonoMs: 302, inputLockWaitMs: 0, inputDispatchMs: 0, inputCdpMs: 0 },
     { status: "input_done", id: 299, atMonoMs: 303, inputLockWaitMs: 0, inputDispatchMs: 0, inputCdpMs: 0 },
     { status: "displayed", appliedInputId: 299, seq: 1, atMonoMs: 310, page: "a", epoch: 1, vp: 1 },

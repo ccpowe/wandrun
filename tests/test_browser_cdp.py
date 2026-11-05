@@ -11,7 +11,7 @@ import unittest
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
-from wandrun.runtime.browser.cdp import BrowserRelay, CDPError, CDPSocket
+from wandrun.runtime.browser.cdp import BrowserRelay, CDPError, CDPRejected, CDPSocket
 
 
 def url(server):
@@ -22,14 +22,20 @@ async def noop(*args):
     pass
 
 
-def relay(client, upstream, page=None, owns=lambda target: target == "A", claim=noop):
+async def unexpected_close(_target):
+    raise AssertionError("This peer does not implement target closure")
+
+
+def relay(client, upstream, page=None, owns=lambda target: target == "A", claim=noop,
+          close_target=unexpected_close):
     def create(_params):
         async def complete():
             return "A"
         return asyncio.create_task(complete())
     return BrowserRelay(client, upstream, epoch=1, page=page, owns=owns,
                         guard=asyncio.Lock(), authorize=lambda method, params: None,
-                        create=create, claim=claim, activated=noop, destroyed=noop,
+                        create=create, close_target=close_target, claim=claim,
+                        activated=noop, destroyed=noop,
                         activity=lambda: None)
 
 
@@ -148,6 +154,55 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                     disconnect.set()
                     with self.assertRaises(CDPError):
                         await asyncio.wait_for(draining, 2)
+
+    async def test_close_rejection_settles_only_when_the_owner_confirms_no_effect(self):
+        for error_type in (CDPRejected, CDPError):
+            with self.subTest(error_type=error_type.__name__):
+                received, release, disconnect = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                active = []
+
+                async def close_target(_target):
+                    received.set()
+                    await release.wait()
+                    raise error_type("页面关闭失败")
+
+                async def chrome(ws):
+                    await disconnect.wait()
+                    await ws.close()
+
+                async with serve(chrome, "127.0.0.1", 0) as upstream:
+                    async def handle(ws):
+                        r = relay(ws, url(upstream), close_target=close_target)
+                        active.append(r)
+                        try:
+                            await r.run()
+                        except CDPError:
+                            pass
+
+                    async with serve(handle, "127.0.0.1", 0) as frontend:
+                        async with connect(url(frontend)) as client:
+                            await client.send(json.dumps({"id": 42, "method": "Target.closeTarget",
+                                                          "params": {"targetId": "A"}}))
+                            await asyncio.wait_for(received.wait(), 2)
+                            draining = asyncio.create_task(active[0].drain())
+                            try:
+                                release.set()
+                                reply = json.loads(await asyncio.wait_for(client.recv(), 2))
+                                self.assertIn("error", reply)
+                                if error_type is CDPRejected:
+                                    await asyncio.wait_for(draining, 2)
+                                    self.assertFalse(active[0].unsettled)
+                                else:
+                                    self.assertTrue(active[0].unsettled)
+                                    self.assertFalse(draining.done())
+                                    disconnect.set()
+                                    with self.assertRaises(CDPError):
+                                        await asyncio.wait_for(draining, 2)
+                            finally:
+                                release.set()
+                                disconnect.set()
+                                draining.cancel()
+                                await asyncio.gather(draining, return_exceptions=True)
 
     async def test_duplicate_id_in_one_session_is_rejected_without_replacing_pending(self):
         received = asyncio.Event()

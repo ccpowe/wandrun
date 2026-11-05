@@ -4,6 +4,7 @@ from collections import defaultdict
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from deepagents.backends import LocalShellBackend
 from langchain.agents.middleware import AgentMiddleware
@@ -18,6 +19,7 @@ from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
 from wandrun.runtime.communication.messages import AgentOutput, SendMessage
 from wandrun.runtime.communication.workers import WorkerManager
 from wandrun.runtime.execution.environments import Environment
+from wandrun.runtime.execution.skills import SkillPackages
 
 
 class SkillsTests(unittest.IsolatedAsyncioTestCase):
@@ -353,6 +355,150 @@ class SkillsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(removed["skills_fingerprints"], [])
             self.assertEqual(removed["skills_metadata"], [])
             self.assertIsNone(await cleared.abefore_agent(removed, None, {}))
+
+    async def test_gateway_snapshots_refresh_script_only_changes_without_backend_io(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = root / "skills" / "recipe"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: recipe\ndescription: Gateway recipe\n---\nSecret instructions.\n",
+                encoding="utf-8",
+            )
+            script = skill / "run.py"
+            script.write_bytes(b"print('first')\n")
+            # Unselected broken packages must not be traversed during this turn.
+            (root / "skills" / "broken").symlink_to(root / "missing")
+            backend = Mock()
+            packages = SkillPackages(root / "skills", None, "/remote/packages")
+            middleware = _ConfiguredSkillsMiddleware(
+                backend, ("recipe",), packages.skills_source, skill_packages=packages,
+            )
+            initial = await middleware.abefore_agent({}, None, {})
+            metadata = initial["skills_metadata"][0]
+            self.assertEqual(metadata["description"], "Gateway recipe")
+            self.assertTrue(metadata["path"].startswith("/remote/packages/"))
+            self.assertNotIn(str(root), metadata["path"])
+            self.assertNotIn("Secret instructions", middleware._format_skills_list(initial["skills_metadata"]))
+            self.assertIsNone(await middleware.abefore_agent(initial, None, {}))
+
+            script.write_bytes(b"print('second')\n")
+            refreshed = await middleware.abefore_agent(initial, None, {})
+            self.assertNotEqual(initial["skills_fingerprints"], refreshed["skills_fingerprints"])
+            self.assertNotEqual(metadata["path"], refreshed["skills_metadata"][0]["path"])
+            self.assertEqual(metadata["description"], refreshed["skills_metadata"][0]["description"])
+            self.assertIsNone(await middleware.abefore_agent(refreshed, None, {}))
+            self.assertEqual(backend.mock_calls, [])
+
+    async def test_gateway_snapshots_keep_builtin_override_and_parser_warnings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # A reserved user path may even be broken: only the builtin is selected.
+            (root / "skills").mkdir()
+            (root / "skills" / "wandrun-ui").symlink_to(root / "absent")
+            builtin = root / "builtin" / "wandrun-ui"
+            builtin.mkdir(parents=True)
+            document = builtin / "SKILL.md"
+            document.write_text(
+                "---\nname: wandrun-ui\ndescription: Builtin recipe\n"
+                "extra: " + "[" * 600 + "0" + "]" * 600 + "\n---\nBody.\n",
+                encoding="utf-8",
+            )
+            backend = Mock()
+            packages = SkillPackages(root / "skills", root / "builtin", "/remote/packages")
+            middleware = _ConfiguredSkillsMiddleware(
+                backend, ("wandrun-ui",), packages.skills_source,
+                builtin_names={"wandrun-ui"}, skill_packages=packages,
+            )
+            invalid = await middleware.abefore_agent({}, None, {})
+            self.assertEqual(invalid["skills_selection"], ["wandrun-ui"])
+            self.assertEqual(invalid["skills_metadata"], [])
+            self.assertIn("YAML 嵌套过深", invalid["skills_load_errors"][0])
+            document.write_text(
+                "---\nname: wandrun-ui\ndescription: Builtin recipe\n---\nBody.\n",
+                encoding="utf-8",
+            )
+            repaired = await middleware.abefore_agent(invalid, None, {})
+            self.assertEqual(repaired["skills_load_errors"], [])
+            self.assertEqual(repaired["skills_metadata"][0]["description"], "Builtin recipe")
+            self.assertIn("/builtin/", repaired["skills_metadata"][0]["path"])
+            self.assertIsNone(await middleware.abefore_agent(repaired, None, {}))
+            cleared = _ConfiguredSkillsMiddleware(
+                backend, (), packages.skills_source, skill_packages=packages,
+            )
+            removed = await cleared.abefore_agent(repaired, None, {})
+            self.assertEqual(removed["skills_metadata"], [])
+            self.assertEqual(removed["skills_fingerprints"], [])
+            self.assertIsNone(await cleared.abefore_agent(removed, None, {}))
+            self.assertEqual(backend.mock_calls, [])
+
+    async def test_instabox_pure_chat_graph_uses_gateway_catalog_without_backend_calls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = root / "skills" / "recipe"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: recipe\ndescription: Gateway-only recipe\n---\nPrivate body.\n",
+                encoding="utf-8",
+            )
+            packages = SkillPackages(root / "skills", None, "/remote/packages")
+            backend = Mock(wraps=LocalShellBackend(root_dir=root, virtual_mode=False))
+            backend.id = "instabox:m_" + "a" * 26
+            observed = []
+
+            class Model(FakeMessagesListChatModel):
+                def bind_tools(self, tools, **kwargs):
+                    return self.bind(**kwargs)
+
+                async def _agenerate(self, messages, **kwargs):
+                    observed.append(str(messages[0].content))
+                    output = AgentOutput(messages=[], next="done")
+                    return ChatResult(generations=[ChatGeneration(message=AIMessage(
+                        content=output.model_dump_json(),
+                        additional_kwargs={"wandrun_agent_output": output.model_dump()},
+                    ))])
+
+            async def run(prompts, task_id):
+                return await run_conversation(agents["helper"].graph, prompts, task_id, "helper")
+
+            manager = WorkerManager(run, agent_workers={"helper": ()}, default_agent="helper")
+            try:
+                agents = build_agents(
+                    manager,
+                    definitions={"helper": AgentDefinition(
+                        "Reads skills", "Work", "offline", skills=("recipe",), code_mode=False,
+                    )},
+                    models={"helper": Model(responses=[])}, tools={"helper": []},
+                    environments={"helper": Environment(
+                        "cloud", backend, packages.skills_source, "/remote/artifacts",
+                        type="instabox", skill_packages=packages,
+                    )},
+                    checkpointer=InMemorySaver(),
+                )
+                manager.start("Just chat, do not use tools", "root")
+                self.assertEqual((await manager.wait("root"))["status"], "completed")
+                self.assertEqual(len(observed), 1)
+                self.assertIn("Gateway-only recipe", observed[0])
+                self.assertIn(packages.snapshot(("recipe",))[0].path, observed[0])
+                self.assertNotIn(str(root), observed[0])
+                self.assertNotIn("Private body", observed[0])
+                self.assertEqual(backend.mock_calls, [])
+                (skill / "script.py").symlink_to(root / "outside")
+                manager.start("Continue chatting without tools", "root")
+                self.assertEqual((await manager.wait("root"))["status"], "completed")
+                failed = await agents["helper"].graph.aget_state({"configurable": {"thread_id": "root"}})
+                self.assertEqual(failed.values["skills_metadata"], [])
+                warning, = failed.values["skills_load_errors"]
+                self.assertNotIn(str(root), warning)
+                (skill / "script.py").unlink()
+                manager.start("Continue after repairing the gateway package", "root")
+                self.assertEqual((await manager.wait("root"))["status"], "completed")
+                repaired = await agents["helper"].graph.aget_state({"configurable": {"thread_id": "root"}})
+                self.assertEqual(repaired.values["skills_load_errors"], [])
+                self.assertEqual(repaired.values["skills_metadata"][0]["name"], "recipe")
+                self.assertEqual(backend.mock_calls, [])
+            finally:
+                await manager.close()
 
     async def test_reopened_builtin_refreshes_checkpoint_path_even_when_content_is_identical(self):
         with tempfile.TemporaryDirectory() as directory:

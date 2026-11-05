@@ -33,7 +33,10 @@ const hosts: Record<string, string> = {
     return {playing:player.playing,duration:10,currentTime:0,didJustFinish:false};
   }`,
   "expo-router": `export const router={push(){}};
-    export const useIsFocused=()=>globalThis.__audioReact.useContext(globalThis.__audioFocus);`,
+    export function useFocusEffect(effect) {
+      const focused=globalThis.__audioReact.useContext(globalThis.__audioFocus);
+      globalThis.__audioReact.useEffect(()=>focused ? effect() : undefined,[focused,effect]);
+    }`,
   "react-native": `export const View='View', Pressable='Pressable';
     export const AppState={addEventListener(_event,listener){
       globalThis.__audioListeners.add(listener);
@@ -41,6 +44,9 @@ const hosts: Record<string, string> = {
     }};`,
   "@react-native-community/slider": `export default 'Slider';`,
   "lucide-react-native": `export const Pause='Pause', Play='Play';`,
+  "uniwind": `export const useCSSVariable=(names)=>names.map(()=> '#666666');`,
+  "react-native-drawer-layout": `export const DrawerGestureContext=globalThis.__audioReact.createContext(undefined);`,
+  "react-native-gesture-handler": `export const Gesture={}, GestureDetector='GestureDetector';`,
   "@/components/file-type-icon.tsx": `export const FileTypeIcon='FileTypeIcon';`,
   "@/components/ui/icon.tsx": `export const Icon='Icon';`,
   "@/components/ui/text.tsx": `export const Text='Text';`,

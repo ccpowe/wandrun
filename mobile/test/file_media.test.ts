@@ -52,3 +52,23 @@ test("markdown summary reads a ranged prefix from the gateway content path", asy
     api.close();
   }
 });
+
+test("attachment.A2 metadata observers share one owner and revoked access receives no late notification", async () => {
+  const pending = Promise.withResolvers<Response>();
+  const api = new GatewayApi({ baseUrl: "https://gateway.test", token: "secret" }, () => pending.promise);
+  let currentNotifications = 0;
+  let abandonedNotifications = 0;
+  const abandon = api.subscribeFilePreview("pdf", () => abandonedNotifications++);
+  const keep = api.subscribeFilePreview("pdf", () => currentNotifications++);
+  try {
+    const loading = api.filePreviewSnapshot("pdf");
+    assert.equal(loading.preview, null);
+    assert.equal(api.filePreviewSnapshot("pdf"), loading);
+    abandon();
+    pending.resolve(Response.json({ kind: "pdf", width: 612, height: 792, duration_ms: null, page_count: 8 }));
+    await api.getFilePreview("pdf");
+    assert.equal(api.filePreviewSnapshot("pdf").preview?.page_count, 8);
+    assert.equal(currentNotifications, 1);
+    assert.equal(abandonedNotifications, 0);
+  } finally { abandon(); keep(); api.close(); }
+});

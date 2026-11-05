@@ -1,0 +1,78 @@
+{
+  "src/app/connect.tsx": {
+    "no-restricted-properties": {
+      "count": 1
+    }
+  },
+  "src/components/chat/chat-surface.ts": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/components/rich-message/math.tsx": {
+    "react-native/no-color-literals": {
+      "count": 1
+    },
+    "wandrun/no-use-effect": {
+      "count": 7
+    }
+  },
+  "src/components/rich-message/media.tsx": {
+    "wandrun/no-use-effect": {
+      "count": 5
+    }
+  },
+  "src/components/rich-message/mermaid-toolbar.tsx": {
+    "no-restricted-syntax": {
+      "count": 2
+    }
+  },
+  "src/components/rich-message/mermaid.tsx": {
+    "react-native/no-color-literals": {
+      "count": 1
+    },
+    "wandrun/no-use-effect": {
+      "count": 12
+    }
+  },
+  "src/components/ui/alert-dialog.tsx": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/components/ui/card.tsx": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/components/ui/dialog.tsx": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/components/ui/dropdown-menu.tsx": {
+    "wandrun/no-use-effect": {
+      "count": 1
+    }
+  },
+  "src/components/ui/radio-group.tsx": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/components/ui/switch.tsx": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/components/ui/toggle-group.tsx": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/components/ui/toggle.tsx": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  }
+}

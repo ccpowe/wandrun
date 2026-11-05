@@ -66,10 +66,11 @@ const userSubmission = (seq: number, messageSeq: number, block: number, values: 
 function sessionWith(fetchImpl: typeof fetch): ChatSession {
   const session = new ChatSession({ baseUrl: "https://gateway.test", token: "dev" }, fetchImpl);
   session.agents.close();
+  session.connection = "open";
   session.conversations.set("conversation", {
     id: "conversation", agent_id: "agent", title: "对话", source: "user", schedule_origin: null,
     created_at: 1, updated_at: 1, read_seq: 0, status: "idle", unread: false, last_text: null,
-    activity: null, lastTextSeq: 0, lastActivityAt: null, lastAgentSeq: 0,
+    activity: null, lastTextSeq: 0, lastAgentSeq: 0, last_activity_seq: null, last_activity_at: null,
   });
   return session;
 }
@@ -159,20 +160,23 @@ test("消息行卸载重挂恢复草稿、在途身份及未知结果重试，�
     assert.deepEqual(session.uiDraftFor("conversation", 3, 0)?.values, { choice: "B" });
     let first!: Promise<void>;
     await act(async () => { first = card.send(); });
-    assert.equal(session.uiDraftFor("conversation", 3, 0)?.pending, true);
+    assert.equal(session.uiDraftFor("conversation", 3, 0)?.flow.status, 'sending');
     await act(async () => { root.render(createElement(Fragment)); });
     await act(async () => { root.render(createElement(Card)); });
     assert.equal(card.store.getSnapshot().choice, "B");
-    assert.equal(card.currentDraft.pending, true);
+    assert.equal(session.uiDraftFor("conversation", 3, 0)?.flow.status, 'sending');
     assert.equal(card.disabled, true);
     await act(async () => { fail(new Error("connection lost")); await first; });
-    assert.equal(card.currentDraft.error?.retryable, true);
-    const retained = session.uiDraftFor("conversation", 3, 0)?.attempt;
+    assert.equal(session.uiDraftFor("conversation", 3, 0)?.flow.status, 'failed');
+    const retainedFlow = session.uiDraftFor("conversation", 3, 0)!.flow;
+    assert.equal(retainedFlow.status, 'failed');
+    const retained = retainedFlow.status === 'failed' ? retainedFlow.attempt : null;
     assert.deepEqual({ ...retained?.values }, { choice: "B" });
     await act(async () => { root.render(createElement(Fragment)); });
     await act(async () => { root.render(createElement(Card)); });
-    assert.equal(card.currentDraft.attempt?.clientId, retained?.clientId);
-    assert.equal(card.currentDraft.error?.retryable, true);
+    const remounted = session.uiDraftFor("conversation", 3, 0)!.flow;
+    assert.equal(remounted.status, 'failed');
+    assert.equal(remounted.status === 'failed' && remounted.attempt?.clientId, retained?.clientId);
     offline = false;
     await act(async () => { await card.send(true); });
     assert.equal(requests[0].client_id, requests[1].client_id);
@@ -294,4 +298,156 @@ test("网关的 404/400 错误保留业务代码与字段原因供界面提示",
       await session.close();
     }
   }
+});
+
+test("rich.T4–T5 未知发送只读核对，失败读保留冻结，持久赢家覆盖草稿与动作", async () => {
+  let reading: 'failed' | 'winner' = 'failed';
+  const methods: string[] = [];
+  const winner = event(42, 'message.user', { text: '继续展开', ui_submission: {
+    message_seq: 3, block: 0, values: {}, action_id: 'follow/1',
+  } }, 'other-device');
+  const session = sessionWith(async (_url, init) => {
+    methods.push(init?.method ?? 'GET');
+    if (reading === 'failed') throw new Error('read disconnected');
+    return Response.json({ event: winner });
+  });
+  try {
+    session.connection = 'open';
+    session['apply'](event(3, 'message.agent', { text: 'source' }));
+    session.saveUiDraft('conversation', 3, 0, { values: {}, flow: { status: 'unknown',
+      attempt: { clientId: 'mine', actionId: 'follow/0', values: {} } } });
+    await session.recoverUiSubmissions();
+    assert.equal(session.uiDraftFor('conversation', 3, 0)?.flow.status, 'unknown');
+    reading = 'winner';
+    await session.recoverUiSubmissions();
+    assert.equal(session.uiDraftFor('conversation', 3, 0), undefined);
+    assert.equal(session.submissionsFor('conversation', 3).get(0)?.actionId, 'follow/1');
+    assert.deepEqual(methods, ['GET', 'GET']);
+  } finally { await session.close(); }
+});
+
+test("rich.T5 晚到的空核对结果不能覆盖 SSE 已确认发送", async () => {
+  const lookup = Promise.withResolvers<Response>();
+  const session = sessionWith(async () => lookup.promise);
+  try {
+    session.connection = 'open';
+    session['apply'](event(3, 'message.agent', { text: 'source' }));
+    session.saveUiDraft('conversation', 3, 0, { values: {}, flow: { status: 'unknown',
+      attempt: { clientId: 'mine', actionId: 'follow/0', values: {} } } });
+    const checking = session.recoverUiSubmissions();
+    session['apply'](event(42, 'message.user', { text: '继续', ui_submission: {
+      message_seq: 3, block: 0, values: {}, action_id: 'follow/0',
+    } }, 'mine'));
+    lookup.resolve(Response.json({ event: null }));
+    await checking;
+    assert.equal(session.uiDraftFor('conversation', 3, 0), undefined);
+    assert.equal(session.submissionsFor('conversation', 3).get(0)?.actionId, 'follow/0');
+  } finally { await session.close(); }
+});
+
+for (const sending of [false, true]) test(`已知离线不提交或排队，连接订阅与实时准入保留${sending ? 'send' : '表单'}重试身份`, async () => {
+  const spec = parseRichSpec(JSON.stringify(sending ? { root: 'go', state: {}, elements: {
+    go: { type: 'Submit', props: { label: '继续', send: { text: '固定文本' } }, children: [] },
+  } } : { root: 'card', state: { note: '' }, elements: {
+    card: { type: 'Card', props: {}, children: ['note', 'go'] },
+    note: { type: 'TextInput', props: { label: '备注', stateKey: 'note' }, children: [] },
+    go: { type: 'Submit', props: { label: '提交' }, children: [] },
+  } }))!;
+  const requests: { client_id: string; action_id?: string; values: Record<string, unknown> }[] = [];
+  let reject = true;
+  const session = sessionWith(async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    requests.push(body);
+    return reject ? Response.json({ error: { code: 'rate_limited', message: 'busy' } }, { status: 429 }) :
+      Response.json({ event: event(42, 'message.user', { text: '已接受', ui_submission: {
+        message_seq: 3, block: 0, values: body.values, ...(body.action_id ? { action_id: body.action_id } : {}),
+      } }, body.client_id) });
+  });
+  const owner = { session, conversationId: 'conversation', messageSeq: 3, block: 0 };
+  let card!: ReturnType<typeof useUiDraft>;
+  function Card() {
+    card = useUiDraft(spec, session.submissionsFor('conversation', 3).get(0), owner,
+      (values, clientId, actionId) => session.submitUi('conversation', 3, 0, values, clientId, actionId));
+    return createElement('card');
+  }
+  const root = createRoot();
+  try {
+    await act(async () => { root.render(createElement(Card)); });
+    const staleOnlineHandler = card.send;
+    session.connection = 'reconnecting';
+    await act(async () => { await staleOnlineHandler(false, sending ? 'go' : undefined); session['changed'](); });
+    assert.equal(card.submitDisabled, true);
+    assert.equal(card.disabled, false); // Offline edits remain local; only submission is disabled.
+    assert.equal(card.currentDraft.flow.status, 'editing');
+    if (!sending) await act(async () => { card.store.set('/note', '离线草稿'); });
+    await assert.rejects(session.submitUi('conversation', 3, 0, {}, 'direct', sending ? 'go' : undefined),
+      (error: unknown) => error instanceof GatewayError && error.code === 'offline');
+    assert.equal(requests.length, 0);
+    await act(async () => { session.connection = 'open'; session['changed'](); });
+    assert.equal(card.submitDisabled, false);
+    assert.equal(requests.length, 0);
+    await act(async () => { await card.send(false, sending ? 'go' : undefined); });
+    assert.equal(card.currentDraft.flow.status, 'failed');
+    await act(async () => { session.connection = 'reconnecting'; session['changed'](); await card.send(true); });
+    assert.equal(card.submitDisabled, true);
+    assert.equal(requests.length, 1);
+    await act(async () => { session.connection = 'open'; session['changed'](); });
+    assert.equal(requests.length, 1);
+    reject = false;
+    await act(async () => { await card.send(true); });
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].client_id, requests[0].client_id);
+    assert.equal(requests[1].action_id, requests[0].action_id);
+    assert.deepEqual(requests[1].values, sending ? {} : { note: '离线草稿' });
+  } finally { await act(async () => { root.unmount(); }); await session.close(); }
+});
+
+test('rich.T10 SSE一直在线且首次核对失败，用户可再核对；只有null后显式重试同一POST', async () => {
+  const spec = parseRichSpec(JSON.stringify({ root: 'follow', state: {}, elements: {
+    follow: { type: 'FollowUps', props: { items: [{ label: '例子', text: '给例子' }, { label: '展开', text: '继续展开' }] }, children: [] },
+  } }))!;
+  const lookup = Promise.withResolvers<Response>();
+  const methods: string[] = [];
+  const posts: { client_id: string; action_id: string }[] = [];
+  let reads = 0;
+  const session = sessionWith(async (_url, init) => {
+    methods.push(init?.method ?? 'GET');
+    if (init?.method === 'POST') {
+      const body = JSON.parse(String(init.body));
+      posts.push(body);
+      if (posts.length === 1) throw new Error('POST interrupted');
+      return Response.json({ event: event(42, 'message.user', { text: '继续展开', ui_submission: {
+        message_seq: 3, block: 0, values: {}, action_id: body.action_id,
+      } }, body.client_id) });
+    }
+    if (++reads === 1) throw new Error('GET interrupted while SSE remains open');
+    return lookup.promise;
+  });
+  let card!: ReturnType<typeof useUiDraft>;
+  function Card() {
+    card = useUiDraft(spec, session.submissionsFor('conversation', 3).get(0),
+      { session, conversationId: 'conversation', messageSeq: 3, block: 0 },
+      (values, clientId, actionId) => session.submitUi('conversation', 3, 0, values, clientId, actionId));
+    return createElement('card');
+  }
+  const root = createRoot();
+  try {
+    await act(async () => { root.render(createElement(Card)); });
+    await act(async () => { await card.send(false, 'follow/1'); });
+    assert.equal(card.currentDraft.flow.status, 'unknown');
+    assert.equal(session.connection, 'open');
+    assert.deepEqual(methods, ['POST', 'GET']);
+    let checking!: Promise<void>;
+    await act(async () => { checking = card.check!(); await card.check!(); });
+    assert.equal(card.currentDraft.flow.status, 'checking');
+    assert.deepEqual(methods, ['POST', 'GET', 'GET']);
+    await act(async () => { lookup.resolve(Response.json({ event: null })); await checking; });
+    assert.equal(card.currentDraft.flow.status, 'failed');
+    assert.equal(posts.length, 1);
+    await act(async () => { await card.send(true); });
+    assert.deepEqual(posts.map(({ client_id, action_id }) => ({ client_id, action_id })), [
+      { client_id: posts[0].client_id, action_id: 'follow/1' }, { client_id: posts[0].client_id, action_id: 'follow/1' },
+    ]);
+    assert.equal(session.submissionsFor('conversation', 3).get(0)?.actionId, 'follow/1');
+  } finally { await act(async () => { root.unmount(); }); await session.close(); }
 });

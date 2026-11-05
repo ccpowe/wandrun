@@ -13,6 +13,8 @@ export type SavedComputer = ConnectionConfig & {
   /** Changes on pairing, not on rename or switch: late refusals cannot remove a replacement. */
   connectionId: string;
   localName?: string;
+  /** Last opened root conversation on this computer; child routes never replace it. */
+  lastConversationId?: string;
   /** Confirmed authentication failure; the pairing and local files are retained for repair. */
   authStatus?: "invalid";
 };
@@ -22,10 +24,12 @@ export type CredentialState = {
   config: SavedComputer | null;
   ready: boolean;
   revoked: boolean;
+  /** One first-connect navigation intent. Never persisted or replayed after relaunch. */
+  newChatConnectionId: string | null;
 };
 type Storage = { getItemAsync(key: string): Promise<string | null>; setItemAsync(key: string, value: string): Promise<void>; deleteItemAsync(key: string): Promise<void> };
 const KEY = "wandrun.computers.v1";
-const empty = (): CredentialState => ({ computers: [], currentId: null, config: null, ready: false, revoked: false });
+const empty = (): CredentialState => ({ computers: [], currentId: null, config: null, ready: false, revoked: false, newChatConnectionId: null });
 const identity = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 
 /** One atomic secure-store document owns the list and selection. No old single-computer key
@@ -55,18 +59,19 @@ export class Credentials {
     this.pending = result.catch(() => {});
     return result;
   }
-  private selected(computers: readonly SavedComputer[], currentId: string | null, revoked: boolean): CredentialState {
+  private selected(computers: readonly SavedComputer[], currentId: string | null, revoked: boolean, newChatConnectionId = this.state.newChatConnectionId): CredentialState {
     const available = computers.filter((item) => !this.invalid.has(item.connectionId)).map((item) =>
       this.authInvalid.has(item.connectionId) && item.authStatus !== "invalid" ? { ...item, authStatus: "invalid" as const } : item);
     const config = available.find((item) => item.computerId === currentId) ?? available[0] ?? null;
-    return { computers: available, config, currentId: config?.computerId ?? null, ready: true, revoked };
+    return { computers: available, config, currentId: config?.computerId ?? null, ready: true, revoked,
+      newChatConnectionId: config?.connectionId === newChatConnectionId ? newChatConnectionId : null };
   }
-  private async persist(computers: readonly SavedComputer[], currentId: string | null, revoked: boolean): Promise<void> {
-    let next = this.selected(computers, currentId, revoked);
+  private async persist(computers: readonly SavedComputer[], currentId: string | null, revoked: boolean, newChatConnectionId = this.state.newChatConnectionId): Promise<void> {
+    let next = this.selected(computers, currentId, revoked, newChatConnectionId);
     for (;;) {
       if (next.computers.length) await this.storage.setItemAsync(KEY, JSON.stringify({ computers: next.computers, currentId: next.currentId }));
       else await this.storage.deleteItemAsync(KEY);
-      const checked = this.selected(next.computers, next.currentId, revoked);
+      const checked = this.selected(next.computers, next.currentId, revoked, newChatConnectionId);
       // A refusal during a pending secure write must not resurrect an invalid installation.
       if (checked.computers.length === next.computers.length &&
         checked.computers.every((item, index) => item === next.computers[index])) break;
@@ -78,7 +83,7 @@ export class Credentials {
     return this.enqueue(async () => {
       const saved = await this.storage.getItemAsync(KEY);
       const value = saved ? JSON.parse(saved) as { computers: SavedComputer[]; currentId: string | null } : { computers: [], currentId: null };
-      this.publish(this.selected(value.computers, value.currentId, false));
+      this.publish(this.selected(value.computers, value.currentId, false, null));
     });
   }
   /** Explicit repair replaces an invalid installation at the same endpoint, preserving its local namespace. */
@@ -88,7 +93,7 @@ export class Credentials {
       const repair = repairConnectionId
         ? this.state.computers.find((item) => item.connectionId === repairConnectionId) : undefined;
       if (repairConnectionId && (!repair || repair.authStatus !== "invalid" || repair.baseUrl !== baseUrl)) {
-        throw new Error("原电脑连接已变化，请返回「关于与连接」重新选择");
+        throw new Error("原服务器连接已变化，请返回「服务器与连接」重新选择");
       }
       // Without explicit repair intent, address/name cannot prove computer identity.
       // Only a repeated authenticated device identity or exact development token is merged.
@@ -97,14 +102,15 @@ export class Credentials {
           config.pairingMethod === "development" && item.pairingMethod === "development" && item.token === config.token
       ));
       const computer: SavedComputer = { ...config, baseUrl, computerId: previous?.computerId ?? identity(), connectionId: identity(),
-        ...(previous?.localName ? { localName: previous.localName } : {}) };
+        ...(previous?.localName ? { localName: previous.localName } : {}),
+        ...(previous?.lastConversationId ? { lastConversationId: previous.lastConversationId } : {}) };
       const computers = previous ? this.state.computers.map((item) => item === previous ? computer : item) : [...this.state.computers, computer];
-      await this.persist(computers, computer.computerId, false);
+      await this.persist(computers, computer.computerId, false, previous ? null : computer.connectionId);
     });
   }
   switchComputer(computerId: string): Promise<void> {
     return this.enqueue(async () => {
-      if (!this.state.computers.some((item) => item.computerId === computerId)) throw new Error("电脑已移除，请重新配对");
+      if (!this.state.computers.some((item) => item.computerId === computerId)) throw new Error("服务器已移除，请重新配对");
       if (this.state.currentId !== computerId) await this.persist(this.state.computers, computerId, false);
     });
   }
@@ -112,8 +118,19 @@ export class Credentials {
     return this.enqueue(async () => {
       const localName = name.trim();
       if (Array.from(localName).length > 64 || /[\r\n]/.test(localName)) throw new Error("备注名须为单行，最多 64 个字符");
-      if (!this.state.computers.some((item) => item.computerId === computerId)) throw new Error("电脑已移除");
+      if (!this.state.computers.some((item) => item.computerId === computerId)) throw new Error("服务器已移除");
       await this.persist(this.state.computers.map((item) => item.computerId === computerId ? { ...item, localName: localName || undefined } : item), this.state.currentId, this.state.revoked);
+    });
+  }
+  /** Opening consumes first-connect intent; durable root history uses the existing atomic queue. */
+  rememberConversation(connectionId: string, conversationId: string): Promise<void> {
+    return this.enqueue(async () => {
+      const computer = this.state.computers.find((item) => item.connectionId === connectionId);
+      if (!computer) return;
+      if (this.state.newChatConnectionId === connectionId) this.publish({ ...this.state, newChatConnectionId: null });
+      if (computer.lastConversationId === conversationId) return;
+      await this.persist(this.state.computers.map((item) => item === computer
+        ? { ...item, lastConversationId: conversationId } : item), this.state.currentId, this.state.revoked);
     });
   }
   beginDisconnect(expected: SavedComputer): void { this.disconnecting.add(expected.connectionId); }
@@ -138,7 +155,7 @@ export class Credentials {
       return true;
     });
   }
-  /** Call only after confirmed remote revocation (or for a development credential). */
+  /** Durably remove this installation before any best-effort remote revocation. */
   finishDisconnect(expected: SavedComputer): Promise<void> {
     return this.enqueue(async () => {
       await this.persist(this.state.computers.filter((item) => item.connectionId !== expected.connectionId), this.state.currentId, false);

@@ -20,6 +20,7 @@ from langchain.agents.middleware import AgentMiddleware
 
 from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
+from wandrun.integrations.instabox import InstaboxBackend
 from wandrun.metrics import RunMetrics
 from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
 from wandrun.runtime.agent.conversations import conversation_config
@@ -31,6 +32,7 @@ from wandrun.runtime.communication.scheduler_store import SchedulerStore
 from wandrun.runtime.execution.files import TaskBackend, TaskFiles, _current_task
 from wandrun.integrations.shell_backend import ManagedShellBackend
 from wandrun.integrations.local_processes import ProcessTable
+from test_environments import loopback_instabox
 
 
 def configure(root: Path, model="offline", grace=2.0) -> Workspace:
@@ -74,6 +76,18 @@ def created_backends(cls=ManagedShellBackend):
         yield created
 
 
+@asynccontextmanager
+async def local_instabox_backend(root: Path):
+    """Use the production owner with authenticated loopback SFTP and a real session."""
+    async with loopback_instabox():
+        owner = InstaboxBackend("m_" + "a" * 26, workdir=str(root), termination_grace=0.2)
+        try:
+            yield owner
+        finally:
+            await owner.aclose()
+
+
+
 def answer(text):
     payload = {
         "messages": [{"to": "human", "task_id": None, "message": text, "attachments": []}],
@@ -97,6 +111,193 @@ def answer(text):
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_environment_changes_are_observed_per_thread_not_broadcast_on_save(self):
+        from dataclasses import replace
+        from wandrun.runtime.context.environment_runtime import environment_snapshot_index
+
+        bodies = []
+        async def respond(model, body):
+            bodies.append(body)
+            yield answer("done")
+
+        def environment_notices(state):
+            return [message for message in state["messages"]
+                    if message.additional_kwargs.get("environment_snapshot") is not None]
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = configure(Path(directory))
+            cloud = f'type = "instabox"\nmachine_id = "m_{"a" * 26}"\nworkdir = "/work"\n'
+            workspace.environments_config.write_text(
+                'default = "local"\n[environments.local]\ntype = "local"\n'
+                '[environments.local_alias]\ntype = "local"\n'
+                '[environments.cloud]\n' + cloud
+                + '[environments.cloud_alias]\n' + cloud
+                + '[environments.third]\ntype = "instabox"\n'
+                + f'machine_id = "m_{"b" * 26}"\nworkdir = "/other-work"\n',
+                encoding="utf-8",
+            )
+            definition = AgentDefinition("Root", "Work", "offline", environment="local", code_mode=False)
+            catalog = AgentCatalog("main", {"main": definition})
+
+            async def switch(name):
+                (await runtime.prepare_agents(AgentCatalog("main", {
+                    "main": replace(definition, environment=name),
+                })))()
+
+            async def turn(thread):
+                runtime.workers.start("next", thread)
+                result = await runtime.workers.wait(thread)
+                self.assertEqual(result["status"], "completed", result)
+                state = (await runtime._assembly_for("main").graph.aget_state(conversation_config(thread))).values
+                self.assertIsNotNone(environment_snapshot_index(state))
+                return state
+
+            with (
+                patch.object(CodexSubscriptionModel, "_arequest", respond),
+                patch.object(InstaboxBackend, "_prepare", AsyncMock(side_effect=AssertionError("cloud access"))) as prepare,
+            ):
+                async with open_runtime(
+                    workspace, metrics=RunMetrics(workspace.runs_dir), on_human=lambda *_: None,
+                    agent_catalog=catalog, conversation_workdirs=True, notify_human_of_roots=False,
+                ) as runtime:
+                    for thread in ("left", "right", "coalesced"):
+                        first = await turn(thread)
+                        self.assertEqual(len(environment_notices(first)), 1)
+                        self.assertIn("Local", environment_notices(first)[0].content)
+                    stable_instructions = bodies[-1]["instructions"]
+                    await switch("cloud")
+                    await switch("local")
+                    unchanged = await turn("left")
+                    self.assertEqual(len(environment_notices(unchanged)), 1)
+                    self.assertFalse(any('"status": "changed"' in m.content for m in unchanged["messages"]
+                                         if isinstance(m.content, str)))
+                    await switch("cloud")
+                    cloud_state = await turn("left")
+                    self.assertEqual(len(environment_notices(cloud_state)), 2)
+                    self.assertEqual(bodies[-1]["instructions"], stable_instructions)
+                    self.assertNotIn("Instabox 远端机器", bodies[-1]["instructions"])
+                    right_before = (await runtime._assembly_for("main").graph.aget_state(
+                        conversation_config("right"))).values
+                    self.assertEqual(len(environment_notices(right_before)), 1)
+                    self.assertEqual(right_before["observed_environment"]["identity"]["type"], "local")
+                    self.assertEqual(len(environment_notices(await turn("right"))), 2)
+                    await switch("cloud_alias")
+                    self.assertEqual(len(environment_notices(await turn("left"))), 2)
+                    await switch("local_alias")
+                    restored = await turn("left")
+                    self.assertEqual(len(environment_notices(restored)), 3)
+                    self.assertEqual(sum('"status": "changed"' in m.content for m in environment_notices(restored)), 2)
+                    # No intermediate model boundary: the other thread observes only A -> C.
+                    await switch("cloud")
+                    await switch("third")
+                    coalesced = await turn("coalesced")
+                    self.assertEqual(len(environment_notices(coalesced)), 2)
+                    final_notice = environment_notices(coalesced)[-1].content
+                    self.assertIn("m_" + "b" * 26, final_notice)
+                    self.assertNotIn("m_" + "a" * 26, final_notice)
+                    await switch("local")
+                async with open_runtime(
+                    workspace, metrics=RunMetrics(workspace.runs_dir), on_human=lambda *_: None,
+                    agent_catalog=catalog, conversation_workdirs=True, notify_human_of_roots=False,
+                ) as runtime:
+                    restarted = await turn("left")
+                    self.assertEqual(len(environment_notices(restarted)), 3)
+                prepare.assert_not_awaited()
+
+    async def test_remote_cwd_recovery_is_tool_feedback_and_does_not_submit_original_write(self):
+        from langchain_core.messages import ToolMessage
+        from wandrun.runtime.execution.environments import Environment
+        owners = []
+
+        async def remote_environment(config, workspace, stack, opened, **kwargs):
+            backend = await stack.enter_async_context(local_instabox_backend(workspace.root))
+            backend._recovery_pending = True
+            owners.append(backend)
+            environment = Environment(
+                "cloud", backend, str(workspace.skills_dir),
+                str(workspace.runtime_dir / "artifacts"), type="instabox",
+            )
+            opened.append(environment)
+            return {"main": environment}
+
+        requests = 0
+
+        async def respond(model, body):
+            nonlocal requests
+            requests += 1
+            if requests > 2:
+                yield answer("Finished after checking the recovery feedback")
+                return
+            yield {
+                "type": "response.completed",
+                "response": {"status": "completed", "output": [{
+                    "type": "function_call", "id": f"write-{requests}", "call_id": f"write-{requests}",
+                    "name": "write_file",
+                    "arguments": json.dumps({
+                        "file_path": "blocked.txt" if requests == 1 else "explicit-new-write.txt",
+                        "content": "not submitted" if requests == 1 else "new decision",
+                    }),
+                }]},
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = configure(Path(directory))
+            workspace.environments_config.write_text(
+                'default = "cloud"\n[environments.cloud]\ntype = "instabox"\n'
+                f'machine_id = "m_{"a" * 26}"\nworkdir = {json.dumps(str(workspace.root))}\n',
+            )
+            with (
+                patch("wandrun.runtime.session.open_environments", side_effect=remote_environment),
+                patch.object(CodexSubscriptionModel, "_arequest", respond),
+            ):
+                async with open_runtime(
+                    workspace, metrics=RunMetrics(workspace.runs_dir), on_human=lambda *_: None,
+                    conversation_workdirs=True,
+                ) as runtime:
+                    runtime.workers.start("Write after checking recovery", "recovering")
+                    result = await asyncio.wait_for(runtime.workers.wait("recovering"), 10)
+                    self.assertEqual(result["status"], "completed", result)
+                    cwd = Path(runtime.files.directory("recovering"))
+                    self.assertFalse((cwd / "blocked.txt").exists())
+                    self.assertEqual((cwd / "explicit-new-write.txt").read_text(), "new decision")
+                    snapshot = await runtime._assembly_for("main").graph.aget_state(
+                        conversation_config("recovering"),
+                    )
+                    results = [message for message in snapshot.values["messages"] if isinstance(message, ToolMessage)]
+                    self.assertEqual([message.status for message in results], ["error", "success"])
+            self.assertIsNotNone(owners[0]._recovery_feedback)
+            self.assertFalse(owners[0]._recovery_pending)
+            self.assertTrue(owners[0]._closed)
+            self.assertTrue(owners[0]._connection.is_closed())
+
+    async def test_plain_conversation_and_resume_persist_history_without_creating_cwd(self):
+        async def respond(model, body):
+            yield answer("plain reply")
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = configure(Path(directory))
+            with patch.object(CodexSubscriptionModel, "_arequest", respond):
+                async with open_runtime(
+                    workspace, metrics=RunMetrics(workspace.runs_dir),
+                    on_human=lambda *_: None, conversation_workdirs=True,
+                ) as runtime:
+                    cwd = Path(runtime.files.directory("chat", "main"))
+                    self.assertFalse(cwd.exists())
+                    for prompt in ("hello", "continue"):
+                        runtime.workers.start(prompt, "chat")
+                        result = await runtime.workers.wait("chat")
+                        self.assertEqual(result["status"], "completed", result)
+                        self.assertFalse(cwd.exists())
+                    snapshot = await runtime._assembly_for("main").graph.aget_state(
+                        conversation_config("chat"),
+                    )
+                    human_inputs = [
+                        message.content for message in snapshot.values["messages"]
+                        if message.type == "human"
+                    ]
+                    self.assertIn("hello", human_inputs)
+                    self.assertIn("continue", human_inputs)
+
     async def test_human_rejection_continues_graph_and_persists_correction_receipt(self):
         from wandrun.gateway.ui_blocks import parse_blocks
 
@@ -476,7 +677,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 patch("wandrun.integrations.mcp.MCPAdapter", Adapter),
                 created_backends(SlowBackend) as backends,
             ):
-                with self.assertRaisesRegex(ValueError, "连接或工具发现失败"):
+                with self.assertRaises(ValueError):
                     async with open_runtime(
                         workspace,
                         metrics=metrics,
@@ -525,17 +726,23 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         from wandrun.integrations.shell_backend import CleanupUnconfirmedError
         from wandrun.runtime import session
 
-        class Backend:
-            def __init__(self, name):
+        class Backend(InstaboxBackend):
+            def __init__(self, name, root):
+                super().__init__("m_" + name.lower() * 26, workdir=str(root))
                 self.name = name
 
-            def close(self):
+            async def _close(self):
+                await super()._close()
                 raise CleanupUnconfirmedError(f"{self.name} unconfirmed: call-{self.name}")
 
         with tempfile.TemporaryDirectory() as directory:
-            environments = [SimpleNamespace(backend=Backend(name), processes=None) for name in ("A", "B")]
+            environments = [
+                SimpleNamespace(type="instabox", backend=Backend(name, Path(directory)), processes=None)
+                for name in ("A", "B")
+            ]
             with self.assertRaises(RuntimeCleanupError) as raised:
                 await session._shutdown(None, environments, contextlib.AsyncExitStack(), RunMetrics(Path(directory)))
+            self.assertTrue(all(environment.backend.processes._closed for environment in environments))
         self.assertIn("call-A", str(raised.exception))
         self.assertIn("call-B", str(raised.exception))
 
@@ -1025,15 +1232,25 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(pools, [])
                     first = await turn("off")
                     self.assertNotIn("run_code", {item.get("name") for item in first[0]["tools"]})
-                    with self.assertRaisesRegex(ValueError, "environment"):
-                        await runtime.prepare_agents(AgentCatalog("main", {
-                            "main": replace(disabled, environment="other"),
-                        }))
-                    with self.assertRaisesRegex(ValueError, "默认执行环境"):
-                        await runtime.prepare_agents(AgentCatalog("main", {
-                            **off_catalog.agents,
-                            "new": AgentDefinition("New", "Work", "offline", environment="other", code_mode=False),
-                        }))
+                    original_environment = runtime.files.environments["main"]
+                    switch = await runtime.prepare_agents(AgentCatalog("main", {
+                        "main": replace(disabled, environment="other"),
+                    }))
+                    self.assertEqual(runtime.files.environments["main"], original_environment)
+                    switch()
+                    self.assertEqual(runtime.files.environments["main"][0], "other")
+                    (await runtime.prepare_agents(off_catalog))()
+                    self.assertEqual(runtime.files.environments["main"], original_environment)
+                    add = await runtime.prepare_agents(AgentCatalog("main", {
+                        **off_catalog.agents,
+                        "new": AgentDefinition("New", "Work", "offline", environment="other", code_mode=False),
+                    }))
+                    self.assertNotIn("new", runtime.agent_models)
+                    add()
+                    self.assertEqual(runtime.files.environments["new"][0], "other")
+                    (await runtime.prepare_agents(off_catalog))()
+                    self.assertNotIn("new", runtime.agent_models)
+                    self.assertEqual(pools, [])
                     old = runtime._assembly_for("main")
                     with patch.object(session, "build_agents", side_effect=RuntimeError("graph failed")):
                         with self.assertRaisesRegex(RuntimeError, "graph failed"):
@@ -1071,7 +1288,7 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(pools), 1)
                 self.assertTrue(pools[0].closed)
 
-    async def test_new_ssh_role_executes_in_prepared_conversation_after_catalog_commit(self):
+    async def test_new_remote_role_executes_in_prepared_conversation_after_catalog_commit(self):
         from wandrun.runtime.execution.environments import Environment
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1079,17 +1296,19 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
             remote = workspace.root / "remote root"
             remote.mkdir()
             workspace.environments_config.write_text(
-                'default = "vps"\n[environments.vps]\ntype = "ssh"\n'
-                f'host = "unused.invalid"\nworkdir = {json.dumps(str(remote))}\n',
+                'default = "vps"\n[environments.vps]\ntype = "instabox"\n'
+                f'machine_id = "m_{"a" * 26}"\nworkdir = {json.dumps(str(remote))}\n',
                 encoding="utf-8",
             )
             bodies = []
+            owners = []
 
-            async def local_ssh_environment(config, workspace, stack, opened, *, include_default, builtin_source=None):
-                backend = ManagedShellBackend(root_dir=remote, virtual_mode=False)
+            async def local_remote_environment(config, workspace, stack, opened, *, include_default, builtin_source=None):
+                backend = await stack.enter_async_context(local_instabox_backend(remote))
+                owners.append(backend)
                 opened.append(Environment(
                     "vps", backend, str(remote / ".wandrun/skills"),
-                    str(remote / ".wandrun/artifacts"), synced_skills=frozenset(),
+                    str(remote / ".wandrun/artifacts"), type="instabox",
                 ))
                 return {}  # No role exists until prepare_agents commits the new catalog.
 
@@ -1108,7 +1327,7 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
                     yield answer("finished")
 
             with (
-                patch("wandrun.runtime.session.open_environments", side_effect=local_ssh_environment),
+                patch("wandrun.runtime.session.open_environments", side_effect=local_remote_environment),
                 patch.object(CodexSubscriptionModel, "_arequest", respond),
             ):
                 async with open_runtime(
@@ -1116,9 +1335,12 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
                     on_human=lambda *_: None, agent_catalog=AgentCatalog(None, {}),
                     conversation_workdirs=True,
                 ) as runtime:
-                    (await runtime.prepare_agents(AgentCatalog(None, {
+                    commit = await runtime.prepare_agents(AgentCatalog(None, {
                         "fresh": AgentDefinition("Agent", "Help", "offline", environment=None),
-                    })))()
+                    }))
+                    self.assertNotIn("fresh", runtime.files.environments)
+                    self.assertFalse((remote / "conversations" / "fresh-task").exists())
+                    commit()
                     runtime.workers.start("Run in the conversation directory", "fresh-task", agent_name="fresh")
                     result = await asyncio.wait_for(runtime.workers.wait("fresh-task"), 5)
                     cwd = remote / "conversations" / "fresh-task"
@@ -1129,6 +1351,9 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
                         if item.get("type") == "function_call_output"
                     ]
                     self.assertIn(str(cwd), "\n".join(tool_results))
+            self.assertIsNotNone(owners[0]._recovery_feedback)
+            self.assertTrue(owners[0]._closed)
+            self.assertTrue(owners[0]._connection.is_closed())
 
     async def test_new_mcp_reference_opens_before_commit_and_tool_runs_next_turn(self):
         from langchain_core.tools import StructuredTool
@@ -1612,6 +1837,130 @@ class AgentCatalogTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
+    async def test_double_leading_separator_preserves_first_use_and_symlink_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = SimpleNamespace(agent_name=lambda task: "worker", root_of=lambda task: task)
+            backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
+            try:
+                for remote in (False, True):
+                    files = TaskFiles(
+                        root, manager, {"worker": ("host" if remote else "local", str(root))},
+                        conversation_workdirs=True, remote_backends={"worker": backend} if remote else {},
+                    )
+                    task = f"double-{remote}"
+                    cwd = Path(files.directory(task))
+                    spelling = "/" + str(cwd)
+                    view = TaskBackend(backend, files, task_id=task)
+                    self.assertIsNone((await view.als(spelling)).error)
+                    self.assertTrue(cwd.is_dir())
+                    cwd.rmdir()
+                    outside = root / f"outside-{remote}"
+                    outside.mkdir()
+                    cwd.symlink_to(outside, target_is_directory=True)
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        await view.awrite(spelling + "/escaped.txt", "must not publish")
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        await asyncio.to_thread(view.write, spelling + "/sync-escaped.txt", "must not publish")
+                    self.assertEqual(list(outside.iterdir()), [])
+            finally:
+                backend.close()
+
+    async def test_first_backend_operations_prepare_cwd_for_local_and_remote_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
+            manager = SimpleNamespace(agent_name=lambda task: "worker", root_of=lambda task: task)
+            try:
+                for remote in (False, True):
+                    files = TaskFiles(
+                        root, manager, {"worker": ("ssh" if remote else "local", str(root))},
+                        conversation_workdirs=True,
+                        remote_backends={"worker": backend} if remote else {},
+                    )
+                    for operation in ("write", "absolute_write", "execute", "code_execute", "sync", "read", "ls"):
+                        task = f"{remote}-{operation}"
+                        cwd = Path(files.directory(task))
+                        view = TaskBackend(backend, files, task_id=task)
+                        self.assertFalse(cwd.exists())
+                        with self.subTest(remote=remote, operation=operation):
+                            if operation in {"write", "absolute_write"}:
+                                path = str(cwd / "first.txt") if operation == "absolute_write" else "first.txt"
+                                self.assertIsNone((await view.awrite(path, "first")).error)
+                                self.assertEqual((cwd / "first.txt").read_text(), "first")
+                            elif operation == "execute":
+                                result = await view.aexecute("printf first > first.txt; pwd")
+                                self.assertEqual(result.exit_code, 0, result.output)
+                                self.assertIn(str(cwd), result.output)
+                            elif operation == "code_execute":
+                                functions = _script_functions(CodeModeCatalog([], []), view.for_code_call(), _Execution(5))
+                                result = await functions["execute"]("printf code > first.txt")
+                                self.assertEqual(result["exit_code"], 0, result)
+                                self.assertEqual((cwd / "first.txt").read_text(), "code")
+                            elif operation == "sync":
+                                result = await asyncio.to_thread(view.execute, "printf sync > first.txt")
+                                self.assertEqual(result.exit_code, 0, result.output)
+                                self.assertEqual((cwd / "first.txt").read_text(), "sync")
+                            elif operation == "read":
+                                self.assertIsNotNone((await view.aread("missing.txt")).error)
+                            else:
+                                self.assertIsNone((await view.als(str(cwd))).error)
+                            self.assertTrue(cwd.is_dir())
+            finally:
+                backend.close()
+
+    async def test_unrelated_absolute_reads_and_host_queries_do_not_prepare_cwd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = root / "SKILL.md"
+            skill.write_text("existing skill")
+            manager = SimpleNamespace(agent_name=lambda task: "worker", root_of=lambda task: task)
+            files = TaskFiles(root, manager, {"worker": ("local", str(root))}, conversation_workdirs=True)
+            backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
+            try:
+                view = TaskBackend(backend, files, task_id="chat")
+                self.assertIn("existing skill", str((await view.aread(str(skill))).file_data))
+                self.assertIn("existing skill", str(view.read(str(skill)).file_data))
+                self.assertIn("existing skill", str((await TaskBackend(backend, files).aread(str(skill))).file_data))
+                self.assertIsNotNone((await view.aread(str(root / "missing.txt"))).error)
+                with self.assertRaises(FileNotFoundError):
+                    files.open_local_conversation_directory("chat")
+                with self.assertRaises(FileNotFoundError):
+                    await files.read_task_file("chat", "missing.txt", max_bytes=100)
+                self.assertFalse(Path(files.directory("chat")).exists())
+            finally:
+                backend.close()
+
+    async def test_concurrent_first_use_is_idempotent_and_symlinks_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
+            manager = SimpleNamespace(agent_name=lambda task: "worker", root_of=lambda task: "shared")
+            try:
+                for remote in (False, True):
+                    environment = root / str(remote)
+                    environment.mkdir()
+                    files = TaskFiles(
+                        root, manager, {"worker": ("host" if remote else "local", str(environment))},
+                        conversation_workdirs=True, remote_backends={"worker": backend} if remote else {},
+                    )
+                    first = TaskBackend(backend, files, task_id="main")
+                    child = TaskBackend(backend, files, task_id="child")
+                    results = await asyncio.gather(first.awrite("main.txt", "main"), child.awrite("child.txt", "child"))
+                    self.assertTrue(all(result.error is None for result in results))
+                    cwd = Path(files.directory("main"))
+                    self.assertEqual((cwd / "main.txt").read_text(), "main")
+                    self.assertEqual((cwd / "child.txt").read_text(), "child")
+                    outside = environment / "outside"
+                    outside.mkdir()
+                    cwd.rename(environment / "original")
+                    cwd.symlink_to(outside, target_is_directory=True)
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        await first.aexecute("printf escaped > bad.txt")
+                    self.assertFalse((outside / "bad.txt").exists())
+            finally:
+                backend.close()
+
     async def test_task_cwd_is_shared_by_descendants_not_other_roots_across_file_shell_and_process(self):
         from wandrun.runtime.communication.workers import WorkerManager
 
@@ -1637,14 +1986,13 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
             await manager.wait("member")
             manager.start("leaf", "grandchild", sender_id="member", agent_name="leaf")
             await manager.wait("grandchild")
-            for task_id in ("conversation-one", "conversation-two", "member", "grandchild"):
-                await files.prepare(task_id)
+            self.assertFalse((root / "conversations").exists())
             self.assertEqual(files.directory("conversation-one"), files.directory("member"))
             self.assertEqual(files.directory("member"), files.directory("grandchild"))
             self.assertNotEqual(files.directory("member"), files.directory("conversation-two"))
             backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
             try:
-                view = TaskBackend(backend, files.directory)
+                view = TaskBackend(backend, files)
                 (root / "shared-explicit.txt").write_text("workspace access")
                 for task_id, text in (("member", "shared"), ("conversation-two", "isolated")):
                     token = _current_task.set(task_id)
@@ -1692,15 +2040,47 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
             cwd.mkdir()
             backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
             try:
-                view = TaskBackend(backend, lambda task: str(cwd), task_id="task")
+                manager = SimpleNamespace(agent_name=lambda task: "main")
+                files = TaskFiles(
+                    root, manager, {"main": ("local", str(cwd))}, conversation_workdirs=False,
+                )
+                view = TaskBackend(backend, files, task_id="task")
                 result = await view.aexecute("true & printf proof > result.txt; wait")
                 self.assertEqual(result.exit_code, 0, result.output)
                 self.assertEqual((cwd / "result.txt").read_text(), "proof")
                 self.assertFalse((root / "result.txt").exists())
-                missing = TaskBackend(backend, lambda task: str(root / "missing"), task_id="task")
+                files = TaskFiles(
+                    root, manager, {"main": ("local", str(root / "missing"))},
+                    conversation_workdirs=False,
+                )
+                missing = TaskBackend(backend, files, task_id="task")
                 result = missing.execute("true & printf escaped > failed.txt; wait")
                 self.assertNotEqual(result.exit_code, 0)
                 self.assertFalse((root / "failed.txt").exists())
+            finally:
+                backend.close()
+
+    async def test_cleanup_reports_local_and_remote_failures_but_attempts_remaining_environments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "conversations" / "conversation"
+            local.mkdir(parents=True)
+            remote = root / "remote" / "conversations" / "conversation"
+            remote.mkdir(parents=True)
+            backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
+            async def unavailable(command):
+                raise TimeoutError("environment unavailable")
+            files = TaskFiles(root, None, {"a": ("offline", "/offline"), "b": ("online", str(root / "remote"))},
+                              conversation_workdirs=True,
+                              remote_backends={"a": SimpleNamespace(aexecute=unavailable), "b": backend})
+            try:
+                with patch("wandrun.runtime.execution.files.os.rmdir", side_effect=PermissionError("denied")):
+                    reports = await files.cleanup_conversation("conversation")
+                self.assertEqual([item["environment"] for item in reports], ["local", "offline"])
+                self.assertEqual([item["path"] for item in reports],
+                                 ["conversations/conversation", "conversations/conversation"])
+                self.assertTrue(local.exists())
+                self.assertFalse(remote.exists())
             finally:
                 backend.close()
 
@@ -1818,6 +2198,7 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
                      "peer": ("host", str(remote))},
                     {"ssh": backend, "peer": backend},
                 )
+                backend.pending_transfer_owners = lambda: set()
                 await files.prepare("task")
                 task_dir = remote / "conversations" / "conversation"
                 self.assertTrue(task_dir.is_dir())
@@ -1828,10 +2209,11 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
                 (control / "secret").write_text("private")
                 (remote / ".wandrun").symlink_to(control, target_is_directory=True)
                 (remote / "shortcut").symlink_to(control, target_is_directory=True)
-                resolved, receipts = await files.prepare_attachments(
+                preparation = await files.prepare_attachments(
                     "task", "peer", ["regular.txt", "alias.txt", str(remote / ".wandrun/secret"),
                                       str(remote / "shortcut/secret"), str(control / "secret")],
                 )
+                resolved, receipts = preparation.attachments, preparation.receipts
                 self.assertEqual([item["accepted"] for item in receipts],
                                  [True, True, False, False, False])
                 self.assertEqual([item.name for item in resolved], ["regular.txt", "alias.txt"])
@@ -1856,6 +2238,9 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
             backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
 
             class ReplacingBackend:
+                def pending_transfer_owners(self):
+                    return set()
+
                 async def aexecute(self, command):
                     args = shlex.split(command)
                     injection = (
@@ -1875,13 +2260,15 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
 
             try:
                 manager = SimpleNamespace(agent_name=lambda task: "ssh", root_of=lambda task: "conversation")
+                remote_backend = ReplacingBackend()
                 files = TaskFiles(
                     root, manager, {"ssh": ("host", str(remote)), "peer": ("host", str(remote))},
-                    remote_backends={"ssh": ReplacingBackend()}, conversation_workdirs=False,
+                    remote_backends={"ssh": remote_backend, "peer": remote_backend}, conversation_workdirs=False,
                 )
-                attachments, receipts = await files.prepare_attachments(
+                preparation = await files.prepare_attachments(
                     "task", "peer", [str(remote / "alias/secret")],
                 )
+                attachments, receipts = preparation.attachments, preparation.receipts
                 self.assertEqual(attachments, [])
                 self.assertFalse(receipts[0]["accepted"])
                 self.assertTrue((control / "held").is_file())

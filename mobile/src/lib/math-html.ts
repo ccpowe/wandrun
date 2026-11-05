@@ -49,3 +49,9 @@ export function groupMarkdownBlocks(tokens: readonly Token[]): Token[][] {
 export function mathBlockHtml(tokens: readonly Token[], managedMemory?: AgentMemory): string {
   return markdown.renderer.render(tokens as Token[], markdown.options, { managedMemory });
 }
+
+const ENTITIES: Record<string, string> = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" };
+/** The TeX of every formula node in document order — the order the math page reports a long-pressed index in. */
+export function formulaSources(html: string): string[] {
+  return [...html.matchAll(/data-tex="([^"]*)"/g)].map(match => match[1].replace(/&(?:amp|lt|gt|quot|#39);/g, entity => ENTITIES[entity]));
+}

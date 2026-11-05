@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfoNotFoundError
+from uuid import uuid4
 
 import httpx
 
@@ -58,7 +59,7 @@ class ScheduleCase(unittest.TestCase):
         self.assertEqual(self.store.delete_schedule("s1"), deleted)
         self.assertEqual(deleted.data, {"kind": "schedule", "id": "s1", "op": "deleted"})
         self.assertEqual(self.store.replay_create_schedule("create"), (detail, event))
-        conversation, _ = self.store.create_conversation("x", "a")
+        conversation, _ = self.store.create_conversation("x", "a", client_id=uuid4().hex)
         self.store.append_user_message(conversation["id"], "text", "other-command")
         with self.assertRaises(ClientIdConflict):
             self.store.replay_create_schedule("other-command")

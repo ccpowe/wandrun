@@ -1,9 +1,9 @@
 import { KeyboardAwareLegendList } from "@legendapp/list/keyboard";
 import { type ComponentProps, useState } from "react";
 
-import type { Item } from "@/lib/chat-timeline.ts";
+import type { ChatRow } from "@/lib/chat-timeline.ts";
 
-type Props = ComponentProps<typeof KeyboardAwareLegendList<Item>>;
+type Props = ComponentProps<typeof KeyboardAwareLegendList<ChatRow>>;
 
 /**
  * ChatScreen mounts this boundary only after composer/target readiness. This

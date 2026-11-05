@@ -1,0 +1,225 @@
+import { composeStories } from '@storybook/react';
+import { act, fireEvent, render, screen } from '@testing-library/react-native';
+import * as agentStories from '../src/dev/agent-editor.stories';
+import * as scheduleStories from '../src/dev/schedule-editor.stories';
+import { editorScenario } from '../src/dev/editor-scenario';
+import { GatewayApi } from '../src/gateway/api';
+
+jest.mock('react-native-keyboard-controller', () => jest.requireActual('react-native-keyboard-controller/jest'));
+jest.mock('react-native-webview', () => ({ __esModule: true, default: jest.requireActual('react-native').View }));
+const Agent = composeStories(agentStories);
+const Schedule = composeStories(scheduleStories);
+beforeEach(() => jest.useFakeTimers());
+afterEach(() => { jest.restoreAllMocks(); jest.useRealTimers(); });
+const tick = async (ms = 200) => act(async () => { await jest.advanceTimersByTimeAsync(ms); });
+
+for (const schedule of [false, true]) {
+  const prefix = schedule ? 'schedule' : 'editor';
+  const name = schedule ? 'schedule-editor' : 'agent-editor';
+  test(`${name}.A1 A3 读取失败后台恢复，没有手动重试`, async () => {
+    const peer = editorScenario('read-failure');
+    const Story = schedule ? Schedule.A3 : Agent.A1;
+    await render(<Story scenario={peer} />); await tick();
+    await tick(3000);
+    expect(screen.getByRole('alert')).toBeOnTheScreen();
+    expect(screen.queryByText('重试')).toBeNull();
+    await act(() => peer.recover()); await tick(1500);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByTestId(`${prefix}-name`)).toBeOnTheScreen();
+  });
+  test(`${name}.A4 A5 离线禁写但可编辑`, async () => {
+    const Story = schedule ? Schedule.A5 : Agent.A4;
+    await render(<Story />); await tick(1500);
+    expect(screen.getByTestId(`${prefix}-save`)).toBeDisabled();
+    expect(screen.getByTestId(`${prefix}-delete`)).toBeDisabled();
+    await fireEvent.changeText(screen.getByTestId(`${prefix}-name`), '离线草稿');
+    expect(screen.getByTestId(`${prefix}-name`)).toHaveProp('value', '离线草稿');
+  });
+  test(`${name}.A4 A5 离线脏稿返回可继续编辑或明确放弃，不写入`, async () => {
+    const Story = schedule ? Schedule.A5 : Agent.A4;
+    const peer = editorScenario('offline');
+    const originalName = schedule ? peer.gateway.state.schedules[0].name : peer.gateway.state.agentDetails.get('planner')!.name;
+    const write = jest.spyOn(GatewayApi.prototype, schedule ? 'updateSchedule' : 'updateAgent');
+    await render(<Story scenario={peer} />); await tick(1500);
+    await fireEvent.changeText(screen.getByTestId(`${prefix}-name`), '离线未保存内容');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(screen.getByTestId('editor-leave-sheet')).toBeOnTheScreen();
+    expect(screen.queryByTestId('editor-unknown-leave-sheet')).toBeNull();
+    expect(write).not.toHaveBeenCalled();
+    await fireEvent.press(screen.getByTestId('editor-leave-continue')); await tick();
+    expect(screen.queryByTestId('editor-leave-sheet')).toBeNull();
+    expect(screen.getByTestId(`${prefix}-name`)).toHaveProp('value', '离线未保存内容');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    await fireEvent.press(screen.getByTestId('editor-leave-discard')); await tick();
+    expect(screen.queryByTestId(`${prefix}-name`)).toBeNull();
+    expect(screen.queryByTestId(`${prefix}-save`)).toBeNull();
+    expect(write).not.toHaveBeenCalled();
+    expect(schedule ? peer.gateway.state.schedules[0].name : peer.gateway.state.agentDetails.get('planner')?.name).toBe(originalName);
+    if (schedule) expect(screen.getByTestId('profile-schedule-morning')).toHaveTextContent(new RegExp(originalName));
+    else expect(screen.getByTestId('agent-row-planner')).toHaveTextContent(new RegExp(originalName));
+  });
+  test(`${name}.A4 A5 离线选择继续后恢复在线，返回自动保存原草稿`, async () => {
+    const Story = schedule ? Schedule.A5 : Agent.A4;
+    const peer = editorScenario('offline');
+    const write = jest.spyOn(GatewayApi.prototype, schedule ? 'updateSchedule' : 'updateAgent');
+    await render(<Story scenario={peer} />); await tick(1500);
+    await fireEvent.changeText(screen.getByTestId(`${prefix}-name`), '恢复后保存的草稿');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(screen.getByTestId('editor-leave-sheet')).toBeOnTheScreen();
+    await fireEvent.press(screen.getByTestId('editor-leave-continue')); await tick();
+    expect(write).not.toHaveBeenCalled();
+    await act(() => peer.recover()); await tick(5000);
+    expect(screen.getByTestId(`${prefix}-save`)).not.toBeDisabled();
+    expect(screen.getByTestId(`${prefix}-name`)).toHaveProp('value', '恢复后保存的草稿');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(screen.queryByTestId('editor-leave-sheet')).toBeNull();
+    expect(screen.queryByTestId(`${prefix}-save`)).toBeNull();
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(schedule ? peer.gateway.state.schedules[0].name : peer.gateway.state.agentDetails.get('planner')?.name).toBe('恢复后保存的草稿');
+  });
+  test(`${name}.A5 A6 返回自动保存并同步上一页`, async () => {
+    const Story = schedule ? Schedule.A6 : Agent.A5;
+    const peer = editorScenario();
+    await render(<Story scenario={peer} />); await tick();
+    await fireEvent.changeText(screen.getByTestId(`${prefix}-name`), '新的名字');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(screen.queryByTestId('editor-leave-sheet')).toBeNull();
+    expect(screen.queryByTestId(`${prefix}-save`)).toBeNull();
+    expect(schedule ? peer.gateway.state.schedules[0].name : peer.gateway.state.agentDetails.get('planner')?.name).toBe('新的名字');
+    if (schedule) expect(screen.getByTestId('profile-schedule-morning')).toHaveTextContent(/新的名字/);
+    else expect(screen.getByTestId('agent-row-planner')).toHaveTextContent(/新的名字/);
+  });
+  test(`${name}.A5 A6 校验失败顶部报错，保留草稿，再次返回只确认放弃`, async () => {
+    const peer = editorScenario();
+    const Story = schedule ? Schedule.A6Validation : Agent.A5Validation;
+    await render(<Story scenario={peer} />); await tick();
+    await fireEvent.changeText(screen.getByTestId(`${prefix}-name`), '');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(screen.getByRole('alert')).toHaveTextContent(/请填写/);
+    expect(screen.queryByTestId('editor-leave-sheet')).toBeNull();
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(screen.getByText('放弃')).toBeOnTheScreen();
+    await fireEvent.press(screen.getByTestId('editor-leave-continue')); await tick();
+    expect(screen.getByTestId(`${prefix}-name`)).toHaveProp('value', '');
+    await fireEvent.changeText(screen.getByTestId(`${prefix}-name`), '修正后的名字');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(schedule ? peer.gateway.state.schedules[0].name : peer.gateway.state.agentDetails.get('planner')?.name).toBe('修正后的名字');
+  });
+  test(`${name}.A5 A6 明确失败不丢字，再次返回不重提，显式保存可重试`, async () => {
+    const peer = editorScenario('save-failure');
+    const Story = schedule ? Schedule.A6Failure : Agent.A5Failure;
+    const write = jest.spyOn(GatewayApi.prototype, schedule ? 'updateSchedule' : 'updateAgent');
+    await render(<Story scenario={peer} />); await tick();
+    await fireEvent.changeText(screen.getByTestId(`${prefix}-name`), '未写入的名字');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(screen.getByRole('alert')).toHaveTextContent('当前配置不能保存，请检查后重试。');
+    expect(screen.getByTestId(`${prefix}-name`)).toHaveProp('value', '未写入的名字');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(write).toHaveBeenCalledTimes(1);
+    await fireEvent.press(screen.getByTestId('editor-leave-continue')); await tick();
+    await act(() => peer.recover()); await tick(1500);
+    await fireEvent.press(screen.getByTestId(`${prefix}-save`)); await tick();
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(schedule ? peer.gateway.state.schedules[0].name : peer.gateway.state.agentDetails.get('planner')?.name).toBe('未写入的名字');
+  });
+  test(`${name}.A5 A6 保存在途重复返回只提交一次`, async () => {
+    const peer = editorScenario();
+    const Story = schedule ? Schedule.A6 : Agent.A5;
+    const gate = Promise.withResolvers<void>();
+    let writes = 0;
+    peer.gateway.overrides[schedule ? 'PATCH /schedules/:id' : 'PATCH /agents/:id'] = async () => {
+      writes++;
+      await gate.promise;
+    };
+    await render(<Story scenario={peer} />); await tick();
+    await fireEvent.changeText(screen.getByTestId(`${prefix}-name`), '只提交一次');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`));
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(screen.getByTestId(`${prefix}-name`)).toHaveProp('editable', false);
+    await act(() => gate.resolve()); await tick();
+    expect(writes).toBe(1);
+    expect(schedule ? peer.gateway.state.schedules[0].name : peer.gateway.state.agentDetails.get('planner')?.name).toBe('只提交一次');
+  });
+  test(`${name}.B4 B5 未确认只读，Agent 离开先确认不保留，重入显示实际值`, async () => {
+    const peer = editorScenario('unknown');
+    const Story = schedule ? Schedule.B5 : Agent.B4;
+    await render(<Story scenario={peer} />); await tick();
+    await fireEvent.changeText(screen.getByTestId(`${prefix}-name`), '待核对');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    await tick(3000);
+    expect(screen.getByText('结果未确认，恢复连接后会核对')).toBeOnTheScreen();
+    expect(screen.getByTestId(`${prefix}-save`)).toBeDisabled();
+    expect(screen.getByTestId(`${prefix}-name`)).toHaveProp('editable', false);
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    expect(screen.getByTestId('editor-unknown-leave-sheet')).toBeOnTheScreen();
+    await fireEvent.press(screen.getByTestId('editor-unknown-stay')); await tick();
+    expect(screen.getByTestId(`${prefix}-name`)).toHaveProp('value', '待核对');
+    await fireEvent.press(screen.getByTestId(`${prefix}-back`)); await tick();
+    await fireEvent.press(screen.getByTestId('editor-unknown-leave')); await tick();
+    expect(screen.queryByTestId('editor-leave-sheet')).toBeNull();
+    expect(screen.queryByTestId(`${prefix}-save`)).toBeNull();
+    expect(peer.session.editorOperations.get(schedule ? 'schedule:morning' : 'agent:planner')?.status).toBe('unknown');
+    await act(() => peer.recover()); await tick(1500);
+    if (schedule) await fireEvent.press(screen.getByTestId('profile-schedule-morning'));
+    else await fireEvent.press(screen.getByLabelText('编辑 小万'));
+    await tick();
+
+    expect(screen.getByTestId(`${prefix}-name`)).toHaveProp('editable', true);
+    expect(screen.getByTestId(`${prefix}-name`)).toHaveProp('value', schedule ? '每日新闻简报' : '小万');
+  });
+}
+
+test('agent-editor.A3 新建空表单直接返回，已填内容仅放弃或继续编辑，不创建', async () => {
+  const peer = editorScenario();
+  const create = jest.spyOn(GatewayApi.prototype, 'createAgent');
+  await render(<Agent.A3 scenario={peer} />); await tick();
+  await fireEvent.press(screen.getByTestId('editor-back')); await tick();
+  expect(screen.queryByTestId('editor-leave-sheet')).toBeNull();
+  await fireEvent.press(screen.getByTestId('agents-add')); await tick();
+  await fireEvent.changeText(screen.getByTestId('editor-name'), '未创建');
+  await fireEvent.press(screen.getByTestId('editor-back')); await tick();
+  expect(screen.getByText('放弃')).toBeOnTheScreen();
+  await fireEvent.press(screen.getByTestId('editor-leave-continue')); await tick();
+  expect(screen.getByTestId('editor-name')).toHaveProp('value', '未创建');
+  await fireEvent.press(screen.getByTestId('editor-back')); await tick();
+  await fireEvent.press(screen.getByTestId('editor-leave-discard')); await tick();
+  expect(screen.queryByTestId('editor-save')).toBeNull();
+  expect(create).not.toHaveBeenCalled();
+});
+
+test('agent-editor.A1 A2 旧缓存重开必须等本次成功读取，随后刷新不覆盖正在编辑的草稿', async () => {
+  const peer = editorScenario();
+  await render(<Agent.A2 scenario={peer} />); await tick(300);
+  await fireEvent.press(screen.getByTestId('editor-back')); await tick();
+  peer.gateway.state.agentDetails.get('planner')!.system_prompt = '电脑上后来保存的提示词';
+  const held = Promise.withResolvers<void>();
+  peer.gateway.overrides['GET /agents/:id'] = async () => { await held.promise; };
+  await fireEvent.press(screen.getByLabelText('编辑 小万')); await tick();
+  expect(screen.queryByTestId('editor-name')).toBeNull();
+  await act(() => held.resolve()); await tick();
+  await fireEvent.press(screen.getByTestId('editor-prompt')); await tick();
+  expect(screen.getByTestId('editor-prompt-input')).toHaveProp('value', '电脑上后来保存的提示词');
+  await fireEvent.changeText(screen.getByTestId('editor-prompt-input'), '本次尚未保存的提示词');
+  await act(() => peer.updateAgent({ system_prompt: '另一设备再次更新' })); await tick();
+  expect(screen.getByTestId('editor-prompt-input')).toHaveProp('value', '本次尚未保存的提示词');
+});
+
+test('agent-editor.T2 未确认重入的详情仍失败时，先提示上次核对且离开仍需确认', async () => {
+  const peer = editorScenario('unknown');
+  await render(<Agent.B4 scenario={peer} />); await tick();
+  await fireEvent.changeText(screen.getByTestId('editor-name'), '不应恢复的修改');
+  await fireEvent.press(screen.getByTestId('editor-save')); await tick();
+  await fireEvent.press(screen.getByTestId('editor-back')); await tick();
+  await fireEvent.press(screen.getByTestId('editor-unknown-leave')); await tick();
+  await fireEvent.press(screen.getByLabelText('编辑 小万')); await tick();
+  await tick(3000);
+  expect(screen.getByRole('alert')).toHaveTextContent(/上次保存结果未确认，正在核对/);
+  expect(screen.queryByTestId('editor-name')).toBeNull();
+  await fireEvent.press(screen.getByTestId('editor-back')); await tick();
+  expect(screen.getByTestId('editor-unknown-leave-sheet')).toBeOnTheScreen();
+  await fireEvent.press(screen.getByTestId('editor-unknown-stay')); await tick();
+  await act(() => peer.recover()); await tick(2000);
+  expect(screen.getByTestId('editor-name')).toHaveProp('value', '小万');
+  expect(screen.getByTestId('editor-name')).toHaveProp('editable', true);
+  expect(screen.getByRole('alert')).toHaveTextContent('上次修改未保存。');
+});

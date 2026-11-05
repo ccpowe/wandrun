@@ -3,7 +3,7 @@ import { ChevronRight, Copy, ExternalLink } from "lucide-react-native";
 import { cloneElement, isValidElement, memo, useMemo, useState, type ReactElement } from "react";
 import type { default as MarkdownIt, Token } from "markdown-it";
 import Markdown, { renderRules as defaultRules, type ASTNode, type RenderRules } from "react-native-markdown-display";
-import { AccessibilityInfo, Alert, Linking, Platform, Pressable, ScrollView, Text as NativeText, View, type TextProps, type TextStyle } from "react-native";
+import { AccessibilityInfo, Linking, Platform, Pressable, ScrollView, Text as NativeText, View, type TextProps, type TextStyle } from "react-native";
 import { useCSSVariable } from "uniwind";
 
 import { Text } from "@/components/ui/text.tsx";
@@ -167,28 +167,29 @@ function indexRowSlug(node: ASTNode, memory: AgentMemory): string | null {
 
 type LinkTarget = { url: string; pageX: number; pageY: number };
 
-function LinkMenu({ target, onClose }: { target: LinkTarget; onClose(): void }) {
+function LinkMenu({ target, onClose, onError }: { target: LinkTarget; onClose(): void; onError(message: string | null): void }) {
   const { t } = useTranslation();
   const copy = async () => {
     onClose();
+    onError(null);
     try {
       if (!await Clipboard.setStringAsync(target.url)) throw new Error(t("剪贴板不可用"));
       AccessibilityInfo.announceForAccessibility(t("已复制链接"));
     } catch (error) {
-      Alert.alert(t("无法复制链接"), t(userErrorMessage(error, "剪贴板不可用，请稍后重试")));
+      onError(userErrorMessage(error, "剪贴板不可用，请稍后重试"));
     }
   };
   return <DropdownMenu onOpenChange={(open) => { if (!open) onClose(); }}>
     <DropdownMenuAnchor point={target} />
-    <DropdownMenuContent className="min-w-[220px] rounded-[16px] p-1.5">
-      <DropdownMenuItem accessibilityLabel={t("复制链接")} onPress={() => void copy()} className="min-h-12 gap-3 rounded-[10px] px-3">
-        <Icon as={Copy} className="size-[18px]" /><Text>{t("复制链接")}</Text>
+    <DropdownMenuContent className="min-w-[220px]">
+      <DropdownMenuItem accessibilityLabel={t("复制链接")} icon={Copy} onPress={() => void copy()}>
+        <Text variant="body">{t("复制链接")}</Text>
       </DropdownMenuItem>
-      <DropdownMenuItem accessibilityLabel={t("打开链接")} onPress={() => {
+      <DropdownMenuItem accessibilityLabel={t("打开链接")} icon={ExternalLink} onPress={() => {
         onClose();
         void Linking.openURL(target.url);
-      }} className="min-h-12 gap-3 rounded-[10px] px-3">
-        <Icon as={ExternalLink} className="size-[18px]" /><Text>{t("打开链接")}</Text>
+      }}>
+        <Text variant="body">{t("打开链接")}</Text>
       </DropdownMenuItem>
     </DropdownMenuContent>
   </DropdownMenu>;
@@ -226,6 +227,7 @@ export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, 
   const conversationId = media?.conversationId;
   const messageSeq = media?.messageSeq;
   const [linkTarget, setLinkTarget] = useState<LinkTarget | null>(null);
+  const [linkError, setLinkError] = useState<string | null>(null);
   const selectableParts = useMemo(() => {
     if (projectedParts) return projectedParts;
     if (!selectable || readOnly) return null;
@@ -247,10 +249,10 @@ export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, 
   const [foreground, muted, border, mutedForeground] = useCSSVariable([
     "--color-foreground", "--color-muted", "--color-border", "--color-muted-foreground",
   ]);
-  const textColor = String(foreground ?? "#141414");
-  const mutedColor = String(muted ?? "#F0F0ED");
-  const borderColor = String(border ?? "#E3E3DF");
-  const secondaryColor = String(mutedForeground ?? "#777773");
+  const textColor = String(foreground);
+  const mutedColor = String(muted);
+  const borderColor = String(border);
+  const secondaryColor = String(mutedForeground);
   const baseRules = useMemo<RenderRules>(() => {
     const base: RenderRules = !selectable ? { ...rules } : {
       ...selectableRules,
@@ -383,8 +385,10 @@ export const AgentMemoryMarkdown = memo(function AgentMemoryMarkdown({ content, 
     table: { borderColor },
     tr: { borderColor },
   }), [textColor, mutedColor, borderColor, secondaryColor, compact, memoryIndex]);
-  const linkMenu = selectable && !readOnly && linkTarget
-    ? <LinkMenu target={linkTarget} onClose={() => setLinkTarget(null)} /> : null;
+  const linkMenu = <>
+    {linkError && <Text testID="markdown-link-error" accessibilityRole="alert" variant="caption" className="text-destructive">{t("无法复制链接")}：{t(linkError)}</Text>}
+    {selectable && !readOnly && linkTarget ? <LinkMenu target={linkTarget} onClose={() => setLinkTarget(null)} onError={setLinkError} /> : null}
+  </>;
   const onManagedLink = managedMemory ? (url: string) => {
     const slug = managedMemorySlug(url, managedMemory.memory);
     if (!slug) return false;

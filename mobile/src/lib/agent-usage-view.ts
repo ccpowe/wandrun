@@ -2,7 +2,7 @@ import type { AgentSummary, AgentUsage, AgentUsageReport } from "../gateway/api.
 
 type DisplayAgent = Pick<AgentSummary, "id" | "name" | "avatar">;
 
-type AgentUsageView =
+export type AgentUsageView =
   | { kind: "loading-agents" | "no-agents" | "loading-usage" | "usage-error" | "no-usage" }
   | { kind: "rows"; rows: { item: AgentUsage; agent: DisplayAgent }[] };
 

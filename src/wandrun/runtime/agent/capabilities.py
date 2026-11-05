@@ -135,8 +135,8 @@ def resolve_capabilities(
         else ("not_applicable", "未提供记忆库"),
         "task_path": ("enabled", "所有 Agent 都有") if files is not None
         else ("not_applicable", "未提供任务目录"),
-        "processes": ("enabled", "本机环境可用") if environment.processes is not None
-        else ("not_applicable", "需要本机环境"),
+        "processes": ("enabled", "执行环境提供后台命令") if environment.processes is not None
+        else ("not_applicable", "执行环境未提供后台命令"),
         "tool_search": ("enabled", "已选择按需连接器") if searchable
         else ("disabled", "没有按需连接器"),
         "code_mode": ("enabled", "已开启") if definition.code_mode

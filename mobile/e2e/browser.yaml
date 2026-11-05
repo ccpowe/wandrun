@@ -1,82 +1,40 @@
-# Real browser-skilled Agent, loopback HTTP fixture and owned conversation/lease are cleaned by run.py.
-# Only semantic targets; screenshots in both appearances. Never run without a configured CDP browser.
+# Real model/browser skill opens one controlled page; this run owns the lease and HTTP fixture.
+# Shared close outcomes and URL/pages combinations are covered by real Router L2; native steps cover pixels/input/layout.
+# Skia/thumbnail screenshots require visual review of the actual fixture, not frame marker presence.
 appId: host.exp.exponent
 ---
-- extendedWaitUntil:
-    visible:
-      id: agent-row-${BROWSER_AGENT_ID}
-    timeout: 10000
-- tapOn:
-    id: agent-row-${BROWSER_AGENT_ID}
-- extendedWaitUntil:
-    visible:
-      id: browser-card-${BROWSER_TASK_ID}
-    timeout: 10000
-- assertVisible:
-    id: browser-watch-${BROWSER_TASK_ID}
+# @phase thumbnail-and-watch
+# @open-root BROWSER_CONVERSATION_ID
 - extendedWaitUntil:
     visible:
       id: browser-thumbnail-displayed-${BROWSER_TASK_ID}
     timeout: 20000
-- takeScreenshot: ${ARTIFACTS}/01-chat-browser-card-light.png
-# @dark-mode
-- takeScreenshot: ${ARTIFACTS}/02-chat-browser-card-dark.png
-# @light-mode
+- takeScreenshot: ${ARTIFACTS}/01-chat-browser-thumbnail.png
 - tapOn:
     id: browser-watch-${BROWSER_TASK_ID}
 - extendedWaitUntil:
     visible:
       id: viewer-frame
     timeout: 10000
-- assertVisible:
-    id: viewer-takeover
-- takeScreenshot: ${ARTIFACTS}/03-viewer-light.png
+# Visual review: actual title BROWSER_TITLE, button, drag tile and input must be visible in Skia.
+- takeScreenshot: ${ARTIFACTS}/02-viewer-skia.png
 # @dark-mode
-- takeScreenshot: ${ARTIFACTS}/04-viewer-dark.png
-# @light-mode
+- takeScreenshot: ${ARTIFACTS}/02-viewer-skia-dark.png
+# @phase native-pointer-and-input
 - tapOn:
     id: viewer-takeover
 - extendedWaitUntil:
     visible:
       id: takeover-frame
     timeout: 10000
-# @browser-taken-over
-- assertVisible:
-    id: takeover-url
-- tapOn:
-    id: takeover-more
-- tapOn:
-    id: takeover-landscape
-- extendedWaitUntil:
-    visible:
-      id: takeover-landscape-back
-    timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/05-takeover-landscape-light.png
-- tapOn:
-    id: takeover-more
-- tapOn:
-    id: takeover-landscape
-- extendedWaitUntil:
-    visible:
-      id: takeover-url
-    timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/05-takeover-light.png
-# @dark-mode
-- takeScreenshot: ${ARTIFACTS}/06-takeover-dark.png
-# @light-mode
-- tapOn:
-    id: takeover-url
-- assertVisible:
-    id: takeover-url-cancel
-- tapOn:
-    id: takeover-pages
-- extendedWaitUntil:
-    visible:
-      id: takeover-new-page
-    timeout: 10000
-- assertNotVisible:
-    id: takeover-url-cancel
-- tapOn: 关闭弹层
+# @browser-native-taken-over
+# Native coordinates are only for remote controls inside Skia (no AX child nodes).
+# Frame marker + measured mouse buttons/wheel recover production canvas bounds;
+# page viewport/control rects determine the fitted frame, with no fixed device coordinates.
+# Native mouse probe reports its real remote cursor before aiming; trusted click/focus
+# and an >=80 CSS px remote drag/actual tile movement must reach HTTP.
+# @browser-native-pointer
+- takeScreenshot: ${ARTIFACTS}/03-takeover-pointer-result.png
 - tapOn:
     id: takeover-keyboard
 - extendedWaitUntil:
@@ -84,102 +42,82 @@ appId: host.exp.exponent
       id: takeover-key-Tab
     timeout: 10000
 - inputText: ${BROWSER_INPUT}
-# @browser-input
-- takeScreenshot: ${ARTIFACTS}/07-takeover-input-light.png
+# @browser-native-input
+- takeScreenshot: ${ARTIFACTS}/04-phone-ime-remote-input.png
 - tapOn:
     id: takeover-keyboard-hide
+# @browser-native-scroll
+# @phase native-layout-and-back
+- tapOn:
+    id: takeover-more
+- tapOn:
+    id: takeover-landscape
+# Landscape B is up (control column mounted) and the More sheet has closed (its switch is gone).
+- extendedWaitUntil:
+    visible:
+      id: takeover-control-column
+    timeout: 10000
+- extendedWaitUntil:
+    notVisible:
+      id: takeover-landscape
+    timeout: 10000
+# @browser-native-landscape
+# Visual review: landscape B — wheel column at far left, handback / buttons / dock in the right column, picture between.
+- takeScreenshot: ${ARTIFACTS}/05-landscape-controls.png
+# Actual Android Back leaves control for the retained viewer; do not depend on the unmerged P8 flow.
+- back
+- extendedWaitUntil:
+    visible:
+      id: viewer-frame
+    timeout: 10000
+- tapOn:
+    id: viewer-takeover
+- extendedWaitUntil:
+    visible:
+      id: takeover-url
+    timeout: 10000
+# @browser-native-portrait
+- takeScreenshot: ${ARTIFACTS}/06-portrait-controls-after-system-back.png
+# @phase handback-and-native-close
 - tapOn:
     id: takeover-handback
-# @browser-handed-back
+# @browser-native-handed-back
 - scrollUntilVisible:
     element:
       id: takeover-ended-${TAKEOVER_SEQ}
     direction: DOWN
-- assertVisible:
-    id: takeover-ended-${TAKEOVER_SEQ}
-- takeScreenshot: ${ARTIFACTS}/08-handback-system-line-light.png
-# @dark-mode
-- takeScreenshot: ${ARTIFACTS}/09-handback-system-line-dark.png
+- takeScreenshot: ${ARTIFACTS}/07-handed-back.png
 # @light-mode
+# @phase profile-browser-thumbnail
 - tapOn:
     id: chat-agent-profile
 - tapOn:
     id: profile-tab-computer
 - extendedWaitUntil:
     visible:
-      id: profile-computer-card-${BROWSER_TASK_ID}
-    timeout: 10000
-- assertVisible:
-    id: profile-computer-watch-${BROWSER_TASK_ID}
-- extendedWaitUntil:
-    visible:
       id: browser-thumbnail-displayed-${BROWSER_TASK_ID}
     timeout: 20000
-- takeScreenshot: ${ARTIFACTS}/10-profile-computer-light.png
-# @dark-mode
-- takeScreenshot: ${ARTIFACTS}/11-profile-computer-dark.png
-# @light-mode
-- tapOn:
-    id: profile-computer-watch-${BROWSER_TASK_ID}
-- extendedWaitUntil:
-    visible:
-      id: viewer-frame
-    timeout: 10000
-- tapOn:
-    id: viewer-close
-- assertVisible:
-    id: profile-computer-card-${BROWSER_TASK_ID}
+- takeScreenshot: ${ARTIFACTS}/07-profile-browser-thumbnail.png
 - tapOn:
     id: profile-close
-- tapOn: 返回
-- tapOn: 设置
-- extendedWaitUntil:
-    visible:
-      id: settings-computer
-    timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/12-settings-computer-summary-light.png
+# The drawer's Computer entry owns browser resources; settings manages saved connections.
 - tapOn:
-    id: settings-computer
+    id: chat-open-drawer
+- tapOn:
+    id: drawer-computer
 - extendedWaitUntil:
     visible:
       id: settings-computer-page-${BROWSER_TASK_ID}-${BROWSER_PAGE_ID}
     timeout: 10000
-- assertVisible:
-    id: settings-computer-cpu
-- assertVisible:
-    id: settings-computer-memory
-- assertVisible:
-    id: settings-computer-pages
-- takeScreenshot: ${ARTIFACTS}/13-settings-computer-light.png
-# @dark-mode
-- takeScreenshot: ${ARTIFACTS}/14-settings-computer-dark.png
-# @light-mode
-- tapOn:
-    id: settings-computer-page-${BROWSER_TASK_ID}-${BROWSER_PAGE_ID}
-- extendedWaitUntil:
-    visible:
-      id: viewer-frame
-    timeout: 10000
-- tapOn:
-    id: viewer-close
 - swipe:
     from:
       id: settings-computer-page-${BROWSER_TASK_ID}-${BROWSER_PAGE_ID}
     direction: LEFT
 - tapOn: 关闭此任务的全部浏览器页面
-- extendedWaitUntil:
-    visible:
-      id: settings-computer-close-${BROWSER_TASK_ID}
-    timeout: 10000
-- tapOn:
-    id: settings-computer-close-${BROWSER_TASK_ID}
-# @browser-closed
+# @browser-native-closed
 - extendedWaitUntil:
     notVisible:
       id: settings-computer-page-${BROWSER_TASK_ID}-${BROWSER_PAGE_ID}
     timeout: 10000
-- takeScreenshot: ${ARTIFACTS}/15-settings-computer-after-close-light.png
-- tapOn:
-    id: settings-computer-back
-- back
-- assertVisible: 设置
+- takeScreenshot: ${ARTIFACTS}/08-native-swipe-closed.png
+# @home

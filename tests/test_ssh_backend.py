@@ -1,4 +1,4 @@
-"""ADR-0014：SSH 环境（远端会话服务）对真实主机运行。
+"""Instabox 底层 SSH 传输与远端会话服务对真实主机运行。
 
 设置 WANDRUN_SSH_TEST=user@host:port 时运行（认证使用本机 ~/.ssh），否则跳过。
 每个测试在远端新建独立工作目录（路径含空格），结束后删除并确认已删除。
@@ -8,10 +8,9 @@ import asyncio
 import json
 import os
 import shlex
-import stat
 import tempfile
 import unittest
-from contextlib import AsyncExitStack
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -19,11 +18,11 @@ from uuid import uuid4
 import asyncssh
 
 from langchain_core.messages import HumanMessage
-from wandrun.config import EnvironmentDefinition, load_config
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
+from wandrun.integrations.instabox import InstaboxBackend
 from wandrun.integrations.ssh_backend import SSHBackend
 from wandrun.metrics import RunMetrics
-from wandrun.runtime.execution.environments import open_environments, open_ssh
+from wandrun.runtime.execution.environments import Environment
 from wandrun.runtime.context.compaction_archive import CompactionArchive
 from wandrun.runtime.execution.files import TaskBackend, TaskFiles, _current_task
 from wandrun.runtime.communication.messages import AgentOutput, SendMessage
@@ -56,6 +55,31 @@ async def cleanup(connection, tag: str, *paths: str) -> None:
     for path in paths:
         await connection.run(f"find {q(path)} -type d -exec chmod u+w {{}} + 2>/dev/null; rm -rf {q(path)}", check=False)
         assert (await connection.run(f"test -e {q(path)}", check=False)).exit_status != 0, path
+
+
+@asynccontextmanager
+async def prepared_remote_environment(workdir: str):
+    """Bind a real SSH session to its Instabox owner, bypassing only provider discovery.
+
+    The explicit SSH test target remains opt-in; no real Instabox account is used.
+    No process-table tools or skill publication are needed by these scenarios.
+    """
+    connection = await connect()
+    owner = InstaboxBackend("m_" + "a" * 26, workdir=workdir, termination_grace=0.5)
+    owner._connection = connection
+    owner._connections.append(connection)
+    try:
+        backend = await SSHBackend.start(
+            connection, label=target()[1], workdir=workdir, timeout=20, termination_grace=0.5,
+        )
+        owner._backend = backend
+        owner._sessions.append(backend)
+        yield Environment(
+            "vps", owner, f"{workdir}/.wandrun/skills", f"{workdir}/.wandrun/artifacts",
+            description=f"远端工作区：{workdir}", type="instabox",
+        )
+    finally:
+        await owner.aclose()
 
 
 @unittest.skipUnless(TARGET, "设置 WANDRUN_SSH_TEST=user@host:port 以运行 SSH 集成测试")
@@ -251,105 +275,6 @@ class SSHBackendTests(unittest.IsolatedAsyncioTestCase):
             self.backend.execute("echo on-loop")
 
 
-@unittest.skipUnless(TARGET, "设置 WANDRUN_SSH_TEST=user@host:port 以运行 SSH 集成测试")
-class SSHEnvironmentTests(unittest.IsolatedAsyncioTestCase):
-    def definition(self, workdir):
-        user, host, port = target()
-        return EnvironmentDefinition(type="ssh", host=host, port=port, user=user, workdir=workdir,
-                                     termination_grace=0.5)
-
-    async def test_open_syncs_selected_skills_with_permissions_and_describes_host(self):
-        user, host, port = target()
-        workdir = f"/tmp/wandrun-test-{uuid4().hex[:12]}"
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Workspace(Path(directory))
-            workspace.ensure_config()
-            for name in ("tool", "unused"):
-                (workspace.skills_dir / name).mkdir()
-                (workspace.skills_dir / name / "SKILL.md").write_text(
-                    f"---\nname: {name}\ndescription: d\n---\n", encoding="utf-8"
-                )
-            script = workspace.skills_dir / "tool" / "run.sh"
-            script.write_text("#!/bin/sh\necho ran-remotely\n", encoding="utf-8")
-            script.chmod(script.stat().st_mode | stat.S_IXUSR)
-            workspace.agents_config.write_text(
-                'main_agent = "main"\n[agents.main]\ndescription = "m"\nsystem_prompt = "m"\n'
-                'model = "x"\nenvironment = "vps"\nskills = ["tool"]\n',
-                encoding="utf-8",
-            )
-            workspace.environments_config.write_text(
-                f'default = "vps"\n[environments.vps]\ntype = "ssh"\nhost = "{host}"\n'
-                f'port = {port}\nuser = "{user}"\nworkdir = "{workdir}"\n',
-                encoding="utf-8",
-            )
-            config = load_config(workspace.agents_config)
-            try:
-                async with AsyncExitStack() as stack:
-                    environment = (await open_environments(config, workspace, stack, []))["main"]
-                    self.assertEqual(environment.skills_source, f"{workdir}/.wandrun/skills")
-                    self.assertIn(workdir, environment.description)
-                    result = await environment.backend.aexecute(
-                        f"{environment.skills_source}/tool/run.sh; ls {environment.skills_source}"
-                    )
-                    self.assertIn("ran-remotely", result.output)  # 可执行位随同步保留
-                    self.assertNotIn("unused", result.output)  # 只同步本环境角色引用的 skill
-            finally:
-                async with connect() as connection:
-                    await cleanup(connection, uuid4().hex, workdir)
-
-    async def test_resync_removes_stale_files_tolerates_readonly_dirs_and_rejects_links(self):
-        workdir = f"/tmp/wandrun-test-{uuid4().hex[:12]}"
-        definition = self.definition(workdir)
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Workspace(Path(directory))
-            workspace.ensure_config()
-            (workspace.skills_dir / "tool").mkdir()
-            (workspace.skills_dir / "tool" / "old.sh").write_text("old", encoding="utf-8")
-            try:
-                async with open_ssh("vps", definition, workspace, {"tool"}):
-                    pass
-                (workspace.skills_dir / "tool" / "old.sh").unlink()
-                (workspace.skills_dir / "tool" / "new.sh").write_text("new", encoding="utf-8")
-                (workspace.skills_dir / "tool").chmod(0o555)
-                try:
-                    for _ in range(2):
-                        async with open_ssh("vps", definition, workspace, {"tool"}) as environment:
-                            result = await environment.backend.aexecute(f"ls {environment.skills_source}/tool")
-                            self.assertEqual(result.output.split(), ["new.sh"])
-                finally:
-                    (workspace.skills_dir / "tool").chmod(0o755)
-                (workspace.skills_dir / "tool" / "link").symlink_to("/etc/hostname")
-                with self.assertRaisesRegex(ValueError, "符号链接"):
-                    async with open_ssh("vps", definition, workspace, {"tool"}):
-                        pass
-            finally:
-                async with connect() as connection:
-                    await cleanup(connection, uuid4().hex, workdir)
-
-    async def test_resync_does_not_change_permissions_outside_the_tree(self):
-        workdir = f"/tmp/wandrun-test-{uuid4().hex[:12]}"
-        outside = f"{workdir}-outside"
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Workspace(Path(directory))
-            workspace.ensure_config()
-            async with connect() as connection:
-                try:
-                    await connection.run(
-                        f"mkdir -p {outside} {workdir}/.wandrun/skills/old && echo x > {outside}/file "
-                        f"&& chmod 0444 {outside}/file && ln {outside}/file {workdir}/.wandrun/skills/old/file "
-                        f"&& chmod 0555 {workdir}/.wandrun/skills/old",
-                        check=True,
-                    )
-                    async with open_ssh("vps", self.definition(workdir), workspace, set()):
-                        pass
-                    mode = await connection.run(f"stat -c %a {outside}/file", check=True)
-                    self.assertEqual(mode.stdout.strip(), "444")
-                    gone = await connection.run(f"test -e {workdir}/.wandrun/skills/old", check=False)
-                    self.assertNotEqual(gone.exit_status, 0)
-                finally:
-                    await cleanup(connection, uuid4().hex, workdir, outside)
-
-
 def call(call_id: str, command: str) -> dict:
     return {"type": "response.completed", "response": {"status": "completed", "output": [{
         "type": "function_call", "id": f"fc_{call_id}", "call_id": call_id,
@@ -368,18 +293,24 @@ def answer(text: str) -> dict:
 @unittest.skipUnless(TARGET, "设置 WANDRUN_SSH_TEST=user@host:port 以运行 SSH 集成测试")
 class SSHRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_role_executes_remotely_and_worker_cancel_stops_remote_command(self):
-        user, host, port = target()
         workdir = f"/tmp/wandrun-test-{uuid4().hex[:12]}"
         tag = uuid4().hex[:10]
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(Path(directory))
             workspace.ensure_config()
             workspace.environments_config.write_text(
-                f'default = "vps"\n[environments.vps]\ntype = "ssh"\nhost = "{host}"\n'
-                f'port = {port}\nuser = "{user}"\nworkdir = "{workdir}"\ntermination_grace = 0.5\n',
+                'default = "vps"\n[environments.vps]\ntype = "instabox"\n'
+                f'machine_id = "m_{"a" * 26}"\nworkdir = "{workdir}"\ntermination_grace = 0.5\n',
                 encoding="utf-8",
             )
             bodies = []
+            owners = []
+
+            async def environments(config, workspace, stack, opened, **kwargs):
+                environment = await stack.enter_async_context(prepared_remote_environment(workdir))
+                opened.append(environment)
+                owners.append(environment.backend)
+                return {name: environment for name in config.agents}
 
             async def respond(model, body):
                 bodies.append(body)
@@ -391,7 +322,10 @@ class SSHRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     yield call("long", f"sleep 60 # {tag}")
 
             try:
-                with patch.object(CodexSubscriptionModel, "_arequest", respond):
+                with (
+                    patch.object(CodexSubscriptionModel, "_arequest", respond),
+                    patch("wandrun.runtime.session.open_environments", environments),
+                ):
                     async with open_runtime(
                         workspace, metrics=RunMetrics(workspace.runs_dir), on_human=lambda *_: None
                     ) as runtime:
@@ -403,7 +337,6 @@ class SSHRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         ]
                         self.assertIn(workdir, output)
                         self.assertNotIn(os.uname().nodename, output)
-                        self.assertIn(f"远端主机 {user}@{host}", bodies[0]["instructions"])
 
                         runtime.workers.start("run long", "root")
                         async with connect() as probe:
@@ -414,6 +347,9 @@ class SSHRuntimeTests(unittest.IsolatedAsyncioTestCase):
                             await asyncio.wait_for(runtime.workers.cancel("root"), 15)
                             self.assertEqual(runtime.workers.get("root")["status"], "cancelled")
                             self.assertEqual(int((await probe.run(count, check=False)).stdout), 0)
+                    self.assertIsNotNone(owners[0]._recovery_feedback)
+                    self.assertTrue(owners[0]._closed)
+                    self.assertTrue(owners[0]._connection.is_closed())
             finally:
                 async with connect() as connection:
                     await cleanup(connection, tag, workdir)
@@ -425,12 +361,7 @@ class SSHRuntimeTests(unittest.IsolatedAsyncioTestCase):
             workspace = Workspace(Path(directory))
             workspace.ensure_config()
             try:
-                async with open_ssh(
-                    "vps", EnvironmentDefinition(
-                        type="ssh", host=target()[1], port=target()[2],
-                        user=target()[0], workdir=workdir, termination_grace=0.5,
-                    ), workspace, set(),
-                ) as environment:
+                async with prepared_remote_environment(workdir) as environment:
                     async def run(prompts, task_id):
                         return AgentOutput(messages=[], next="wait")
 
@@ -455,8 +386,7 @@ class SSHRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         await manager.wait("child-task")
                         self.assertEqual(files.directory("root"), files.directory("child-task"))
                         path = files.directory("root")
-                        await files.prepare("child-task")
-                        view = TaskBackend(environment.backend, files.directory)
+                        view = TaskBackend(environment.backend, files)
                         token = _current_task.set("child-task")
                         try:
                             self.assertIsNone((await view.awrite("shared.txt", "remote-proof")).error)
@@ -470,8 +400,8 @@ class SSHRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                         attachments=["shared.txt", "absent.txt"]),
                         ], next="done")
                         prepared = await manager.prepare_attachments(output, "child-task")
-                        self.assertEqual([item["accepted"] for item in prepared[0].resolution[1]], [True, False])
-                        self.assertEqual(prepared[0].resolution[0][0].path, f"{path}/shared.txt")
+                        self.assertEqual([item["accepted"] for item in prepared[0].resolution.receipts], [True, False])
+                        self.assertEqual(prepared[0].resolution.attachments[0].path, f"{path}/shared.txt")
                         delivered = manager.dispatch(output, "child-task", prepared=prepared)[0]
                         self.assertTrue(delivered["accepted"])
                         self.assertEqual([item["accepted"] for item in delivered["attachments"]], [True, False])

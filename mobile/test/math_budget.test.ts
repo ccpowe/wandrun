@@ -11,7 +11,8 @@ import ts from 'typescript';
 import { MAX_ACTIVE_RENDERERS, RenderBudget, intersectsRenderViewport } from '../src/lib/render-budget.ts';
 import { parseMessageMarkdown } from '../src/lib/agent-message-markdown.ts';
 import { splitAgentMessage } from '../src/lib/agent-message.ts';
-import { groupMarkdownBlocks, mathBlockHtml, mathNode } from '../src/lib/math-html.ts';
+import { formulaSources, groupMarkdownBlocks, mathBlockHtml, mathNode } from '../src/lib/math-html.ts';
+import { mathDocument } from '../src/lib/math-document.ts';
 import type { AgentMemory } from '../src/gateway/api.ts';
 import { managedMemorySlug } from '../src/lib/agent-memory.ts';
 
@@ -76,10 +77,13 @@ const hosts: Record<string, string> = {
   'expo-router': `export const useIsFocused = globalThis.__mathNative.focused;`,
   'expo-file-system': `export const { File, Directory, Paths } = globalThis.__mathFilesystem;`,
   'expo-file-system/legacy': `export const { writeAsStringAsync } = globalThis.__mathFilesystem;`,
-  'react-native': `export const View = 'View', Pressable = 'Pressable', Text = 'Text'; export const Platform = { OS: 'ios' }; export const Linking = { openURL: url => {globalThis.__mathOpenedLinks.push(url)} }; export const StyleSheet = { flatten: values => Object.assign({}, ...values) };`,
+  'react-native': `export const View = 'View', Pressable = 'Pressable', Text = 'Text'; export const AccessibilityInfo = { announceForAccessibility: () => {} }; export const Platform = { OS: 'ios' }; export const Linking = { openURL: url => {globalThis.__mathOpenedLinks.push(url)} }; export const StyleSheet = { flatten: values => Object.assign({}, ...values) };`,
   'react-native-webview': `export default globalThis.__mathNative.WebView;`,
   'uniwind': `export const useCSSVariable = () => []; export const useResolveClassNames = () => ({});`,
   '@/components/ui/text.tsx': `export const Text = 'Text';`,
+  '@/components/ui/icon.tsx': `export const Icon = 'Icon';`,
+  'lucide-react-native': `export const ChevronDown = 'ChevronDown', ChevronUp = 'ChevronUp', Copy = 'Copy';`,
+  'expo-clipboard': `export const setStringAsync = async value => { (globalThis.__mathCopied ??= []).push(value); return true; };`,
   '@/lib/session-context.tsx': `export const useSession=()=>({api:{config:{computerId:'computer-a'}}});`,
   './render-visibility.ts': `export const observeRenderVisibility = globalThis.__mathNative.observe;`,
 };
@@ -354,4 +358,94 @@ test('unmount during a content write releases the permit and deletes the late fi
     release.resolve();
     await act(async () => { root.unmount(); });
   }
+});
+
+test('Math.source: no resident source link; long press offers a copy bubble that a tap or copy dismisses', async () => {
+  (globalThis as typeof globalThis & { __mathCopied?: string[] }).__mathCopied = [];
+  const root = createRoot({ textComponentTypes: ['Text'] });
+  const send = async (message: object) => {
+    const bridge = root.container.queryAll(node => node.type === 'WebView')[0];
+    await act(async () => bridge.props.onMessage({ nativeEvent: { data: JSON.stringify(message) } }));
+  };
+  const bubble = () => root.container.queryAll(node => node.props.testID === 'math-copy-source');
+  try {
+    await act(async () => root.render(createElement(MathContent, { html: '<span data-tex="x^2"></span>', source: 'x^2' })));
+    await act(async () => [...visibility.values()].forEach(notify => notify(true)));
+    await send({ kind: 'height', height: 30, failed: 0 });
+    assert.equal(root.container.queryAll(node => node.props.accessibilityLabel === '查看公式源码').length, 0, 'F10: no resident source link');
+    assert.equal(bubble().length, 0);
+    await send({ kind: 'longpress', index: 0, top: 4, bottom: 28 });
+    assert.equal(bubble().length, 1);
+    assert.equal(root.container.queryAll(node => node.props.testID === 'math-source-active').length, 1, 'the pressed formula is active');
+    await send({ kind: 'tap' });
+    assert.equal(bubble().length, 0, 'a tap on the formula dismisses it');
+    await send({ kind: 'longpress', index: 0, top: 4, bottom: 28 });
+    await act(async () => { await bubble()[0].props.onPress(); });
+    assert.equal(bubble().length, 0, 'copying dismisses it');
+    assert.deepEqual((globalThis as typeof globalThis & { __mathCopied?: string[] }).__mathCopied, ['x^2']);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test('Math.error: a failed standalone formula shows a reason with collapsible source and releases its frame', async () => {
+  const root = createRoot({ textComponentTypes: ['Text'] });
+  const byId = (id: string) => root.container.queryAll(node => node.props.testID === id);
+  try {
+    await act(async () => root.render(createElement(MathContent, { html: '<span data-tex="\\frac{1}{"></span>', source: '\\frac{1}{', standalone: true })));
+    await act(async () => [...visibility.values()].forEach(notify => notify(true)));
+    const bridge = root.container.queryAll(node => node.type === 'WebView')[0];
+    await act(async () => bridge.props.onMessage({ nativeEvent: { data: JSON.stringify({ kind: 'height', height: 30, failed: 1 }) } }));
+    assert.equal(byId('math-error').length, 1);
+    assert.equal(root.container.queryAll(node => node.type === 'WebView').length, 0, 'the failed frame is released');
+    assert.ok(root.container.queryAll(node => node.type === 'Text' && node.props.children === '公式无法显示').length);
+    assert.equal(root.container.queryAll(node => node.type === 'Text' && node.props.children === '\\frac{1}{').length, 0, 'source collapsed');
+    await act(async () => { byId('math-error-source-toggle')[0].props.onPress(); });
+    assert.equal(root.container.queryAll(node => node.type === 'Text' && node.props.children === '\\frac{1}{').length, 1);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test('Math in running text keeps the failed TeX inline instead of replacing the paragraph', async () => {
+  const root = createRoot({ textComponentTypes: ['Text'] });
+  try {
+    await act(async () => root.render(createElement(MathContent, { html: '速度 <span data-tex="\\frac{1}{"></span>', source: '速度 $\\frac{1}{$' })));
+    await act(async () => [...visibility.values()].forEach(notify => notify(true)));
+    const bridge = root.container.queryAll(node => node.type === 'WebView')[0];
+    await act(async () => bridge.props.onMessage({ nativeEvent: { data: JSON.stringify({ kind: 'height', height: 30, failed: 1 }) } }));
+    assert.equal(root.container.queryAll(node => node.props.testID === 'math-error').length, 0);
+    assert.equal(root.container.queryAll(node => node.type === 'WebView').length, 1);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test('Math.source copies the long-pressed formula, not the whole paragraph, and flips below near the top', async () => {
+  (globalThis as typeof globalThis & { __mathCopied?: string[] }).__mathCopied = [];
+  const root = createRoot({ textComponentTypes: ['Text'] });
+  const html = '面积 <span data-tex="x^2"></span>，体积 <span data-tex="a &lt; b &amp; c"></span>。';
+  try {
+    await act(async () => root.render(createElement(MathContent, { html, source: '面积 $x^2$，体积 $a < b & c$。' })));
+    await act(async () => [...visibility.values()].forEach(notify => notify(true)));
+    const bridge = root.container.queryAll(node => node.type === 'WebView')[0];
+    await act(async () => bridge.props.onMessage({ nativeEvent: { data: JSON.stringify({ kind: 'longpress', index: 1, top: 30, bottom: 54 }) } }));
+    assert.equal(root.container.queryAll(node => node.props.testID === 'math-copy-above').length, 1, 'room above by default');
+    await act(async () => { await root.container.queryAll(node => node.props.testID === 'math-copy-source')[0].props.onPress(); });
+    assert.deepEqual((globalThis as typeof globalThis & { __mathCopied?: string[] }).__mathCopied, ['a < b & c'], 'exactly the pressed TeX, unescaped');
+    assert.deepEqual(formulaSources(html), ['x^2', 'a < b & c']);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test('Math.error covers renderer failures of a standalone formula, not only KaTeX syntax errors', async () => {
+  const root = createRoot({ textComponentTypes: ['Text'] });
+  try {
+    await act(async () => root.render(createElement(MathContent, { html: '<span data-tex="x^2"></span>', source: 'x^2', standalone: true })));
+    await act(async () => [...visibility.values()].forEach(notify => notify(true)));
+    await act(async () => { root.container.queryAll(node => node.type === 'WebView')[0].props.onError(); });
+    assert.equal(root.container.queryAll(node => node.props.testID === 'math-error').length, 1);
+    assert.equal(root.container.queryAll(node => node.type === 'Text' && node.props.children === 'x^2').length, 0, 'source stays collapsed');
+    assert.equal(root.container.queryAll(node => node.type === 'WebView').length, 0);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test('the math page only treats long presses on formula nodes as Math.source and keeps prose selectable', () => {
+  const page = mathDocument('<p>正文 <span data-tex="x"></span></p>', { color: '#000', muted: '#eee', border: '#ddd', fontSize: 16 }, { script: 'katex.js', styles: 'katex.css' });
+  assert.match(page, /closest\('\[data-tex\]'\)/, 'long press is resolved to the formula node under the finger');
+  assert.match(page, /\[data-tex\]\{-webkit-user-select:none/, 'selection is suppressed on formulas');
+  assert.doesNotMatch(page, /body\{[^}]*user-select:none/, 'prose keeps native selection');
 });

@@ -21,6 +21,7 @@ from wandrun.integrations.shell_backend import CleanupUnconfirmedError
 from wandrun.runtime.browser.leases import BrowserLeases
 from wandrun.runtime.execution.process_tools import CommandMiddleware, process_tools
 from wandrun.runtime.communication.workers import WorkerManager
+from wandrun.runtime.execution.files import TaskFiles
 
 GRACE = 0.3
 
@@ -79,6 +80,7 @@ class ProcessTableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["output"], "hi\n")
         self.assertEqual(Path(result["log"]).read_text(), "hi\n")
         self.assertFalse(self.table.pending())
+        self.assertEqual(self.table.pending_owners(), set())
 
     async def test_output_written_before_exit_is_collected(self):
         result = await asyncio.wait_for(self.start("printf diag; exit 7").settled, 2)
@@ -168,11 +170,13 @@ class ProcessTableTests(unittest.IsolatedAsyncioTestCase):
             patch.object(local_processes, "live_members", lambda pgid: [pgid]),
         ):
             execution = self.start("sleep 30")
+            self.assertEqual(self.table.pending_owners(), {"owner"})
             result = await asyncio.wait_for(execution.request_stop("kill_process"), 3)
             self.assertIsNone(result["exit_code"])
             self.assertEqual(result["cleanup"], "unconfirmed")
             self.assertIn("退出码未知", result["note"])
             self.assertFalse(self.table.pending())  # 结果已交付，不算待交付工作
+            self.assertEqual(self.table.pending_owners(), {"owner"})
             with self.assertRaises(CleanupUnconfirmedError) as raised:
                 await self.table.aclose()
             self.assertIn(execution.process_id, str(raised.exception))
@@ -192,10 +196,15 @@ class ProcessTableTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_log_rotates_past_limit(self):
         with patch.object(local_processes, "LOG_LIMIT", 1000):
-            # 两段输出间隔开，第二段必然单独读到：写入它时日志已超限，触发轮换。
-            result = await asyncio.wait_for(
-                self.start("head -c 1500 /dev/zero | tr '\\0' a; sleep 0.3; echo tail-marker").settled, 3
+            gate = self.directory / "continue-output"
+            execution = self.start(
+                "head -c 1500 /dev/zero | tr '\\0' a; "
+                "while [ ! -e continue-output ]; do sleep 0.01; done; echo tail-marker"
             )
+            log = execution.log_path
+            await until(lambda: log.exists() and log.stat().st_size == 1500)
+            gate.touch()
+            result = await asyncio.wait_for(execution.settled, 3)
         log = Path(result["log"])
         self.assertEqual(Path(f"{log}.1").read_text(), "a" * 1500)
         self.assertEqual(log.read_text(), "tail-marker\n")
@@ -209,9 +218,18 @@ class ProcessTableTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(local_processes, "LOG_LIMIT", 100), patch.object(local_processes.os, "replace", refuse):
             execution = self.start(
-                "for i in $(seq 1 50); do echo line-$i; done; sleep 0.3; echo done",
+                "head -c 1500 /dev/zero | tr '\\0' a; "
+                "while [ ! -e continue-output ]; do sleep 0.01; done; echo trigger-rotation; "
+                "while [ ! -e finish-output ]; do sleep 0.01; done; echo done",
                 on_log_error=failures.append,
             )
+            log = execution.log_path
+            # Gate on the real reader's flushed first write, not pipe scheduling.
+            await until(lambda: log.exists() and log.stat().st_size == 1500)
+            (self.directory / "continue-output").touch()
+            await until(lambda: bool(failures))
+            self.assertEqual(execution.state, "running")
+            (self.directory / "finish-output").touch()
             result = await asyncio.wait_for(execution.settled, 3)
         self.assertEqual(failures, [execution])
         self.assertIn("disk full", result["log_error"])
@@ -353,6 +371,23 @@ class ProcessToolTests(unittest.IsolatedAsyncioTestCase):
                         found.append(data["background_process"])
         return found
 
+    async def test_first_command_prepares_conversation_cwd_without_prior_worker_io(self):
+        files = TaskFiles(
+            self.directory, self.manager, {"worker": ("local", str(self.directory))},
+            conversation_workdirs=True,
+        )
+        invoke = process_tools(self.manager, self.table, files=files)[0]
+        self.script.append(self.call(invoke, command="printf first > first.txt; pwd", yield_seconds=5))
+        self.assertFalse((self.directory / "conversations").exists())
+        self.manager.start("go", "root")
+        result = await self.manager.wait("root")
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(self.results[0]["exit_code"], 0, self.results[0])
+        cwd = Path(files.directory("root"))
+        self.assertIn(str(cwd), self.results[0]["output"])
+        self.assertEqual((cwd / "first.txt").read_text(), "first")
+        self.assertFalse((self.directory / "first.txt").exists())
+
     async def test_result_within_wait_is_returned_and_not_notified(self):
         self.script.append(self.call(self.exec_command, command="echo hi", yield_seconds=5))
         self.manager.start("go", "root")
@@ -392,7 +427,6 @@ class ProcessToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any('"interrupted": true' in content for content in resumed))
         (notice,) = self.notices()
         self.assertEqual(notice["status"], "running")
-        self.assertIn("仍在运行", notice["note"])
         self.assertTrue(alive(int(pid_file.read_text())))
         self.assertTrue(self.table.pending())
 

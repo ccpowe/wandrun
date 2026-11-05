@@ -196,7 +196,7 @@ test("closing a session clears old state and ignores a late command response", a
   old.conversations.set("same", {
     id: "same", agent_id: "assistant", title: "old", created_at: 1, updated_at: 1,
     status: "idle", unread: false, read_seq: 0, last_text: null, source: "user", schedule_origin: null,
-    activity: null, lastTextSeq: 0, lastActivityAt: null, lastAgentSeq: 0,
+    activity: null, lastTextSeq: 0, lastAgentSeq: 0, last_activity_seq: null, last_activity_at: null,
   });
   const starting = old.start();
   await old.close();
@@ -218,7 +218,7 @@ test("transport failures keep their cause out of display messages without changi
   const cause = new TypeError("fetch failed: private transport detail");
   const api = new GatewayApi({ baseUrl: "http://gateway", token: "test" }, async () => { throw cause; });
   try {
-    for (const request of [() => api.createConversation("agent"), () => api.readBinary("/image")]) {
+    for (const request of [() => api.createConversation("agent", undefined, globalThis.crypto.randomUUID()), () => api.readBinary("/image")]) {
       await assert.rejects(request, (error: unknown) => {
         assert.ok(error instanceof GatewayError);
         assert.equal(error.status, 0);
@@ -259,7 +259,7 @@ test("HTTP refusals retain business details; absent or malformed messages use lo
       assert.match(error.message, /网关/);
       return true;
     });
-    await assert.rejects(api.createConversation("agent"), (error: unknown) =>
+    await assert.rejects(api.createConversation("agent", undefined, globalThis.crypto.randomUUID()), (error: unknown) =>
       error instanceof GatewayError && error.status === 400 && !error.retryable && /提交内容/.test(error.message));
     await assert.rejects(api.listAgents(), (error: unknown) =>
       error instanceof GatewayError && error.status === 403 && !error.retryable && /权限/.test(error.message));

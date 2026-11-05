@@ -1,6 +1,7 @@
 import { Icon } from '@/components/ui/icon';
 import { TextClassContext } from '@/components/ui/text';
 import { cn } from '@/lib/utils';
+import { duration, easing, reduceMotion, webDuration } from '@/lib/motion.ts';
 import * as AccordionPrimitive from '@rn-primitives/accordion';
 import { ChevronDown } from 'lucide-react-native';
 import { Platform, Pressable, View } from 'react-native';
@@ -8,7 +9,6 @@ import Animated, {
   FadeOutUp,
   LayoutAnimationConfig,
   LinearTransition,
-  ReduceMotion,
   useAnimatedStyle,
   useDerivedValue,
   withTiming,
@@ -24,7 +24,7 @@ function Accordion({
       <AccordionPrimitive.Root
         {...(props as AccordionPrimitive.RootProps)}
         asChild={Platform.OS !== 'web'}>
-        <Animated.View layout={LinearTransition.duration(200)}>{children}</Animated.View>
+        <Animated.View layout={LinearTransition.duration(duration.base).easing(easing.standard).reduceMotion(reduceMotion)}>{children}</Animated.View>
       </AccordionPrimitive.Root>
     </LayoutAnimationConfig>
   );
@@ -48,7 +48,7 @@ function AccordionItem({
       {...props}>
       <Animated.View
         className="native:overflow-hidden"
-        layout={Platform.select({ native: LinearTransition.duration(200) })}>
+        layout={Platform.select({ native: LinearTransition.duration(duration.base).easing(easing.standard).reduceMotion(reduceMotion) })}>
         {children}
       </Animated.View>
     </AccordionPrimitive.Item>
@@ -67,7 +67,7 @@ function AccordionTrigger({
   const { isExpanded } = AccordionPrimitive.useItemContext();
 
   const progress = useDerivedValue(
-    () => (isExpanded ? withTiming(1, { duration: 250 }) : withTiming(0, { duration: 200 })),
+    () => withTiming(isExpanded ? 1 : 0, { duration: duration.base, easing: easing.standard, reduceMotion }),
     [isExpanded]
   );
   const chevronStyle = useAnimatedStyle(
@@ -101,7 +101,7 @@ function AccordionTrigger({
                 className={cn(
                   'text-muted-foreground shrink-0',
                   Platform.select({
-                    web: 'pointer-events-none translate-y-0.5 transition-transform duration-200',
+                    web: `pointer-events-none translate-y-0.5 transition-transform ${webDuration.base}`,
                   })
                 )}
               />
@@ -131,7 +131,7 @@ function AccordionContent({
         {...props}>
         <Animated.View
           exiting={Platform.select({
-            native: FadeOutUp.duration(200).reduceMotion(ReduceMotion.System),
+            native: FadeOutUp.duration(duration.base).easing(easing.standard).reduceMotion(reduceMotion),
           })}
           className={cn('pb-4', className)}>
           {children}

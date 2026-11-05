@@ -1,32 +1,40 @@
 import { Pressable, View } from "react-native";
 
-import { CHAT_FLOATING_SURFACE } from "@/components/chat/chat-surface.ts";
+import { AlertCircle, WifiOff, X } from "lucide-react-native";
+import { StatusBanner } from "@/components/status-banner.tsx";
 import { Text } from "@/components/ui/text.tsx";
-import type { ChatNotice, ChatNoticeKind } from "@/lib/chat-notices.ts";
+import type { ChatLocalNotice, ChatNotice } from "@/lib/chat-notices.ts";
 import { useTranslation } from "@/lib/i18n.ts";
 
-/** The screen owns recovery actions; cards never interpret gateway errors or change their order. */
-export function ChatNotices({ notices, onRetry, canRetryCollaboration }: {
+/** Reads recover in the background; only an unconfirmed write offers a user retry. */
+export function ChatNotices({ notices, onRetryStop }: {
   notices: ChatNotice[];
-  onRetry(kind: ChatNoticeKind): void;
-  canRetryCollaboration: boolean;
+  onRetryStop(): void;
 }) {
   const { t } = useTranslation();
-  const labels = {
-    history: t("重试加载历史消息"), stop: t("重试停止"),
-    collaboration: t("重试加载协作"), target: t("重试加载目标消息"),
-  };
-  return <View className="gap-2 px-3" testID="chat-notices">
+  return <View className="gap-2" testID="chat-notices">
     {notices.map(({ kind, message }) => {
-      const retry = kind !== "offline" && (kind !== "collaboration" || canRetryCollaboration) ? labels[kind] : null;
-      return <View key={kind} testID={`chat-${kind}-error`} style={CHAT_FLOATING_SURFACE}
-        className="gap-2 rounded-2xl border border-border bg-card px-3 py-2.5">
-        <Text accessibilityRole="alert" className="text-[13px] leading-[18px] text-foreground">{message}</Text>
+      const retry = kind === "stop" ? t("重试停止") : null;
+      return <View key={kind} testID={`chat-${kind}-error`} className="gap-1">
+        <StatusBanner icon={kind === "offline" ? WifiOff : AlertCircle} title={message} accessibilityRole="alert" />
         {retry && <Pressable testID={`chat-${kind}-retry`} accessibilityRole="button" accessibilityLabel={retry}
-          onPress={() => onRetry(kind)}>
+          hitSlop={12} className="self-start px-4" onPress={onRetryStop}>
           <Text className="text-[13px] text-primary">{retry}</Text>
         </Pressable>}
       </View>;
     })}
+  </View>;
+}
+
+/** This screen's own action result, shown in place under the banner instead of a system dialog.
+ * design.md §6: closing is an × inside the banner, not a separate text link. */
+export function ChatLocalNoticeView({ notice, onDismiss }: {
+  /** Unknown first-action hints are owned by the app draft and stay until retried. */
+  notice: ChatLocalNotice; onDismiss?: () => void;
+}) {
+  const { t } = useTranslation();
+  return <View testID={`chat-local-${notice.kind}`}>
+    <StatusBanner icon={AlertCircle} title={notice.title} description={notice.description || undefined} accessibilityRole="alert"
+      action={onDismiss ? { icon: X, label: t("关闭提示"), onPress: onDismiss, testID: "chat-local-dismiss" } : undefined} />
   </View>;
 }

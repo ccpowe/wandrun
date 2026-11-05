@@ -6,8 +6,7 @@ import { GatewayApi, type AgentSummary } from "../src/gateway/api.ts";
 import { agentDisplayName } from "../src/lib/agent-display-name.ts";
 
 const id = "a_8f4e0034aa684ee0bb067dc29cfba782";
-const agent: AgentSummary = { id, name: "当前名字", avatar: 0, description: "", workers: [],
-  home: true, latest_conversation: null, unread: false };
+const agent: AgentSummary = { id, name: "当前名字", avatar: 0, description: "", workers: [], environment: "local", latest_conversation: null, unread: false }
 
 test("名字优先级与占位：不把加载失败当删除，也不展示快照中的随机 ID", () => {
   const directory = { agents: [agent], loaded: true, error: null as string | null, deletedIds: new Set<string>() };
@@ -44,10 +43,10 @@ test("真实目录请求失败、恢复、改名、删除后，历史名字仍�
     assert.ok(directory.error);
     assert.equal(agentDisplayName(directory, id), "Agent");
     assert.equal(agentDisplayName(directory, id, "历史名字"), "历史名字");
-    response = () => Response.json({ agents: [agent], as_of_seq: 1 });
+    response = () => Response.json({ agents: [agent], as_of_seq: 1, order_revision: 1 });
     await refresh();
     assert.equal(agentDisplayName(directory, id, "历史名字"), "当前名字");
-    response = () => Response.json({ agents: [{ ...agent, name: "改名后" }], as_of_seq: 2 });
+    response = () => Response.json({ agents: [{ ...agent, name: "改名后" }], as_of_seq: 2, order_revision: 1 });
     await refresh();
     assert.equal(agentDisplayName(directory, id, "历史名字"), "改名后");
     directory.observe({ seq: 3, at: 3, type: "resource.changed", data: { kind: "agent", id, op: "deleted" } });

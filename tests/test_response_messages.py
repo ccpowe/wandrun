@@ -530,7 +530,12 @@ class ResponseGraphTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertEqual(len(parent_bodies), 2)
                     self.assertEqual(invoked, ["ran"])
-                    self.assertFalse(runtime_feedback(body))
+                    # The initial environment snapshot remains in history; no other feedback is expected.
+                    feedback = runtime_feedback(body)
+                    self.assertEqual(
+                        [entry["kind"] for entry in feedback], ["当前执行环境"]
+                    )
+                    self.assertEqual(feedback[0]["execution_environment"]["status"], "initial")
                     self.assertTrue(
                         any(
                             entry.get("type") == "function_call_output"

@@ -1,0 +1,11 @@
+import type { Meta, StoryObj } from '@storybook/react-native';
+import { BrowserScene } from './browser-scene.tsx';
+const meta = { title: 'browser', component: BrowserScene, parameters: { fullScreen: true } } satisfies Meta<typeof BrowserScene>;
+export default meta;
+type Story = StoryObj<typeof meta>;
+export const A1: Story = { name: 'A1 观看与接管入口（浅色）', args: { theme: 'light' } };
+export const A2Dark: Story = { name: 'A2 已接管的观看页（深色）', args: { theme: 'dark', state: 'human' } };
+export const A4: Story = { name: 'A4 任务已结束', args: { state: 'released' } };
+export const B1: Story = { name: 'B1 接管工具与页面列表（浅色）', args: { control: true } };
+export const B1Dark: Story = { name: 'B1 接管工具与页面列表（深色）', args: { control: true, theme: 'dark' } };
+export const B6Input: Story = { name: 'B6 状态输入真实接线 · 假网关拖动计数', args: { control: true, stream: true } };

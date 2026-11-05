@@ -15,6 +15,8 @@ export class AppearanceStore {
   private readonly listeners = new Set<() => void>();
   private pending: Promise<unknown> = Promise.resolve();
   private restoring: Promise<void> | null = null;
+  private restoreFailure: "read" | "invalid" | null = null;
+  get restoreRetryable(): boolean { return this.restoreFailure === "read"; }
 
   private readonly storage: AppearanceStorage;
   private readonly apply: (preferences: AppearancePreferences) => void;
@@ -45,14 +47,24 @@ export class AppearanceStore {
     if (this.state.ready) return Promise.resolve();
     if (this.restoring) return this.restoring;
     const operation = this.enqueue(async () => {
+      let raw: string | null;
       try {
-        const raw = await this.storage.read();
+        raw = await this.storage.read();
+      } catch (error) {
+        this.restoreFailure = "read";
+        console.warn("Unable to load appearance preferences", error);
+        this.publish({ ...this.state, ready: false, saving: false, error: "无法读取外观设置，正在重试…" });
+        throw error;
+      }
+      try {
         const preferences = raw === null ? { language: "zh", theme: "system" } as const : preferenceSchema.parse(JSON.parse(raw));
         this.apply(preferences);
+        this.restoreFailure = null;
         this.publish({ ...preferences, ready: true, saving: false, error: null });
       } catch (error) {
-        console.warn("Unable to load appearance preferences", error);
-        this.publish({ ...this.state, ready: false, saving: false, error: "无法读取外观设置，请重试。" });
+        this.restoreFailure = "invalid";
+        console.warn("Invalid appearance preferences", error);
+        this.publish({ ...this.state, ready: false, saving: false, error: "已保存的外观设置无法读取，未更改原有设置。" });
         throw error;
       }
     });
@@ -73,7 +85,9 @@ export class AppearanceStore {
         this.publish({ ...preferences, ready: true, saving: false, error: null });
       } catch (error) {
         console.warn("Unable to save appearance preferences", error);
-        this.publish({ ...this.state, saving: false, error: "无法保存外观设置，请重试。" });
+        // The rejection is the result; the page that asked shows it for that visit only
+        // (useVisitNotice). The device-level store keeps no save-failure text.
+        this.publish({ ...this.state, saving: false });
         throw error;
       }
     });

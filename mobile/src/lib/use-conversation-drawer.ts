@@ -1,106 +1,122 @@
-import { t } from "./i18n.ts";
-import { router } from "expo-router";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Alert } from "react-native";
+import { t } from './i18n.ts';
+import { router, useFocusEffect } from 'expo-router';
+import { useCallback, useMemo, useSyncExternalStore } from 'react';
+import { Keyboard } from 'react-native';
+import { KeyboardController } from 'react-native-keyboard-controller';
 
-import type { DrawerConversation } from "@/components/chat/conversation-drawer.tsx";
-import type { ChatSession, TaskView } from "@/gateway/session.ts";
-import { DrawerFlow } from "@/lib/drawer-flow.ts";
-import { switchConversation } from "@/lib/conversation-navigation.ts";
-import { agentDisplayName } from "@/lib/agent-display-name.ts";
+import type { DrawerConversation } from '@/components/chat/conversation-drawer.tsx';
+import type { ChatSession } from '@/gateway/session.ts';
+import { DrawerFlow } from '@/lib/drawer-flow.ts';
+import { chatLocation } from '@/lib/chat-route.ts';
+import { agentDisplayName } from '@/lib/agent-display-name.ts';
+import { rootBranches } from '@/lib/chat-branches.ts';
+import { conversationActivityOrder } from '@/lib/conversation-activity.ts';
+import { LoadResource } from '@/lib/load-state.ts';
+import { useNewConversationStore } from '@/lib/new-conversation-context.tsx';
 
-/**
- * 聊天页对话列表抽屉：把 DrawerFlow（切换与防重）接到会话、路由和 React state。
- * 聊天页以 id 为 key；切换会同时清除旧消息定位，整页重建，抽屉状态随之重置。
- * 卸载、失焦或会话来源变化时销毁旧 Flow；交互读取当前 owner，动画结算保留发起关闭的 owner。
- */
-export function useConversationDrawer(session: ChatSession | null, currentId: string, agentId: string | undefined, focused: boolean) {
-  const owner = useMemo(() => ({ session, currentId, agentId, focused }), [session, currentId, agentId, focused]);
-  const flowRef = useRef<{ owner: typeof owner; flow: DrawerFlow } | null>(null);
-  const [view, setView] = useState<{ owner: typeof owner; open: boolean; closing: boolean; onClosed(): void } | null>(null);
-  useEffect(() => {
-    if (session?.connection === "open" && agentId && focused) void session.refreshCollaborations(agentId);
-  }, [session, agentId, focused, session?.connection]);
-  // 提交时先替换 owner，避免界面可交互时仍绑定旧 Flow；Strict Mode 重放也创建全新实例。
-  useLayoutEffect(() => {
+const noSessionSubscribe = () => () => {};
+const noSessionVersion = () => 0;
+
+/** One Flow per route/focus identity; cleanup revokes only this visit's closing/navigation. */
+export function useConversationDrawer(session: ChatSession | null, currentId: string | undefined, agentId: string | undefined, focused: boolean, initialOpen = false, onNavigate?: (id?: string) => void, targetVisits?: { subscribe(changed: () => void): () => void }) {
+  const newDraft = useNewConversationStore();
+  const showTarget = useCallback((id?: string) => {
+    if (onNavigate) onNavigate(id);
+    else router.replace(chatLocation(id));
+  }, [onNavigate]);
+  const flow = useMemo(() => new DrawerFlow({
+    hasConversation: id => !!session?.chat(id),
+    dismissKeyboard: KeyboardController.dismiss,
+    navigate: id => showTarget(id),
+  }, initialOpen && focused), [session, focused, initialOpen, showTarget]);
+  const subscribe = useCallback((changed: () => void) => {
+    const stopFlow = flow.subscribe(changed);
+    const stopTargets = targetVisits?.subscribe(() => flow.reset());
+    return () => { stopTargets?.(); stopFlow(); };
+  }, [flow, targetVisits]);
+  const snapshot = useSyncExternalStore(subscribe, flow.getSnapshot);
+  // Conversations and leases remain session facts, never copied into drawer state.
+  useSyncExternalStore(session?.subscribe ?? noSessionSubscribe, session?.getVersion ?? noSessionVersion);
+  useFocusEffect(useCallback(() => {
     if (!focused) return;
-    const { session, currentId, agentId } = owner;
-    const next = new DrawerFlow({
-      currentId,
-      blankConversation: () =>
-        session && agentId !== undefined ? session.blankConversation(agentId) : Promise.reject(new Error(t("对话还没加载"))),
-      hasConversation: (id) => !!session?.chat(id),
-      navigate: (id) => switchConversation(id, (params) => router.setParams(params)),
-      // Only a real Flow close emits false; keep its input barrier until animation completion.
-      setOpen: (open) => setView({ owner, open, closing: !open, onClosed: () => {
-        next.onClosed();
-        setView((current) => current?.owner === owner && !current.open ? { ...current, closing: false } : current);
-      } }),
-      failed: (error) => Alert.alert(t("无法新建对话"), error instanceof Error ? t(error.message) : String(error)),
-    });
-    flowRef.current = { owner, flow: next };
-    return () => {
-      next.dispose();
-      flowRef.current = null;
-    };
-  }, [owner, focused]);
+    flow.activate(initialOpen);
+    return () => flow.deactivate();
+  }, [flow, focused, initialOpen]));
 
-  const currentFlow = () => {
-    const current = flowRef.current;
-    return focused && current?.owner === owner ? current.flow : null;
-  };
+  const agentIds = session?.agents.agents.map(agent => agent.id).join('\n') ?? '';
+  // These reads merge watermarked collaboration facts into session; they are not a second JSON cache.
+  const collaborations = useMemo(() => agentIds.split('\n').filter(Boolean).map(id => new LoadResource(async () => {
+    if (!session) return;
+    await session.refreshCollaborations(id);
+    const error = session.collaborationErrors.get(id);
+    if (error) throw new Error(error);
+  })), [session, agentIds]);
+  const connected = session?.connection === 'open';
+  useFocusEffect(useCallback(() => {
+    if (!connected || !focused) return;
+    for (const resource of collaborations) { resource.start(); void resource.retry(); }
+    return () => { for (const resource of collaborations) resource.stop(); };
+  }, [collaborations, connected, focused]));
 
-  const agents = new Map(session?.agents.agents.map((a) => [a.id, a]));
+  const agents = session?.agents.agents ?? [];
   const requested = new Set<string>();
   for (const lease of session?.browserTasks.values() ?? []) {
-    if (lease.state === "requested") { requested.add(lease.task_id); requested.add(lease.root_id); }
+    if (lease.state === 'requested') requested.add(lease.root_id);
   }
-  const taskRow = (task: TaskView, outgoing: boolean): DrawerConversation => {
-    const counterpart = outgoing ? task.recipient : task.initiator;
-    return {
-      id: task.id, title: task.title, kind: "task", updatedAt: task.updated_at,
-      running: task.status === "running" || task.status === "waiting",
-      unread: task.id !== currentId && (task.unread || task.status === "failed" || task.status === "unavailable" || requested.has(task.id)),
-      counterpart: { name: agentDisplayName(session?.agents, counterpart), avatar: agents.get(counterpart)?.avatar ?? 0 },
-    };
+  const conversations: DrawerConversation[] = session ? [...session.conversations.values()]
+    .filter(conversation => conversation.last_text !== null || session.pendingFor(conversation.id).length > 0)
+    .sort(conversationActivityOrder).map(conversation => {
+      const agent = agents.find(item => item.id === conversation.agent_id);
+      const branches = rootBranches(session, conversation.id);
+      return {
+        id: conversation.id, title: conversation.title, source: conversation.source,
+        activityAt: conversation.last_activity_at,
+        // An unconfirmed first send (pending) outranks this: it belongs to E7, not “earlier”.
+        unranked: conversation.last_activity_seq === null && conversation.last_text !== null &&
+          session.pendingFor(conversation.id).length === 0,
+        running: session.isWorking(conversation.id),
+        // conversation-drawer.B5 / P6: AI reply not yet seen, failure and takeover requests all light the same dot; none moves the row.
+        unread: conversation.id !== currentId &&
+          (conversation.unread || branches.attention || conversation.status === 'failed' || requested.has(conversation.id)),
+        agent: { name: agentDisplayName(session.agents, conversation.agent_id), avatar: agent?.avatar ?? 0 },
+        collaborationCount: branches.count,
+        reason: requested.has(conversation.id) ? t('等你接管') : conversation.source === 'schedule' ? t('定时') : undefined,
+      };
+    }) : [];
+  const show = () => {
+    if (!focused) return;
+    Keyboard.dismiss();
+    if (connected) for (const resource of collaborations) void resource.retry();
+    flow.show();
   };
-  const conversations: DrawerConversation[] = session && agentId ? [
-    ...session.conversationsOf(agentId).map((c) => ({
-      id: c.id, title: c.title, source: c.source, kind: "conversation" as const, updatedAt: c.updated_at,
-      running: session.isWorking(c.id),
-      unread: c.id !== currentId && (c.unread || c.status === "failed" || requested.has(c.id)),
-    })),
-    ...[...session.tasks.values()].filter((task) => task.agent_id === agentId).map((task) => taskRow(task, false)),
-  ].sort((a, b) => b.updatedAt - a.updatedAt) : [];
-  const collaborations = [...session?.tasks.values() ?? []].filter((task) => task.creator_agent_id === agentId)
-    .sort((a, b) => b.updated_at - a.updated_at).map((task) => taskRow(task, true));
-  const agentName = agentDisplayName(session?.agents, agentId);
-
+  // Freeze the user's command at the click, not the route id at Flow construction.
+  const newConversation = () => {
+    if (!focused) return;
+    flow.newConversation(() => {
+      if (!session || !agentId || currentId === undefined) return;
+      newDraft.select(session.api.config.computerId!, agentId);
+      showTarget();
+    });
+  };
   return {
-    show: () => {
-      if (session && agentId) void session.refreshCollaborations(agentId);
-      currentFlow()?.show();
-    },
-    /** 与抽屉内按钮共用同步 busy 防重和关闭后导航规则。 */
-    newConversation: () => void currentFlow()?.newConversation(),
+    show,
+    newConversation,
     drawerProps: {
-      open: view?.owner === owner && view.open,
-      closing: view?.owner === owner && view.closing,
-      agentName,
-      agentId: agentId ?? "",
+      open: focused && snapshot.open,
+      closing: focused && snapshot.closing,
+      closeTicket: snapshot.closeTicket,
+      drawerVisit: snapshot.drawerVisit,
+      agents, connected,
+      newConversationDisabled: !agentId,
       conversations,
-      collaborations,
-      loadError: agentId ? session?.collaborationErrors.get(agentId) : undefined,
-      onReload: () => { if (session && agentId) void session.refreshCollaborations(agentId); },
+      loadError: session ? [...session.collaborationErrors.values()][0] : undefined,
       onRename: (id: string, title: string) => session?.renameConversation(id, title) ?? Promise.resolve(false),
       onDelete: (id: string) => session?.deleteConversation(id) ?? Promise.resolve(false),
       failureMessage: () => session?.notice ?? null,
       currentId,
-      onSelect: (id: string) => currentFlow()?.select(id),
-      onNewConversation: () => void currentFlow()?.newConversation(),
-      onRequestClose: () => currentFlow()?.requestClose(),
-      // 动画结算必须回到发起关闭的实例，不能查 ref 转投替换后的 Flow。
-      onClosed: () => view?.onClosed(),
+      onSelect: (id: string) => { if (focused) flow.select(id, currentId); },
+      onNewConversation: newConversation,
+      onRequestClose: () => flow.requestClose(),
     },
   };
 }

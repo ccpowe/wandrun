@@ -1,17 +1,18 @@
 // One secure list owner gates routes; one session owner serializes all transport lifetimes.
-import * as Network from "expo-network";
 import * as SecureStore from "expo-secure-store";
-import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { AppState, Platform, View } from "react-native";
+import { createContext, type ReactNode, useCallback, useContext, useEffectEvent, useMemo, useState, useSyncExternalStore } from "react";
+import { Platform, View } from "react-native";
 
 import { Text } from "@/components/ui/text.tsx";
-import { GatewayApi, GatewayError } from "@/gateway/api.ts";
+import { GatewayApi, GatewayError, type Fetch } from "@/gateway/api.ts";
 import { ChatSession } from "@/gateway/session.ts";
-import { backgroundRecoveryMs, resetConnections } from "@/lib/connection-liveness.ts";
+import { resetConnections } from "@/lib/connection-liveness.ts";
 import { Credentials, type ConnectionConfig, type SavedComputer } from "@/lib/credentials.ts";
 import { useTranslation } from "@/lib/i18n.ts";
 import { SessionOwner } from "@/lib/session-owner.ts";
-import { discardConversationDraft, pruneConversationDrafts, suspendComputerUploads } from "@/lib/upload-drafts.ts";
+import { acknowledgeFirstSendDraft, discardConversationDraft, reconcileConversationDrafts, suspendComputerUploads } from "@/lib/upload-drafts.ts";
+import { GatewayQueryProvider, subscribeQueryRecovery } from "./gateway-query-provider.tsx";
+import { useMountEffect } from "./use-mount-effect.ts";
 
 // expo-secure-store has no web implementation; the web build is a development preview only.
 const credentials = new Credentials(Platform.OS === "web" ? {
@@ -27,114 +28,128 @@ type Value = {
   config: SavedComputer | null;
   ready: boolean;
   revoked: boolean;
+  newChatConnectionId: string | null;
   configure(config: ConnectionConfig, repairConnectionId?: string): Promise<void>;
   switchComputer(id: string): Promise<void>;
   renameComputer(id: string, name: string): Promise<void>;
-  disconnect(id?: string): Promise<void>;
+  /** Resolves once the local record is durably removed. The best-effort server revoke continues
+   * afterwards; a non-401 failure is reported only to `onRemoteFailed` (the page that asked). */
+  disconnect(id?: string, onRemoteFailed?: () => void): Promise<void>;
+  rememberConversation(connectionId: string, conversationId: string): Promise<void>;
 };
 const SessionContext = createContext<Value | null>(null);
 
-export function SessionProvider({ children }: { children: ReactNode }) {
+// An isolated storage/HTTP boundary lets whole-page stories exercise the real owner without
+// reading or overwriting the app's paired computers. Production keeps the defaults above.
+const defaultCredentials = credentials;
+export type SessionRuntime = { credentials: Credentials; fetch: Fetch };
+export function SessionProvider({ children, runtime }: { children: ReactNode; runtime?: SessionRuntime }) {
+  const credentials = runtime?.credentials ?? defaultCredentials;
+  const fetch = runtime?.fetch;
+  const [host, setHost] = useState({ credentials, fetch, generation: 0 });
+  if (host.credentials !== credentials || host.fetch !== fetch) setHost({ credentials, fetch, generation: host.generation + 1 });
+  return <GatewayQueryProvider><SessionContent key={host.generation} runtime={runtime}>{children}</SessionContent></GatewayQueryProvider>;
+}
+
+function SessionContent({ children, runtime }: { children: ReactNode; runtime?: SessionRuntime }) {
+  const credentials = runtime?.credentials ?? defaultCredentials;
+  const fetch = runtime?.fetch;
   const { t } = useTranslation();
-  const { computers, config, ready, revoked } = useSyncExternalStore(credentials.subscribe, credentials.snapshot, credentials.snapshot);
+  const { computers, config, ready, revoked, newChatConnectionId } = useSyncExternalStore(credentials.subscribe, credentials.snapshot, credentials.snapshot);
   const [failure, setFailure] = useState<string | null>(null);
   const sessionOwner = useMemo(() => new SessionOwner((owner) => {
-    const session = new ChatSession(owner, undefined, {}, (reason) => {
+    const session = new ChatSession(owner, fetch, {}, (reason) => {
       const operation = reason === "revoked" ? credentials.clear(owner, true) : credentials.markInvalid(owner);
-      void operation.catch(() => setFailure("无法保存电脑认证状态，请重新打开 App 后重试。"));
+      void operation.catch(() => setFailure("无法保存服务器认证状态，请重新打开 App 后重试。"));
     }, resetConnections);
     session.onConversationDeleted = (id) => {
       try { discardConversationDraft(owner.computerId, id); }
       catch (error) { console.warn("Could not clear deleted conversation draft", error); }
     };
+    session.onMessageConfirmed = (id, clientId) => {
+      if (!session.conversations.has(id)) return;
+      try { acknowledgeFirstSendDraft(owner.computerId, id, clientId); }
+      catch (error) { console.warn("Could not clear confirmed first-send receipt", error); }
+    };
     return session;
   }, suspendComputerUploads, ({ owner, session }) => {
     if (session.connection === "error") return;
-    try { pruneConversationDrafts(owner.computerId, new Set(session.conversations.keys())); }
-    catch (error) { console.warn("Could not prune deleted conversation drafts", error); }
-  }), []);
+    try { reconcileConversationDrafts(owner.computerId, session); }
+    catch (error) { console.warn("Could not reconcile conversation drafts", error); }
+  }), [credentials, fetch]);
   const active = useSyncExternalStore(sessionOwner.subscribe, sessionOwner.snapshot, sessionOwner.snapshot);
-  useEffect(() => {
-    void credentials.restore().catch(() => setFailure("无法读取已配对电脑，请重新打开 App 后重试。"));
-  }, []);
-  // Local notes don't change connectionId; invalid authentication closes this installation.
-  const connectionId = config?.connectionId;
+  // One mounted bridge owns the credentials subscription and serial session selection.
+  // Local metadata still publishes, but SessionOwner admits only a changed connection identity.
+  useMountEffect(() => {
+    let attached = true;
+    const select = () => {
+      const config = credentials.snapshot().config;
+      void sessionOwner.select(config?.authStatus === "invalid" ? null : config).catch(() => {
+        if (attached) setFailure("无法结束原服务器连接，请重新打开 App 后重试。");
+      });
+    };
+    const unsubscribe = credentials.subscribe(select);
+    select();
+    void credentials.restore().catch(() => {
+      if (attached) setFailure("无法读取已配对服务器，请重新打开 App 后重试。");
+    });
+    return () => {
+      attached = false;
+      unsubscribe();
+      void sessionOwner.select(null).catch(error => console.warn("Could not close session owner", error));
+    };
+  });
   const authStatus = config?.authStatus;
-  useEffect(() => {
-    void sessionOwner.select(authStatus === "invalid" ? null : credentials.snapshot().config)
-      .catch(() => setFailure("无法结束原电脑连接，请重新打开 App 后重试。"));
-  }, [connectionId, authStatus, sessionOwner]);
-  useEffect(() => () => { void sessionOwner.select(null); }, [sessionOwner]);
-  useEffect(() => {
-    let backgroundAt: number | null = AppState.currentState === "background" ? Date.now() : null;
-    const subscription = AppState.addEventListener("change", (state) => {
-      if (state !== "active") {
-        backgroundAt ??= Date.now();
-        return;
-      }
-      const backgroundMs = backgroundAt === null ? 0 : Math.max(0, Date.now() - backgroundAt);
-      backgroundAt = null;
-      if (backgroundMs >= backgroundRecoveryMs) sessionOwner.snapshot()?.session.resume("foreground", backgroundMs);
-    });
-    let previousNetwork: { type: Network.NetworkStateType | undefined; isConnected: boolean | undefined } | undefined;
-    const network = Network.addNetworkStateListener((state) => {
-      const nextNetwork = { type: state.type, isConnected: state.isConnected };
-      if (previousNetwork === undefined) {
-        // The first subscription event establishes the current-state baseline; it is not a recovery.
-        previousNetwork = nextNetwork;
-        return;
-      }
-      const changed = previousNetwork.type !== nextNetwork.type || previousNetwork.isConnected !== nextNetwork.isConnected;
-      previousNetwork = nextNetwork;
-      if (!changed) return;
-      if (state.isConnected === false || state.type === Network.NetworkStateType.NONE) return;
-      // Do not include isInternetReachable: Android validation can fluctuate without changing the
-      // gateway route. Native HTTP/2 PING detects a same-type route failure within about 30 seconds.
-      if (AppState.currentState === "active") sessionOwner.snapshot()?.session.resume("network");
-    });
-    return () => { subscription.remove(); network.remove(); };
-  }, [sessionOwner]);
+  const recover = useEffectEvent((source: "foreground" | "network", backgroundMs: number) => {
+    sessionOwner.snapshot()?.session.resume(source, backgroundMs);
+  });
+  // Same recovery thresholds/route comparison as the former local listeners; the shared adapter
+  // additionally updates Query focus/online, without installing a second pair of native listeners.
+  useMountEffect(() => subscribeQueryRecovery((source, backgroundMs) => recover(source, backgroundMs)));
 
   const configure = useCallback(async (next: ConnectionConfig, repairConnectionId?: string) => {
     await credentials.install(next, repairConnectionId);
     const selected = credentials.snapshot().config;
     await sessionOwner.select(selected?.authStatus === "invalid" ? null : selected);
-  }, [sessionOwner]);
+  }, [sessionOwner, credentials]);
   const switchComputer = useCallback(async (id: string) => {
     await credentials.switchComputer(id);
     const selected = credentials.snapshot().config;
     await sessionOwner.select(selected?.authStatus === "invalid" ? null : selected);
-  }, [sessionOwner]);
-  const renameComputer = useCallback((id: string, name: string) => credentials.renameComputer(id, name), []);
-  const disconnect = useCallback(async (id?: string) => {
+  }, [sessionOwner, credentials]);
+  const renameComputer = useCallback((id: string, name: string) => credentials.renameComputer(id, name), [credentials]);
+  const rememberConversation = useCallback((connectionId: string, conversationId: string) =>
+    credentials.rememberConversation(connectionId, conversationId), [credentials]);
+  const disconnect = useCallback(async (id?: string, onRemoteFailed?: () => void) => {
     const snapshot = credentials.snapshot();
     const current = snapshot.computers.find((item) => item.computerId === (id ?? snapshot.currentId));
     if (!current) return;
     credentials.beginDisconnect(current);
-    // Revoke is bound to the selected list entry, not the active session. A racing SSE 401
-    // can close that session without aborting the confirmation request that caused it.
-    const api = new GatewayApi(current);
     try {
-      if (current.pairingMethod !== "development") {
-        try { await api.revokeCurrent(); }
-        catch (error) {
-          // User-requested disconnect may remove the saved entry even when the old
-          // credential was already rejected; generic 401 itself is not revocation.
-          if (!(error instanceof GatewayError) || error.status !== 401) throw error;
-        }
-      }
+      // Only a durable local deletion completes disconnect; remote availability is irrelevant.
       await credentials.finishDisconnect(current);
-      const selected = credentials.snapshot().config;
-      await sessionOwner.select(selected?.authStatus === "invalid" ? null : selected);
     } finally {
-      api.close();
       credentials.endDisconnect(current);
     }
-  }, [sessionOwner]);
+    if (current.pairingMethod !== "development") {
+      // Keep the removed credential outside the session lifetime. revokeCurrent has a
+      // 15-second deadline; closing the old session must not cancel this best-effort request.
+      const api = new GatewayApi(current, fetch);
+      void api.revokeCurrent().catch((error) => {
+        if (!(error instanceof GatewayError) || error.status !== 401) onRemoteFailed?.();
+      }).finally(() => api.close());
+    }
+    const selected = credentials.snapshot().config;
+    void sessionOwner.select(selected?.authStatus === "invalid" ? null : selected)
+      .catch(() => setFailure("无法结束原服务器连接，请重新打开 App 后重试。"));
+  }, [sessionOwner, credentials, fetch]);
 
   if (failure) return <View className="flex-1 items-center justify-center bg-background px-6"><Text accessibilityRole="alert" className="text-destructive">{t(failure)}</Text></View>;
   return <SessionContext.Provider value={{ session: authStatus !== "invalid" && active?.owner.connectionId === config?.connectionId ? active?.session ?? null : null,
-    sessionKey: authStatus === "invalid" ? 0 : active?.key ?? 0, computers, config, ready, revoked, configure, switchComputer, renameComputer, disconnect }}>{children}</SessionContext.Provider>;
+    sessionKey: authStatus === "invalid" ? 0 : active?.key ?? 0, computers, config, ready, revoked, newChatConnectionId, configure, switchComputer, renameComputer, disconnect, rememberConversation }}>
+    {/* design.md: no notice is mounted at the root; pages own their notices. */}
+    <View className="flex-1">{children}</View>
+  </SessionContext.Provider>;
 }
 
 export function useGateway(): Value {

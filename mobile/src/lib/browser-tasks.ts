@@ -1,8 +1,13 @@
-import type { BrowserPage, BrowserTask } from "@/gateway/api.ts";
+import type { BrowserCapacity, BrowserPage, BrowserTask, ComputerStatus } from "@/gateway/api.ts";
 import { t } from "./i18n.ts";
 
 export type ActiveBrowserPage = { task: BrowserTask; page: BrowserPage };
 export type BrowserPageGroup = { agentId: string; agentName: string; pages: ActiveBrowserPage[] };
+
+/** Physical local owners use this canonical id, including configuration aliases; cloud capacity is excluded. */
+export function localBrowserCapacity(status: ComputerStatus | null | undefined): BrowserCapacity | undefined {
+  return status?.environments.find((environment) => environment.environment_id === "local")?.capacity;
+}
 
 /** Only pages still owned by a live lease are navigable. Identity follows the entry Agent, not its delegate. */
 export function activeBrowserPages(tasks: Iterable<BrowserTask>, entryAgentId?: string): ActiveBrowserPage[] {

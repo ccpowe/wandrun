@@ -3,18 +3,22 @@
 import asyncio
 from contextlib import AsyncExitStack, closing
 from dataclasses import replace
+import os
+import shutil
 import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 import httpx
 
-from wandrun.config import AgentCatalog, AgentDefinition
+from wandrun.config import AgentCatalog, AgentDefinition, EnvironmentDefinition
 from wandrun.gateway.app import ensure_agents
 from wandrun.gateway.capabilities import gateway_capabilities
+from wandrun.gateway.connectors import connector_fields
 from wandrun.gateway.http import create_app
 from wandrun.gateway.service import Gateway, GatewayFailure
 from wandrun.gateway.store import GatewayStore
@@ -74,6 +78,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
             agent_catalog=self.store.agent_catalog(), on_human=self.gateway.on_human,
             on_task=self.gateway.on_task, notify_human_of_roots=False,
             entry_capabilities=gateway_capabilities(self.gateway),
+            environment_definitions=self.store.environment_definitions(),
         ))
         self.gateway.attach(self.runtime.workers, self.runtime.checkpointer, runtime=self.runtime)
         self.client = await self.stack.enter_async_context(httpx.AsyncClient(
@@ -84,6 +89,44 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
     def payload(self, **extra):
         return {"client_id": "create", "name": "写作者", "description": "写作",
                 "system_prompt": "写文章", "model": "offline", **extra}
+
+    async def test_agent_name_conflicts_are_explicit_atomic_and_do_not_break_replay(self):
+        created = await self.client.post("/agents", json=self.payload(name=" Test "))
+        self.assertEqual(created.status_code, 201, created.text)
+        first = created.json()
+        identity = first["agent"]["id"]
+        self.assertEqual(first["agent"]["name"], "Test")
+        self.assertEqual(self.store.agent_catalog().agents[identity].name, "Test")
+        seq = self.store.last_seq()
+        for name in ("test", " Test ", "TEST"):
+            with self.subTest(name=name):
+                rejected = await self.client.post("/agents", json=self.payload(client_id="duplicate", name=name))
+                self.assertEqual(rejected.status_code, 409, rejected.text)
+                self.assertEqual(rejected.json(), {"error": {"code": "agent_name_conflict", "message": "已有同名 Agent"}})
+                rejected = await self.client.patch("/agents/desktop", json={"name": name, "description": "不应保存"})
+                self.assertEqual(rejected.status_code, 409, rejected.text)
+                self.assertEqual(rejected.json()["error"]["code"], "agent_name_conflict")
+        self.assertEqual(self.store.last_seq(), seq)
+        self.assertEqual(self.store.agent("desktop")["description"], "说明")
+        same = await self.client.patch(f"/agents/{identity}", json={"name": " Test "})
+        self.assertEqual(same.status_code, 200, same.text)
+        self.assertIsNone(same.json()["event"])
+        renamed = await self.client.patch(f"/agents/{identity}", json={"name": " Different "})
+        self.assertEqual(renamed.json()["agent"]["name"], "Different")
+        self.assertEqual(self.store.agent_catalog().agents[identity].name, "Different")
+        replacement = await self.client.post("/agents", json=self.payload(client_id="replacement", name="Test"))
+        self.assertEqual(replacement.status_code, 201, replacement.text)
+        replay = await self.client.post("/agents", json=self.payload(name="Test"))
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json(), {**first, "replayed": True})
+        fresh = await self.client.post("/agents", json=self.payload(client_id="duplicate", name="Recovered"))
+        self.assertEqual(fresh.status_code, 201, fresh.text)
+        concurrent = await asyncio.gather(*(
+            self.client.post("/agents", json=self.payload(client_id=f"race-{index}", name=name))
+            for index, name in enumerate(("Race", " race "))
+        ))
+        self.assertEqual(sorted(response.status_code for response in concurrent), [201, 409])
+        self.assertIsNone(self.gateway._failure)
 
     async def test_required_agent_text_rejections_do_not_persist(self):
         seq = self.store.last_seq()
@@ -109,7 +152,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(models.json()["capabilities"], {"fast_mode": True})
         connection = await self.client.get("/connection")
         self.assertEqual(connection.json()["capabilities"], {"fast_mode": True})
-        default = await self.client.post("/agents", json=self.payload(client_id="fast-default", code_mode=False))
+        default = await self.client.post("/agents", json=self.payload(client_id="fast-default", name="默认 Fast", code_mode=False))
         self.assertEqual(default.status_code, 201, default.text)
         self.assertIs(default.json()["agent"]["fast_mode"], False)
         payload = self.payload(client_id="fast-enabled", fast_mode=True, reasoning_effort="xhigh", code_mode=False)
@@ -119,7 +162,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         identity = first["agent"]["id"]
         self.assertIs(first["agent"]["fast_mode"], True)
         self.assertTrue(self.store.agent_catalog().agents[identity].fast_mode)
-        root = self.gateway.create_conversation("Fast request", identity)["id"]
+        root = self.gateway.create_conversation("Fast request", identity, client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "fast-request", "完成")
         self.assertEqual((await self.runtime.workers.wait(root))["status"], "completed")
         self.assertEqual(self.requests[-1]["service_tier"], "priority")
@@ -156,11 +199,159 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replay.json()["agent"], first["agent"])
         self.assertEqual(replay.json()["event"], first["event"])
         self.assertEqual(self.store.last_seq(), seq + 1)
-        root = self.gateway.create_conversation("Standard request", identity)["id"]
+        root = self.gateway.create_conversation("Standard request", identity, client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "standard-request", "完成")
         self.assertEqual((await self.runtime.workers.wait(root))["status"], "completed")
         self.assertNotIn("service_tier", self.requests[-1])
         self.assertEqual(self.requests[-1]["reasoning"], {"effort": "xhigh"})
+
+    async def test_environment_create_idle_switch_active_conflict_and_restart_are_lazy(self):
+        machine = "m_" + "a" * 26
+        cloud = EnvironmentDefinition(
+            type="instabox", machine_id=machine, workdir=str(self.workspace.root / "remote"),
+        )
+        self.runtime.environment_definitions.update({"cloud": cloud, "cloud-alias": cloud})
+        with patch("wandrun.integrations.instabox.InstaboxBackend._prepare",
+                   side_effect=AssertionError("configuration must not prepare a machine")):
+            first = await self.client.post("/agents", json=self.payload(
+                client_id="cloud-create", environment="cloud", code_mode=False,
+            ))
+            self.assertEqual(first.status_code, 201, first.text)
+            identity = first.json()["agent"]["id"]
+            second = await self.client.post("/agents", json=self.payload(
+                client_id="cloud-alias-create", name="云端别名", environment="cloud-alias", code_mode=False,
+            ))
+            self.assertEqual(second.status_code, 201, second.text)
+            alias = second.json()["agent"]["id"]
+            self.assertIs(self.runtime.files.remote_backends[identity], self.runtime.files.remote_backends[alias])
+            selected = await self.client.patch("/agents/desktop", json={"environment": "cloud"})
+            self.assertEqual(selected.status_code, 200, selected.text)
+            # The list read by the App's server page carries each Agent's environment, not only the detail.
+            listing = {item["id"]: item["environment"] for item in (await self.client.get("/agents")).json()["agents"]}
+            self.assertEqual((listing["desktop"], listing[identity], listing[alias]), ("cloud", "cloud", "cloud-alias"))
+            self.assertIs(self.runtime.files.remote_backends["desktop"], self.runtime.files.remote_backends[identity])
+            self.block = True
+            root = self.gateway.create_conversation("active", "desktop", client_id=uuid4().hex)[0]["id"]
+            self.gateway.send_message(root, "cloud-chat", "只聊天")
+            await self.entered.wait()
+            rejected = await self.client.patch("/agents/desktop", json={"environment": "local"})
+            self.assertEqual(rejected.status_code, 409, rejected.text)
+            self.assertEqual(self.store.agent("desktop")["environment"], "cloud")
+            self.assertEqual(self.runtime.workers.get(root)["status"], "running")
+            self.release.set()
+            await self.runtime.workers.wait(root)
+            switched = await self.client.patch("/agents/desktop", json={"environment": "local"})
+            self.assertEqual(switched.status_code, 200, switched.text)
+            self.assertNotIn("desktop", self.runtime.files.remote_backends)
+            self.assertEqual(self.store.environment_definitions()["cloud"], cloud)
+            await self.stack.aclose()
+            await self.start_runtime()
+            self.assertEqual(self.store.agent(identity)["environment"], "cloud")
+            self.assertEqual(self.store.agent("desktop")["environment"], "local")
+            self.assertIs(self.runtime.files.remote_backends[identity], self.runtime.files.remote_backends[alias])
+
+    async def test_discovered_browser_switch_create_alias_restart_and_shutdown(self):
+        from wandrun.integrations.instabox import InstaboxBackend
+        from wandrun.runtime.agent.conversations import conversation_config
+
+        machine = "m_" + "b" * 26
+        selected = "instabox-" + machine
+        shutil.copytree(
+            Path(__file__).parents[1] / "src/wandrun/defaults/skills/browser",
+            self.workspace.skills_dir / "browser",
+        )
+        original = httpx.AsyncClient
+        provider = httpx.MockTransport(lambda request: httpx.Response(200, json={
+            "machines": [{"id": machine, "name": "Discovered", "state": "suspended"}],
+        }))
+        with patch.dict(os.environ, {"INSTABOX_API_KEY": "test"}), patch(
+            "wandrun.gateway.environments.httpx.AsyncClient",
+            side_effect=lambda **kwargs: original(transport=provider, **kwargs),
+        ):
+            choices = await self.client.get("/execution-environments")
+        self.assertEqual(choices.status_code, 200, choices.text)
+        with patch.object(InstaboxBackend, "_prepare", side_effect=AssertionError("cloud I/O")):
+            switched = await self.client.patch("/agents/desktop", json={
+                "environment": selected, "skills": ["browser"],
+            })
+            self.assertEqual(switched.status_code, 200, switched.text)
+            browser = self.runtime.browsers[selected]
+            self.assertTrue(self.runtime._assembly_for("desktop").capabilities.enabled("browser"))
+            self.assertEqual(
+                [item["environment_id"] for item in self.gateway.computer()["environments"]],
+                ["instabox:" + machine],
+            )
+            root = self.gateway.create_conversation("browser feedback", "desktop", client_id=uuid4().hex)[0]["id"]
+            self.gateway.send_message(root, "browser-feedback", "只聊天")
+            self.assertEqual((await self.runtime.workers.wait(root))["status"], "completed")
+            checkpoint = await self.runtime.checkpointer.aget_tuple(conversation_config(root))
+            feedback = checkpoint.checkpoint["channel_values"]["observed_environment"]["browser"]
+            self.assertTrue(feedback["configured"])
+            self.assertEqual(feedback["availability"], "未探测，实际使用时确认")
+            # A configured alias and a discovered identity borrow the physical owner.
+            definition = self.runtime.environment_definitions[selected]
+            with self.workspace.environments_config.open("a") as config:
+                config.write(
+                    '\n[environments.discovered_alias]\ntype = "instabox"\n'
+                    f'machine_id = "{machine}"\nworkdir = "/data/home/wandrun"\n'
+                    '[environments.discovered_alias.browser]\n'
+                )
+            self.runtime.environment_definitions["discovered_alias"] = definition
+            created = await self.client.post("/agents", json=self.payload(
+                client_id="discovered-browser", environment="discovered_alias",
+                skills=["browser"], code_mode=False,
+            ))
+            self.assertEqual(created.status_code, 201, created.text)
+            self.assertIs(self.runtime.browsers["discovered_alias"], browser)
+            self.assertEqual(len(self.gateway.computer()["environments"]), 1)
+            await self.stack.aclose()
+            self.assertTrue(browser._closed)
+            await self.start_runtime()
+            restored = self.runtime.browsers[selected]
+            self.assertIsNot(restored, browser)
+            self.assertIs(self.runtime.browsers["discovered_alias"], restored)
+            self.assertTrue(self.runtime._assembly_for("desktop").capabilities.enabled("browser"))
+            self.assertEqual(restored.config, definition.browser)
+
+    async def test_background_command_blocks_environment_switch_after_model_done_until_explicit_stop(self):
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "a" * 26,
+            workdir=str(self.workspace.root / "remote"),
+        )
+        calls = 0
+
+        async def respond(model, body):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                yield {
+                    "type": "response.completed",
+                    "response": {"status": "completed", "output": [{
+                        "type": "function_call", "id": "background", "call_id": "background",
+                        "name": "exec_command",
+                        "arguments": json.dumps({"command": "sleep 60", "yield_seconds": 0}),
+                    }]},
+                }
+            else:
+                yield answer("后台命令仍在执行")
+
+        with patch.object(CodexSubscriptionModel, "_arequest", respond):
+            root = self.gateway.create_conversation("background", "desktop", client_id=uuid4().hex)[0]["id"]
+            self.gateway.send_message(root, "start-background", "启动后台命令然后结束本轮")
+            self.assertEqual((await self.runtime.workers.wait(root))["status"], "completed")
+            self.assertEqual(self.runtime.workers.running_tasks("desktop"), [])
+            self.assertIn(root, self.runtime.agent_tasks_pending("desktop"))
+            rejected = await self.client.patch("/agents/desktop", json={"environment": "cloud"})
+            self.assertEqual(rejected.status_code, 409, rejected.text)
+            self.assertEqual(self.store.agent("desktop")["environment"], "local")
+            stopped = await self.runtime.workers.cancel(root)
+            self.assertNotIn("cleanup_unconfirmed", stopped)
+            async def released():
+                while self.runtime.agent_tasks_pending("desktop"):
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(released(), 5)
+            switched = await self.client.patch("/agents/desktop", json={"environment": "cloud"})
+            self.assertEqual(switched.status_code, 200, switched.text)
 
     async def test_code_mode_default_explicit_value_edits_and_validation(self):
         self.assertFalse(self.store.agent("main")["code_mode"])  # Imported definitions keep their saved value.
@@ -169,7 +360,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         identity = default.json()["agent"]["id"]
         self.assertTrue(default.json()["agent"]["code_mode"])
         self.assertTrue(self.store.agent_catalog().agents[identity].code_mode)
-        disabled = await self.client.post("/agents", json=self.payload(client_id="code-disabled", code_mode=False))
+        disabled = await self.client.post("/agents", json=self.payload(client_id="code-disabled", name="禁用代码模式", code_mode=False))
         self.assertEqual(disabled.status_code, 201, disabled.text)
         self.assertFalse(disabled.json()["agent"]["code_mode"])
         self.assertFalse(self.store.agent_catalog().agents[disabled.json()["agent"]["id"]].code_mode)
@@ -202,12 +393,13 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(rejected.status_code, 400, rejected.text)
                 self.assertNotIn("agents.", rejected.json()["error"]["message"])
                 rejected_create = await self.client.post(
-                    "/agents", json=self.payload(client_id=f"bad-code-{str(value)}", code_mode=value),
+                    "/agents", json=self.payload(client_id=f"bad-code-{str(value)}", name="无效代码模式", code_mode=value),
                 )
                 self.assertEqual(rejected_create.status_code, 400, rejected_create.text)
                 self.assertEqual(self.store.last_seq(), seq)
         environment = await self.client.patch(f"/agents/{identity}", json={"environment": "local"})
-        self.assertEqual(environment.status_code, 400, environment.text)
+        self.assertEqual(environment.status_code, 200, environment.text)
+        self.assertIsNone(environment.json()["event"])
         self.assertTrue(self.store.agent(identity)["code_mode"])
 
     async def test_first_code_pool_open_serializes_overlapping_agent_edits(self):
@@ -292,7 +484,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(pools), 1)
             self.assertEqual(pools[0].exits, 0)
 
-            root = self.gateway.create_conversation("并发编辑后的执行", "main")["id"]
+            root = self.gateway.create_conversation("并发编辑后的执行", "main", client_id=uuid4().hex)[0]["id"]
             self.gateway.send_message(root, "run-code", "执行脚本")
             result = await asyncio.wait_for(self.runtime.workers.wait(root), 10)
             self.assertEqual(result["status"], "completed", result)
@@ -311,9 +503,10 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
             "client_id": "head-connector", "name": "文档",
             "url": "https://example.com/mcp", "description": "查询文档",
         }
-        connector = await self.client.post("/connectors", json=connector_body)
-        self.assertEqual(connector.status_code, 201, connector.text)
-        connector_id = connector.json()["connector"]["id"]
+        connector_id = "head-fixture"
+        definition = connector_fields(connector_id, {key: value for key, value in connector_body.items()
+                                                     if key != "client_id"})
+        self.store.create_connector(definition, connector_body["client_id"])
         schedule_body = {
             "client_id": "head-schedule", "name": "晨报", "content": "独立说明",
             "rule": {"kind": "daily", "time": "00:00"}, "timezone": "Etc/UTC",
@@ -321,8 +514,8 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         schedule = await self.client.post("/agents/desktop/schedules", json=schedule_body)
         self.assertEqual(schedule.status_code, 201, schedule.text)
         schedule_id = schedule.json()["schedule"]["id"]
-        conversation_body = {"title": "保留对话", "agent_id": "desktop"}
-        conversation = await self.client.post("/conversations", json=conversation_body)
+        conversation_body = {"title": "保留对话", "agent_id": "desktop", "client_id": "head-new-conversation"}
+        conversation = await self.client.post("/conversations", json={**conversation_body, "client_id": uuid4().hex})
         self.assertEqual(conversation.status_code, 201, conversation.text)
         conversation_id = conversation.json()["id"]
         memory = (await self.client.get("/agents/desktop/memory")).json()
@@ -368,7 +561,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         entries = initial.json()["capabilities"]
         self.assertEqual([item["id"] for item in entries], [
             "memory", "tool_search", "files", "processes", "browser", "code_mode",
-            "schedule", "image_generation", "ui_blocks",
+            "schedule", "image_generation", "uploads", "ui_blocks",
         ])
         by_id = {item["id"]: item for item in entries}
         self.assertEqual((by_id["files"]["status"], by_id["files"]["reason"]),
@@ -383,6 +576,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_id["memory"]["tools"], [])
         self.assertEqual(by_id["schedule"]["tools"], ["create_schedule"])
         self.assertEqual(by_id["image_generation"]["tools"], ["generate_image"])
+        self.assertEqual(by_id["uploads"]["tools"], ["fetch_upload"])
         self.assertEqual(by_id["processes"]["tools"], ["exec_command", "kill_process"])
         bodies = []
 
@@ -390,7 +584,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
             bodies.append(body)
             yield answer("done")
 
-        conversation = self.gateway.create_conversation("Tools", "desktop")["id"]
+        conversation = self.gateway.create_conversation("Tools", "desktop", client_id=uuid4().hex)[0]["id"]
         with patch.object(CodexSubscriptionModel, "_arequest", respond):
             self.runtime.workers.start("tools", conversation, agent_name="desktop")
             self.assertEqual((await self.runtime.workers.wait(conversation))["status"], "completed")
@@ -575,7 +769,6 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         original = response.json()
         identity = original["agent"]["id"]
         self.assertRegex(identity, r"^a_[a-f0-9]{32}$")
-        self.assertTrue(self.store.agent_item(identity)["home"])
         self.assertEqual((await self.client.post("/agents", json=self.payload())).json()["agent"], original["agent"])
         updated = await self.client.patch(f"/agents/{identity}", json={"name": "新名", "workers": ["child"]})
         self.assertEqual(updated.status_code, 200, updated.text)
@@ -587,7 +780,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         for fields in ({"workers": [identity]}, {"workers": ["missing"]}, {"skills": ["../escape"]},
                        {"name": ""}, {"name": None}, {"name": "两\n行"}, {"name": "名" * 65},
                        {"avatar": True}, {"avatar": -1}, {"avatar": 8}, {"avatar": None}, {"model": ""},
-                       {"reasoning_effort": "wrong"}, {"skills": "bad"}, {"environment": "local"},
+                       {"reasoning_effort": "wrong"}, {"skills": "bad"}, {"environment": "missing"},
                        {"mcp_servers": ["missing"]}, {"searchable_mcp_servers": "bad"}, {"code_mode": "false"},
                        {"code_mode": None}, {"code_mode": 0}, {"code_mode": []}):
             rejected = await self.client.patch(f"/agents/{identity}", json=fields)
@@ -655,7 +848,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.get("/agents/missing/memory")).status_code, 404)
 
     async def test_agent_memory_callback_records_root_event_but_user_edits_do_not(self):
-        root = self.gateway.create_conversation("委派", "main")["id"]
+        root = self.gateway.create_conversation("委派", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "begin", "开始")
         await self.runtime.workers.wait(root)
         child = self.runtime.workers.start("记住", sender_id=root, agent_name="child")["task_id"]
@@ -716,7 +909,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(stale.status_code, 409)
         self.assertEqual(stale.json()["error"]["details"]["current"], profile)
-        root = self.gateway.create_conversation("入口", "main")["id"]
+        root = self.gateway.create_conversation("入口", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "profile-root", "开始")
         await self.runtime.workers.wait(root)
         cursor = self.store.last_seq()
@@ -903,6 +1096,20 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.last_seq(), cursor)
         self.assertIsInstance(self.gateway.failure, GatewayFailure)
 
+    async def test_delete_waits_for_file_transfer_cleanup_without_publishing_intent(self):
+        with patch.object(self.runtime, "file_transfers_pending", return_value=True):
+            rejected = await self.client.delete("/agents/desktop")
+        self.assertEqual(rejected.status_code, 409, rejected.text)
+        self.assertTrue(rejected.json()["error"]["details"]["file_transfers_pending"])
+        self.assertFalse(self.store.agent_deleting("desktop"))
+        self.assertIsNone(self.store.deleted_agent_event("desktop"))
+        self.assertEqual((await self.client.get("/agents/desktop")).status_code, 200)
+        self.assertIsNone(self.gateway.failure)
+
+        deleted = await self.client.delete("/agents/desktop")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertIsNotNone(self.store.deleted_agent_event("desktop"))
+
     async def test_delete_conflicts_report_members_and_running_tasks(self):
         response = await self.client.delete("/agents/child")
         self.assertEqual(response.status_code, 409)
@@ -913,7 +1120,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         desktop = await self.client.delete("/agents/desktop")
         self.assertEqual(desktop.status_code, 200)
         self.block = True
-        root = self.gateway.create_conversation("运行中", "main")["id"]
+        root = self.gateway.create_conversation("运行中", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "run", "开始")
         await asyncio.wait_for(self.entered.wait(), 5)
         working = await self.client.delete("/agents/main")
@@ -924,7 +1131,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_removed_member_with_running_delegation_cannot_be_deleted(self):
-        root = self.gateway.create_conversation("其他入口", "main")["id"]
+        root = self.gateway.create_conversation("其他入口", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "run", "开始")
         await self.runtime.workers.wait(root)
         self.block = True
@@ -951,14 +1158,14 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.workers.get(child)["status"], "completed")
 
     async def test_deletion_intent_blocks_existing_delegation_and_notification_resume(self):
-        root = self.gateway.create_conversation("其他入口", "main")["id"]
+        root = self.gateway.create_conversation("其他入口", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "run", "开始")
         manager = self.runtime.workers
         await manager.wait(root)
         child = manager.start("委派", sender_id=root, agent_name="child")["task_id"]
         await manager.wait(child)
         await self.client.patch("/agents/main", json={"workers": []})
-        history = self.gateway.create_conversation("子角色历史", "child")["id"]
+        history = self.gateway.create_conversation("子角色历史", "child", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(history, "child-run", "开始")
         await manager.wait(history)
         started, release = asyncio.Event(), asyncio.Event()
@@ -994,7 +1201,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/agents", json=self.payload())
         self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(response.json()["agent"]["avatar"], 3)
-        explicit = await self.client.post("/agents", json=self.payload(client_id="explicit", avatar=7))
+        explicit = await self.client.post("/agents", json=self.payload(client_id="explicit", name="指定头像", avatar=7))
         self.assertEqual(explicit.status_code, 201, explicit.text)
         self.assertEqual(explicit.json()["agent"]["avatar"], 7)
         replay = await self.client.post("/agents", json=self.payload(avatar=6))
@@ -1005,7 +1212,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(renamed.json()["agent"]["avatar"], 3)
 
     async def test_delete_cleans_threads_scheduler_settings_and_preserves_members(self):
-        root = self.gateway.create_conversation("历史", "main")["id"]
+        root = self.gateway.create_conversation("历史", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "run", "开始")
         await self.runtime.workers.wait(root)
         checkpointer = self.runtime.checkpointer
@@ -1022,14 +1229,44 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.execute("SELECT task_id FROM tasks").fetchall(), [])
         self.assertIsNone(self.store.agent_catalog().main_agent)
         self.assertEqual(self.store.agent("child")["member_of"], [])
-        child = self.gateway.create_conversation("成员仍可用", "child")["id"]
+        child = self.gateway.create_conversation("成员仍可用", "child", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(child, "child-run", "工作")
         await self.runtime.workers.wait(child)
         self.assertEqual(self.runtime.workers.get(child)["status"], "completed")
         self.assertEqual((await self.client.delete("/agents/main")).json(), result.json())
 
+    async def test_delete_agent_preserves_unconfirmed_browser_and_directory_reports(self):
+        from types import SimpleNamespace
+        from wandrun.runtime.browser.leases import BrowserRejected
+        root = self.gateway.create_conversation("外部未确认", "main", client_id=uuid4().hex)[0]["id"]
+
+        async def fail_close_agent(*args, **kwargs):
+            raise ExceptionGroup("close", [BrowserRejected("Chrome unavailable")])
+
+        async def remote(command):
+            raise TimeoutError("SSH unavailable")
+
+        class Browser:
+            list_tasks = staticmethod(lambda: [])
+            close_agent = staticmethod(fail_close_agent)
+
+        self.runtime.browsers = {"local": Browser()}
+        self.runtime.files.conversation_workdirs = True
+        self.runtime.files.update_environments(
+            {"main": ("cloud", "/remote")}, {"main": SimpleNamespace(aexecute=remote)},
+        )
+        deleted = await self.client.delete("/agents/main")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        stages = {item["stage"] for item in deleted.json()["event"]["data"]["cleanup_unconfirmed"]}
+        self.assertEqual(stages, {"browser", "directory"})
+        self.assertIsNone(self.gateway.failure)
+        self.assertIsNone(self.store.agent("main"))
+        self.assertIsNone(self.store.conversation(root))
+        self.assertEqual((await self.client.delete("/agents/main")).json(), deleted.json())
+        self.assertEqual(self.store.deleted_event(root).data["cleanup_unconfirmed"][0]["environment"], "cloud")
+
     async def test_failed_delete_survives_restart_and_resumes_without_duplicate_events(self):
-        root = self.gateway.create_conversation("历史", "main")["id"]
+        root = self.gateway.create_conversation("历史", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "run", "开始")
         await self.runtime.workers.wait(root)
         with patch.object(self.runtime.checkpointer, "adelete_thread", side_effect=OSError("disk failed")):
@@ -1093,7 +1330,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(deleted), 1)
 
     async def test_delete_intent_blocks_new_work_and_references_while_waiter_cancels(self):
-        root = self.gateway.create_conversation("历史", "main")["id"]
+        root = self.gateway.create_conversation("历史", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "run", "开始")
         await self.runtime.workers.wait(root)
         memory = self.runtime.memory
@@ -1115,7 +1352,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await operation
         try:
-            self.assertEqual((await self.client.post("/conversations", json={"agent_id": "main"})).status_code, 409)
+            self.assertEqual((await self.client.post("/conversations", json={"client_id": uuid4().hex, "agent_id": "main"})).status_code, 409)
             self.assertEqual((await self.client.patch("/agents/main", json={"name": "晚到"})).status_code, 409)
             self.assertEqual((await self.client.patch("/agents/child", json={"workers": ["main"]})).status_code, 400)
             changed = await self.client.patch("/agents/child", json={"name": "独立更新"})
@@ -1142,7 +1379,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         created = await self.client.post("/agents", json=self.payload())
         self.assertEqual(created.status_code, 201, created.text)
         identity = created.json()["agent"]["id"]
-        root = self.gateway.create_conversation("新开始", identity)["id"]
+        root = self.gateway.create_conversation("新开始", identity, client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "new-run", "工作")
         await self.runtime.workers.wait(root)
         self.assertEqual(self.runtime.workers.get(root)["status"], "completed")

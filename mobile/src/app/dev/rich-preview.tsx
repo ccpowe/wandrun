@@ -1,5 +1,5 @@
 import { Redirect, useLocalSearchParams } from "expo-router";
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Uniwind, useUniwind } from "uniwind";
@@ -8,8 +8,10 @@ import { AgentMessageContent } from "@/components/chat/agent-message-content.tsx
 import { Button } from "@/components/ui/button.tsx";
 import { Text } from "@/components/ui/text.tsx";
 import { richScenarios } from "@/dev/rich-scenarios.ts";
+import { FakeGateway } from "@/dev/fake-gateway";
 import { GatewayApi, GatewayError } from "@/gateway/api.ts";
 import type { ChatSession } from "@/gateway/session.ts";
+import { useMountEffect } from "@/lib/use-mount-effect.ts";
 
 type Submission = { values: Record<string, unknown>; createdAt: string };
 type Outcome = "success" | "pending" | "400" | "404" | "409";
@@ -17,7 +19,7 @@ type Outcome = "success" | "pending" | "400" | "404" | "409";
 // error path in the link-list scenario without contacting a gateway or the source URL.
 const failedLinkMedia = new GatewayApi(
   { baseUrl: "https://preview.invalid", token: "preview", computerId: "preview" },
-  async () => Response.json({ error: { code: "media_not_found", message: "Image unavailable" } }, { status: 404 }),
+  new FakeGateway().fetch,
 );
 const failedLinkOwner = {
   session: { api: failedLinkMedia, subscribe: () => () => {}, uiDraftFor: () => undefined, saveUiDraft: () => {} } as unknown as ChatSession,
@@ -39,11 +41,10 @@ function RichPreview() {
   const [submitted, setSubmitted] = useState<Record<string, Submission>>({});
   const [outcome, setOutcome] = useState<Outcome>("success");
   const { theme, hasAdaptiveThemes } = useUniwind();
-  const previousTheme = useRef<"light" | "dark" | "system">(hasAdaptiveThemes ? "system" : theme);
-  useEffect(() => {
-    const restore = previousTheme.current;
+  useMountEffect(() => {
+    const restore = hasAdaptiveThemes ? "system" : theme;
     return () => Uniwind.setTheme(restore);
-  }, []);
+  });
   const scenario = richScenarios.find((item) => item.id === selected)!;
   const submission = submitted[selected] ?? (scenario.submitted
     ? { values: scenario.state, createdAt: "2026-10-12T10:42:00+08:00" } : undefined);
@@ -52,15 +53,12 @@ function RichPreview() {
     {bare ? null : <View className="gap-2 border-b border-border px-4 py-3">
       <View className="flex-row items-center justify-between gap-3">
         <Text className="text-lg font-semibold">富交互消息 · P0/P1/P2</Text>
-        <Button size="sm" variant="outline" accessibilityLabel="切换预览主题"
-          onPress={() => Uniwind.setTheme(theme === "dark" ? "light" : "dark")}>
-          <Text>{theme === "dark" ? "浅色" : "深色"}</Text>
-        </Button>
+        <Button size="sm" intent="soft" accessibilityLabel="切换预览主题"
+          onPress={() => Uniwind.setTheme(theme === "dark" ? "light" : "dark")}><Text>{theme === "dark" ? "浅色" : "深色"}</Text></Button>
       </View>
       <Text className="text-xs text-muted-foreground">仅开发预览 · 不连接提交 API，不会触发 Agent</Text>
       <View className="flex-row flex-wrap gap-2">
-        {richScenarios.map((item) => <Button key={item.id} size="sm" variant="outline"
-          className={selected === item.id ? "border-foreground bg-muted" : "border-border"}
+        {richScenarios.map((item) => <Button key={item.id} size="sm" intent={selected === item.id ? "primary" : "soft"}
           accessibilityLabel={`预览${item.title}`} onPress={() => setSelected(item.id)}>
           <Text>{item.title}</Text>
         </Button>)}
@@ -68,11 +66,11 @@ function RichPreview() {
       <View className="flex-row flex-wrap items-center gap-2">
         <Text className="text-xs text-muted-foreground">提交结果：</Text>
         {(["success", "pending", "400", "404", "409"] as const).map((value) => <Button key={value}
-          size="sm" variant="outline" className={outcome === value ? "border-foreground" : "border-border"}
+          size="sm" intent={outcome === value ? "primary" : "soft"}
           accessibilityLabel={`预览提交${value}`} onPress={() => setOutcome(value)}>
           <Text>{value === "success" ? "成功" : value === "pending" ? "慢提交（5秒）" : value}</Text>
         </Button>)}
-        <Button size="sm" variant="ghost" accessibilityLabel="重置预览"
+        <Button size="sm" intent="quiet" accessibilityLabel="重置预览"
           onPress={() => { setSubmitted({}); setGeneration((value) => value + 1); }}><Text>重置</Text></Button>
       </View>
     </View>}

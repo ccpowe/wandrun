@@ -145,10 +145,10 @@ export function decodeUtf8Prefix(bytes: ArrayBuffer | Uint8Array, maxBytes = 409
 export const MARKDOWN_PREFIX_BYTES = 4096;
 
 /** Reads only the head of a Markdown attachment for the summary card. */
-export async function loadMarkdownPrefix(api: GatewayApi, fileId: string, fileSize: number): Promise<string> {
+export async function loadMarkdownPrefix(api: GatewayApi, fileId: string, fileSize: number, signal?: AbortSignal): Promise<string> {
   if (fileSize === 0) return "";
   // consumeResponse takes a gateway path; fileContentUrl() is the absolute URL players need.
-  return api.consumeResponse(`/files/${encodeURIComponent(fileId)}/content`, { headers: api.headers({ Range: `bytes=0-${MARKDOWN_PREFIX_BYTES - 1}` }) }, async (response) => {
+  return api.consumeResponse(`/files/${encodeURIComponent(fileId)}/content`, { signal, headers: api.headers({ Range: `bytes=0-${MARKDOWN_PREFIX_BYTES - 1}` }) }, async (response) => {
     if (!response.ok) throw new Error("无法预览文件");
     return decodeUtf8Prefix(await response.arrayBuffer(), MARKDOWN_PREFIX_BYTES);
   });

@@ -32,7 +32,7 @@ test("重启保留网关、对话上传元数据和 URL，不把最后一次在�
   assert.equal(mimeForFile("notes.unknown", null), "application/octet-stream");
 });
 
-test("附件消息离线重试复用同一 client_id 与附件 ID，不用新正文替代旧命令", async () => {
+test("chat.T6 在线事件流下 HTTP 发送失败，手动重试复用同一附件与消息身份", async () => {
   const bodies: Record<string, unknown>[] = [];
   const mock: typeof fetch = async (_input, init) => {
     const body = JSON.parse(String(init?.body));
@@ -45,6 +45,7 @@ test("附件消息离线重试复用同一 client_id 与附件 ID，不用新正
   };
 
   const session = new ChatSession({ baseUrl: "http://gateway", token: "secret" }, mock);
+  session.connection = "open";
   await session.send("conversation-1", "", [{ id: ready.fileId!, name: ready.name, size: ready.size, media_type: ready.mediaType }]);
   const pending = session.pendingFor("conversation-1")[0];
   assert.equal(pending.status, "failed");

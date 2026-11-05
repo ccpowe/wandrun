@@ -12,6 +12,14 @@ def task_failure(error: str | None) -> str:
         return _TASK_FAILURE
     kind, _, detail = error.partition(": ")
     lower = detail.lower()
+    if kind == "CredentialError":
+        if detail == "Codex file login required":
+            return "模型尚未登录，请先在电脑上登录模型。"
+        if detail == "Codex credential rotation uncertain; stop the gateway and log in again":
+            return "模型登录状态未确认，请先在电脑上停止网关并重新登录模型。"
+        if detail == "Codex login must be renewed":
+            return "模型登录已失效，请先在电脑上重新登录模型。"
+        return "模型登录暂不可用，请在电脑上检查登录状态。"
     if kind in {"ContextBudgetExhausted", "ContextWindowExceededError", "ContextWindowExceeded"} or (
         kind in {"BadRequestError", "InvalidRequestError"}
         and any(marker in lower for marker in ("context_length_exceeded", "context window", "maximum context length"))

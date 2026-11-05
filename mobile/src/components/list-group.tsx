@@ -3,18 +3,30 @@ import { View } from "react-native";
 
 import { Separator } from "@/components/ui/separator.tsx";
 import { Text } from "@/components/ui/text.tsx";
+import { cn } from "@/lib/utils";
 
-/** 分组（视觉方向 v1）：小字标题 + 圆角描边卡片，子项之间一条细线。子项为空时整组不显示。 */
-export function ListGroup({ label, children }: { label?: string; children: ReactNode }) {
+/** 无描边填充分组；divider 只控制分隔方式。 */
+export function ListGroup({ label, children, surface = "filled", divider, inset = "icon", className }: {
+  label?: string;
+  children: ReactNode;
+  surface?: "filled";
+  divider?: "full" | "inset" | "gap" | "none";
+  /** 无左图标的认证 / 工具行使用 content，分隔线从文字起点开始。 */
+  inset?: "icon" | "content";
+  className?: string;
+}) {
   const items = Children.toArray(children);
   if (items.length === 0) return null;
+  const filled = surface === "filled";
+  const separator = divider ?? "inset";
   return (
-    <View>
-      {label !== undefined && <Text className="px-8 pb-2 pt-5 text-[13px] leading-[18px] text-muted-foreground">{label}</Text>}
-      <View className="mx-4 overflow-hidden rounded-md border border-border bg-card">
+    <View className={cn("mt-6", className)}>
+      {label !== undefined && <Text className="mx-4 mb-2 px-4 text-xs text-muted-foreground">{label}</Text>}
+      <View className={cn("mx-4 overflow-hidden rounded-lg", separator === "gap" && "gap-[3px]")}>
         {items.map((item, index) => (
-          <View key={index}>
-            {index > 0 ? <Separator /> : null}
+          <View key={index} className={filled ? "bg-card" : undefined}>
+            {index > 0 && separator === "full" ? <Separator /> : null}
+            {index > 0 && separator === "inset" ? <View className={cn("mr-4 h-px bg-border/50", inset === "icon" ? "ml-12" : "ml-4")} /> : null}
             {item}
           </View>
         ))}

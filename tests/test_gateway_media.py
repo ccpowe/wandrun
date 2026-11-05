@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 import httpx
 from PIL import Image
@@ -33,8 +34,8 @@ class MessageMediaTests(unittest.IsolatedAsyncioTestCase):
         self.cache = MediaCache(root / "rich-media")
         self.gateway.image_proxy = ImageProxy(self.cache)
         self.addAsyncCleanup(self.gateway.image_proxy.aclose)
-        self.conversation = self.store.create_conversation("Media", "main")[0]["id"]
-        self.other = self.store.create_conversation("Other", "main")[0]["id"]
+        self.conversation = self.store.create_conversation("Media", "main", client_id=uuid4().hex)[0]["id"]
+        self.other = self.store.create_conversation("Other", "main", client_id=uuid4().hex)[0]["id"]
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(self.gateway, "secret")),
                                        base_url="http://gateway", headers={"Authorization": "Bearer secret"})
         self.addAsyncCleanup(self.client.aclose)

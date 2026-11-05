@@ -4,7 +4,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -16,18 +16,21 @@ from wandrun.runtime.agent.capabilities import CAPABILITY_DEFINITIONS, EntryCapa
 from wandrun.integrations.codex_subscription import ModelRequestBudget, ReasoningEffort
 from wandrun.integrations.codex_credentials import CodexCredentials
 from wandrun.config import (
-    AgentCatalog, load_config, load_config_for_catalog, validate_catalog, validate_mcp_servers,
+    AgentCatalog, EnvironmentDefinition, load_config, load_config_for_catalog, validate_catalog, validate_mcp_servers,
 )
 from wandrun.integrations.mcp import MCPConnectionError, MCPConnectionPool, select_mcp_tools
 from wandrun.integrations.mcp_oauth import ConnectorOAuth
 from wandrun.runtime.agent.tool_search import ToolNamespace
 from wandrun.metrics import RunMetrics
 from wandrun.integrations.shell_backend import CleanupUnconfirmedError
-from wandrun.runtime.execution.environments import Environment, open_environments
+from wandrun.runtime.execution.environments import (
+    Environment, environment_identity, open_environments, open_instabox, open_local,
+)
 from wandrun.runtime.execution.files import ResolvedAttachment, TaskFiles, _current_task
 from wandrun.runtime.communication.scheduler_store import SchedulerStore, paired_store_path
+from wandrun.runtime.context.environment_runtime import recovery_feedback_applies
 from wandrun.runtime.context.memory import MemoryStore
-from wandrun.runtime.browser.leases import BrowserLeases
+from wandrun.runtime.browser.leases import BrowserLeases, UnknownBrowserTask
 from wandrun.runtime.agent.conversations import conversation_config
 from wandrun.runtime.communication.workers import WorkerManager
 from wandrun.runtime.execution.workspace import Workspace
@@ -51,8 +54,25 @@ class Runtime:
     _refresh_mcp: Callable[[str], Awaitable[None]] | None = None
     # 是否还有待交付结果的后台执行；入口据此判断等待中的任务是否仍有工作在进行（ADR-0017）。
     processes_pending: Callable[[], bool] = lambda: False
-    browser: BrowserLeases | None = None
+    # 包括已结束模型轮次仍负责的命令；不主动停止或释放这些 owner。
+    agent_tasks_pending: Callable[[str], list[str]] = lambda agent: []
+    # 仍负责的文件传输/清理；无法归属的内部资源只保守阻止当前共享该环境的角色。
+    file_transfers_pending: Callable[[str], bool] = lambda agent: False
+    # Configuration aliases borrow the same physical environment's browser owner.
+    browsers: dict[str, BrowserLeases] = field(default_factory=dict)
+    on_browser_event: Callable[[str, dict], None] | None = None
     memory: MemoryStore | None = None
+    environment_definitions: dict[str, EnvironmentDefinition] = field(default_factory=dict)
+
+    def browser_for_lease(self, lease_id: str) -> BrowserLeases:
+        """Resolve immutable lease ownership, never the Agent's current environment."""
+        for browser in dict.fromkeys(self.browsers.values()):
+            try:
+                browser.detail(lease_id)
+            except UnknownBrowserTask:
+                continue
+            return browser
+        raise UnknownBrowserTask(lease_id)
 
     async def compaction_events(self, task_id: str) -> list[dict]:
         """读取图恢复后的压缩事件（含 pending writes）；未登记任务或已移除角色返回空列表。"""
@@ -98,6 +118,34 @@ class Runtime:
         return self._prepare_connectors(servers, descriptions)
 
 
+async def _environment_recovered(
+    manager: WorkerManager, checkpointer: AsyncSqliteSaver, identity: dict[str, str], note: str,
+) -> bool:
+    """Durably queue recovery only for threads that last observed this owner.
+
+    Read all checkpoints before enqueueing: cancellation cannot leave a partially
+    delivered batch that the backend would duplicate on its next readiness attempt.
+    """
+    task_id = _current_task.get()
+    if task_id is None:
+        return False
+    manager.ensure_active(task_id)
+    owners = [owner for owner in manager.snapshot()["tasks"] if not manager.is_stopped(owner)]
+    checkpoints = await asyncio.gather(*(
+        checkpointer.aget_tuple(conversation_config(owner)) for owner in owners
+    ))
+    manager.ensure_active(task_id)
+    for owner, checkpoint in zip(owners, checkpoints):
+        if checkpoint is None or manager.is_stopped(owner):
+            continue
+        observed = checkpoint.checkpoint["channel_values"].get("observed_environment")
+        if isinstance(observed, dict) and observed.get("identity") == identity:
+            manager.add_feedback(owner, {"execution_environment": {
+                "identity": identity, "status": "recovered", "note": note,
+            }})
+    return True
+
+
 async def _browser_notify(manager: WorkerManager | None, task_id: str, text: str, interrupt: bool) -> None:
     """Interrupt only the owner's current execution on takeover, preserving its task."""
     if manager is not None:
@@ -106,26 +154,41 @@ async def _browser_notify(manager: WorkerManager | None, task_id: str, text: str
         }}, interrupt=interrupt)
 
 
+class AgentEnvironmentBusy(ValueError):
+    """A proposed cutover would abandon in-flight work or unreleased environment resources."""
+
+    def __init__(self, agent: str):
+        self.agent = agent
+        super().__init__("Agent 有在途任务或未释放的执行环境资源，不能切换执行环境")
+
+
 class RuntimeCleanupError(RuntimeError):
     """清理超过调用方的等待阈值；资源安全收拢后再报告，不提前释放活跃依赖。"""
 
 
-async def _shutdown(manager, environments, stack, metrics) -> None:
+async def _shutdown(manager, environments, stack, metrics, browsers=()) -> None:
     unconfirmed: list[CleanupUnconfirmedError] = []
     try:
         operations = []
         if manager is not None:
             # close 首先停止接收输入、取消任务；后端关闭禁止新进程启动并终止现有命令。
             operations.append(manager.close())
-        operations.extend(
-            asyncio.to_thread(environment.backend.close) for environment in environments
-        )
-        operations.extend(
-            environment.processes.aclose()
-            for environment in environments
-            if environment.processes is not None
-        )
+        for environment in environments:
+            if environment.type == "instabox":
+                # Keep SSH alive until Workers and browser target cleanup settle.
+                continue
+            else:
+                operations.append(asyncio.to_thread(environment.backend.close))
+                if environment.processes is not None:
+                    operations.append(environment.processes.aclose())
         results = await asyncio.gather(*operations, return_exceptions=True)
+        results.extend(await asyncio.gather(
+            *(browser.aclose() for browser in browsers), return_exceptions=True,
+        ))
+        results.extend(await asyncio.gather(*(
+            environment.backend.aclose()
+            for environment in environments if environment.type == "instabox"
+        ), return_exceptions=True))
         # 远端环境关闭时汇总的未确认调用（ADR-0014）：所有环境的都要报告，作为一次清理失败交给入口。
         unconfirmed += [result for result in results if isinstance(result, CleanupUnconfirmedError)]
         for result in results:
@@ -147,8 +210,8 @@ async def _shutdown(manager, environments, stack, metrics) -> None:
             metrics.write_summary()
 
 
-async def _finish_shutdown(manager, environments, stack, metrics, timeout) -> None:
-    closing = asyncio.create_task(_shutdown(manager, environments, stack, metrics))
+async def _finish_shutdown(manager, environments, stack, metrics, timeout, browsers=()) -> None:
+    closing = asyncio.create_task(_shutdown(manager, environments, stack, metrics, browsers))
     cancelled = False
     timed_out = False
     try:
@@ -205,6 +268,7 @@ async def open_runtime(
     mcp_oauth: ConnectorOAuth | None = None,
     oauth_connectors: set[str] | None = None,
     environments_config: Path | None = None,
+    environment_definitions: Mapping[str, EnvironmentDefinition] | None = None,
     checkpoint_path: Path | None = None,
     model_name: str | None = None,
     reasoning_effort: ReasoningEffort | None = None,
@@ -249,10 +313,12 @@ async def open_runtime(
     """
     stack = AsyncExitStack()
     manager = None
-    browser = None
+    runtime: Runtime | None = None
     tracing = None
     failure = None
     environments: list[Environment] = []
+    browser_owners: dict[tuple[str, str], BrowserLeases] = {}
+    configured_browser_transports: set[tuple[str, str]] = set()
     try:
         entry_capabilities = tuple(entry_capabilities)
         builtin_skills = {}
@@ -287,6 +353,7 @@ async def open_runtime(
                 mcps_config or workspace.mcps_config if mcp_servers is None else None,
                 environments_config or workspace.environments_config,
                 mcp_servers=mcp_servers, mcp_descriptions=mcp_descriptions,
+                environment_definitions=environment_definitions,
             )
         credentials = credentials if credentials is not None else CodexCredentials()
         traced_oauth_ids = frozenset(config.mcp_servers)
@@ -303,19 +370,70 @@ async def open_runtime(
                 tracing.remember_credentials(credentials.peek())
             except CredentialError:
                 pass  # Preserve the normal model invocation's credential error.
-        browser_settings = [
-            environment.browser for environment in config.environments.values()
-            if environment.browser is not None
-        ]
-        browser = BrowserLeases(
-            browser_settings[0], state_path=workspace.state_dir / "browser-leases.json",
-            notify=lambda task_id, text, interrupt: _browser_notify(
-                manager, task_id, text, interrupt,
-            ),
-        ) if browser_settings else None
-        if browser is not None:
-            await browser.start()
-            stack.push_async_callback(browser.aclose)
+        browsers: dict[str, BrowserLeases] = {}
+        startup_environment_names = frozenset(config.environments)
+
+        async def prepare_browsers(definitions, agents) -> dict[str, BrowserLeases]:
+            """Bind one ledger to each prepared physical owner without waking Instabox.
+
+            Candidate preparation retains its resources until runtime shutdown; it
+            never changes an existing lease's environment or transport. Callers select
+            startup or adopted environments; cached candidates must not be published.
+            The returned aliases become visible only when the candidate commits.
+            """
+            prepared = {}
+            for name, definition in definitions.items():
+                if definition.browser is None:
+                    continue
+                transport = None
+                if definition.type == "instabox":
+                    transport = next((
+                        environment.backend for environment in environments
+                        if environment.type == "instabox"
+                        and environment.backend.id == f"instabox:{definition.machine_id}"
+                    ), None)
+                    if transport is None:
+                        continue
+                identity = (definition.type, definition.machine_id if transport else "local")
+                environment_id = f"instabox:{definition.machine_id}" if transport else "local"
+                browser = browser_owners.get(identity)
+                if browser is None:
+                    browser = BrowserLeases(
+                        definition.browser,
+                        environment_id=environment_id,
+                        environment_name=name if transport else "Local",
+                        state_path=workspace.state_dir / (
+                            f"browser-leases-{definition.machine_id if transport else 'local'}.json"
+                        ),
+                        transport=transport,
+                        on_event=lambda kind, data: (
+                            runtime.on_browser_event(kind, data)
+                            if runtime is not None and runtime.on_browser_event is not None else None
+                        ),
+                        notify=lambda task_id, text, interrupt: _browser_notify(
+                            manager, task_id, text, interrupt,
+                        ),
+                    )
+                    await browser.start()
+                    stack.push_async_callback(browser.aclose)
+                    browser_owners[identity] = browser
+                elif browser.config != definition.browser:
+                    raise ValueError(f"执行环境 {name} 的同一物理机器浏览器配置冲突")
+                prepared[name] = browser
+                if transport is not None and identity not in configured_browser_transports and any(
+                    "browser" in agent.skills
+                    and definitions[agent.environment].machine_id == definition.machine_id
+                    for agent in agents.values()
+                ):
+                    environment = next(env for env in environments if env.backend is transport)
+                    package, = environment.skill_packages.snapshot(("browser",))
+                    transport.configure_browser(
+                        definition.browser, browser.connection_lost,
+                        start_script=f"{package.root}/scripts/start_browser.py",
+                    )
+                    configured_browser_transports.add(identity)
+            return prepared
+
         checkpoint = checkpoint_path or workspace.checkpoint_path
         memory = MemoryStore(workspace.memory_dir)
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -332,6 +450,7 @@ async def open_runtime(
             config, workspace, stack, environments, include_default=agent_catalog is not None,
             builtin_source=builtin_source,
         )
+        browsers.update(await prepare_browsers(config.environments, config.agents))
         mcp = await stack.enter_async_context(MCPConnectionPool(oauth=mcp_oauth))
         mcp.oauth_connectors = set(oauth_connectors or ())
         used = sorted({
@@ -361,7 +480,7 @@ async def open_runtime(
         context_windows = dict(model_context_windows or {})
         role_roots = {
             name: (
-                role.environment,
+                role_environments[name].name,
                 str(workspace.root) if config.environments[role.environment].type == "local"
                 else config.environments[role.environment].workdir,
             )
@@ -371,14 +490,10 @@ async def open_runtime(
             workspace.root, None, role_roots, conversation_workdirs=conversation_workdirs,
             remote_backends={
                 name: role_environments[name].backend for name, role in config.agents.items()
-                if config.environments[role.environment].type == "ssh"
+                if config.environments[role.environment].type != "local"
             },
         )
 
-        browser_environments = frozenset(
-            name for name, environment in config.environments.items()
-            if environment.browser is not None
-        )
 
         async def run_worker(prompts, task_id):
             name = manager.agent_name(task_id)
@@ -389,7 +504,6 @@ async def open_runtime(
             if role_browser is not None:
                 root = manager.root_of(task_id)
                 role_browser.register(task_id, root, name, manager.agent_name(root))
-            await files.prepare(task_id)
             token = _current_task.set(task_id)
             try:
                 with metrics.agent_scope(task_id, name):
@@ -400,11 +514,19 @@ async def open_runtime(
                     )
             finally:
                 _current_task.reset(token)
+
+        def accept_feedback(task_id, message):
+            name = manager.agent_name(task_id)
+            environment = role_environments.get(name) if name in config.agents else None
+            return recovery_feedback_applies(
+                message, environment.context_identity() if environment is not None else None,
+            )
         manager = WorkerManager(
             tracing.wrap_worker(run_worker, lambda: manager) if tracing is not None else run_worker,
             on_human=on_human,
             on_preview=on_preview,
             validate_human=validate_human,
+            accept_feedback=accept_feedback,
             agent_workers={name: role.workers for name, role in config.agents.items()},
             default_agent=config.main_agent,
             store=store,
@@ -417,6 +539,13 @@ async def open_runtime(
         )
         manager.bind_memory(memory)
         files.manager = manager
+        for environment in environments:
+            if environment.type == "instabox":
+                environment.backend.bind_recovery_feedback(
+                    lambda note, identity=environment.context_identity(): _environment_recovered(
+                        manager, checkpointer, identity, note,
+                    ),
+                )
         entry_middleware_factories = {
             kind: {
                 capability.id: capability.prepare_middleware(manager, files, kind)
@@ -427,10 +556,12 @@ async def open_runtime(
         tables = [env.processes for env in environments if env.processes is not None]
         for table in tables:
             manager.add_stop_hook(table.stop_owners)
-        if browser is not None:
-            async def close_browser_tasks(scope):
-                await asyncio.gather(*(browser.close_task(task_id, reason="任务结束") for task_id in scope))
-            manager.add_cancel_hook(close_browser_tasks)
+        async def close_browser_tasks(scope):
+            await asyncio.gather(*(
+                browser.close_task(task_id, reason="任务结束")
+                for browser in browser_owners.values() for task_id in scope
+            ))
+        manager.add_cancel_hook(close_browser_tasks)
         searchable = {
             name: [
                 ToolNamespace(server, config.mcp_descriptions[server], tuple(server_tools))
@@ -438,9 +569,33 @@ async def open_runtime(
             ]
             for name, servers in searchable_tools.items()
         }
+        def busy_tasks(agent: str) -> list[str]:
+            tasks = set(manager.running_tasks(agent))
+            for table in tables:
+                tasks.update(
+                    owner for owner in table.pending_owners()
+                    if manager.has_task(owner) and manager.agent_name(owner) == agent
+                )
+            return sorted(tasks)
+
+        def transfer_pending(agent: str) -> bool:
+            if agent in files.pending_transfer_agents():
+                return True
+            binding = files.environments.get(agent)
+            for environment in environments:
+                if environment.type != "instabox":
+                    continue
+                for owner in environment.backend.pending_transfer_owners():
+                    if owner is not None and manager.has_task(owner):
+                        if manager.agent_name(owner) == agent:
+                            return True
+                    elif binding is not None and binding[0] == environment.name:
+                        return True
+            return False
+
         def build_catalog(
             catalog_config, catalog_models, catalog_tools, catalog_namespaces,
-            catalog_environments, catalog_windows, *, graph_names=None,
+            catalog_environments, catalog_windows, catalog_browsers, *, graph_names=None,
         ):
             """Initial and candidate assemblies share all entry/resource bindings."""
             return build_agents(
@@ -451,12 +606,12 @@ async def open_runtime(
                 environments=catalog_environments, graph_names=graph_names,
                 checkpointer=checkpointer, searchable=catalog_namespaces,
                 model_max_retries=model_max_retries, code_pool=code_pool, memory=memory, files=files,
-                browser=browser, browser_environments=browser_environments,
+                browsers=catalog_browsers,
                 model_context_windows=catalog_windows, on_compaction=on_compaction,
             )
 
         agents = build_catalog(
-            config, models, tools, searchable, role_environments, context_windows,
+            config, models, tools, searchable, role_environments, context_windows, browsers,
         )
 
         async def prepare_agents(
@@ -466,22 +621,62 @@ async def open_runtime(
             """Prepare candidate graphs without publishing definitions or refreshed windows yet."""
             nonlocal config, agents, models, by_server, context_windows, code_pool
             candidate_windows = dict(refreshed_windows) if refreshed_windows is not None else context_windows
-            candidate = validate_catalog(catalog, config)
-            by_name = {environment.name: environment for environment in environments}
+            candidate = validate_catalog(catalog, replace(
+                config, environments={**config.environments, **runtime.environment_definitions},
+            ))
+            by_identity = {
+                environment_identity(environment.name, candidate.environments[environment.name]): environment
+                for environment in environments
+            }
+            by_name = {
+                name: by_identity.get(environment_identity(name, definition))
+                for name, definition in candidate.environments.items()
+            }
             for name, definition in candidate.agents.items():
                 previous = config.agents.get(name)
-                if previous is None:
-                    if definition.environment != config.default_environment:
-                        raise ValueError(f"新 Agent {name} 只能使用默认执行环境")
-                elif definition.environment != previous.environment:
-                    raise ValueError(f"Agent {name} 的 environment 不能在运行时改变")
-                environment = by_name.get(definition.environment)
-                if environment is None:
-                    raise ValueError(f"执行环境尚未打开: {definition.environment}")
-                if environment.synced_skills is not None:
-                    missing = set(definition.skills) - environment.synced_skills - environment.builtin_skills
-                    if missing:
-                        raise ValueError(f"远端环境 {environment.name} 尚未同步技能：{', '.join(sorted(missing))}")
+                if previous is not None and definition.environment != previous.environment:
+                    if busy_tasks(name) or transfer_pending(name):
+                        raise AgentEnvironmentBusy(name)
+                    for browser in browser_owners.values():
+                        await browser.revoke_idle_endpoints(name)
+                    if (any(browser.pending_tasks(name) for browser in browser_owners.values())
+                            or busy_tasks(name) or transfer_pending(name)):
+                        raise AgentEnvironmentBusy(name)
+                if by_name.get(definition.environment) is None:
+                    settings = candidate.environments[definition.environment]
+                    identity = environment_identity(definition.environment, settings)
+                    environment = by_identity.get(identity)
+                    if environment is None:
+                        opening = open_instabox if settings.type == "instabox" else open_local
+                        environment = await stack.enter_async_context(opening(
+                            definition.environment, settings, workspace, builtin_source,
+                        ))
+                        environments.append(environment)
+                        by_identity[identity] = environment
+                        if environment.type == "instabox":
+                            environment.backend.bind_recovery_feedback(
+                                lambda note, identity=environment.context_identity(): _environment_recovered(
+                                    manager, checkpointer, identity, note,
+                                ),
+                            )
+                        if environment.processes is not None:
+                            tables.append(environment.processes)
+                            manager.add_stop_hook(environment.processes.stop_owners)
+                    by_name[definition.environment] = environment
+                kind = candidate.environments[definition.environment].type
+                if kind not in entry_middleware_factories:
+                    entry_middleware_factories[kind] = {
+                        capability.id: capability.prepare_middleware(manager, files, kind)
+                        for capability in entry_capabilities
+                    }
+            # Retained transports from failed/abandoned candidates are not adoption.
+            candidate_browser_names = startup_environment_names | {
+                definition.environment for definition in candidate.agents.values()
+            }
+            candidate_browsers = await prepare_browsers({
+                name: definition for name, definition in candidate.environments.items()
+                if name in candidate_browser_names
+            }, candidate.agents)
             referenced = {
                 server for definition in candidate.agents.values()
                 for server in (*definition.mcp_servers, *definition.searchable_mcp_servers)
@@ -535,6 +730,11 @@ async def open_runtime(
             }
             rebuild.update(
                 name for name, definition in candidate.agents.items()
+                if name in config.agents and candidate.environments[definition.environment].browser
+                != config.environments[config.agents[name].environment].browser
+            )
+            rebuild.update(
+                name for name, definition in candidate.agents.items()
                 if name in config.agents and definition.context_window is None
                 and context_windows.get(models[name].model_name) != candidate_windows.get(
                     model_name or definition.model
@@ -553,11 +753,15 @@ async def open_runtime(
             candidate_models = {**models, **replacement_models}
             candidate_models = {name: candidate_models[name] for name in candidate.agents}
             candidate_environments = {
-                name: by_name[definition.environment] for name, definition in candidate.agents.items()
+                name: replace(
+                    by_name[definition.environment],
+                    browser=candidate.environments[definition.environment].browser,
+                )
+                for name, definition in candidate.agents.items()
             }
             replacement_assemblies = build_catalog(
                 candidate, candidate_models, candidate_tools, candidate_namespaces,
-                candidate_environments, candidate_windows, graph_names=tuple(rebuild),
+                candidate_environments, candidate_windows, candidate_browsers, graph_names=tuple(rebuild),
             )
             # Reuse whole assemblies, not just graphs; prepare never mutates committed decisions.
             candidate_assemblies = {
@@ -568,10 +772,16 @@ async def open_runtime(
             manager._check_agent_workers(candidate_workers, candidate.main_agent)
 
             def commit() -> None:
-                nonlocal config, agents, models, by_server, context_windows
+                nonlocal config, agents, models, by_server, context_windows, role_environments
+                for name, definition in candidate.agents.items():
+                    previous = config.agents.get(name)
+                    if previous is not None and previous.environment != definition.environment:
+                        if (busy_tasks(name) or transfer_pending(name)
+                                or any(browser.pending_tasks(name) for browser in browser_owners.values())):
+                            raise AgentEnvironmentBusy(name)
                 candidate_roots = {
                     name: (
-                        role.environment,
+                        candidate_environments[name].name,
                         str(workspace.root) if candidate.environments[role.environment].type == "local"
                         else candidate.environments[role.environment].workdir,
                     )
@@ -580,12 +790,14 @@ async def open_runtime(
                 files.update_environments(candidate_roots, {
                     name: candidate_environments[name].backend
                     for name, role in candidate.agents.items()
-                    if candidate.environments[role.environment].type == "ssh"
+                    if candidate.environments[role.environment].type != "local"
                 })
                 manager.replace_agent_workers(candidate_workers, candidate.main_agent)
-                config, agents, models, by_server, context_windows = (
-                    candidate, candidate_assemblies, candidate_models, candidate_by_server, candidate_windows,
+                config, agents, models, by_server, context_windows, role_environments = (
+                    candidate, candidate_assemblies, candidate_models, candidate_by_server,
+                    candidate_windows, candidate_environments,
                 )
+                browsers.update(candidate_browsers)
                 runtime.main_agent = candidate.main_agent
                 runtime.agent_models = {
                     name: {"model": model.model_name, "reasoning_effort": model.reasoning_effort}
@@ -635,9 +847,12 @@ async def open_runtime(
             _refresh_mcp=refresh_mcp,
             _prepare_agents=prepare_agents,
             processes_pending=lambda: any(table.pending() for table in tables),
-            browser=browser,
+            agent_tasks_pending=busy_tasks,
+            file_transfers_pending=transfer_pending,
+            browsers=browsers,
             memory=memory,
             files=files,
+            environment_definitions=dict(config.environments),
         )
         yield runtime
     except BaseException as error:
@@ -645,7 +860,9 @@ async def open_runtime(
         raise
     finally:
         try:
-            await _finish_shutdown(manager, environments, stack, metrics, cleanup_timeout)
+            await _finish_shutdown(
+                manager, environments, stack, metrics, cleanup_timeout, tuple(browser_owners.values()),
+            )
         except RuntimeCleanupError as error:
             if failure is None:
                 raise

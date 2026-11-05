@@ -2,9 +2,21 @@
 
 from dataclasses import dataclass
 from importlib.resources import files
+from importlib.resources.abc import Traversable
 from pathlib import Path
 
 DEFAULT_CONFIGS = ("agents.toml", "mcps.toml", "environments.toml")
+
+
+def _copy_skill(source: Traversable, target: Path) -> None:
+    """Materialize the complete packaged skill, including executable resources."""
+    target.mkdir()
+    for entry in source.iterdir():
+        destination = target / entry.name
+        if entry.is_dir():
+            _copy_skill(entry, destination)
+        else:
+            destination.write_bytes(entry.read_bytes())
 
 
 @dataclass(frozen=True)
@@ -49,9 +61,7 @@ class Workspace:
                 defaults.joinpath(name).read_text(encoding="utf-8"), encoding="utf-8"
             )
         for skill in defaults.joinpath("skills").iterdir():
-            target = self.skills_dir / skill.name
-            target.mkdir()
-            (target / "SKILL.md").write_bytes(skill.joinpath("SKILL.md").read_bytes())
+            _copy_skill(skill, self.skills_dir / skill.name)
         return True
 
     @property
