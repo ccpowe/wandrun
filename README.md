@@ -15,7 +15,7 @@ English · [简体中文](README.zh-CN.md)
 
 </div>
 
-Screenshots show the previous interface; v0.3.0 updates chat, rich replies, takeover and settings.
+The first four screenshots show the v0.3.0 interface; the last two (plan quota, memory) still show the previous interface.
 
 ---
 
