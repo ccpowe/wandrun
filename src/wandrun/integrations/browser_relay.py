@@ -57,6 +57,7 @@ class BrowserRelay:
         self._closing = None
         self._draining = None
         self.confirmed = False
+        self._expired = False
         self._reading = asyncio.create_task(self._read(), name="browser-relay-read")
         self._reading.add_done_callback(_consume)
         self._stderr = asyncio.create_task(self._discard_stderr(), name="browser-relay-stderr")
@@ -79,9 +80,13 @@ class BrowserRelay:
         return f"http://127.0.0.1:{port}"
 
     async def _drain(self):
+        if self._expired:
+            raise CleanupUnconfirmedError("浏览器 relay 本地接入已终结")
         try:
             async with asyncio.timeout(CLOSE_LIMIT):
                 await self.mux.finish_sending()
+                if self._expired:
+                    raise CleanupUnconfirmedError("浏览器 relay 本地接入已终结")
                 self.process.stdin.write_eof()
                 await self.mux.drain()
                 await self.process.wait_closed()
@@ -99,6 +104,8 @@ class BrowserRelay:
         await asyncio.shield(self._draining)
 
     async def _close(self):
+        if self._expired:
+            raise CleanupUnconfirmedError("浏览器 relay 本地接入已终结，远端退出未确认")
         try:
             async with asyncio.timeout(CLOSE_LIMIT):
                 # EOF may already have arrived with a terminal exit report.
@@ -110,6 +117,8 @@ class BrowserRelay:
                 with contextlib.suppress(OSError, asyncssh.Error):
                     self.process.terminate()
                 await self.process.wait_closed()
+                if self._expired:
+                    raise CleanupUnconfirmedError("浏览器 relay 本地接入已终结")
                 # A lost SSH channel has no remote exit status. Do not infer exit
                 # from EOF, cancellation, or closing the local process object.
                 self.confirmed = (self.process.exit_status is not None
@@ -127,11 +136,27 @@ class BrowserRelay:
 
     async def aclose(self):
         self._intentional = True
-        if (self._closing is None or self._closing.done()
-                and self._closing.exception() is not None):
+        if self._closing is None:
             self._closing = asyncio.create_task(self._close(), name="browser-relay-close")
             self._closing.add_done_callback(_consume)
         await asyncio.shield(self._closing)
+
+    def expire(self):
+        """End only this exec's local handles; never submit another remote stop."""
+        self._intentional = True
+        self._expired = True
+        self.mux.closed = True
+        self.mux.input_closed = True
+        for stream in tuple(self.mux.streams.values()):
+            if stream.writer is not None:
+                stream.writer.transport.abort()
+        for task in (*self.mux.tasks, *self.mux._resetting):
+            if not task.done():
+                task.cancel()
+        for task in (self._closing, self._draining, self._reading, self._stderr):
+            if task is not None and not task.done():
+                task.cancel()
+        self.process.close()
 
 
 class InstaboxBrowserTransport:
@@ -168,6 +193,7 @@ class InstaboxBrowserTransport:
         self._closed = False
         self._closing = None
         self._revoked = set()
+        self._expired_endpoints = set()
 
     def _own_opening(self, coroutine, name):
         task = asyncio.create_task(coroutine, name=name)
@@ -294,6 +320,9 @@ class InstaboxBrowserTransport:
                 lambda: self._signal_loss() if revision == self._revision else None,
             )
             self._retained.add(relay)  # Record responsibility before waiting for R.
+            if url in self._expired_endpoints:
+                relay.expire()
+                raise ConnectionError("浏览器任务接入点已到期")
             self._relays[url] = relay
             try:
                 remote_url = await relay.open()
@@ -301,6 +330,9 @@ class InstaboxBrowserTransport:
                     raise ConnectionError("浏览器任务接入点已撤销")
                 return remote_url
             except BaseException:
+                if url in self._expired_endpoints:
+                    relay.expire()
+                    raise
                 await relay.aclose()
                 if relay.confirmed:
                     self._retained.discard(relay)
@@ -331,14 +363,18 @@ class InstaboxBrowserTransport:
                 "WANDRUN_BROWSER_START": self.start_script}
 
     async def drain_endpoint(self, url: str):
+        if url in self._expired_endpoints:
+            raise CleanupUnconfirmedError("浏览器任务接入点已到期")
         self._revoked.add(url)
         relay = self._relays.get(url)
         if relay is not None:
             await relay.drain()
 
     async def close_endpoint(self, url: str):
+        if url in self._expired_endpoints:
+            raise CleanupUnconfirmedError("浏览器任务接入点已到期")
         self._revoked.add(url)
-        opening = self._relay_opening.pop(url, None)
+        opening = self._relay_opening.get(url)
         if opening is not None:
             try:
                 await asyncio.shield(opening)
@@ -353,6 +389,17 @@ class InstaboxBrowserTransport:
             await relay.aclose()
             self._retained.discard(relay)
             self._relays.pop(url, None)
+
+    def expire_endpoint(self, url: str):
+        """Revoke the old endpoint and cancel shielded I/O without reconnecting."""
+        self._revoked.add(url)
+        self._expired_endpoints.add(url)
+        opening = self._relay_opening.get(url)
+        if opening is not None and not opening.done():
+            opening.cancel()
+        relay = self._relays.get(url)
+        if relay is not None:
+            relay.expire()
 
     @property
     def cleanup_pending(self):

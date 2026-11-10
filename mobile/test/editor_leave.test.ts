@@ -75,3 +75,18 @@ test('leave.T10 保存抛错与返回失败同样撤销目的地，不拒绝 Pro
   await owner.intercept(other, 'save', async () => true);
   assert.deepEqual(actions, [other.kind === 'navigation' ? other.action : null]);
 });
+
+test('环境变更确认前零写入，取消保留页面；确认只保存一次并继续原导航', async () => {
+  const actions: unknown[] = []; const owner = new EditorLeaveOwner(action => actions.push(action)); owner.enter();
+  let writes = 0; const gate = Promise.withResolvers<boolean>();
+  const save = () => { writes++; return gate.promise; };
+  await owner.intercept(back, 'confirm-save', save);
+  assert.equal(writes, 0); assert.deepEqual(actions, []);
+  owner.cancel(); await owner.confirmSave(save);
+  assert.equal(writes, 0); assert.deepEqual(actions, []);
+  owner.arm('confirm-save'); await owner.intercept(other, 'ordinary', save);
+  const saving = owner.confirmSave(save); await owner.confirmSave(save);
+  assert.equal(writes, 1); assert.deepEqual(actions, []);
+  gate.resolve(true); await saving;
+  assert.deepEqual(actions, [other.kind === 'navigation' ? other.action : null]);
+});

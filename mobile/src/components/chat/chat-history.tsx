@@ -30,6 +30,8 @@ import { useTranslation } from '@/lib/i18n.ts';
 import { LoadResource } from '@/lib/load-state.ts';
 import { useMountEffect } from '@/lib/use-mount-effect.ts';
 import { useDelayedNotice } from '@/lib/use-delayed-notice.ts';
+import { CleanupResultNotice } from '@/components/cleanup-result-notice.tsx';
+import { useCleanupResult } from '@/lib/use-cleanup-result.ts';
 
 const VIEWABILITY_CONFIG = { itemVisiblePercentThreshold: 25 };
 const FOLLOW_AT_END = { animated: false };
@@ -191,7 +193,9 @@ export function ChatHistory({ session, id, messageSeq, list, handleRef, composer
   const missingNotice: ChatLocalNotice | null = target.missing
     ? { kind: 'missing', title: t('消息不存在'), description: t('已加载全部历史，未找到目标消息。') } : null;
   const bannerNotice = notice?.kind === 'send-offline' ? missingNotice : notice ?? missingNotice;
-  const headerBottom = notices.length || bannerNotice ? insets.top + CHAT_LAYOUT.bannerTop + topOverlayHeight : insets.top + CHAT_LAYOUT.headerHeight;
+  const cleanupMessage = useCleanupResult(session, session.connection !== 'open' || notices.length > 0 || !!bannerNotice,
+    !!conversation || !id && session.agents.loaded && session.agents.agents.length > 0);
+  const headerBottom = notices.length || bannerNotice || cleanupMessage ? insets.top + CHAT_LAYOUT.bannerTop + topOverlayHeight : insets.top + CHAT_LAYOUT.headerHeight;
   // The pinned user message starts where readable content starts. Only the row key is remembered; the banner
   // and spacing are read from the current layout, so a late banner changes the space but never re-sends the pin.
   const anchorIndex = anchorKey === null ? -1 : items.findIndex(item => item.key === anchorKey);
@@ -261,10 +265,11 @@ export function ChatHistory({ session, id, messageSeq, list, handleRef, composer
     </KeyboardStickyView>}
     <ChatFade edge="top" statusBar={insets.top}
       headerBottom={headerBottom} />
-    {(notices.length > 0 || bannerNotice) && <View className="absolute inset-x-0 gap-2" style={{ top: insets.top + CHAT_LAYOUT.bannerTop }}
+    {(notices.length > 0 || bannerNotice || cleanupMessage) && <View className="absolute inset-x-0 gap-2" style={{ top: insets.top + CHAT_LAYOUT.bannerTop }}
       onLayout={event => setTopOverlayHeight(event.nativeEvent.layout.height)}>
       {notices.length > 0 && <ChatNotices notices={notices} onRetryStop={() => { if (id) void session.stop(id); }} />}
       {bannerNotice && <ChatLocalNoticeView notice={bannerNotice} onDismiss={dismissNotice} />}
+      <CleanupResultNotice message={cleanupMessage} />
       {onRetryCreation && <Button intent="soft" className="self-start mx-4" onPress={onRetryCreation}><Text>{t('重试')}</Text></Button>}
     </View>}
   </>;

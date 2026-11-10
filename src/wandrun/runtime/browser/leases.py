@@ -25,6 +25,7 @@ from websockets.asyncio.server import serve
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 
+from wandrun.integrations.cleanup import CleanupOperation
 from wandrun.runtime.browser.cdp import BrowserRelay, CDPError, CDPRejected, CDPSocket
 from wandrun.runtime.browser.human_input import HumanInputs, HumanInputUnknown
 
@@ -38,6 +39,8 @@ _DISCOVERY_LIMIT = 0.8  # Leave headroom inside agent-browser's 2 s discovery de
 class _BrowserTransport(Protocol):
     """Own preparation and relays; never start Chrome or replay CDP.
 
+    A revoked endpoint's late mapping stays transport-owned: close its new
+    relay locally or within the original deadline, never reset an old close.
     Controlled environment failures raise BrowserEnvironmentError so command
     setup stops instead of treating them as an absent Chrome.
     """
@@ -46,6 +49,7 @@ class _BrowserTransport(Protocol):
     async def browser_command_environment(self, env: dict[str, str]) -> dict[str, str]: ...
     async def drain_browser_endpoint(self, url: str) -> None: ...
     async def close_browser_endpoint(self, url: str) -> None: ...
+    def expire_browser_endpoint(self, url: str) -> None: ...
 
 
 class UnknownBrowserTask(LookupError):
@@ -59,6 +63,60 @@ class BrowserRejected(ValueError):
 class BrowserEnvironmentError(BrowserRejected):
     """Environment I/O was blocked; unlike Chrome absence, command setup must stop."""
 
+
+@dataclass
+class _Closing:
+    operation: CleanupOperation
+    result: asyncio.Future
+    worker: asyncio.Task | None = None
+    kickoff: asyncio.Handle | None = None
+    timer: asyncio.TimerHandle | None = None
+
+
+def _consume_close(future: asyncio.Future) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+def _claim_closing(factory, operation: CleanupOperation, expire) -> _Closing:
+    """Publish the result before even an eager task factory can run cleanup."""
+    loop = asyncio.get_running_loop()
+    closing = _Closing(operation, loop.create_future())
+    closing.result.add_done_callback(_consume_close)
+
+    async def run():
+        try:
+            result = await factory()
+        except BaseException as error:
+            if not closing.result.done():
+                closing.result.set_exception(error)
+        else:
+            if not closing.result.done():
+                closing.result.set_result(result)
+                if closing.timer is not None:
+                    closing.timer.cancel()
+
+    def start():
+        if not closing.result.done():
+            closing.worker = asyncio.create_task(run())
+            closing.worker.add_done_callback(_consume_close)
+
+    closing.timer = loop.call_at(operation.deadline, expire)
+    closing.kickoff = loop.call_soon(start if operation.remote and operation.remaining() > 0 else expire)
+    return closing
+
+
+def _expire_closing(closing: _Closing | None) -> None:
+    if closing is None:
+        return
+    if closing.kickoff is not None:
+        closing.kickoff.cancel()
+    if closing.timer is not None:
+        closing.timer.cancel()
+    if not closing.result.done():
+        closing.result.set_exception(TimeoutError("浏览器清理期限已到"))
+    if closing.worker is not None and not closing.worker.done():
+        closing.worker.cancel()
 
 @dataclass
 class _Page:
@@ -111,7 +169,8 @@ class _Lease:
     keys: dict[str, dict] = field(default_factory=dict)
     touching: str | None = None
     inputs: HumanInputs | None = None
-    close_future: asyncio.Task | None = None
+    close_future: asyncio.Future | None = None
+    close_decision: _Closing | None = None
     # HTTP close replies may complete at target confirmation, before relay exit.
     close_responses: set[asyncio.Future] = field(default_factory=set)
     page_close_reason: str | None = None
@@ -143,8 +202,11 @@ class _Endpoint:
     waiting: int = 0
     reaper: asyncio.Task | None = None
     url: str = ""
-    remote_closing: asyncio.Task | None = None
-    closing: asyncio.Task | None = None
+    remote_closing: asyncio.Future | None = None
+    closing: asyncio.Future | None = None
+    remote_decision: _Closing | None = None
+    close_decision: _Closing | None = None
+    close_expired: bool = False
     responses: set[asyncio.Task] = field(default_factory=set)
     requests: set[asyncio.Task] = field(default_factory=set)
     drain_responses: bool = False
@@ -160,10 +222,12 @@ class _TaskResources:
     endpoint: _Endpoint | None = None
     endpoints: list[_Endpoint] = field(default_factory=list)
     preparing: asyncio.Task | None = None
-    closing: asyncio.Task | None = None
+    closing: asyncio.Future | None = None
+    close_decision: _Closing | None = None
     lease: _Lease | None = None
     # Initial allocation is work in flight, not a task-count capacity reservation.
     admitting: bool = False
+    lifecycle: int = 0
 
 
 class BrowserLeases:
@@ -263,10 +327,25 @@ class BrowserLeases:
             alive = {info["targetId"] for info in existing if info.get("type") == "page"}
             for target in before_census - alive:
                 self._forget_target(target)
+            terminal_targets = {
+                target for lease in self._leases.values() if lease.close_future is not None
+                for target in lease.targets
+            }
+            for info in existing:
+                creation = self._creations.get(info.get("url"))
+                if creation is not None and creation.lease.close_future is not None:
+                    terminal_targets.add(info["targetId"])
+            while True:
+                descendants = {info["targetId"] for info in existing
+                               if info.get("openerId") in terminal_targets}
+                if descendants <= terminal_targets:
+                    break
+                terminal_targets.update(descendants)
             for info in existing:
                 if info.get("type") == "page":
                     self._observe_target(info)
-                    await self._close_target(info["targetId"])
+                    if info["targetId"] not in terminal_targets:
+                        await self._close_target(info["targetId"])
                     self._check_connection_revision(revision)
             # A fresh transport's census and inherited-target cleanup are the
             # only way to settle unidentified creations after connection loss.
@@ -276,7 +355,8 @@ class BrowserLeases:
                     self._creations.pop(creation.marker, None)
             self._capacity_changed()
             for owner in self._tasks.values():
-                if owner.lease is not None and owner.lease.state == "stopping":
+                if (owner.lease is not None and owner.lease.state == "stopping"
+                        and owner.lease.close_future is None):
                     await self.close(owner.lease.id, owner.lease.close_reason or "Chrome 连接中断")
             self._check_connection_revision(revision)
         except BaseException:
@@ -376,8 +456,8 @@ class BrowserLeases:
                 await self.close_task(owner.task_id, reason="重启")
             except Exception as exc:
                 failures.append(exc)
-        # Keep the confirmation transport available after a failed shutdown:
-        # unconfirmed owners remain in the ledger and aclose can retry.
+        # Confirmation failures remain visible. A later shutdown borrows the same
+        # terminal result; it must not submit the old resource's close again.
         if failures:
             raise ExceptionGroup("浏览器资源关闭未确认", failures)
         if self._chrome is not None:
@@ -395,7 +475,21 @@ class BrowserLeases:
                 raise BrowserRejected("任务的浏览器所有者不能改变")
             if owner.closing is not None and not owner.closing.done():
                 raise BrowserRejected("任务浏览器仍在关闭")
+            if not owner.registered and owner.closing is not None:
+                # Registration is a new lifecycle, not another stop of the old one.
+                self._expire_task_owner(owner)
+                owner.lifecycle += 1
+                owner.closing = None
+                owner.close_decision = None
+                owner.preparing = None
+                owner.endpoint = None
+                owner.lease = None
+                owner.admitting = False
             owner.registered = True
+
+    def owned_tasks(self, agent_id: str) -> tuple[str, ...]:
+        """Include page-less registrations so management can revoke every old entry."""
+        return tuple(owner.task_id for owner in self._tasks.values() if owner.identity[1] == agent_id)
 
     def pending_tasks(self, agent_id: str) -> list[str]:
         """Return tasks whose browser resources still prevent a Backend switch.
@@ -457,12 +551,12 @@ class BrowserLeases:
             raise BrowserRejected("任务没有可用的浏览器")
         # The manager, not a cancelled shell invocation, owns endpoint creation.
         if owner.preparing is None or owner.preparing.done():
-            owner.preparing = asyncio.create_task(self._command_environment(owner))
+            owner.preparing = asyncio.create_task(self._command_environment(owner, owner.lifecycle))
             owner.preparing.add_done_callback(
                 lambda task: task.exception() if not task.cancelled() else None)
         return await asyncio.shield(owner.preparing)
 
-    async def _command_environment(self, owner: _TaskResources) -> dict[str, str]:
+    async def _command_environment(self, owner: _TaskResources, lifecycle: int) -> dict[str, str]:
         if (self.transport is None or owner.lease is not None
                 and owner.lease.close_reason is not None and owner.lease.state != "released"):
             try:
@@ -473,7 +567,7 @@ class BrowserLeases:
             except (BrowserRejected, CDPError, OSError, websockets.WebSocketException):
                 # A shell must still be able to diagnose an external Chrome failure.
                 pass
-        if not owner.registered or self._closed:
+        if not owner.registered or self._closed or owner.lifecycle != lifecycle:
             raise BrowserRejected("任务没有可用的浏览器")
         active = owner.lease
         if (self._chrome is not None and active is not None
@@ -494,10 +588,16 @@ class BrowserLeases:
             active = active if active is not None and active.state != "released" and not acknowledged else None
             endpoint = await self._serve(owner.task_id, active.id if active else uuid.uuid4().hex,
                                          active.epoch if active else 1)
+            if owner.lifecycle != lifecycle:
+                self._expire_endpoint(endpoint)
+                raise BrowserRejected("任务浏览器接入已撤销，请重新取得命令环境")
             owner.endpoint = endpoint
             reason = self._restart_reasons.get(owner.task_id)
             if reason:
                 endpoint.error = f"上次浏览器租约已结束（{reason}），请重新确认页面状态"
+        if not owner.registered:
+            await self._close_endpoint(endpoint, operation=self._owner_operation(owner))
+            raise BrowserRejected("任务浏览器接入已撤销，请重新取得命令环境")
         env = {"WANDRUN_BROWSER_CDP": endpoint.url,
                "AGENT_BROWSER_SESSION": f"wandrun-{endpoint.lease_id}-{endpoint.epoch}",
                "AGENT_BROWSER_IDLE_TIMEOUT_MS": "120000"}
@@ -506,30 +606,35 @@ class BrowserLeases:
             try:
                 env = await self.transport.browser_command_environment(env)
             except BaseException:
-                if revision != self._connection_revision:
-                    endpoint.remote_closing = None
-                    await self._close_endpoint(endpoint)
+                if endpoint.close_expired or owner.lifecycle != lifecycle:
+                    self._expire_endpoint(endpoint)
+                elif revision != self._connection_revision:
+                    await self._close_endpoint(endpoint, operation=self._owner_operation(owner))
                 raise
-            if not owner.registered or self._closed or revision != self._connection_revision:
-                # Disconnection can settle an old relay before preparation publishes
-                # its replacement. Close that late result; never restore its address.
-                endpoint.remote_closing = None
-                await self._close_endpoint(endpoint)
+            if (not owner.registered or self._closed or revision != self._connection_revision
+                    or owner.lifecycle != lifecycle):
+                # The transport owns any late relay after revocation. Borrow the
+                # endpoint's old close result; never restore its address or retry.
+                if endpoint.close_expired or owner.lifecycle != lifecycle:
+                    self._expire_endpoint(endpoint)
+                else:
+                    await self._close_endpoint(endpoint, operation=self._owner_operation(owner))
                 raise BrowserRejected("任务浏览器接入已撤销，请重新取得命令环境")
         return env
 
-    def _retire(self, endpoint: _Endpoint) -> None:
-        # Local stale discovery keeps its existing daemon grace. Remote entries
-        # stop immediately; their cleanup record survives the same grace so an
-        # unconfirmed exec can still be settled without owning the next lease.
-        if endpoint.reaper is None:
-            endpoint.reaper = asyncio.create_task(self._reap_endpoint(endpoint))
+    def _retire(self, endpoint: _Endpoint, *, operation: CleanupOperation | None = None) -> None:
+        # Local stale discovery keeps its daemon grace. Remote cleanup is claimed
+        # once, with the original operation's deadline even when grace ends later.
+        if endpoint.reaper is None and not endpoint.close_expired:
+            operation = self._endpoint_operation(endpoint, operation)
+            endpoint.reaper = asyncio.create_task(self._reap_endpoint(endpoint, operation=operation))
             endpoint.reaper.add_done_callback(
                 lambda task: task.exception() if not task.cancelled() else None)
 
-    async def _reap_endpoint(self, endpoint: _Endpoint) -> None:
+    async def _reap_endpoint(self, endpoint: _Endpoint, *,
+                             operation: CleanupOperation | None = None) -> None:
         try:
-            await self._close_remote_endpoint(endpoint)
+            await self._close_remote_endpoint(endpoint, operation=operation)
         except Exception:
             _log.warning("Retired browser relay cleanup unconfirmed: %s", endpoint.url, exc_info=True)
             if self.notify and self._tasks[endpoint.task_id].registered:
@@ -542,19 +647,23 @@ class BrowserLeases:
                                  endpoint.task_id, exc_info=True)
         await asyncio.sleep(180)
         try:
-            await self._close_endpoint(endpoint)
+            await self._close_endpoint(endpoint, operation=operation)
         except Exception:
             _log.warning("Retired browser endpoint cleanup still unconfirmed: %s",
                          endpoint.url, exc_info=True)
 
-    async def _close_remote_endpoint(self, endpoint: _Endpoint) -> None:
+    async def _close_remote_endpoint(self, endpoint: _Endpoint, *,
+                                     operation: CleanupOperation | None = None) -> None:
+        if endpoint.close_expired:
+            raise TimeoutError("浏览器入口清理期限已到")
         if self.transport is None:
             return
-        if (endpoint.remote_closing is None or endpoint.remote_closing.done()
-                and endpoint.remote_closing.exception() is not None):
-            endpoint.remote_closing = asyncio.create_task(self._finish_remote_endpoint(endpoint))
-            endpoint.remote_closing.add_done_callback(
-                lambda task: task.exception() if not task.cancelled() else None)
+        if endpoint.remote_closing is None:
+            operation = self._endpoint_operation(endpoint, operation)
+            endpoint.remote_decision = _claim_closing(
+                lambda: self._finish_remote_endpoint(endpoint), operation,
+                lambda: self._expire_endpoint(endpoint))
+            endpoint.remote_closing = endpoint.remote_decision.result
         await asyncio.shield(endpoint.remote_closing)
 
     async def _finish_remote_endpoint(self, endpoint: _Endpoint) -> None:
@@ -569,23 +678,28 @@ class BrowserLeases:
                 async with asyncio.timeout(3):
                     await asyncio.gather(*(asyncio.shield(task) for task in tuple(endpoint.responses)))
             endpoint.server.server.close_clients()
-            if endpoint.drain_responses:
+            if endpoint.drain_responses and not endpoint.close_expired:
                 await self.transport.drain_browser_endpoint(endpoint.url)
         finally:
             # A failed drain must still use independent TERM + real exit status.
-            await self.transport.close_browser_endpoint(endpoint.url)
+            if not endpoint.close_expired:
+                await self.transport.close_browser_endpoint(endpoint.url)
 
-    async def _close_endpoint(self, endpoint: _Endpoint) -> None:
-        if (endpoint.closing is None or endpoint.closing.done()
-                and endpoint.closing.exception() is not None):
-            endpoint.closing = asyncio.create_task(self._finish_endpoint(endpoint))
-            endpoint.closing.add_done_callback(
-                lambda task: task.exception() if not task.cancelled() else None)
+    async def _close_endpoint(self, endpoint: _Endpoint, *,
+                              operation: CleanupOperation | None = None) -> None:
+        if endpoint.close_expired:
+            raise TimeoutError("浏览器入口清理期限已到")
+        if endpoint.closing is None:
+            operation = self._endpoint_operation(endpoint, operation)
+            endpoint.close_decision = _claim_closing(
+                lambda: self._finish_endpoint(endpoint, operation=operation), operation,
+                lambda: self._expire_endpoint(endpoint))
+            endpoint.closing = endpoint.close_decision.result
         await asyncio.shield(endpoint.closing)
 
-    async def _finish_endpoint(self, endpoint: _Endpoint) -> None:
+    async def _finish_endpoint(self, endpoint: _Endpoint, *, operation: CleanupOperation) -> None:
         try:
-            await self._close_remote_endpoint(endpoint)
+            await self._close_remote_endpoint(endpoint, operation=operation)
         finally:
             endpoint.server.close()
             await asyncio.wait_for(endpoint.server.wait_closed(), 3)
@@ -594,6 +708,66 @@ class BrowserLeases:
             owner.endpoints.remove(endpoint)
         if owner.endpoint is endpoint:
             owner.endpoint = None
+
+    @staticmethod
+    def _owner_operation(owner: _TaskResources) -> CleanupOperation | None:
+        return owner.close_decision.operation if owner.close_decision is not None else None
+
+    @staticmethod
+    def _endpoint_operation(endpoint: _Endpoint, operation: CleanupOperation | None) -> CleanupOperation:
+        decision = endpoint.remote_decision or endpoint.close_decision
+        return decision.operation if decision is not None else operation or CleanupOperation.begin()
+
+    def _expire_endpoint(self, endpoint: _Endpoint) -> None:
+        endpoint.close_expired = True
+        endpoint.error = endpoint.error or "任务浏览器接入已撤销"
+        endpoint.server.close()
+        endpoint.server.server.close_clients()
+        for task in (endpoint.acquiring, endpoint.reaper, *endpoint.requests):
+            if task is not None and not task.done():
+                task.cancel()
+        _expire_closing(endpoint.remote_decision)
+        _expire_closing(endpoint.close_decision)
+        if self.transport is not None:
+            expire = getattr(self.transport, "expire_browser_endpoint", None)
+            if expire is not None:
+                expire(endpoint.url)
+
+    def _expire_lease(self, lease: _Lease) -> None:
+        _expire_closing(lease.close_decision)
+        if lease.close_future is None:
+            lease.close_future = asyncio.get_running_loop().create_future()
+            lease.close_future.add_done_callback(_consume_close)
+            lease.close_future.set_exception(TimeoutError("浏览器清理期限已到"))
+        lease.close_reason = lease.close_reason or "任务结束"
+        if lease.state != "released":
+            if lease.state != "stopping":
+                lease.epoch += 1
+            lease.state = "stopping"
+        for creation in tuple(lease.creating):
+            if not creation.done():
+                creation.cancel()
+        owner = self._tasks.get(lease.task_id)
+        for endpoint in (owner.endpoints if owner is not None else ()):
+            if endpoint.lease_id == lease.id:
+                self._expire_endpoint(endpoint)
+        # These sockets are exclusive to this lease; never abort shared Chrome.
+        sockets = [*lease.clients, *(relay.upstream for relay in lease.relays)]
+        for page in lease.pages.values():
+            sockets.append(page.cdp.ws)
+            sockets.extend(source.ws for _, source in page.personal_streams.values())
+            for source in (page.cdp, *(source for _, source in page.personal_streams.values())):
+                source._closing = True
+                for worker in (source._reader, source._event_worker, source._send_worker):
+                    if worker is not None and not worker.done():
+                        worker.cancel()
+            for task in (page.stream_operation, page.initial_navigation):
+                if task is not None and not task.done():
+                    task.cancel()
+        for socket in sockets:
+            if socket is not None:
+                socket.transport.abort()
+        self._capacity_changed()
 
     async def _serve(self, task_id: str, lease_id: str, epoch: int) -> _Endpoint:
         endpoint = _Endpoint(task_id, lease_id, epoch, None, 0)
@@ -838,7 +1012,8 @@ class BrowserLeases:
         except (CDPError, OSError, websockets.WebSocketException) as exc:
             raise self._unreachable(str(exc)) from exc
         owner = self._tasks[endpoint.task_id]
-        if not owner.registered or self._closed:
+        if (not owner.registered or self._closed or endpoint.close_expired
+                or owner.endpoint is not endpoint):
             raise BrowserRejected("任务结束，浏览器接入已撤销")
         lease = self._leases.get(endpoint.lease_id)
         if lease is not None:
@@ -856,15 +1031,17 @@ class BrowserLeases:
             async with lease.lock:
                 creation = self._start_page(lease, "about:blank")
             await asyncio.shield(creation)
-            if not owner.registered or lease.close_reason is not None:
+            if not owner.registered or lease.close_reason is not None or endpoint.close_expired:
                 raise BrowserRejected("任务结束，浏览器分配已取消")
             owner.admitting = False
             self._emit(lease)
             return lease
         except BaseException as exc:
-            owner.admitting = False
-            await self.close(lease.id, f"浏览器分配失败：{exc}")
-            if owner.registered:
+            if owner.lease is lease:
+                owner.admitting = False
+            await self.close(lease.id, f"浏览器分配失败：{exc}",
+                             operation=self._owner_operation(owner))
+            if owner.registered and owner.lease is lease:
                 self._leases.pop(endpoint.lease_id, None)
                 owner.lease = None
             if isinstance(exc, asyncio.CancelledError):
@@ -943,6 +1120,15 @@ class BrowserLeases:
         lease.targets.add(target)
         self._capacity_changed()
 
+        def check_creation_deadline():
+            if lease.close_future is not None:
+                decision = lease.close_decision
+                if (lease.close_future.done() or decision is None
+                        or decision.operation.remaining() <= 0):
+                    raise BrowserRejected("任务结束，浏览器分配已取消")
+
+        check_creation_deadline()
+
         navigation_events: asyncio.Queue[dict | None] = asyncio.Queue()
         initializing = info is None
 
@@ -961,7 +1147,9 @@ class BrowserLeases:
         cdp.on_disconnect = disconnected
         try:
             await cdp.open()
+            check_creation_deadline()
             await cdp.call("Page.enable")
+            check_creation_deadline()
             await cdp.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
         except BaseException as exc:
             await cdp.close()
@@ -1099,6 +1287,13 @@ class BrowserLeases:
         async with lease.lock:
             if lease.state == "released":
                 return  # Closure's target census has already confirmed absence.
+            if lease.close_future is not None or not self._tasks[lease.task_id].registered:
+                # The already-claimed close owns its census. Late event delivery
+                # may add ownership, never start a second cleanup operation.
+                lease.targets.add(target)
+                self._live_targets.add(target)
+                self._capacity_changed()
+                return
             # Identity prevents repeat attachment, not outstanding cleanup.
             # Keep rejected popups eligible for closure even if capacity frees.
             if target in lease.targets and target not in lease.rejected_popups:
@@ -1185,7 +1380,7 @@ class BrowserLeases:
         async with lease.lock:
             lease.rejected_popups.discard(target)
             reason = await self._remove_page_locked(lease, target)
-        if reason is not None and (lease.close_future is None or lease.close_future.done()):
+        if reason is not None and lease.close_future is None:
             await self.close(lease.id, reason=reason)
 
     def _snapshot(self, lease: _Lease) -> dict:
@@ -1251,26 +1446,40 @@ class BrowserLeases:
         return self._snapshot(self._get(lease_id))
 
     def capacity(self) -> dict:
-        """Disjoint environment budget: registered, creating, and cleanup debt."""
+        """Count live work and in-flight cleanup, not terminal unknown closes."""
+        terminal = {
+            lease.id for lease in self._leases.values()
+            if lease.close_future is not None and lease.close_future.done()
+        }
+        # Retain old identities / results for fencing, without reserving slots
+        # forever after their one close attempt has actually ended.
+        terminal_targets = {
+            target for lease in self._leases.values() if lease.id in terminal
+            for target in lease.targets | lease.pages.keys()
+        }
         registered = {
-            page for lease in self._leases.values() if lease.state not in ("stopping", "released")
+            page for lease in self._leases.values()
+            if lease.id not in terminal and lease.state not in ("stopping", "released")
             for page in lease.pages
             if page not in self._pending_removals and page not in self._retired_targets
         }
         # Hand-built test pages and disconnected-page inventories also remain
         # accountable even when discovery has not (or no longer) supplied them.
-        known = self._live_targets | {
-            page for lease in self._leases.values() if lease.state != "released"
+        known = (self._live_targets | {
+            page for lease in self._leases.values()
+            if lease.id not in terminal and lease.state != "released"
             for page in lease.pages if page not in self._retired_targets
-        }
+        }) - terminal_targets
         creating_targets = {
             creation.target for creation in self._creations.values()
-            if not creation.settled and creation.target is not None
+            if creation.lease.id not in terminal
+            and not creation.settled and creation.target is not None
             and creation.target in known and creation.target not in registered
         }
         unidentified = [
             creation for creation in self._creations.values()
-            if creation.target is None or creation.removed and not creation.settled
+            if creation.lease.id not in terminal
+            and (creation.target is None or creation.removed and not creation.settled)
         ]
         creating = len(creating_targets) + sum(not creation.settled for creation in unidentified)
         pending = len(known - registered - creating_targets) + sum(
@@ -1329,19 +1538,29 @@ class BrowserLeases:
         if timeout <= 0:
             return
         for lease in list(self._leases.values()):
-            if (lease.state in ("released", "stopping", "revoking")
+            if (lease.close_future is not None or lease.state in ("released", "stopping", "revoking")
                     or (lease.state == "human" and lease.pages)
                     or any(p.viewers or p.personal_streams for p in lease.pages.values())):
                 continue
             if self.clock() - lease.last_activity >= timeout:
                 try:
                     await self.close(lease.id, reason="浏览器空闲超时")
-                except BrowserRejected:
-                    # Cleanup debt remains in the budget; other leases and
-                    # subsequent ticks must not depend on this close succeeding.
+                except (BrowserRejected, TimeoutError):
+                    # A controlled close deadline ends this lease, not the idle worker.
+                    # Keep its terminal failure; later ticks never retry that close.
                     _log.warning("Idle browser lease %s closure unconfirmed", lease.id, exc_info=True)
 
     async def _close_target(self, target: str) -> None:
+        lease = next((item for item in self._leases.values() if target in item.targets), None)
+
+        def check_deadline():
+            if lease is not None and lease.close_future is not None:
+                decision = lease.close_decision
+                if (lease.close_future.done() or decision is None
+                        or decision.operation.remaining() <= 0):
+                    raise TimeoutError("浏览器清理期限已到")
+
+        check_deadline()
         chrome = self._chrome
         if chrome is None:
             raise CDPError("Chrome 不可达，页面关闭尚未确认")
@@ -1363,6 +1582,7 @@ class BrowserLeases:
                 if not done:
                     raise CDPError("初始导航停止尚未确认，页面关闭尚未确认")
         try:
+            check_deadline()
             result = await chrome.call("Target.closeTarget", {"targetId": target}, timeout=3)
             if result.get("success") is False:
                 failure = CDPError(f"无法关闭页面 {target}")
@@ -1370,6 +1590,7 @@ class BrowserLeases:
             failure = exc
         deadline = asyncio.get_running_loop().time() + 3
         while True:
+            check_deadline()
             remaining = (await chrome.call("Target.getTargets", timeout=3)).get("targetInfos", [])
             if target not in {t["targetId"] for t in remaining}:
                 self._forget_target(target)
@@ -1428,7 +1649,8 @@ class BrowserLeases:
             lease.inputs.stopped_pages.discard(target_id)
 
     async def close(self, lease_id: str, reason: str = "用户关闭", *,
-                    _response_ready: asyncio.Future | None = None) -> dict:
+                    _response_ready: asyncio.Future | None = None,
+                    operation: CleanupOperation | None = None) -> dict:
         """Confirm page / creation release; retired byte transports settle independently."""
         lease = self._get(lease_id)
         if _response_ready is not None:
@@ -1438,10 +1660,13 @@ class BrowserLeases:
         # cannot reopen a lease while the close worker waits for its lock.
         if lease.close_reason is None:
             lease.close_reason = reason
-        if lease.close_future is None or lease.close_future.done() and lease.state != "released":
-            lease.close_future = asyncio.create_task(self._close(lease, lease.close_reason))
-            lease.close_future.add_done_callback(
-                lambda task: task.exception() if not task.cancelled() else None)
+        if lease.close_future is None:
+            operation = operation or CleanupOperation.begin()
+            lease.close_decision = _claim_closing(
+                lambda: self._close(lease, lease.close_reason), operation,
+                lambda: self._expire_lease(lease))
+            lease.close_future = lease.close_decision.result
+            lease.close_future.add_done_callback(lambda _: self._capacity_changed())
         return await asyncio.shield(lease.close_future)
 
     async def _remaining_targets(self, lease: _Lease) -> set[str]:
@@ -1469,6 +1694,9 @@ class BrowserLeases:
         return lease.targets & {info["targetId"] for info in infos}
 
     async def _close(self, lease: _Lease, reason: str) -> dict:
+        if lease.close_decision.operation.remaining() <= 0:
+            self._expire_lease(lease)
+            raise TimeoutError("浏览器清理期限已到")
         await self._release_human_input(lease, "handback")
         async with lease.lock:
             if lease.state == "released":
@@ -1486,15 +1714,24 @@ class BrowserLeases:
         endpoints = [endpoint for endpoint in self._tasks[lease.task_id].endpoints
                      if endpoint.lease_id == lease.id]
         # A target can exist before its createTarget reply is delivered. Wait for
-        # ledger-owned creations, not for downstream WebSocket handlers. Neither
-        # a timed-out caller nor shutdown may cancel these operations.
+        # ledger-owned creations, not for downstream WebSocket handlers. The
+        # fixed close deadline still fences this lease's local transport.
         if lease.creating:
             await asyncio.wait(tuple(lease.creating), timeout=3)
         try:
+            if lease.close_decision.operation.remaining() <= 0:
+                self._expire_lease(lease)
+                raise TimeoutError("浏览器清理期限已到")
             remaining = await self._remaining_targets(lease)
             while remaining:
                 for target in remaining:
+                    if (lease.close_decision.result.done()
+                            or lease.close_decision.operation.remaining() <= 0):
+                        raise TimeoutError("浏览器清理期限已到")
                     await self._close_target(target)
+                if (lease.close_decision.result.done()
+                        or lease.close_decision.operation.remaining() <= 0):
+                    raise TimeoutError("浏览器清理期限已到")
                 remaining = await self._remaining_targets(lease)
             if any(not operation.done() for operation in lease.creating) or lease.uncertain_creations:
                 raise CDPError("建页结果尚未确认")
@@ -1502,7 +1739,7 @@ class BrowserLeases:
                 if not response.done():
                     response.set_result(None)
             for endpoint in endpoints:
-                self._retire(endpoint)
+                self._retire(endpoint, operation=lease.close_decision.operation)
             # Page / creation confirmation releases the lease. Retired endpoints
             # retain independent cleanup ownership; a byte relay cannot lock the
             # next explicit browser use after the old targets are gone.
@@ -1540,42 +1777,84 @@ class BrowserLeases:
                 await self.notify(lease.task_id, "接管结束，页面已关闭；如需继续请重新打开浏览器。", False)
         return self._snapshot(lease)
 
-    async def close_task(self, task_id: str, reason: str = "任务结束") -> None:
-        """Revoke admission immediately; settle every resource, retaining failures."""
+    def claim_task_close(self, task_id: str, reason: str = "任务结束", *,
+                         operation: CleanupOperation | None = None) -> asyncio.Future:
+        """Synchronously revoke and publish one terminal result per lifecycle."""
         owner = self._tasks.get(task_id)
         if owner is None:
-            return
+            result = asyncio.get_running_loop().create_future()
+            result.set_result(None)
+            return result
         owner.registered = False
-        if owner.closing is None or owner.closing.done():
-            owner.closing = asyncio.create_task(self._close_task(owner, reason))
-            owner.closing.add_done_callback(
-                lambda task: task.exception() if not task.cancelled() else None)
-        await asyncio.shield(owner.closing)
+        for endpoint in owner.endpoints:
+            endpoint.error = endpoint.error or reason
+            endpoint.server.close(close_connections=False)
+        if owner.closing is None:
+            operation = operation or CleanupOperation.begin()
+            owner.close_decision = _claim_closing(
+                lambda: self._close_task(owner, reason, operation=operation), operation,
+                lambda: self._expire_task_owner(owner))
+            owner.closing = owner.close_decision.result
+        return owner.closing
 
-    async def _close_task(self, owner: _TaskResources, reason: str) -> None:
+    def expire_task_close(self, task_id: str) -> None:
+        owner = self._tasks.get(task_id)
+        if owner is not None:
+            self._expire_task_owner(owner)
+
+    def _expire_task_owner(self, owner: _TaskResources) -> None:
+        owner.registered = False
+        _expire_closing(owner.close_decision)
+        if owner.preparing is not None and not owner.preparing.done():
+            owner.preparing.cancel()
+        if owner.lease is not None:
+            self._expire_lease(owner.lease)
+        for endpoint in owner.endpoints:
+            self._expire_endpoint(endpoint)
+
+    async def close_task(self, task_id: str, reason: str = "任务结束", *,
+                         operation: CleanupOperation | None = None) -> None:
+        future = self.claim_task_close(task_id, reason, operation=operation)
+        if operation is None:
+            await asyncio.shield(future)
+        else:
+            try:
+                await operation.wait(asyncio.shield(future))
+            except TimeoutError:
+                owner = self._tasks.get(task_id)
+                if owner is not None and owner.closing is future:
+                    self._expire_task_owner(owner)
+                raise
+
+    async def _close_task(self, owner: _TaskResources, reason: str, *,
+                          operation: CleanupOperation) -> None:
         # Finish single-flight creation so no listener can appear after inventory.
         if owner.preparing is not None:
             await asyncio.gather(owner.preparing, return_exceptions=True)
-        endpoints = tuple(owner.endpoints)
+        if self._owner_operation(owner) is not operation or operation.remaining() <= 0:
+            raise TimeoutError("浏览器清理期限已到")
+        endpoints = tuple(endpoint for endpoint in owner.endpoints if not endpoint.close_expired)
         for endpoint in endpoints:
             endpoint.error = reason
             endpoint.server.close()
         failures = []
         if owner.lease is not None:
             try:
-                await self.close(owner.lease.id, reason)
+                await self.close(owner.lease.id, reason, operation=operation)
             except Exception as exc:
                 failures.append(exc)
         # server.wait_closed includes handlers. A Chrome command may never
         # reply, so this final wait is bounded even after target confirmation.
         for endpoint in endpoints:
+            if self._owner_operation(owner) is not operation or operation.remaining() <= 0:
+                raise TimeoutError("浏览器清理期限已到")
             try:
                 if endpoint.reaper is not None:
                     # Lease closure may just have created this daemon grace
                     # waiter. A finished task must close its entry immediately.
                     endpoint.reaper.cancel()
                     await asyncio.gather(endpoint.reaper, return_exceptions=True)
-                await self._close_endpoint(endpoint)
+                await self._close_endpoint(endpoint, operation=operation)
             except Exception as exc:
                 failures.append(exc)
         self._restart_reasons[owner.task_id] = reason

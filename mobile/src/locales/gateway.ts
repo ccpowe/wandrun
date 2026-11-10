@@ -198,6 +198,8 @@ export const gatewayMessages = {
   "页面不可关闭或不属于本租约": "Page cannot be closed or does not belong to this lease",
   "浏览器操作未完成，请稍后重试；若持续失败，请查看网关日志。": "Browser operation did not complete. Try again later; if it keeps failing, check the gateway logs.",
   "任务分支正在停止，请等待清理完成后再发送": "Task branch is stopping. Wait for cleanup before sending again",
+  "Agent 正在切换执行环境，请稍后再发送。": "The Agent is switching execution environments. Please send again shortly.",
+  "上一轮任务正在停止，请稍后再发送。": "The previous turn is stopping. Please send again shortly.",
   "任务仍在停止和清理中，请稍后重试。": "Task is still stopping and cleaning up. Try again later.",
   "任务已停止，请从上级会话恢复或重新委派。": "Task has stopped. Resume it from the parent conversation or delegate it again.",
   "当前操作无法完成，请检查任务状态后重试；若持续失败，请查看网关日志。": "Could not complete this operation. Check the task status and try again; if it keeps failing, check the gateway logs.",

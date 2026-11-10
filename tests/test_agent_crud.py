@@ -90,6 +90,35 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         return {"client_id": "create", "name": "写作者", "description": "写作",
                 "system_prompt": "写文章", "model": "offline", **extra}
 
+    async def start_remote_command(self, agent, root):
+        """Use the production managed protocol; only provider preparation is loopback."""
+        from test_environments import loopback_instabox
+
+        network = loopback_instabox()
+        await network.__aenter__()
+        self.addAsyncCleanup(network.__aexit__, None, None, None)
+        self.addAsyncCleanup(self.stack.aclose)
+        owner = self.runtime.files.remote_backends[agent]
+        backend = await owner._ready()
+        channel = backend._channel
+        sent, cancellations = asyncio.Event(), []
+        send = channel.send
+
+        async def record_send(message, *args, **kwargs):
+            result = await send(message, *args, **kwargs)
+            if message["type"] == "managed":
+                sent.set()
+            elif message["type"] == "cancel":
+                cancellations.append(message["id"])
+            return result
+
+        self.stack.enter_context(patch.object(channel, "send", record_send))
+        execution = owner.processes.start(
+            "sleep 60", root, on_settled=lambda _: None, on_log_error=lambda _: None,
+        )
+        await asyncio.wait_for(sent.wait(), 5)
+        return execution, cancellations
+
     async def test_agent_name_conflicts_are_explicit_atomic_and_do_not_break_replay(self):
         created = await self.client.post("/agents", json=self.payload(name=" Test "))
         self.assertEqual(created.status_code, 201, created.text)
@@ -205,7 +234,7 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("service_tier", self.requests[-1])
         self.assertEqual(self.requests[-1]["reasoning"], {"effort": "xhigh"})
 
-    async def test_environment_create_idle_switch_active_conflict_and_restart_are_lazy(self):
+    async def test_environment_create_switch_stops_active_worker_and_restart_is_lazy(self):
         machine = "m_" + "a" * 26
         cloud = EnvironmentDefinition(
             type="instabox", machine_id=machine, workdir=str(self.workspace.root / "remote"),
@@ -234,14 +263,13 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
             root = self.gateway.create_conversation("active", "desktop", client_id=uuid4().hex)[0]["id"]
             self.gateway.send_message(root, "cloud-chat", "只聊天")
             await self.entered.wait()
-            rejected = await self.client.patch("/agents/desktop", json={"environment": "local"})
-            self.assertEqual(rejected.status_code, 409, rejected.text)
-            self.assertEqual(self.store.agent("desktop")["environment"], "cloud")
-            self.assertEqual(self.runtime.workers.get(root)["status"], "running")
-            self.release.set()
-            await self.runtime.workers.wait(root)
             switched = await self.client.patch("/agents/desktop", json={"environment": "local"})
             self.assertEqual(switched.status_code, 200, switched.text)
+            self.assertEqual(self.store.agent("desktop")["environment"], "local")
+            self.assertEqual(self.runtime.workers.get(root)["status"], "cancelled")
+            self.assertTrue(switched.json()["cleanup_unconfirmed"])
+            self.assertEqual(switched.json()["cleanup_unconfirmed"], switched.json()["event"]["data"]["cleanup_unconfirmed"])
+            self.assertNotIn("cleanup_unconfirmed", (await self.client.get("/agents/desktop")).json())
             self.assertNotIn("desktop", self.runtime.files.remote_backends)
             self.assertEqual(self.store.environment_definitions()["cloud"], cloud)
             await self.stack.aclose()
@@ -313,7 +341,1116 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(self.runtime._assembly_for("desktop").capabilities.enabled("browser"))
             self.assertEqual(restored.config, definition.browser)
 
-    async def test_background_command_blocks_environment_switch_after_model_done_until_explicit_stop(self):
+    async def test_shared_machine_relay_uncertainty_does_not_block_delete_or_switch_or_stop_other_owner(self):
+        from wandrun.config import BrowserDefinition
+        from wandrun.integrations.browser_relay import InstaboxBrowserTransport
+        from test_environments import loopback_instabox
+
+        cloud = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "a" * 26,
+            workdir=str(self.workspace.root / "remote"), termination_grace=0.1,
+        )
+        self.runtime.environment_definitions.update({"cloud": cloud, "alias": cloud})
+        switched = await self.client.patch("/agents/desktop", json={"environment": "cloud"})
+        self.assertEqual(switched.status_code, 200, switched.text)
+        created = await self.client.post("/agents", json=self.payload(
+            client_id="shared-owner", name="Shared", environment="alias", code_mode=False,
+        ))
+        other = created.json()["agent"]["id"]
+        root = self.gateway.create_conversation("常驻服务", other, client_id=uuid4().hex)[0]["id"]
+        self.gateway.send_message(root, "register-owner", "就绪")
+        await self.runtime.workers.wait(root)
+        owner = self.runtime.files.remote_backends[other]
+        self.assertIs(owner, self.runtime.files.remote_backends["desktop"])
+
+        async with loopback_instabox():
+            try:
+                execution = owner.processes.start(
+                    "sleep 60", root, on_settled=lambda _: None, on_log_error=lambda _: None,
+                )
+                async with asyncio.timeout(5):
+                    while execution._call is None or not execution._call.sent:
+                        await asyncio.sleep(0)
+                transport = InstaboxBrowserTransport(
+                    BrowserDefinition(cdp_port=9222), lambda reason: asyncio.sleep(0),
+                    start_script="", connect=lambda: asyncio.sleep(0),
+                )
+                transport._unconfirmed_open.add("http://127.0.0.1:12345")
+                with patch.object(owner, "_browser", transport):
+                    self.assertIn(None, owner.pending_transfer_owners())
+                    deleted = await self.client.delete("/agents/desktop")
+                    self.assertEqual(deleted.status_code, 200, deleted.text)
+                    self.assertEqual(execution.state, "running")
+                    changed = await self.client.patch(f"/agents/{other}", json={"environment": "local"})
+                    self.assertEqual(changed.status_code, 200, changed.text)
+                    self.assertEqual((await execution.settled)["status"], "stopped")
+                    self.assertTrue(changed.json()["cleanup_unconfirmed"])
+                    self.assertTrue(transport.cleanup_pending)
+                    self.assertFalse(owner._closed)
+                    self.assertTrue(owner._backend._channel.accepting)
+            finally:
+                await owner.aclose()
+
+    async def switch_during_conversation_delete(self, *, cancel):
+        from wandrun.integrations import cleanup, instabox
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "c" * 26, workdir="/remote",
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        running, deleting = [
+            self.gateway.create_conversation(name, "desktop", client_id=uuid4().hex)[0]["id"]
+            for name in ("switch worker", "delete directory")
+        ]
+        self.runtime.files.conversation_workdirs = True
+        entered, cancelled, worker_release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        deciding, decision_release = asyncio.Event(), asyncio.Event()
+        operations, requests, ended = {}, [], []
+        self.addCleanup(worker_release.set)
+        self.addCleanup(decision_release.set)
+        stop_agent = self.runtime.stop_agent
+        owner = self.runtime.files.remote_backends["desktop"]
+        execute = owner.cleanup_execute
+        loop = asyncio.get_running_loop()
+
+        async def respond(model, body):
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await worker_release.wait()
+                raise
+            yield answer("不得发布")
+
+        async def stop(agent, *, operation, claims):
+            operations["patch"] = operation
+            return await stop_agent(agent, operation=operation, claims=claims)
+
+        async def directory(command, *, operation):
+            operations["delete"] = operation
+            return await execute(command, operation=operation)
+
+        async def suspended(backend, api, method, path, **kwargs):
+            requests.append((method, path))
+            deciding.set()
+            try:
+                await decision_release.wait()
+                return {"id": backend._machine_id, "state": "suspended"}
+            finally:
+                ended.append(loop.time())
+
+        with patch.object(CodexSubscriptionModel, "_arequest", respond), \
+                patch.object(self.runtime, "stop_agent", stop), \
+                patch.object(owner, "cleanup_execute", directory), \
+                patch.object(instabox.InstaboxBackend, "_request", suspended), \
+                patch.dict(os.environ, {"INSTABOX_API_KEY": "isolated-test"}), \
+                patch.object(cleanup, "LIMIT", 2):
+            self.gateway.send_message(running, "switch-delete-worker", "运行")
+            await asyncio.wait_for(entered.wait(), 2)
+            old = self.runtime.workers._tasks[running]
+            switching = asyncio.create_task(self.client.patch("/agents/desktop", json={"environment": "local"}))
+            await asyncio.wait_for(cancelled.wait(), 2)
+            deletion = asyncio.create_task(self.client.delete(f"/conversations/{deleting}"))
+            try:
+                await asyncio.wait_for(deciding.wait(), 2)
+                self.assertIs(operations["patch"].batch, operations["delete"].batch)
+                self.assertEqual(self.store.agent("desktop")["environment"], "cloud")
+                if cancel:
+                    switching.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await switching
+                worker_release.set()
+                decision_release.set()
+                response = await asyncio.wait_for(deletion, 3)
+                if not cancel:
+                    switched = await asyncio.wait_for(switching, 3)
+                    self.assertEqual(switched.status_code, 200, switched.text)
+                    self.assertEqual(switched.json()["agent"]["environment"], "local")
+            finally:
+                worker_release.set()
+                decision_release.set()
+                await asyncio.gather(switching, deletion, old, return_exceptions=True)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(self.store.conversation(deleting))
+        self.assertEqual(requests, [("GET", "/v1/machines/m_" + "c" * 26)])
+        self.assertLessEqual(ended[0], operations["delete"].deadline + 0.05)
+        environment = "cloud" if cancel else "local"
+        self.assertEqual(self.store.agent("desktop")["environment"], environment)
+        self.assertEqual(self.runtime.files.environments["desktop"][0], environment)
+        self.assertEqual("desktop" in self.runtime.files.remote_backends, cancel)
+        self.assertEqual(self.runtime.workers.get(running)["status"], "cancelled")
+        self.assertIsNone(self.gateway.failure)
+
+    async def test_switch_and_same_agent_conversation_delete_share_admission_and_commit_binding(self):
+        await self.switch_during_conversation_delete(cancel=False)
+
+    async def test_cancelled_switch_waiter_does_not_cancel_pending_delete_decision_or_commit_binding(self):
+        await self.switch_during_conversation_delete(cancel=True)
+
+    async def test_expired_delete_performs_no_remote_io_but_commits_local_tombstones(self):
+        from wandrun.integrations import cleanup, instabox
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "e" * 26, workdir="/remote",
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        root = self.gateway.create_conversation("expired", "desktop", client_id=uuid4().hex)[0]["id"]
+        self.runtime.files.conversation_workdirs = True
+        local = self.workspace.root / "conversations" / root
+        local.mkdir(parents=True)
+        self.block = True
+        self.gateway.send_message(root, "expired-worker", "等待")
+        await asyncio.wait_for(self.entered.wait(), 2)
+        with patch.object(cleanup, "LIMIT", 0), \
+                patch.object(instabox.InstaboxBackend, "_request", side_effect=AssertionError("expired remote I/O")) as request:
+            response = await self.client.delete("/agents/desktop")
+        self.assertEqual(response.status_code, 200, response.text)
+        request.assert_not_called()
+        self.assertIsNone(self.store.agent("desktop"))
+        self.assertIsNone(self.store.conversation(root))
+        self.assertIsNotNone(self.store.deleted_event(root))
+        self.assertFalse(local.exists())
+        self.assertEqual(self.runtime.workers.running_tasks("desktop"), [])
+        self.assertTrue(response.json()["event"]["data"]["cleanup_unconfirmed"])
+        self.assertIsNone(self.gateway.failure)
+
+    async def test_local_delete_does_not_revisit_old_machine_or_other_agent_roots(self):
+        from wandrun.integrations import instabox
+
+        remote = self.workspace.root / "old-machine"
+        other_remote = self.workspace.root / "other-machine"
+        self.runtime.environment_definitions.update({
+            "cloud": EnvironmentDefinition(type="instabox", machine_id="m_" + "a" * 26, workdir=str(remote)),
+            "other": EnvironmentDefinition(type="instabox", machine_id="m_" + "b" * 26, workdir=str(other_remote)),
+        })
+        for agent, environment in (("desktop", "cloud"), ("child", "other")):
+            response = await self.client.patch(f"/agents/{agent}", json={"environment": environment})
+            self.assertEqual(response.status_code, 200, response.text)
+        root = self.gateway.create_conversation("old root", "desktop", client_id=uuid4().hex)[0]["id"]
+        other = self.gateway.create_conversation("other root", "child", client_id=uuid4().hex)[0]["id"]
+        preserved = [
+            remote / "conversations" / root,
+            other_remote / "conversations" / root,
+            other_remote / "conversations" / other,
+        ]
+        for directory in preserved:
+            directory.mkdir(parents=True)
+        self.runtime.files.conversation_workdirs = True
+        local = self.workspace.root / "conversations" / root
+        local.mkdir(parents=True)
+        other_owner = self.runtime.files.remote_backends["child"]
+        with patch.object(instabox.InstaboxBackend, "_request", side_effect=AssertionError("old machine request")) as request, \
+                patch.object(other_owner, "cleanup_execute", side_effect=AssertionError("another Agent root")) as execute:
+            switched = await self.client.patch("/agents/desktop", json={"environment": "local"})
+            self.assertEqual(switched.status_code, 200, switched.text)
+            deleted = await self.client.delete(f"/conversations/{root}")
+            replayed = await self.client.delete(f"/conversations/{root}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(replayed.json(), deleted.json())
+        request.assert_not_called()
+        execute.assert_not_called()
+        self.assertFalse(local.exists())
+        self.assertTrue(all(directory.is_dir() for directory in preserved))
+        self.assertIsNone(self.store.conversation(root))
+        self.assertIsNotNone(self.store.conversation(other))
+        self.assertEqual(self.store.agent("desktop")["environment"], "local")
+        self.assertEqual(self.runtime.files.environments["desktop"][0], "local")
+
+    async def test_stop_then_agent_delete_reuses_real_command_and_waits_for_stop_record(self):
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "a" * 26,
+            workdir=str(self.workspace.root / "stop-remote"), termination_grace=0.1,
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        root = self.gateway.create_conversation("stop then delete", "desktop", client_id=uuid4().hex)[0]["id"]
+        self.gateway.send_message(root, "stop-owner", "就绪")
+        await self.runtime.workers.wait(root)
+        execution, cancellations = await self.start_remote_command("desktop", root)
+        stopped, release, deleting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        stop_conversation = self.runtime.stop_conversation
+        stop_agent = self.runtime.stop_agent
+        finish_delete = self.store.finish_delete
+        recorded = []
+        self.addCleanup(release.set)
+        first = True
+
+        async def stop(conversation, *, operation, claims):
+            nonlocal first
+            initial = first
+            first = False
+            result = await stop_conversation(conversation, operation=operation, claims=claims)
+            if initial:
+                stopped.set()
+                await release.wait()
+            return result
+
+        async def delete(agent, *, operation, claims):
+            deleting.set()
+            return await stop_agent(agent, operation=operation, claims=claims)
+
+        def commit(identity, cleanup_unconfirmed=None):
+            event = self.store.by_client_id("before-agent-delete")
+            self.assertIsNotNone(event)
+            recorded.append(event)
+            return finish_delete(identity, cleanup_unconfirmed)
+
+        with patch.object(self.runtime, "stop_conversation", stop), \
+                patch.object(self.runtime, "stop_agent", delete), \
+                patch.object(self.store, "finish_delete", commit):
+            stopping = asyncio.create_task(self.client.post(
+                f"/conversations/{root}/stop", json={"client_id": "before-agent-delete"},
+            ))
+            await asyncio.wait_for(stopped.wait(), 5)
+            deletion = asyncio.create_task(self.client.delete("/agents/desktop"))
+            try:
+                await asyncio.wait_for(deleting.wait(), 2)
+                self.assertIsNotNone(self.store.conversation(root))
+                self.assertFalse(deletion.done())
+                self.assertIsNone(self.store.by_client_id("before-agent-delete"))
+            finally:
+                release.set()
+                responses = await asyncio.wait_for(asyncio.gather(stopping, deletion), 5)
+        self.assertEqual([response.status_code for response in responses], [202, 200])
+        self.assertEqual((await execution.settled)["status"], "stopped")
+        self.assertEqual(cancellations, [execution._call.id])
+        self.assertEqual(recorded[0].type, "turn.stopped")
+        self.assertEqual(responses[0].json()["event"]["seq"], recorded[0].seq)
+        self.assertIsNone(self.store.agent("desktop"))
+        self.assertIsNone(self.store.conversation(root))
+        self.assertFalse(self.runtime.processes_pending())
+        self.assertIsNone(self.gateway.failure)
+
+    async def delete_overlapping_member_branch(self, *, member_first):
+        from wandrun.integrations import cleanup
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "f" * 26,
+            workdir=str(self.workspace.root / "member-remote"), termination_grace=0.1,
+        )
+        for agent in ("main", "child"):
+            response = await self.client.patch(f"/agents/{agent}", json={"environment": "cloud"})
+            self.assertEqual(response.status_code, 200, response.text)
+        root = self.gateway.create_conversation("member overlap", "main", client_id=uuid4().hex)[0]["id"]
+        self.gateway.send_message(root, "member-parent", "就绪")
+        await self.runtime.workers.wait(root)
+        child = self.runtime.workers.dispatch(AgentOutput(messages=[
+            SendMessage(to="child", task_id=None, message="成员任务"),
+        ], next="done"), root)[0]["task_id"]
+        await self.runtime.workers.wait(child)
+        response = await self.client.patch("/agents/main", json={"workers": []})
+        self.assertEqual(response.status_code, 200, response.text)
+        execution, cancellations = await self.start_remote_command("child", child)
+        self.runtime.files.conversation_workdirs = True
+        claimed, release, second_admitted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        self.addCleanup(release.set)
+        stop_owned = self.runtime._stop_owned_task
+        stop_agent = self.runtime.stop_agent
+        stop_conversation = self.runtime.stop_conversation
+        operations, stops, finished = {}, [], []
+        loop = asyncio.get_running_loop()
+
+        async def owned(task, *, operation):
+            if task == child:
+                stops.append(task)
+                claimed.set()
+                await release.wait()
+            result = await stop_owned(task, operation=operation)
+            if task == child:
+                finished.append(loop.time())
+            return result
+
+        async def member(agent, *, operation, claims):
+            operations["member"] = operation
+            if len(operations) == 2:
+                second_admitted.set()
+            return await stop_agent(agent, operation=operation, claims=claims)
+
+        async def conversation(identity, *, operation, claims):
+            operations["conversation"] = operation
+            if len(operations) == 2:
+                second_admitted.set()
+            return await stop_conversation(identity, operation=operation, claims=claims)
+
+        member_url, conversation_url = "/agents/child", f"/conversations/{root}"
+        urls = (member_url, conversation_url) if member_first else (conversation_url, member_url)
+        with patch.object(self.runtime, "_stop_owned_task", owned), \
+                patch.object(self.runtime, "stop_agent", member), \
+                patch.object(self.runtime, "stop_conversation", conversation):
+            with patch.object(cleanup, "LIMIT", 0.8):
+                first = asyncio.create_task(self.client.delete(urls[0]))
+                await asyncio.wait_for(claimed.wait(), 2)
+            with patch.object(cleanup, "LIMIT", 2):
+                second = asyncio.create_task(self.client.delete(urls[1]))
+                try:
+                    await asyncio.wait_for(second_admitted.wait(), 2)
+                    self.assertFalse(execution.settled.done())
+                finally:
+                    release.set()
+                    responses = await asyncio.wait_for(asyncio.gather(first, second), 5)
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+        self.assertEqual((await execution.settled)["status"], "stopped")
+        self.assertTrue(execution.result()["submitted"])
+        self.assertEqual(cancellations, [execution._call.id])
+        self.assertEqual(stops, [child])
+        initial = operations["member" if member_first else "conversation"]
+        later = operations["conversation" if member_first else "member"]
+        self.assertIsNot(initial.batch, later.batch)
+        self.assertGreater(later.deadline, initial.deadline + 1)
+        self.assertLessEqual(finished[0], initial.deadline + 0.05)
+        self.assertIsNone(self.store.agent("child"))
+        self.assertIsNotNone(self.store.agent("main"))
+        self.assertIsNone(self.store.conversation(root))
+        self.assertIsNotNone(self.store.deleted_event(root))
+        self.assertFalse(self.runtime.processes_pending())
+        self.assertIsNone(self.gateway.failure)
+
+    async def test_conversation_then_member_agent_delete_singleflights_real_branch_without_joining_budgets(self):
+        await self.delete_overlapping_member_branch(member_first=False)
+
+    async def test_member_agent_then_conversation_delete_singleflights_real_branch_without_joining_budgets(self):
+        await self.delete_overlapping_member_branch(member_first=True)
+
+    async def test_delete_seven_conversations_shares_one_unreachable_connection_and_deadline(self):
+        from wandrun.integrations import cleanup, instabox
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "b" * 26, workdir="/remote",
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        self.runtime.environment_definitions["independent"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "d" * 26, workdir="/independent",
+        )
+        self.assertEqual((await self.client.patch("/agents/child", json={"environment": "independent"})).status_code, 200)
+        independent = self.gateway.create_conversation("independent", "child", client_id=uuid4().hex)[0]["id"]
+        roots = {
+            self.gateway.create_conversation(str(index), "desktop", client_id=uuid4().hex)[0]["id"]
+            for index in range(7)
+        }
+        self.runtime.files.conversation_workdirs = True
+        requests, ended, deadlines = [], {}, []
+        deciding = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        backend = self.runtime.files.remote_backends["desktop"]
+        execute = backend.cleanup_execute
+
+        async def directory(command, *, operation):
+            deadlines.append(operation.deadline)
+            return await execute(command, operation=operation)
+
+        async def unreachable(backend, api, method, path, **kwargs):
+            requests.append((method, path))
+            if backend._machine_id == "m_" + "d" * 26:
+                self.assertFalse(deletion.done())
+                return {"id": backend._machine_id, "state": "suspended"}
+            deciding.set()
+            try:
+                await asyncio.Future()
+            finally:
+                ended[path] = loop.time()
+
+        before = loop.time()
+        with patch.dict(os.environ, {"INSTABOX_API_KEY": "isolated-test"}), \
+                patch.object(instabox.InstaboxBackend, "_request", unreachable), \
+                patch.object(backend, "cleanup_execute", directory):
+            with patch.object(cleanup, "LIMIT", 1.5):
+                deletion = asyncio.create_task(self.client.delete("/agents/desktop"))
+                await asyncio.wait_for(deciding.wait(), 2)
+            with patch.object(cleanup, "LIMIT", 0.2):
+                other = await asyncio.wait_for(self.client.delete(f"/conversations/{independent}"), 0.5)
+            self.assertEqual(other.status_code, 200, other.text)
+            self.assertIsNone(self.store.conversation(independent))
+            self.assertFalse(deletion.done())
+            response = await asyncio.wait_for(deletion, 3)
+        elapsed = loop.time() - before
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertLess(elapsed, 3)
+        self.assertEqual(requests, [
+            ("GET", "/v1/machines/m_" + "b" * 26),
+            ("GET", "/v1/machines/m_" + "d" * 26),
+        ])
+        self.assertEqual(len(deadlines), 7)
+        self.assertEqual(len(set(deadlines)), 1)
+        self.assertLessEqual(ended["/v1/machines/m_" + "b" * 26], deadlines[0] + 0.05)
+        self.assertIsNone(self.store.agent("desktop"))
+        self.assertIsNotNone(self.store.agent("child"))
+        reports = response.json()["event"]["data"]["cleanup_unconfirmed"]
+        self.assertEqual({item["path"] for item in reports if item["stage"] == "directory"}, {
+            "conversations/" + root for root in roots
+        })
+
+    async def test_delete_admission_rejects_already_ready_worker_child_delivery(self):
+        root = self.gateway.create_conversation("ready response", "main", client_id=uuid4().hex)[0]["id"]
+        self.block = True
+        self.gateway.send_message(root, "ready-parent", "等待删除")
+        await asyncio.wait_for(self.entered.wait(), 5)
+        observed = asyncio.get_running_loop().create_future()
+
+        def ready_delivery():
+            intent_published = self.store.deletion_threads(root) is not None
+            output = AgentOutput(messages=[SendMessage(
+                to="child", task_id=None, message="ready before deletion",
+            )], next="wait")
+            try:
+                accepted = self.runtime.workers.dispatch(output, root)[0]["accepted"]
+            except asyncio.CancelledError:
+                accepted = False
+            observed.set_result((intent_published, accepted))
+
+        deleting = asyncio.create_task(self.client.delete(f"/conversations/{root}"))
+        asyncio.get_running_loop().call_soon(ready_delivery)
+        try:
+            published, accepted = await asyncio.wait_for(observed, 2)
+            response = await asyncio.wait_for(deleting, 5)
+        finally:
+            self.release.set()
+        self.assertTrue(published)
+        self.assertFalse(accepted, "an admitted deletion must revoke ready Worker dispatch")
+        self.assertEqual(response.status_code, 200, response.text)
+
+    async def test_failed_child_checkpoint_does_not_end_other_child_machine_participation(self):
+        from wandrun.integrations import cleanup, instabox
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "f" * 26, workdir="/remote",
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        first, second = [
+            self.gateway.create_conversation(name, "desktop", client_id=uuid4().hex)[0]["id"]
+            for name in ("first", "second")
+        ]
+        self.runtime.files.conversation_workdirs = True
+        waiting, release = asyncio.Event(), asyncio.Event()
+        requests = []
+        cleanup_directory = self.runtime.files.cleanup_conversation
+        delete_thread = self.runtime.checkpointer.adelete_thread
+
+        async def directory(conversation, **kwargs):
+            if conversation == second:
+                waiting.set()
+                await release.wait()
+            return await cleanup_directory(conversation, **kwargs)
+
+        async def local_delete(thread):
+            if thread == first:
+                await waiting.wait()
+                raise OSError("checkpoint disk full")
+            return await delete_thread(thread)
+
+        async def suspended(backend, api, method, path, **kwargs):
+            requests.append((method, path))
+            return {"id": backend._machine_id, "state": "suspended"}
+
+        with patch.dict(os.environ, {"INSTABOX_API_KEY": "isolated-test"}), \
+                patch.object(instabox.InstaboxBackend, "_request", suspended), \
+                patch.object(self.runtime.files, "cleanup_conversation", directory), \
+                patch.object(self.runtime.checkpointer, "adelete_thread", local_delete), \
+                patch.object(cleanup, "LIMIT", 2):
+            deleting = asyncio.create_task(self.client.delete("/agents/desktop"))
+            await asyncio.wait_for(waiting.wait(), 2)
+            remaining = self.gateway._deleting[second]
+            try:
+                response = await asyncio.wait_for(deleting, 2)
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.shield(remaining), 2)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(requests, [("GET", "/v1/machines/m_" + "f" * 26)])
+        self.assertIsNone(self.store.conversation(second))
+        self.assertTrue(self.store.agent_deleting("desktop"))
+
+    async def test_conversation_checkpoint_does_not_split_overlapping_agent_machine_decision(self):
+        from wandrun.integrations import cleanup, instabox
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "f" * 26, workdir="/remote",
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        first, second = [
+            self.gateway.create_conversation(name, "desktop", client_id=uuid4().hex)[0]["id"]
+            for name in ("first", "second")
+        ]
+        self.runtime.files.conversation_workdirs = True
+        checkpoint, release, reached_second = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        delete_thread = self.runtime.checkpointer.adelete_thread
+        requests = []
+
+        async def checkpoint_delete(thread):
+            if thread == first:
+                checkpoint.set()
+                await release.wait()
+            else:
+                reached_second.set()
+            return await delete_thread(thread)
+
+        async def suspended(backend, api, method, path, **kwargs):
+            requests.append((method, path))
+            return {"id": backend._machine_id, "state": "suspended"}
+
+        with patch.dict(os.environ, {"INSTABOX_API_KEY": "isolated-test"}), \
+                patch.object(instabox.InstaboxBackend, "_request", suspended), \
+                patch.object(self.runtime.checkpointer, "adelete_thread", checkpoint_delete), \
+                patch.object(cleanup, "LIMIT", 0.2):
+            conversation = asyncio.create_task(self.client.delete(f"/conversations/{first}"))
+            await asyncio.wait_for(checkpoint.wait(), 2)
+            agent = asyncio.create_task(self.client.delete("/agents/desktop"))
+            # Admission must start the new range before waiting for C1's local commit.
+            try:
+                await asyncio.wait_for(reached_second.wait(), 0.5)
+            finally:
+                release.set()
+                responses = await asyncio.gather(conversation, agent)
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+        self.assertEqual(requests, [("GET", "/v1/machines/m_" + "f" * 26)])
+        self.assertIsNone(self.store.agent("desktop"))
+        self.assertIsNone(self.store.conversation(first))
+        self.assertIsNone(self.store.conversation(second))
+
+    async def test_agent_admission_owns_conversation_before_first_stop_await(self):
+        from wandrun.integrations import cleanup, instabox
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "f" * 26, workdir="/remote",
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        roots = [
+            self.gateway.create_conversation(name, "desktop", client_id=uuid4().hex)[0]["id"]
+            for name in ("first", "second")
+        ]
+        self.runtime.files.conversation_workdirs = True
+        stopping, release, checkpoint = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        stop_agent = self.runtime.stop_agent
+        delete_thread = self.runtime.checkpointer.adelete_thread
+        requests = []
+        deadline = []
+        directory_deadlines = []
+        backend = self.runtime.files.remote_backends["desktop"]
+        cleanup_execute = backend.cleanup_execute
+
+        async def directory(command, *, operation):
+            directory_deadlines.append(operation.deadline)
+            return await cleanup_execute(command, operation=operation)
+
+        async def stop(agent, *, operation, claims):
+            deadline.append(operation.deadline)
+            stopping.set()
+            await release.wait()
+            return await stop_agent(agent, operation=operation, claims=claims)
+
+        async def local_delete(thread):
+            checkpoint.set()
+            return await delete_thread(thread)
+
+        async def suspended(backend, api, method, path, **kwargs):
+            requests.append((method, path))
+            return {"id": backend._machine_id, "state": "suspended"}
+
+        with patch.dict(os.environ, {"INSTABOX_API_KEY": "isolated-test"}), \
+                patch.object(instabox.InstaboxBackend, "_request", suspended), \
+                patch.object(self.runtime, "stop_agent", stop), \
+                patch.object(backend, "cleanup_execute", directory), \
+                patch.object(self.runtime.checkpointer, "adelete_thread", local_delete), \
+                patch.object(cleanup, "LIMIT", 0.2):
+            agent = asyncio.create_task(self.client.delete("/agents/desktop"))
+            await asyncio.wait_for(stopping.wait(), 2)
+            conversation = asyncio.create_task(self.client.delete(f"/conversations/{roots[0]}"))
+            try:
+                await asyncio.wait_for(checkpoint.wait(), 2)
+            finally:
+                release.set()
+                responses = await asyncio.gather(agent, conversation)
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+        self.assertEqual(requests, [("GET", "/v1/machines/m_" + "f" * 26)])
+        self.assertEqual(directory_deadlines, [deadline[0]] * len(roots))
+        self.assertIsNone(self.store.agent("desktop"))
+
+    async def test_late_agent_delete_stops_other_live_command_before_first_checkpoint_finishes(self):
+        from test_environments import loopback_instabox
+
+        network = loopback_instabox()
+        await network.__aenter__()
+        self.addAsyncCleanup(network.__aexit__, None, None, None)
+        self.addAsyncCleanup(self.stack.aclose)
+        remote = self.workspace.root / "remote"
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "f" * 26, workdir=str(remote),
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        first, second = [
+            self.gateway.create_conversation(name, "desktop", client_id=uuid4().hex)[0]["id"]
+            for name in ("first", "second")
+        ]
+        ready = asyncio.Event()
+        checkpoint, release, terminated = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        calls = 0
+
+        async def respond(model, body):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                yield {
+                    "type": "response.completed",
+                    "response": {"status": "completed", "output": [{
+                        "type": "function_call", "id": "background", "call_id": "background",
+                        "name": "exec_command",
+                        "arguments": json.dumps({
+                            "command": "trap 'echo TERM > term-proof; exit 0' TERM; echo ready > command-ready; while :; do sleep 0.01; done",
+                            "yield_seconds": 0,
+                        }),
+                    }]},
+                }
+            else:
+                ready.set()
+                yield answer("后台仍运行")
+
+        delete_thread = self.runtime.checkpointer.adelete_thread
+        async def local_delete(thread):
+            if thread == first:
+                checkpoint.set()
+                await release.wait()
+            else:
+                terminated.set()
+            return await delete_thread(thread)
+
+        with patch.object(CodexSubscriptionModel, "_arequest", respond):
+            self.gateway.send_message(second, "real-command", "启动后台命令")
+            await asyncio.wait_for(ready.wait(), 5)
+            await self.runtime.workers.wait(second)
+        async with asyncio.timeout(5):
+            while not (remote / "command-ready").exists():
+                await asyncio.sleep(0.01)
+        channel = self.runtime.files.remote_backends["desktop"]._backend._channel
+        send, cancellations = channel.send, []
+        async def record_send(message, *args, **kwargs):
+            if message["type"] == "cancel":
+                cancellations.append(message["id"])
+            return await send(message, *args, **kwargs)
+        with patch.object(self.runtime.checkpointer, "adelete_thread", local_delete), \
+                patch.object(channel, "send", record_send):
+            conversation = asyncio.create_task(self.client.delete(f"/conversations/{first}"))
+            await asyncio.wait_for(checkpoint.wait(), 2)
+            agent = asyncio.create_task(self.client.delete("/agents/desktop"))
+            try:
+                await asyncio.wait_for(terminated.wait(), 5)
+                self.assertEqual((remote / "term-proof").read_text().strip(), "TERM")
+                self.assertFalse(release.is_set())
+            finally:
+                release.set()
+                responses = await asyncio.gather(conversation, agent)
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+        self.assertFalse(self.runtime.processes_pending())
+        self.assertEqual(len(cancellations), 1)
+
+    async def test_late_agent_new_directory_uses_private_channel_past_first_request_deadline(self):
+        from wandrun.integrations import cleanup, instabox
+        from test_instabox import Connection, ReadyBackend
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "f" * 26, workdir="/remote",
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        first, second = [
+            self.gateway.create_conversation(name, "desktop", client_id=uuid4().hex)[0]["id"]
+            for name in ("first", "second")
+        ]
+        self.runtime.files.conversation_workdirs = True
+        owner = self.runtime.files.remote_backends["desktop"]
+        connection, backend = Connection(), ReadyBackend()
+        checkpoint, release, first_expired = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        second_directory = asyncio.Event()
+        delete_thread = self.runtime.checkpointer.adelete_thread
+        stop_owned = self.runtime._stop_owned_task
+        execute = owner.cleanup_execute
+        loop = asyncio.get_running_loop()
+        requests, deadlines, ended = [], {}, {}
+
+        async def local_delete(thread):
+            if thread == first:
+                checkpoint.set()
+                await release.wait()
+            return await delete_thread(thread)
+
+        async def stop(task, *, operation):
+            if task == second:
+                await first_expired.wait()
+            return await stop_owned(task, operation=operation)
+
+        async def directory(command, *, operation):
+            task = first if first in command else second
+            deadlines[task] = operation.deadline
+            if task == first:
+                loop.call_at(operation.deadline + 0.01, first_expired.set)
+            else:
+                self.assertTrue(first_expired.is_set())
+                self.assertFalse(connection.is_closed())
+                second_directory.set()
+            try:
+                return await execute(command, operation=operation)
+            finally:
+                ended[task] = loop.time()
+
+        async def running(provider, api, method, path, **kwargs):
+            requests.append((method, path))
+            return {"id": provider._machine_id, "state": "running", "runtime": {"ready": True}}
+
+        with patch.dict(os.environ, {"INSTABOX_API_KEY": "isolated-test"}), \
+                patch.object(instabox.InstaboxBackend, "_request", running), \
+                patch.object(owner, "_connect_ssh", return_value=connection) as connect, \
+                patch.object(instabox.SSHBackend, "start", return_value=backend), \
+                patch.object(owner, "cleanup_execute", directory), \
+                patch.object(self.runtime, "_stop_owned_task", stop), \
+                patch.object(self.runtime.checkpointer, "adelete_thread", local_delete):
+            with patch.object(cleanup, "LIMIT", 0.3):
+                conversation = asyncio.create_task(self.client.delete(f"/conversations/{first}"))
+                await asyncio.wait_for(checkpoint.wait(), 2)
+            with patch.object(cleanup, "LIMIT", 1):
+                agent = asyncio.create_task(self.client.delete("/agents/desktop"))
+                try:
+                    await asyncio.wait_for(second_directory.wait(), 2)
+                finally:
+                    release.set()
+                    responses = await asyncio.gather(conversation, agent)
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+        self.assertEqual(requests, [("GET", "/v1/machines/m_" + "f" * 26)])
+        self.assertEqual(connect.await_count, 1)
+        self.assertEqual(len(backend.commands), 2)
+        self.assertGreater(ended[second], deadlines[first])
+        self.assertLessEqual(ended[second], deadlines[second] + 0.05)
+        self.assertTrue(connection.is_closed())
+
+    async def test_finished_switch_in_same_caller_does_not_retain_machine_failure_or_private_channel(self):
+        from wandrun.integrations import instabox
+        from test_instabox import Connection, ReadyBackend
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "f" * 26, workdir="/remote",
+        )
+        # ASGITransport keeps this caller alive across each completed request.
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        first, second = [
+            self.gateway.create_conversation(name, "desktop", client_id=uuid4().hex)[0]["id"]
+            for name in ("suspended", "later-running")
+        ]
+        self.runtime.files.conversation_workdirs = True
+        owner = self.runtime.files.remote_backends["desktop"]
+        connection, backend = Connection(), ReadyBackend()
+        running = False
+        requests = []
+
+        async def state(provider, api, method, path, **kwargs):
+            requests.append((method, path))
+            return {
+                "id": provider._machine_id, "state": "running" if running else "suspended",
+                "runtime": {"ready": running},
+            }
+
+        with patch.dict(os.environ, {"INSTABOX_API_KEY": "isolated-test"}), \
+                patch.object(instabox.InstaboxBackend, "_request", state), \
+                patch.object(owner, "_connect_ssh", return_value=connection), \
+                patch.object(instabox.SSHBackend, "start", return_value=backend):
+            suspended = await self.client.delete(f"/conversations/{first}")
+            running = True
+            ready = await self.client.delete(f"/conversations/{second}")
+        self.assertEqual([suspended.status_code, ready.status_code], [200, 200])
+        self.assertTrue(suspended.json()["event"]["data"]["cleanup_unconfirmed"])
+        self.assertFalse(ready.json()["event"]["data"].get("cleanup_unconfirmed"))
+        self.assertEqual(requests, [("GET", "/v1/machines/m_" + "f" * 26)] * 2)
+        self.assertTrue(connection.is_closed())
+
+    async def test_switch_waiting_for_catalog_lock_keeps_full_local_stop_budget(self):
+        from wandrun.integrations import cleanup
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "d" * 26, workdir="/remote",
+        )
+        entered = asyncio.Event()
+
+        async def finishing_cancel(model, body):
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.01)
+                raise
+            yield answer("不得交付")
+
+        root = self.gateway.create_conversation("lock wait", "desktop", client_id=uuid4().hex)[0]["id"]
+        with patch.object(CodexSubscriptionModel, "_arequest", finishing_cancel), patch.object(cleanup, "LIMIT", 0.05):
+            self.gateway.send_message(root, "lock-wait", "运行")
+            await entered.wait()
+            async with self.gateway._catalog_lock:
+                switching = asyncio.create_task(self.client.patch("/agents/desktop", json={"environment": "cloud"}))
+                # Deliberately exceed the operation budget before stop can begin.
+                await asyncio.sleep(0.08)
+            response = await switching
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.store.agent("desktop")["environment"], "cloud")
+        self.assertIn("desktop", self.runtime.files.remote_backends)
+        self.assertEqual(self.runtime.workers.get(root)["status"], "cancelled")
+        self.assertIsNone(self.gateway.failure)
+
+    async def test_expired_switch_settles_real_publication_before_binding_commit(self):
+        from wandrun.integrations import cleanup
+        from test_file_transfer import remote_backend
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "d" * 26,
+            workdir=str(self.workspace.root / "remote"),
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        root = self.gateway.create_conversation("publication", "desktop", client_id=uuid4().hex)[0]["id"]
+        self.gateway.send_message(root, "publication-owner", "就绪")
+        await self.runtime.workers.wait(root)
+        self.runtime.files.conversation_workdirs = True
+        observed, release = asyncio.Event(), asyncio.Event()
+        async with remote_backend(self.workspace.root / "remote", observed=observed, publication_gate=release) as backend:
+            self.runtime.files.remote_backends["desktop"] = backend
+            saving = asyncio.create_task(self.runtime.files.save_task_file(root, "real.txt", b"actual publication"))
+            try:
+                await asyncio.wait_for(observed.wait(), 5)
+                with patch.object(cleanup, "LIMIT", 0):
+                    response = await self.client.patch("/agents/desktop", json={"environment": "local"})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(self.store.agent("desktop")["environment"], "local")
+                self.assertNotIn("desktop", self.runtime.files.remote_backends)
+                self.assertEqual(self.runtime.files.pending_transfer_agents(), set())
+                self.assertTrue(response.json()["cleanup_unconfirmed"])
+                self.assertIsNone(self.gateway.failure)
+            finally:
+                release.set()
+                saving.cancel()
+                await asyncio.gather(saving, return_exceptions=True)
+            self.assertEqual((self.workspace.root / "remote" / "conversations" / root / "real.txt").read_bytes(), b"actual publication")
+
+    async def test_switched_thread_waits_for_old_graph_exit_without_blocking_other_threads(self):
+        from wandrun.integrations import cleanup
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "d" * 26, workdir="/remote",
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        root = self.gateway.create_conversation("old graph", "desktop", client_id=uuid4().hex)[0]["id"]
+        other = self.gateway.create_conversation("other thread", "desktop", client_id=uuid4().hex)[0]["id"]
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = 0
+
+        async def finishing_cancel(model, body):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    await release.wait()
+                    raise
+            yield answer("新轮完成")
+
+        with patch.object(CodexSubscriptionModel, "_arequest", finishing_cancel):
+            self.gateway.send_message(root, "old-graph", "运行")
+            await entered.wait()
+            old = self.runtime.workers._tasks[root]
+            try:
+                with patch.object(cleanup, "LIMIT", 0.02):
+                    response = await self.client.patch("/agents/desktop", json={"environment": "local"})
+                self.assertEqual(response.status_code, 200, response.text)
+                with self.assertRaisesRegex(ValueError, "正在停止"):
+                    self.gateway.send_message(root, "too-early", "同线程不能并发")
+                self.gateway.send_message(other, "other-thread", "另一对话正常")
+                self.assertEqual((await self.runtime.workers.wait(other))["status"], "completed")
+                self.assertEqual(calls, 2)
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(old, return_exceptions=True), 1)
+            self.gateway.send_message(root, "after-exit", "继续")
+            self.assertEqual((await self.runtime.workers.wait(root))["status"], "completed")
+            self.assertEqual(calls, 3)
+        self.assertIsNone(self.gateway.failure)
+
+    async def test_delete_agent_reports_shared_stop_uncertainty_once(self):
+        from wandrun.integrations import cleanup
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "e" * 26, workdir="/remote",
+        )
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def stopping(model, body):
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+                raise
+            yield answer("不得交付")
+
+        roots = [self.gateway.create_conversation(str(index), "desktop", client_id=uuid4().hex)[0]["id"] for index in range(2)]
+        with patch.object(CodexSubscriptionModel, "_arequest", stopping):
+            self.gateway.send_message(roots[0], "shared-stop", "运行")
+            await entered.wait()
+            old = self.runtime.workers._tasks[roots[0]]
+            try:
+                with patch.object(cleanup, "LIMIT", 0.02):
+                    response = await self.client.delete("/agents/desktop")
+                self.assertEqual(response.status_code, 200, response.text)
+                reports = response.json()["event"]["data"]["cleanup_unconfirmed"]
+                self.assertEqual([item for item in reports if item["stage"] == "execution"],
+                                 [{"stage": "execution", "agent_id": "desktop", "error": "CleanupUnconfirmed"}])
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(old, return_exceptions=True), 1)
+
+    async def test_switching_from_local_alias_does_not_report_remote_directory_residue(self):
+        self.runtime.environment_definitions["desktop-local"] = EnvironmentDefinition(type="local")
+        self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "desktop-local"})).status_code, 200)
+        response = await self.client.patch("/agents/desktop", json={"environment": "local"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json().get("cleanup_unconfirmed", []), [])
+        self.assertEqual(self.store.agent("desktop")["environment"], "local")
+
+    async def test_management_deadline_settles_slow_remote_worker_and_ignores_late_cleanup(self):
+        from wandrun.integrations import cleanup
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "c" * 26,
+            workdir=str(self.workspace.root / "remote"),
+        )
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed_cancel(model, body):
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+                raise
+            yield answer("不得交付")
+
+        for operation in ("switch", "delete"):
+            entered.clear()
+            release.clear()
+            self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "cloud"})).status_code, 200)
+            root = self.gateway.create_conversation(operation, "desktop", client_id=uuid4().hex)[0]["id"]
+            with patch.object(CodexSubscriptionModel, "_arequest", delayed_cancel):
+                self.gateway.send_message(root, "slow-cleanup-" + operation, "运行")
+                await asyncio.wait_for(entered.wait(), 2)
+                old_execution = self.runtime.workers._tasks[root]
+                try:
+                    with patch.object(cleanup, "LIMIT", 0.05):
+                        if operation == "switch":
+                            response = await self.client.patch("/agents/desktop", json={"environment": "local"})
+                            reports = response.json().get("cleanup_unconfirmed", [])
+                        else:
+                            response = await self.client.delete("/agents/desktop")
+                            reports = response.json().get("event", {}).get("data", {}).get("cleanup_unconfirmed", [])
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertTrue(any(item["error"] == "CleanupUnconfirmed" for item in reports))
+                    self.assertEqual(self.runtime.workers.running_tasks("desktop"), [])
+                finally:
+                    release.set()
+                    await asyncio.wait_for(asyncio.gather(old_execution, return_exceptions=True), 2)
+            if operation == "switch":
+                self.assertEqual(self.store.agent("desktop")["environment"], "local")
+                self.assertEqual(self.runtime.workers.get(root)["status"], "cancelled")
+            else:
+                self.assertIsNone(self.store.agent("desktop"))
+                self.assertIsNone(self.store.conversation(root))
+                self.assertIsNone(await self.runtime.checkpointer.aget_tuple({"configurable": {"thread_id": root}}))
+            self.assertIsNone(self.gateway.failure)
+
+    async def fail_local_stop_then_release(self):
+        """Keep real Local execution/settlement; fail only its first stop boundary."""
+        calls = 0
+
+        async def respond(model, body):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                yield {
+                    "type": "response.completed",
+                    "response": {"status": "completed", "output": [{
+                        "type": "function_call", "id": "local-background", "call_id": "local-background",
+                        "name": "exec_command",
+                        "arguments": json.dumps({"command": "sleep 60", "yield_seconds": 0}),
+                    }]},
+                }
+            else:
+                yield answer("本地后台命令已启动")
+
+        root = self.gateway.create_conversation("failed local stop", "desktop", client_id=uuid4().hex)[0]["id"]
+        with patch.object(CodexSubscriptionModel, "_arequest", respond):
+            self.gateway.send_message(root, "start-local-background", "启动后台命令")
+            self.assertEqual((await self.runtime.workers.wait(root))["status"], "completed")
+        self.assertIn(root, self.runtime.agent_tasks_pending("desktop"))
+        self.assertTrue(self.runtime.processes_pending())
+        config = {"configurable": {"thread_id": root}}
+        self.assertIsNotNone(await self.runtime.checkpointer.aget_tuple(config))
+        stop_commands = self.runtime._stop_commands
+        attempts = []
+        failure = RuntimeError("本机执行未释放：首次本地停止边界故障")
+
+        async def fail_first(scope):
+            attempts.append(frozenset(scope))
+            if len(attempts) == 1:
+                raise failure
+            return await stop_commands(scope)
+
+        self.stack.enter_context(patch.object(self.runtime, "_stop_commands", fail_first))
+        with self.assertRaisesRegex(RuntimeError, "首次本地停止边界故障") as stopped:
+            await self.client.post(f"/conversations/{root}/stop", json={"client_id": "failed-local-stop"})
+        self.assertIs(stopped.exception, failure)
+        self.assertEqual(attempts, [frozenset({root})])
+        self.assertIsNone(self.store.by_client_id("failed-local-stop"))
+        self.assertIsNotNone(self.store.conversation(root))
+        self.assertTrue(self.runtime.workers.is_stopped(root))
+        self.assertIsNone(self.gateway.failure)
+        # Local resources may also settle through the real Worker stop hook.
+        # Explicitly await the original boundary before the independent request;
+        # no timing assumption, synthetic stop Future, or new execution is needed.
+        self.assertEqual(await stop_commands({root}), [])
+        self.assertFalse(self.runtime.processes_pending())
+        await self.runtime.workers.stop_tasks({root})
+        return root, attempts
+
+    async def test_conversation_delete_rechecks_local_resources_after_failed_stop(self):
+        root, attempts = await self.fail_local_stop_then_release()
+        deleted = await self.client.delete(f"/conversations/{root}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(attempts, [frozenset({root})] * 2)
+        self.assertIsNone(self.gateway.failure)
+        self.assertIsNone(self.store.conversation(root))
+        self.assertEqual(self.store.deleted_event(root).seq, deleted.json()["event"]["seq"])
+        self.assertIsNone(await self.runtime.checkpointer.aget_tuple({"configurable": {"thread_id": root}}))
+        self.assertEqual(self.runtime.workers.get(root)["status"], "not_found")
+        self.assertFalse(self.runtime.processes_pending())
+        self.assertIsNone(self.store.by_client_id("failed-local-stop"))
+        self.assertEqual((await self.client.get("/agents/desktop")).status_code, 200)
+
+    async def test_environment_switch_rechecks_local_resources_after_failed_stop(self):
+        root, attempts = await self.fail_local_stop_then_release()
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "a" * 26,
+            workdir=str(self.workspace.root / "recovered-remote"),
+        )
+        before = self.runtime._assembly_for("desktop")
+        switched = await self.client.patch("/agents/desktop", json={"environment": "cloud"})
+        self.assertEqual(switched.status_code, 200, switched.text)
+        self.assertEqual(attempts, [frozenset({root})] * 2)
+        self.assertEqual(switched.json()["agent"]["environment"], "cloud")
+        self.assertEqual(self.store.agent("desktop")["environment"], "cloud")
+        self.assertEqual(self.store.agent_catalog().agents["desktop"].environment, "cloud")
+        self.assertEqual(self.runtime.files.environments["desktop"][0], "cloud")
+        self.assertIn("desktop", self.runtime.files.remote_backends)
+        self.assertIsNot(self.runtime._assembly_for("desktop"), before)
+        self.assertIsNotNone(self.store.conversation(root))
+        self.assertIsNotNone(await self.runtime.checkpointer.aget_tuple({"configurable": {"thread_id": root}}))
+        self.assertTrue(self.runtime.workers.is_stopped(root))
+        self.assertFalse(self.runtime.processes_pending())
+        self.assertIsNone(self.store.by_client_id("failed-local-stop"))
+        self.assertIsNone(self.gateway.failure)
+
+    async def test_switch_and_delete_automatically_stop_idle_owners_background_command(self):
         self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
             type="instabox", machine_id="m_" + "a" * 26,
             workdir=str(self.workspace.root / "remote"),
@@ -341,17 +1478,20 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.runtime.workers.wait(root))["status"], "completed")
             self.assertEqual(self.runtime.workers.running_tasks("desktop"), [])
             self.assertIn(root, self.runtime.agent_tasks_pending("desktop"))
-            rejected = await self.client.patch("/agents/desktop", json={"environment": "cloud"})
-            self.assertEqual(rejected.status_code, 409, rejected.text)
-            self.assertEqual(self.store.agent("desktop")["environment"], "local")
-            stopped = await self.runtime.workers.cancel(root)
-            self.assertNotIn("cleanup_unconfirmed", stopped)
-            async def released():
-                while self.runtime.agent_tasks_pending("desktop"):
-                    await asyncio.sleep(0.01)
-            await asyncio.wait_for(released(), 5)
             switched = await self.client.patch("/agents/desktop", json={"environment": "cloud"})
             self.assertEqual(switched.status_code, 200, switched.text)
+            self.assertTrue(self.runtime.workers.is_stopped(root))
+            self.assertEqual(self.runtime.workers.running_tasks("desktop"), [])
+            self.assertEqual((await self.client.patch("/agents/desktop", json={"environment": "local"})).status_code, 200)
+            calls = 0
+            root = self.gateway.create_conversation("delete-background", "desktop", client_id=uuid4().hex)[0]["id"]
+            self.gateway.send_message(root, "start-for-delete", "启动后台命令")
+            await self.runtime.workers.wait(root)
+            self.assertIn(root, self.runtime.agent_tasks_pending("desktop"))
+            deleted = await self.client.delete("/agents/desktop")
+            self.assertEqual(deleted.status_code, 200, deleted.text)
+            self.assertIsNone(self.store.agent("desktop"))
+            self.assertFalse(self.runtime.processes_pending())
 
     async def test_code_mode_default_explicit_value_edits_and_validation(self):
         self.assertFalse(self.store.agent("main")["code_mode"])  # Imported definitions keep their saved value.
@@ -1096,27 +2236,11 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.last_seq(), cursor)
         self.assertIsInstance(self.gateway.failure, GatewayFailure)
 
-    async def test_delete_waits_for_file_transfer_cleanup_without_publishing_intent(self):
-        with patch.object(self.runtime, "file_transfers_pending", return_value=True):
-            rejected = await self.client.delete("/agents/desktop")
-        self.assertEqual(rejected.status_code, 409, rejected.text)
-        self.assertTrue(rejected.json()["error"]["details"]["file_transfers_pending"])
-        self.assertFalse(self.store.agent_deleting("desktop"))
-        self.assertIsNone(self.store.deleted_agent_event("desktop"))
-        self.assertEqual((await self.client.get("/agents/desktop")).status_code, 200)
-        self.assertIsNone(self.gateway.failure)
 
-        deleted = await self.client.delete("/agents/desktop")
-        self.assertEqual(deleted.status_code, 200, deleted.text)
-        self.assertIsNotNone(self.store.deleted_agent_event("desktop"))
-
-    async def test_delete_conflicts_report_members_and_running_tasks(self):
+    async def test_delete_rejects_member_reference_but_automatically_stops_worker(self):
         response = await self.client.delete("/agents/child")
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json()["error"]["details"], {
-            "member_of": [{"id": "main", "name": "main"}], "running_conversations": 0,
-            "running_tasks": 0,
-        })
+        self.assertEqual(response.json()["error"]["details"]["member_of"], [{"id": "main", "name": "main"}])
         desktop = await self.client.delete("/agents/desktop")
         self.assertEqual(desktop.status_code, 200)
         self.block = True
@@ -1124,13 +2248,12 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         self.gateway.send_message(root, "run", "开始")
         await asyncio.wait_for(self.entered.wait(), 5)
         working = await self.client.delete("/agents/main")
-        self.assertEqual(working.status_code, 409)
-        self.assertEqual(working.json()["error"]["details"]["running_conversations"], 1)
-        self.release.set()
-        await self.runtime.workers.wait(root)
+        self.assertEqual(working.status_code, 200, working.text)
+        self.assertIsNone(self.store.agent("main"))
+        self.assertIsNone(self.store.conversation(root))
 
 
-    async def test_removed_member_with_running_delegation_cannot_be_deleted(self):
+    async def test_removed_member_is_stopped_and_deleted_without_deleting_parent_conversation(self):
         root = self.gateway.create_conversation("其他入口", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "run", "开始")
         await self.runtime.workers.wait(root)
@@ -1143,19 +2266,12 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.entered.wait(), 5)
         updated = await self.client.patch("/agents/main", json={"workers": []})
         self.assertEqual(updated.status_code, 200, updated.text)
-        rejected = await self.client.delete("/agents/child")
-        self.assertEqual(rejected.status_code, 409, rejected.text)
-        self.assertEqual(rejected.json()["error"]["details"], {
-            "member_of": [], "running_conversations": 0, "running_tasks": 1,
-        })
-        self.assertFalse(self.store.agent_deleting("child"))
-        self.assertEqual(self.runtime.workers.get(child)["status"], "running")
-        self.assertIsNone(self.gateway.failure)
-        self.release.set()
-        await self.runtime.workers.wait(child)
-        self.assertEqual((await self.client.delete("/agents/child")).status_code, 200)
+        deleted = await self.client.delete("/agents/child")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertIsNone(self.store.agent("child"))
+        self.assertEqual(self.runtime.workers.get(child)["status"], "cancelled")
         self.assertIsNotNone(self.store.conversation(root))
-        self.assertEqual(self.runtime.workers.get(child)["status"], "completed")
+        self.assertIsNone(self.gateway.failure)
 
     async def test_deletion_intent_blocks_existing_delegation_and_notification_resume(self):
         root = self.gateway.create_conversation("其他入口", "main", client_id=uuid4().hex)[0]["id"]
@@ -1243,35 +2359,66 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         async def fail_close_agent(*args, **kwargs):
             raise ExceptionGroup("close", [BrowserRejected("Chrome unavailable")])
 
-        async def remote(command):
-            raise TimeoutError("SSH unavailable")
+        async def remote(command, *, operation):
+            raise OSError("SSH unavailable")
 
         class Browser:
             list_tasks = staticmethod(lambda: [])
-            close_agent = staticmethod(fail_close_agent)
+            owned_tasks = staticmethod(lambda agent: (root,))
+            close_task = staticmethod(fail_close_agent)
+            closing = None
+
+            def claim_task_close(self, task, **kwargs):
+                if self.closing is None:
+                    self.closing = asyncio.create_task(fail_close_agent())
+                return self.closing
+
+            def expire_task_close(self, task):
+                if self.closing is not None and not self.closing.done():
+                    self.closing.cancel()
 
         self.runtime.browsers = {"local": Browser()}
         self.runtime.files.conversation_workdirs = True
         self.runtime.files.update_environments(
-            {"main": ("cloud", "/remote")}, {"main": SimpleNamespace(aexecute=remote)},
+            {"main": ("cloud", "/remote")}, {"main": SimpleNamespace(cleanup_execute=remote)},
         )
         deleted = await self.client.delete("/agents/main")
         self.assertEqual(deleted.status_code, 200, deleted.text)
         stages = {item["stage"] for item in deleted.json()["event"]["data"]["cleanup_unconfirmed"]}
-        self.assertEqual(stages, {"browser", "directory"})
+        self.assertTrue({"browser", "directory"} <= stages)
         self.assertIsNone(self.gateway.failure)
         self.assertIsNone(self.store.agent("main"))
         self.assertIsNone(self.store.conversation(root))
         self.assertEqual((await self.client.delete("/agents/main")).json(), deleted.json())
-        self.assertEqual(self.store.deleted_event(root).data["cleanup_unconfirmed"][0]["environment"], "cloud")
+        self.assertTrue(any(
+            item["stage"] == "directory" and item.get("environment") == "cloud"
+            for item in self.store.deleted_event(root).data["cleanup_unconfirmed"]
+        ))
 
     async def test_failed_delete_survives_restart_and_resumes_without_duplicate_events(self):
+        from wandrun.integrations import instabox
+
+        self.runtime.environment_definitions["cloud"] = EnvironmentDefinition(
+            type="instabox", machine_id="m_" + "f" * 26, workdir="/restart-remote",
+        )
+        response = await self.client.patch("/agents/main", json={"environment": "cloud"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.runtime.files.conversation_workdirs = True
+        requests = []
+
+        async def suspended(backend, api, method, path, **kwargs):
+            requests.append((method, path))
+            return {"id": backend._machine_id, "state": "suspended"}
+
         root = self.gateway.create_conversation("历史", "main", client_id=uuid4().hex)[0]["id"]
         self.gateway.send_message(root, "run", "开始")
         await self.runtime.workers.wait(root)
-        with patch.object(self.runtime.checkpointer, "adelete_thread", side_effect=OSError("disk failed")):
+        with patch.object(self.runtime.checkpointer, "adelete_thread", side_effect=OSError("disk failed")), \
+                patch.object(instabox.InstaboxBackend, "_request", suspended), \
+                patch.dict(os.environ, {"INSTABOX_API_KEY": "isolated-test"}):
             with self.assertRaises(GatewayFailure):
                 await self.gateway.delete_agent("main")
+        self.assertEqual(requests, [("GET", "/v1/machines/m_" + "f" * 26)])
         self.assertTrue(self.store.agent_deleting("main"))
         self.assertIsNotNone(self.store.agent("main"))
         self.assertEqual((await self.client.patch("/agents/main", json={"name": "不能修改"})).status_code, 503)
@@ -1279,7 +2426,12 @@ class AgentCrudTests(unittest.IsolatedAsyncioTestCase):
         await self.start_runtime()
         with self.assertRaisesRegex(ValueError, "正在删除"):
             self.runtime.workers.start("重启后恢复", root, agent_name="main")
-        await self.gateway.resume_deletions()
+        self.runtime.files.conversation_workdirs = True
+        with patch.object(instabox.InstaboxBackend, "_request", side_effect=AssertionError("restart must stay local")) as request:
+            await self.gateway.resume_deletions()
+            replayed = await self.client.delete("/agents/main")
+            self.assertEqual(replayed.status_code, 200, replayed.text)
+            request.assert_not_called()
         self.assertIsNone(self.store.agent("main"))
         self.assertEqual(self.store.pending_agent_deletions(), [])
         deleted = [event for event in self.store.after(0)

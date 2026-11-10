@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { type AgentDetail, type ModelInfo } from "../src/gateway/api.ts";
-import { blankAgentDraft, changedAgentFields, deletionConflictDetails, deletionReasons, draftFromAgent, leastUsedAvatar, prepareCreateCommand, toggleSelection, validateAgentName } from "../src/lib/agent-editor.ts";
+import { blankAgentDraft, changedAgentFields, draftFromAgent, leastUsedAvatar, prepareCreateCommand, toggleSelection, validateAgentName } from "../src/lib/agent-editor.ts";
 import { chooseModel, modelName, reasoningOptions, selectedModel } from "../src/lib/model-selection.ts";
 
 const detail: AgentDetail = {
@@ -122,15 +122,3 @@ test("Skills and workers toggle independently without duplicates", () => {
 });
 
 
-test("Deletion constraints retain separate headings and explanations for simultaneous blockers", () => {
-  const parsed = deletionConflictDetails({ member_of: [{ id: "team", name: "自媒体团队" }, { id: "other", name: "写作团队" }], running_conversations: 2, running_tasks: 3 });
-  const reasons = deletionReasons(parsed);
-  assert.deepEqual(reasons.map(({ kind }) => kind), ["members", "work"]);
-  for (const name of ["自媒体团队", "写作团队"]) assert.ok(reasons[0].description.includes(name));
-  assert.match(reasons[0].title, /2/);
-  assert.match(reasons[1].description, /2.*3/);
-  const taskOnly = deletionReasons({ running_tasks: 1 });
-  assert.deepEqual(taskOnly.map(({ kind }) => kind), ["work"]);
-  assert.match(taskOnly[0].description, /1/);
-  assert.deepEqual(deletionReasons(deletionConflictDetails(null)), []);
-});

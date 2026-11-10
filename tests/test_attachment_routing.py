@@ -220,7 +220,7 @@ class AttachmentRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(receipt["accepted"])
         self.assertFalse(any("must not arrive" in message.content for message in self.seen["b-root"]))
 
-    async def test_delayed_real_cleanup_ack_retains_both_roles_after_failed_delivery(self):
+    async def test_delayed_cleanup_ack_does_not_freeze_bindings_after_failed_delivery(self):
         (Path(self.files.directory("a-root")) / "report.txt").write_bytes(b"owned until cleanup")
         gate, observed = asyncio.Event(), asyncio.Event()
         slow_root = self.base / "slow-machine"
@@ -235,23 +235,23 @@ class AttachmentRoutingTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(observed.wait(), 5)
                 self.assertTrue(receipt["accepted"])
                 self.assertFalse(receipt["attachments"][0]["accepted"])
-                self.assertEqual(self.files.pending_transfer_agents(), {"a", "b"})
+                self.assertEqual(self.files.pending_transfer_agents(), set())
                 self.assertEqual(backend.pending_transfer_owners(), {"a-root"})
                 for role in ("a", "b"):
-                    with self.subTest(role=role), self.assertRaisesRegex(ValueError, "不能切换"):
-                        self.files.update_environments(
-                            {**self.files.environments, role: ("local", str(self.local))},
-                            {key: value for key, value in self.files.remote_backends.items() if key != role},
-                        )
+                    self.files.update_environments(
+                        {**self.files.environments, role: ("local", str(self.local))},
+                        {key: value for key, value in self.files.remote_backends.items() if key != role},
+                    )
+                    self.assertEqual(self.files.environments[role], ("local", str(self.local)))
                 gate.set()
                 async with asyncio.timeout(5):
-                    while self.files.pending_transfer_agents():
+                    while backend.pending_transfer_owners():
                         await asyncio.sleep(0.001)
                 self.assertEqual(list(slow_root.rglob("*.stage")), [])
             finally:
                 gate.set()
 
-    async def test_missing_publication_receipt_is_never_success_and_retains_both_bindings(self):
+    async def test_missing_publication_receipt_is_never_success_without_freezing_bindings(self):
         (Path(self.files.directory("a-root")) / "report.txt").write_bytes(b"commit acknowledgement lost")
         unknown_root = self.base / "unknown-machine"
         with self.assertRaises(CleanupUnconfirmedError):
@@ -267,8 +267,8 @@ class AttachmentRoutingTests(unittest.IsolatedAsyncioTestCase):
                 published, = unknown_root.rglob("report.txt")
                 self.assertEqual(published.read_bytes(), b"commit acknowledgement lost")
                 self.assertEqual(backend.pending_transfer_owners(), {"a-root"})
-                self.assertEqual(self.files.pending_transfer_agents(), {"a", "b"})
-        self.assertEqual(self.files.pending_transfer_agents(), {"a", "b"})
+                self.assertEqual(self.files.pending_transfer_agents(), set())
+        self.assertEqual(self.files.pending_transfer_agents(), set())
 
     async def test_cancellation_during_real_upload_does_not_publish_partial_bytes(self):
         (Path(self.files.directory("local-root")) / "report.txt").write_bytes(b"x" * (8 * 1024 * 1024))
@@ -308,7 +308,7 @@ class AttachmentRoutingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual(self.files.pending_transfer_agents(), set())
 
-    async def test_cancel_after_publish_retains_roles_until_late_success_and_cleanup_are_consumed(self):
+    async def test_cancel_after_publish_releases_bindings_while_late_cleanup_finishes(self):
         content = b"fully published before caller cancellation"
         (Path(self.files.directory("a-root")) / "report.txt").write_bytes(content)
         gate, observed = asyncio.Event(), asyncio.Event()
@@ -329,12 +329,12 @@ class AttachmentRoutingTests(unittest.IsolatedAsyncioTestCase):
                     copying.cancel()
                     with self.assertRaises(asyncio.CancelledError):
                         await copying
-                self.assertEqual(self.files.pending_transfer_agents(), {"a", "b"})
+                self.assertEqual(self.files.pending_transfer_agents(), set())
                 self.assertEqual(backend.pending_transfer_owners(), {"a-root"})
                 self.assertTrue(backend._backend._transfers)
                 gate.set()
                 async with asyncio.timeout(5):
-                    while self.files.pending_transfer_agents():
+                    while backend.pending_transfer_owners():
                         await asyncio.sleep(0.001)
                 self.assertEqual(backend.pending_transfer_owners(), set())
                 self.assertEqual(backend._backend._unconfirmed, {})

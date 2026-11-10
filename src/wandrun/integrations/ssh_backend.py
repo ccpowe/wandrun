@@ -13,6 +13,7 @@ SSH 通道只是传输，不管理进程生命周期：一个环境在远端只�
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import hashlib
 import json
@@ -43,9 +44,12 @@ from deepagents.backends.protocol import (
     ReadResult,
     WriteResult,
 )
+from deepagents.backends.protocol import FileData
 from deepagents.backends.sandbox import BaseSandbox
+from deepagents.backends.utils import _get_backend_read_file_type
 
 from wandrun.integrations import remote_session
+from wandrun.integrations import cleanup
 from wandrun.integrations.shell_backend import (
     CleanupUnconfirmedError,
     execute_response,
@@ -106,6 +110,16 @@ class _Call:
     result: dict | None = None  # 收到的 result 消息
     on_event: Callable[[dict], None] | None = None
     arrived: asyncio.Event = field(default_factory=asyncio.Event)  # result 到达或通道断开
+    deadline: float | None = None
+    remote: bool = True
+    revoked: bool = False
+
+    def can_submit(self) -> bool:
+        """A cleanup call owns submission and delivery only until its original D."""
+        return (
+            self.remote and not self.revoked
+            and (self.deadline is None or asyncio.get_running_loop().time() < self.deadline)
+        )
 
     @property
     def unresolved(self) -> bool:
@@ -153,12 +167,12 @@ class SessionChannel:
                 message = json.loads(line)
                 if message["type"] == "result":
                     call = self.calls.get(message["id"])
-                    if call is not None and call.result is None:
+                    if call is not None and call.can_submit() and call.result is None:
                         call.result = message
                         call.arrived.set()
                 elif message["type"] in ("output", "log_error", "finalizing"):
                     call = self.calls.get(message["id"])
-                    if call is not None and call.on_event is not None:
+                    if call is not None and call.can_submit() and call.on_event is not None:
                         call.on_event(message)
                 elif message["type"] == "closed" and not self.closed.done():
                     self.closed.set_result(message)
@@ -174,8 +188,8 @@ class SessionChannel:
             self.closed.set_exception(failure)
             self.closed.exception()  # 标记已取回：没有等待者时不报警告
 
-    def register(self, on_event=None) -> _Call:
-        call = _Call(uuid4().hex, on_event=on_event)
+    def register(self, on_event=None, *, deadline: float | None = None, remote: bool = True) -> _Call:
+        call = _Call(uuid4().hex, on_event=on_event, deadline=deadline, remote=remote)
         if self.broken:
             call.arrived.set()
         self.calls[call.id] = call
@@ -198,7 +212,7 @@ class SessionChannel:
         async with self._lock:
             if self.broken:
                 raise ChannelClosed("远端会话通道已断开")
-            if call is not None and not self.accepting:
+            if call is not None and (not self.accepting or not call.can_submit()):
                 return
             if can_send is not None and not can_send():
                 return
@@ -241,6 +255,11 @@ def _file_operation():
         yield
     finally:
         _FILE_OPERATION.reset(token)
+
+
+# 经 SFTP 读取的二进制（图片、PDF 等）预览上限。deepagents 默认 500 KB 是为“base64 经命令输出”设的，
+# 手机截图常超过；5 MB 与常见模型接口的单张图片上限相当，超过时返回明确错误而不是截断。
+MAX_BINARY_READ_BYTES = 5 * 1024 * 1024
 
 
 class SSHBackend(BaseSandbox):
@@ -342,6 +361,12 @@ class SSHBackend(BaseSandbox):
                 why = f"远端报告 {call.result['reason']} 后仍有进程未结束"
             self._unconfirmed.setdefault(call.id, why)
 
+    async def cleanup_execute(self, command: str, *, operation: cleanup.CleanupOperation) -> ExecuteResponse:
+        """Bound this call's real submission, cancellation and delivery by the cleanup D."""
+        if not operation.remote or operation.remaining() <= 0:
+            raise OSError("远端清理总期限已耗尽")
+        return await self._execute(command, None, False, deadline=operation.deadline, remote=operation.remote)
+
     async def aexecute(
         self, command: str, *, timeout: int | None = None, env: dict[str, str] | None = None  # noqa: ASYNC109
     ) -> ExecuteResponse:
@@ -352,18 +377,31 @@ class SSHBackend(BaseSandbox):
         return self._blocking(self._execute(command, timeout, _FILE_OPERATION.get(), env))
 
     async def _execute(self, command: str, timeout: int | None, file_operation: bool,
-                       env: dict[str, str] | None = None) -> ExecuteResponse:
+                       env: dict[str, str] | None = None, *,
+                       deadline: float | None = None, remote: bool = True) -> ExecuteResponse:
         if not command or not isinstance(command, str):
             return invalid_command_response()
         if self._closed:
             raise RuntimeError("SSH backend is closed")
         effective = self._timeout(timeout)
-        call = self._channel.register()
+        call = self._channel.register(deadline=deadline, remote=remote)
+        expiry = None
+        if deadline is not None:
+            def expire() -> None:
+                # Revoke the call, not the healthy shared session. Queued writes and late
+                # replies independently check this same D even before the timer is run.
+                call.revoked = True
+                call.arrived.set()
+                self._channel.calls.pop(call.id, None)
+                self._record(call, "远端清理总期限已耗尽")
+
+            expiry = self._loop.call_at(deadline, expire)
+        limit = self._loop.time() + effective + self._stop_limit if deadline is None else deadline
         why = "通道断开"
         try:
             try:
                 # 计时从写出之前开始：发送阶段卡住也计入上限。
-                async with asyncio.timeout(effective + self._stop_limit):
+                async with asyncio.timeout_at(limit):
                     try:
                         await self._channel.send(
                             {"type": "run", "id": call.id, "command": command, "timeout": effective,
@@ -380,18 +418,25 @@ class SSHBackend(BaseSandbox):
                     else:
                         why = "执行环境已关闭，本次命令未提交"
             except TimeoutError:
-                why = "等待结果超时"
+                why = "远端清理总期限已耗尽" if deadline is not None else "等待结果超时"
             except ChannelClosed as error:  # 没有写出
                 why = str(error)
             except asyncio.CancelledError:
-                if call.sent and call.result is None:
+                if call.sent and call.result is None and call.can_submit():
                     await self._cancel(call)
-                self._record(call, "取消后没有得到确认清理的结果")
+                why = ("取消后没有得到确认清理的结果" if deadline is None or call.can_submit()
+                       else "远端清理总期限已耗尽")
+                self._record(call, why)
                 raise
+            if deadline is not None and not call.can_submit():
+                why = "远端清理总期限已耗尽"
             if self._channel.broken and why == "通道断开":
                 why = "远端会话通道已断开"
             self._record(call, why)  # 先记账，再从通道里移除，关闭汇总不会漏掉
         finally:
+            if expiry is not None:
+                expiry.cancel()
+                call.revoked = True
             self._channel.calls.pop(call.id, None)
         return self._conclude(call, effective, why, file_operation)
 
@@ -424,16 +469,20 @@ class SSHBackend(BaseSandbox):
         return ExecuteResponse(output=f"Error: {message}", exit_code=None, truncated=False)
 
     async def _cancel(self, call: _Call) -> None:
-        """请求远端取消，在上限内等结果写进记录。再次取消不截断等待（与本机 backend 相同：先收尾、再传播）。
+        """Request cancellation once; cleanup calls retain their original D throughout.
 
-        续聊时已有的中断提示会告诉 Agent 外部操作可能已经发生、先检查实际状态。
+        Ordinary business cancellation keeps its existing stop window and repeated-cancel
+        behavior. An expired cleanup only settles locally; it cannot close a shared session.
         """
 
         async def stop() -> None:
             try:
-                async with asyncio.timeout(self._stop_limit):
+                limit = self._loop.time() + self._stop_limit if call.deadline is None else call.deadline
+                async with asyncio.timeout_at(limit):
                     try:
-                        await self._channel.send({"type": "cancel", "id": call.id})
+                        await self._channel.send(
+                            {"type": "cancel", "id": call.id}, can_send=call.can_submit,
+                        )
                     except ChannelClosed:
                         pass  # 发送失败不决定结论：结果可能已在路上，等记录落定
                     await self._channel.wait(call)
@@ -443,7 +492,14 @@ class SSHBackend(BaseSandbox):
         stopping = asyncio.create_task(stop())
         while not stopping.done():
             try:
-                await asyncio.shield(stopping)
+                if call.deadline is None:
+                    await asyncio.shield(stopping)
+                else:
+                    await asyncio.wait({stopping}, timeout=max(0.0, call.deadline - self._loop.time()))
+                    if not stopping.done():
+                        stopping.cancel()
+                        stopping.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+                        return
             except asyncio.CancelledError:
                 pass
 
@@ -620,6 +676,39 @@ class SSHBackend(BaseSandbox):
                     responses.append(FileDownloadResponse(path=path, error=_sftp_error(error)))
         return responses
 
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        """文本沿用 BaseSandbox 的命令分页；图片、PDF 等二进制经 SFTP 取字节。
+
+        BaseSandbox 把二进制 base64 成一行 JSON 打印到命令输出，而命令输出上限只有
+        max_output_bytes，稍大的图片会在传输中被截断，解析失败（读不了手机截图）。
+        """
+        if _get_backend_read_file_type(file_path) == "text":
+            return await BaseSandbox.aread(self, file_path, offset, limit)
+        target = self._path(file_path)
+        try:
+            async with sftp_client(self._connection) as sftp:
+                if await sftp.isdir(target):
+                    return ReadResult(error=f"File '{file_path}': {IS_DIRECTORY}")
+                size = (await sftp.stat(target)).size or 0
+                if size == 0:
+                    return ReadResult(file_data=FileData(
+                        content="System reminder: File exists but has empty contents", encoding="utf-8"))
+                if size > MAX_BINARY_READ_BYTES:
+                    return ReadResult(error=(
+                        f"File '{file_path}': Binary file exceeds maximum preview size of {MAX_BINARY_READ_BYTES} bytes"))
+                async with sftp.open(target, "rb") as handle:
+                    content = await handle.read(MAX_BINARY_READ_BYTES + 1)
+        except asyncssh.SFTPError as error:
+            return ReadResult(error=f"File '{file_path}': {_sftp_error(error)}")
+        if len(content) > MAX_BINARY_READ_BYTES:  # 读取期间文件变大
+            return ReadResult(error=(
+                f"File '{file_path}': Binary file exceeds maximum preview size of {MAX_BINARY_READ_BYTES} bytes"))
+        return ReadResult(file_data=FileData(
+            content=base64.b64encode(content).decode("ascii"), encoding="base64"))
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        return self._blocking(self.aread(file_path, offset, limit))
+
     def _blocking(self, coroutine):
         """同步接口只能从其他线程调用：在连接所属的事件循环上执行并等待。"""
         try:
@@ -676,7 +765,7 @@ class SSHBackend(BaseSandbox):
 
 def _adapt_file_operation(name: str, result_type: type) -> None:
     """为 BaseSandbox 的一个文件操作（同步与异步两个入口）加上标记，并把非正常结果放进 error。"""
-    sync_method = getattr(BaseSandbox, name)
+    sync_method = SSHBackend.__dict__.get(name) or getattr(BaseSandbox, name)
     # 本类自己实现的异步入口（如 adelete）优先，其余沿用 BaseSandbox。
     async_method = SSHBackend.__dict__.get(f"a{name}") or getattr(BaseSandbox, f"a{name}")
 

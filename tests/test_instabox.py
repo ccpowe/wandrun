@@ -3,14 +3,15 @@
 import asyncio
 import os
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import asyncssh
 import httpx
 from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse, ReadResult
 
-from wandrun.integrations import instabox
+from wandrun.integrations import cleanup, instabox
 from wandrun.integrations.instabox import InstaboxBackend
 from wandrun.integrations.shell_backend import CleanupUnconfirmedError
 from wandrun.runtime.browser.leases import BrowserEnvironmentError
@@ -50,6 +51,9 @@ class ReadyBackend:
     async def aexecute(self, command, *, timeout=None):
         self.commands.append(command)
         return ExecuteResponse(output="actual", exit_code=0, truncated=False)
+
+    async def cleanup_execute(self, command, *, operation):
+        return await operation.wait(self.aexecute(command))
 
     def pending_transfer_owners(self):
         return set()
@@ -116,12 +120,345 @@ class InstaboxTests(unittest.IsolatedAsyncioTestCase):
         return httpx.Response(200, json={"id": MACHINE, "state": self.state,
                                        "operationId": None, "runtime": {"ready": self.state == "running"}})
 
+    @contextmanager
+    def cleanup_operation(self, *, deadline=None, remote=True, batch=None):
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + cleanup.LIMIT
+        operation = cleanup.CleanupOperation(deadline, remote, batch or cleanup.Batch())
+        operation.batch.join(operation)
+        try:
+            yield operation
+        finally:
+            operation.batch.leave(operation)
+
     async def test_constructor_paths_and_unused_close_do_not_activate(self):
         self.assertEqual(self.backend.id, "instabox:" + MACHINE)
         self.assertEqual(self.backend.processes.workdir, "/data/work")
         await self.backend.aclose()
         self.assertEqual(self.requests, [])
         self.skills.assert_not_awaited()
+
+    async def test_cleanup_skips_suspended_machine_once_without_resuming(self):
+        self.state = "suspended"
+        with self.cleanup_operation() as operation:
+            for _ in range(7):
+                with self.assertRaises(OSError):
+                    await self.backend.cleanup_execute("rmdir empty", operation=operation)
+        self.assertEqual(self.requests, [("GET", "/v1/machines/" + MACHINE)])
+        self.assertEqual(self.ready.commands, [])
+        self.assertFalse(self.backend._resume_pending)
+
+    async def test_cleanup_uses_real_io_without_consuming_agents_pending_recovery(self):
+        self.state = "suspended"
+        feedback = AsyncMock(return_value=False)
+        self.backend.bind_recovery_feedback(feedback)
+        blocked = await self.backend.aexecute("agent-must-decide-again")
+        self.assertIsNone(blocked.exit_code)
+        self.assertTrue(self.backend._recovery_pending)
+        with self.cleanup_operation() as operation:
+            result = await self.backend.cleanup_execute("remove-empty-directory", operation=operation)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.ready.commands, ["remove-empty-directory"])
+        self.assertTrue(self.backend._recovery_pending)
+        feedback.assert_awaited_once()
+        self.assertEqual(sum(path.endswith("/resume") for _, path in self.requests), 1)
+
+    async def test_cleanup_concurrent_first_connection_is_singleflight(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def start(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return self.ready
+
+        instabox.SSHBackend.start.side_effect = start
+        with self.cleanup_operation() as operation:
+            first = asyncio.create_task(self.backend.cleanup_execute("first", operation=operation))
+            await entered.wait()
+            second = asyncio.create_task(self.backend.cleanup_execute("second", operation=operation))
+            release.set()
+            results = await asyncio.gather(first, second)
+            self.assertTrue(all(result.exit_code == 0 for result in results))
+            self.assertEqual(set(self.ready.commands), {"first", "second"})
+            self.assertEqual(len(operation.batch.machines), 1)
+            self.assertIsNone(self.backend._backend)
+            self.assertIsNone(self.backend._connection)
+            self.assertEqual(self.backend._sessions, [])
+            self.assertEqual(self.backend._connections, [])
+            self.assertFalse(self.connection.closed)
+        self.assertTrue(self.connection.closed)
+        self.assertEqual(sum(method == "GET" for method, _ in self.requests), 1)
+        instabox.asyncssh.connect.assert_awaited_once()
+        instabox.SSHBackend.start.assert_awaited_once()
+        self.ready.aclose.assert_not_awaited()
+        self.skills.assert_not_awaited()
+
+    async def test_cleanup_cancelled_first_waiter_does_not_cancel_factory(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def start(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return self.ready
+
+        instabox.SSHBackend.start.side_effect = start
+        batch = cleanup.Batch()
+        with self.cleanup_operation(batch=batch) as first_operation:
+            with self.cleanup_operation(batch=batch) as second_operation:
+                first = asyncio.create_task(
+                    self.backend.cleanup_execute("cancelled", operation=first_operation),
+                )
+                await entered.wait()
+                second = asyncio.create_task(
+                    self.backend.cleanup_execute("survived", operation=second_operation),
+                )
+                first.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+                self.assertFalse(batch.machines[self.backend.id].done())
+                release.set()
+                self.assertEqual((await second).exit_code, 0)
+        self.assertEqual(self.ready.commands, ["survived"])
+        instabox.asyncssh.connect.assert_awaited_once()
+        instabox.SSHBackend.start.assert_awaited_once()
+
+    async def test_cleanup_failed_connection_fact_is_reused_by_later_request(self):
+        instabox.SSHBackend.start.side_effect = OSError("unavailable")
+        batch = cleanup.Batch()
+        with self.cleanup_operation(batch=batch) as first:
+            with self.assertRaises(OSError):
+                await self.backend.cleanup_execute("first", operation=first)
+            fact = batch.machines[self.backend.id]
+            with self.cleanup_operation(batch=batch) as later:
+                with self.assertRaises(OSError):
+                    await self.backend.cleanup_execute("later", operation=later)
+                self.assertIs(batch.machines[self.backend.id], fact)
+        self.assertTrue(self.connection.closed)
+        self.assertEqual(sum(method == "GET" for method, _ in self.requests), 1)
+        instabox.asyncssh.connect.assert_awaited_once()
+        instabox.SSHBackend.start.assert_awaited_once()
+        self.assertEqual(self.ready.commands, [])
+
+    async def test_cleanup_remote_false_and_expired_do_not_get_or_execute(self):
+        now = asyncio.get_running_loop().time()
+        for options in ({"remote": False}, {"deadline": now - 1}):
+            with self.subTest(options=options):
+                with self.cleanup_operation(**options) as operation:
+                    with self.assertRaises(OSError):
+                        await self.backend.cleanup_execute("never", operation=operation)
+                    self.assertEqual(operation.batch.machines, {})
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.ready.commands, [])
+        instabox.asyncssh.connect.assert_not_awaited()
+        instabox.SSHBackend.start.assert_not_awaited()
+
+    async def test_cleanup_later_deadline_keeps_private_channel_for_new_directory(self):
+        loop = asyncio.get_running_loop()
+        first_deadline = loop.time() + 0.1
+        later_deadline = loop.time() + 1.0
+        entered = asyncio.Event()
+        execute = self.ready.aexecute
+
+        async def blocked(command, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        self.ready.aexecute = AsyncMock(side_effect=blocked)
+        batch = cleanup.Batch()
+        with self.cleanup_operation(deadline=first_deadline, batch=batch) as first:
+            with self.cleanup_operation(deadline=later_deadline, batch=batch) as later:
+                waiting = asyncio.create_task(
+                    self.backend.cleanup_execute("first-directory", operation=first),
+                )
+                await entered.wait()
+                with self.assertRaisesRegex(OSError, "超时"):
+                    await waiting
+                self.assertGreaterEqual(loop.time(), first_deadline)
+                self.assertLess(loop.time(), first_deadline + 0.25)
+                self.assertFalse(self.connection.closed)
+                self.ready.aexecute = execute
+                with self.assertRaises(OSError):
+                    await self.backend.cleanup_execute("expired-directory", operation=first)
+                result = await self.backend.cleanup_execute("new-directory", operation=later)
+                self.assertEqual(result.exit_code, 0)
+                self.assertLess(loop.time(), later_deadline)
+                self.assertFalse(self.connection.closed)
+                self.assertEqual(self.ready.commands, ["new-directory"])
+                self.assertEqual(sum(method == "GET" for method, _ in self.requests), 1)
+                instabox.asyncssh.connect.assert_awaited_once()
+                instabox.SSHBackend.start.assert_awaited_once()
+        self.assertTrue(self.connection.closed)
+        self.ready.aclose.assert_not_awaited()
+
+    async def test_cleanup_pending_preparation_does_not_compete_for_business_connection(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def connect(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return self.connection
+
+        instabox.asyncssh.connect.side_effect = connect
+        business = asyncio.create_task(self.backend.aexecute("business"))
+        await entered.wait()
+        with self.cleanup_operation() as operation:
+            with self.assertRaises(OSError):
+                await self.backend.cleanup_execute("skipped", operation=operation)
+            self.assertIsNone(self.backend._backend)
+            self.assertIsNone(self.backend._connection)
+            self.assertEqual(self.backend._sessions, [])
+            self.assertEqual(self.backend._connections, [])
+            self.assertEqual(sum(method == "GET" for method, _ in self.requests), 1)
+            instabox.asyncssh.connect.assert_awaited_once()
+            instabox.SSHBackend.start.assert_not_awaited()
+            release.set()
+            self.assertEqual((await business).exit_code, 0)
+            with self.assertRaises(OSError):
+                await self.backend.cleanup_execute("still-skipped", operation=operation)
+        self.assertIs(self.backend._backend, self.ready)
+        self.assertIs(self.backend._connection, self.connection)
+        self.assertFalse(self.connection.closed)
+        self.assertEqual(self.ready.commands, ["business"])
+        with self.cleanup_operation() as fresh:
+            await self.backend.cleanup_execute("healthy-cleanup", operation=fresh)
+        self.assertFalse(self.connection.closed)
+        instabox.asyncssh.connect.assert_awaited_once()
+
+    async def test_first_business_connection_after_private_cleanup_is_not_recovery(self):
+        business_connection, business_backend = Connection(), ReadyBackend()
+        instabox.asyncssh.connect.side_effect = [self.connection, business_connection]
+        instabox.SSHBackend.start.side_effect = [self.ready, business_backend]
+        feedback = AsyncMock(return_value=False)
+        self.backend.bind_recovery_feedback(feedback)
+        with self.cleanup_operation() as operation:
+            await self.backend.cleanup_execute("private-directory", operation=operation)
+        result = await self.backend.aexecute("first-business-command")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(business_backend.commands, ["first-business-command"])
+        feedback.assert_not_awaited()
+
+    async def test_cleanup_private_expiry_does_not_close_later_business_connection(self):
+        business_connection, business_backend = Connection(), ReadyBackend()
+        instabox.asyncssh.connect.side_effect = [self.connection, business_connection]
+        instabox.SSHBackend.start.side_effect = [self.ready, business_backend]
+        with self.cleanup_operation() as operation:
+            await self.backend.cleanup_execute("private-directory", operation=operation)
+            self.assertEqual((await self.backend.aexecute("business")).exit_code, 0)
+            self.assertIs(self.backend._backend, business_backend)
+            self.assertEqual(self.backend._sessions, [business_backend])
+            self.assertEqual(self.backend._connections, [business_connection])
+        self.assertTrue(self.connection.closed)
+        self.assertFalse(business_connection.closed)
+        self.assertEqual(business_backend.commands, ["business"])
+        self.ready.aclose.assert_not_awaited()
+
+    async def test_cleanup_private_rebuild_preserves_unconsumed_recovery_fact(self):
+        await self.backend.aexecute("original")
+        original_backend, original_connection = self.ready, self.connection
+        original_backend._channel.broken = True
+        replacement, private_connection = ReadyBackend(), Connection()
+        instabox.asyncssh.connect.return_value = private_connection
+        instabox.SSHBackend.start.return_value = replacement
+        feedback = AsyncMock(return_value=False)
+        self.backend.bind_recovery_feedback(feedback)
+        with self.cleanup_operation() as operation:
+            result = await self.backend.cleanup_execute("private-directory", operation=operation)
+            self.assertEqual(result.exit_code, 0)
+            self.assertTrue(self.backend._recovery_pending)
+            self.assertIn("SSH 连接或执行通道已重建", self.backend._recovery_note)
+            feedback.assert_not_awaited()
+            self.assertIs(self.backend._backend, original_backend)
+            self.assertIs(self.backend._connection, original_connection)
+            self.assertEqual(self.backend._sessions, [original_backend])
+            self.assertEqual(self.backend._connections, [original_connection])
+        self.assertTrue(private_connection.closed)
+        self.assertFalse(original_connection.closed)
+        replacement.aclose.assert_not_awaited()
+
+    async def test_cleanup_first_factory_deadline_is_terminal_and_late_backend_only_closes_locally(self):
+        loop = asyncio.get_running_loop()
+        entered, cancelled, release, closed = (asyncio.Event() for _ in range(4))
+        self.ready._channel.seal = Mock()
+        original_close = self.connection.close
+
+        def close():
+            original_close()
+            closed.set()
+
+        async def stubborn_start(*args, **kwargs):
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+            return self.ready
+
+        instabox.SSHBackend.start.side_effect = stubborn_start
+        batch = cleanup.Batch()
+        first_deadline = loop.time() + 0.1
+        with patch.object(self.connection, "close", side_effect=close):
+            with self.cleanup_operation(deadline=first_deadline, batch=batch) as first:
+                with self.cleanup_operation(deadline=loop.time() + 1, batch=batch) as later:
+                    waiting = asyncio.create_task(
+                        self.backend.cleanup_execute("first-directory", operation=first),
+                    )
+                    await entered.wait()
+                    with self.assertRaises(OSError):
+                        await waiting
+                    await cancelled.wait()
+                    self.assertLess(loop.time(), first_deadline + 0.25)
+                    with self.assertRaises(OSError):
+                        await self.backend.cleanup_execute("later-directory", operation=later)
+                    self.assertTrue(batch.machines[self.backend.id].done())
+                    self.assertFalse(self.connection.closed)
+                    release.set()
+                    await closed.wait()
+                    self.ready._channel.seal.assert_called_once()
+                    self.assertEqual(batch._handles, [])
+        instabox.SSHBackend.start.assert_awaited_once()
+        instabox.asyncssh.connect.assert_awaited_once()
+        self.assertEqual(self.ready.commands, [])
+        self.ready.aclose.assert_not_awaited()
+        self.assertIsNone(self.backend._backend)
+        self.assertIsNone(self.backend._connection)
+        self.assertEqual(self.backend._sessions, [])
+        self.assertEqual(self.backend._connections, [])
+
+    async def test_cleanup_late_connection_closes_without_starting_session(self):
+        entered, cancelled, release, closed = (asyncio.Event() for _ in range(4))
+        original_close = self.connection.close
+
+        def close():
+            original_close()
+            closed.set()
+
+        async def stubborn_connect(*args, **kwargs):
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+            return self.connection
+
+        instabox.asyncssh.connect.side_effect = stubborn_connect
+        deadline = asyncio.get_running_loop().time() + 0.1
+        with patch.object(self.connection, "close", side_effect=close):
+            with self.cleanup_operation(deadline=deadline) as operation:
+                waiting = asyncio.create_task(
+                    self.backend.cleanup_execute("never", operation=operation),
+                )
+                await entered.wait()
+                with self.assertRaises(OSError):
+                    await waiting
+                await cancelled.wait()
+                release.set()
+                await closed.wait()
+        instabox.asyncssh.connect.assert_awaited_once()
+        instabox.SSHBackend.start.assert_not_awaited()
+        self.assertEqual(self.ready.commands, [])
+        self.assertIsNone(self.backend._connection)
 
     async def test_first_io_prepares_once_and_healthy_io_reuses_connection(self):
         feedback = AsyncMock(return_value=True)

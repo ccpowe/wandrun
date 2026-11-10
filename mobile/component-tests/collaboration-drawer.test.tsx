@@ -4,6 +4,9 @@ import type { BrowserTask, Conversation } from '../src/gateway/api';
 import { ChatSession } from '../src/gateway/session';
 import { SceneProviders } from '../src/dev/scene-providers';
 import { useConversationDrawer } from '../src/lib/use-conversation-drawer';
+import { useNavigation } from 'expo-router';
+import { FakeGateway, jsonResponse } from '../src/dev/fake-gateway';
+import { seedGatewayAgent, tickGateway } from './gateway-harness';
 
 jest.mock('react-native-keyboard-controller', () => jest.requireActual('react-native-keyboard-controller/jest'));
 
@@ -157,4 +160,27 @@ test('conversation-drawer.P9 E7 只有 AI 回复的根上出现未确认首发�
     f.session.pending.set('p', { clientId: 'p', conversationId: 'reply-only', text: 'Unconfirmed', attachments: [], error: null, status: 'sending', retryable: false });
     expect((await f.rows())[0].unranked).toBe(false);
   } finally { await f.close(); }
+});
+
+test('CleanupResultNotice.once 抽屉删除明确拒绝后，不认领其他设备的同 id 墓碑', async () => {
+  const peer = new FakeGateway({ conversations: [conversation('root', 'research'), conversation('other', 'research')] });
+  seedGatewayAgent(peer);
+  peer.overrides['DELETE /conversations/:id'] = () => jsonResponse({ error: { code: 'conflict', message: '明确拒绝删除' } }, 409);
+  const session = new ChatSession({ baseUrl: 'https://drawer.invalid', token: 'test' }, peer.fetch);
+  await session.start();
+  const mounted = await renderHook(() => ({
+    navigation: useNavigation(),
+    drawer: useConversationDrawer(session, 'root', 'research', true, true),
+  }), { wrapper: Wrapper });
+  try {
+    let deleted = true;
+    await act(async () => { deleted = await mounted.result.current.drawer.drawerProps.onDelete('other'); });
+    expect(deleted).toBe(false);
+    await act(() => peer.emit(peer.event('conversation.deleted', { id: 'other', agent_id: 'research',
+      cleanup_unconfirmed: [{ stage: 'directory', error: 'CleanupUnconfirmed' }] })));
+    await tickGateway();
+    expect(session.conversations.has('other')).toBe(false);
+    const state = mounted.result.current.navigation.getState()!;
+    expect(session.cleanupResults.claim(state.routes[state.index].key)).toBeNull();
+  } finally { await mounted.unmount(); await session.close(); peer.disconnect(); }
 });

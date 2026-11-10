@@ -1,5 +1,5 @@
 import { skipToken } from "@tanstack/react-query";
-import { Redirect, router, Stack, useFocusEffect, useLocalSearchParams } from "expo-router";
+import { Redirect, router, Stack, useFocusEffect, useLocalSearchParams, useNavigation } from "expo-router";
 import { useCallback, useReducer, useRef, useState, useSyncExternalStore } from "react";
 
 import { AgentEditorView } from "@/components/agent-editor-view.tsx";
@@ -58,6 +58,7 @@ function AgentEditorContainer({ session, id }: { session: ChatSession; id?: stri
   const [state, dispatch] = useReducer(agentEditorReducer, { status: "loading", sessionId: session.queryIdentity, resourceId: id ?? "new" });
   const [memberQuery, setMemberQuery] = useState("");
   const captureVisit = useFocusedVisit();
+  const navigation = useNavigation();
   const operationKey = `agent:${id ?? "new"}`;
   const outcome = session.editorOperations.get(operationKey);
   const [attachedCreationId] = useState(() => !id && (outcome?.status === "pending" || outcome?.status === "unknown") ? outcome.operationId : undefined);
@@ -108,21 +109,24 @@ function AgentEditorContainer({ session, id }: { session: ChatSession; id?: stri
     const operationId = newClientId();
     const stillHere = captureVisit();
     dispatch({ type: "save-started", operationId });
+    if (id && patch.environment !== undefined) session.cleanupResults.begin(operationId, "switch", id, stillHere, navigation);
     try {
       // Submitted fields remain solely for outcome comparison; no Agent draft survives page removal.
       const command = id ? null : prepareCreateCommand(draft, newClientId(), fastSupported);
       const result = await session.editorOperations.run(operationKey, { operationId, resource: "agent", id, action: "save",
         clientId: command?.clientId, fields: command?.fields ?? patch, baseline: id ? original : undefined },
       () => id ? session.api.updateAgent(id, patch) : session.api.createAgent(command!.clientId, command!.fields));
-      if (!result) { dispatch({ type: "save-failed", operationId, message: "保存未完成" }); return false; }
+      if (!result) { session.cleanupResults.reject(operationId); dispatch({ type: "save-failed", operationId, message: "保存未完成" }); return false; }
       session.connectorChanged(result.event);
       if (!result.event || !id) session.agents.refresh();
       const canLeave = stillHere() && currentSelection().phase !== "gone";
+      if (canLeave && patch.environment !== undefined) session.cleanupResults.confirm(operationId, result.event);
       dispatch({ type: "save-succeeded", operationId, current: result.agent, leave: canLeave });
       return canLeave;
     } catch (error) {
       const settled = session.editorOperations.get(operationKey);
       if (settled?.operationId !== operationId || !settled.reconciled && settled.status !== "unknown") {
+        session.cleanupResults.reject(operationId);
         const duplicateName = error instanceof GatewayError && error.code === "agent_name_conflict";
         dispatch({ type: "save-failed", operationId, field: duplicateName ? "name" : undefined,
           message: duplicateName ? "已有同名 Agent" : userErrorMessage(error, "保存未完成") });
@@ -146,15 +150,17 @@ function AgentEditorContainer({ session, id }: { session: ChatSession; id?: stri
   const remove = async () => {
     if (!id || !currentSelection().canDelete) return;
     const operationId = newClientId();
+    session.cleanupResults.begin(operationId, "delete-agent", id, captureVisit(), navigation);
     dispatch({ type: "delete-started", operationId });
     try {
       const result = await session.editorOperations.run(operationKey, { operationId, resource: "agent", id, action: "delete" }, () => session.api.deleteAgent(id));
-      if (!result) { dispatch({ type: "delete-failed", operationId, message: "删除未完成，请重新加载后重试" }); return; }
-      session.agents.observe(result.event);
+      if (!result) { session.cleanupResults.reject(operationId); dispatch({ type: "delete-failed", operationId, message: "删除未完成，请重新加载后重试" }); return; }
+      session.connectorChanged(result.event);
       dispatch({ type: "delete-succeeded", operationId });
     } catch (error) {
       const settled = session.editorOperations.get(operationKey);
       if (settled?.operationId === operationId && (settled.status === "unknown" || settled.reconciled)) return;
+      session.cleanupResults.reject(operationId);
       if (error instanceof GatewayError && error.status === 409) {
         const reasons = deletionReasons(deletionConflictDetails(error.details));
         dispatch({ type: "delete-conflict", operationId, reasons: reasons.length ? reasons : [{ kind: "other", title: "现在不能删除", description: error.message }] });
@@ -190,6 +196,6 @@ function AgentEditorContainer({ session, id }: { session: ChatSession; id?: stri
       onDeleteCheck={requestDeletion} onDelete={remove} onCloseDelete={() => { if (currentSelection().deleteDialog) dispatch({ type: "close-delete" }); }}
       onCapabilities={() => { if (id && currentSelection().canReadCapabilities) router.push({ pathname: "/agent-capabilities", params: { id } }); }} />
     <AgentEditorLeaveBoundary key={selection.leaveIdentity} ref={leaveControl} selection={selection}
-      changes={changes} save={save} onMain={() => openPanel("main")} />
+      changes={changes} save={save} confirmEnvironment={!!id && fields.environment !== undefined} onMain={() => openPanel("main")} />
   </>;
 }

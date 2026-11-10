@@ -5,9 +5,12 @@
 """
 
 import asyncio
+import base64
 import json
 import os
 import shlex
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
@@ -18,9 +21,11 @@ from uuid import uuid4
 import asyncssh
 
 from langchain_core.messages import HumanMessage
+from wandrun.integrations import cleanup as cleanup_operations, remote_session
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.integrations.instabox import InstaboxBackend
-from wandrun.integrations.ssh_backend import SSHBackend
+from wandrun.integrations.ssh_backend import SSHBackend, SessionChannel
+from wandrun.integrations.shell_backend import CleanupUnconfirmedError
 from wandrun.metrics import RunMetrics
 from wandrun.runtime.execution.environments import Environment
 from wandrun.runtime.context.compaction_archive import CompactionArchive
@@ -80,6 +85,164 @@ async def prepared_remote_environment(workdir: str):
         )
     finally:
         await owner.aclose()
+
+
+class SSHCleanupDeadlineTests(unittest.IsolatedAsyncioTestCase):
+    """Fixed cleanup D reaches the real protocol writer without sealing shared work."""
+
+    async def asyncSetUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="wandrun cleanup session ")
+        self.process = await asyncio.create_subprocess_exec(
+            sys.executable, remote_session.__file__, self.directory.name, "0.1",
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        )
+        self.channel = SessionChannel(self.process.stdout, self.process.stdin)
+        await self.channel.open(0.1)
+        self.backend = SSHBackend(
+            self.channel, connection=None, label="loopback-cleanup", workdir=self.directory.name,
+            timeout=30, termination_grace=0.1,
+        )
+        self.writes = []
+        self.run_written = asyncio.Event()
+        write = self.process.stdin.write
+
+        def record(data):
+            message = json.loads(data)
+            write(data)  # Observe accepted bytes, not merely entry into send().
+            self.writes.append((message, asyncio.get_running_loop().time()))
+            if message["type"] == "run":
+                self.run_written.set()
+
+        self.recording = patch.object(self.process.stdin, "write", record)
+        self.recording.start()
+        self.cancel_submitting = asyncio.Event()
+        self.cancel_finished = asyncio.Event()
+        self.cancel_gate = None
+        send = self.channel.send
+
+        async def observe_submission(message, *args, **kwargs):
+            if message["type"] != "cancel":
+                return await send(message, *args, **kwargs)
+            self.cancel_submitting.set()
+            try:
+                if self.cancel_gate is not None:
+                    while not self.cancel_gate.is_set():
+                        try:
+                            await self.cancel_gate.wait()
+                        except asyncio.CancelledError:
+                            # Model a submission already queued below its cancelled waiter.
+                            pass
+                return await send(message, *args, **kwargs)
+            finally:
+                self.cancel_finished.set()
+
+        self.submissions = patch.object(self.channel, "send", observe_submission)
+        self.submissions.start()
+
+    async def asyncTearDown(self):
+        if self.cancel_gate is not None:
+            self.cancel_gate.set()
+        try:
+            await self.backend.aclose()
+        except CleanupUnconfirmedError:
+            pass  # An expired cleanup truthfully leaves an unconfirmed call.
+        finally:
+            self.recording.stop()
+            self.submissions.stop()
+            self.process.stdin.close()
+            await asyncio.wait_for(self.process.wait(), 5)
+            self.directory.cleanup()
+
+    async def _delayed_cancel_after_timeout(self):
+        loop = asyncio.get_running_loop()
+        self.cancel_gate = asyncio.Event()
+        operation = cleanup_operations.CleanupOperation(loop.time() + 0.2)
+        running = asyncio.create_task(self.backend.cleanup_execute("sleep 30", operation=operation))
+        await asyncio.wait_for(self.run_written.wait(), 2)
+        # Occupy the actual SessionChannel serialization boundary after run is written.
+        # Any cancellation must pass this same lock before touching the real writer.
+        async with self.channel._lock:
+            (outcome,) = await asyncio.wait_for(
+                asyncio.gather(running, return_exceptions=True), 2,
+            )
+            release = asyncio.Event()
+            timer = loop.call_at(operation.deadline + 0.25, release.set)
+            try:
+                await asyncio.wait_for(release.wait(), 2)
+            finally:
+                timer.cancel()
+            self.cancel_gate.set()
+        # Release the delayed submitter into the real SessionChannel locking/check path.
+        business = await asyncio.wait_for(self.backend.aexecute("printf shared-business-ok"), 2)
+        if self.cancel_submitting.is_set():
+            await asyncio.wait_for(self.cancel_finished.wait(), 2)
+        self.assertEqual(business.exit_code, 0)
+        self.assertIn("shared-business-ok", business.output)
+        self.assertFalse(self.channel.broken)
+        self.assertTrue(self.channel.accepting)
+        cancels = [(message, when) for message, when in self.writes if message["type"] == "cancel"]
+        self.assertEqual(cancels, [], "expired cleanup submitted a late or second cancel")
+        self.assertFalse(isinstance(outcome, BaseException), repr(outcome))
+        self.assertIsNone(outcome.exit_code)
+        self.assertIn("无法确认", outcome.output)
+        self.assertEqual(self.channel.calls, {})
+
+    async def test_expired_cleanup_drops_cancel_queued_until_after_deadline(self):
+        await self._delayed_cancel_after_timeout()
+
+
+    async def test_cleanup_at_deadline_or_remote_false_never_writes_run(self):
+        loop = asyncio.get_running_loop()
+        for operation in (
+            cleanup_operations.CleanupOperation(loop.time()),
+            cleanup_operations.CleanupOperation(loop.time() + 2, remote=False),
+        ):
+            with self.subTest(remote=operation.remote), self.assertRaises(OSError):
+                await self.backend.cleanup_execute("printf forbidden-cleanup", operation=operation)
+        self.assertEqual(self.writes, [])
+        self.assertEqual((await self.backend.aexecute("printf independent")).exit_code, 0)
+
+    async def test_cleanup_run_queued_past_deadline_never_reaches_writer(self):
+        loop = asyncio.get_running_loop()
+        operation = cleanup_operations.CleanupOperation(loop.time() + 0.1)
+        async with self.channel._lock:
+            result = await asyncio.wait_for(
+                self.backend.cleanup_execute("printf forbidden-cleanup", operation=operation), 2,
+            )
+        self.assertIsNone(result.exit_code)
+        self.assertFalse(any(message["type"] == "run" for message, _ in self.writes))
+        self.assertEqual((await self.backend.aexecute("printf independent")).exit_code, 0)
+
+    async def test_external_cancel_before_cleanup_deadline_submits_once(self):
+        loop = asyncio.get_running_loop()
+        operation = cleanup_operations.CleanupOperation(loop.time() + 3)
+        running = asyncio.create_task(self.backend.cleanup_execute("sleep 30", operation=operation))
+        await asyncio.wait_for(self.run_written.wait(), 2)
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(running, 2)
+        cancels = [(message, when) for message, when in self.writes if message["type"] == "cancel"]
+        self.assertEqual(len(cancels), 1)
+        self.assertLess(cancels[0][1], operation.deadline)
+        self.assertEqual(self.channel.calls, {})
+        self.assertEqual((await self.backend.aexecute("printf independent")).exit_code, 0)
+
+    async def test_external_cancellation_survives_cancel_protocol_reaching_resource_deadline(self):
+        loop = asyncio.get_running_loop()
+        self.cancel_gate = asyncio.Event()
+        operation = cleanup_operations.CleanupOperation(loop.time() + 0.3)
+        running = asyncio.create_task(self.backend.cleanup_execute("sleep 30", operation=operation))
+        await asyncio.wait_for(self.run_written.wait(), 2)
+        running.cancel()
+        await asyncio.wait_for(self.cancel_submitting.wait(), 2)
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(running, 2)
+        finally:
+            self.cancel_gate.set()
+            await asyncio.wait_for(self.cancel_finished.wait(), 2)
+        self.assertFalse(any(message["type"] == "cancel" for message, _ in self.writes))
+        self.assertEqual((await self.backend.aexecute("printf independent-after-cancel")).exit_code, 0)
 
 
 @unittest.skipUnless(TARGET, "设置 WANDRUN_SSH_TEST=user@host:port 以运行 SSH 集成测试")
@@ -268,6 +431,20 @@ class SSHBackendTests(unittest.IsolatedAsyncioTestCase):
             while len(self.connection._channels) > baseline:
                 await asyncio.sleep(0.1)
 
+    async def test_binary_read_is_not_limited_by_command_output_cap(self):
+        """图片经 SFTP 读取：base64 后超过命令输出上限的文件也完整（手机截图读不了的回归）。"""
+        content = os.urandom(200_000)  # base64 后约 267 KB，远超 100 KB 的命令输出上限
+        uploaded = await self.backend.aupload_files([("shot.jpg", content)])
+        self.assertIsNone(uploaded[0].error)
+        result = await self.backend.aread("shot.jpg")
+        self.assertIsNone(result.error)
+        self.assertEqual(result.file_data["encoding"], "base64")
+        self.assertEqual(base64.b64decode(result.file_data["content"]), content)
+        big = await self.backend.aupload_files([("big.png", os.urandom(5 * 1024 * 1024 + 1))])
+        self.assertIsNone(big[0].error)
+        self.assertIn("exceeds maximum preview size", (await self.backend.aread("big.png")).error)
+        self.assertIn("file_not_found", (await self.backend.aread("missing.png")).error)
+
     async def test_sync_interface_from_worker_thread_only(self):
         result = await asyncio.to_thread(self.backend.execute, "echo threaded")
         self.assertIn("threaded", result.output)
@@ -413,10 +590,16 @@ class SSHRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(cross["accepted"])
                         self.assertFalse(cross["attachments"][0]["accepted"])
                         self.assertEqual(shown[-1], ("text survives", []))
-                        await files.cleanup_conversation("root")
+                        await files.cleanup_conversation(
+                            "root", operation=cleanup_operations.CleanupOperation.begin(),
+                            binding=files.cleanup_binding("main"),
+                        )
                         self.assertEqual((await environment.backend.aexecute(f"test -d {q(path)}")).exit_code, 0)
                         self.assertIsNone((await bound.adelete("shared.txt")).error)
-                        await files.cleanup_conversation("root")
+                        await files.cleanup_conversation(
+                            "root", operation=cleanup_operations.CleanupOperation.begin(),
+                            binding=files.cleanup_binding("main"),
+                        )
                         self.assertNotEqual((await environment.backend.aexecute(f"test -e {q(path)}")).exit_code, 0)
                     finally:
                         await manager.close()

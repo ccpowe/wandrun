@@ -585,7 +585,7 @@ class GatewayEntryCapabilityTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(Path(source).read_bytes(), content)
                             self.assertIn(content.decode(), "\n".join(read_outputs))
 
-    async def test_switch_waits_for_real_transfer_cleanup_without_blocking_another_agent(self):
+    async def test_switch_stops_actual_transfer_without_waiting_for_historical_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = configure(Path(directory))
             remote_root = workspace.root / "sandbox"
@@ -672,22 +672,20 @@ class GatewayEntryCapabilityTests(unittest.IsolatedAsyncioTestCase):
                         ) as client:
                             other = await client.patch("/agents/other", json={"environment": "local"})
                             self.assertEqual(other.status_code, 200, other.text)
-                            rejected = await client.patch("/agents/main", json={"environment": "local"})
-                            self.assertEqual(rejected.status_code, 409, rejected.text)
-                            self.assertTrue(rejected.json()["error"]["details"]["file_transfers_pending"])
-                            self.assertEqual(store.agent("main")["environment"], "cloud")
-                            self.assertFalse(owners[0]._connection.is_closed())
+                            switched = await client.patch("/agents/main", json={"environment": "local"})
+                            self.assertEqual(switched.status_code, 200, switched.text)
+                            self.assertEqual(store.agent("main")["environment"], "local")
+                            self.assertTrue(any(item.get("environment") == "cloud"
+                                                for item in switched.json()["cleanup_unconfirmed"]))
                             gate.set()
                             async with asyncio.timeout(5):
-                                while runtime.file_transfers_pending("main"):
+                                while owners[0].pending_transfer_owners():
                                     await asyncio.sleep(0.001)
-                            self.assertEqual(owners[0].pending_transfer_owners(), set())
-                            selected = await client.patch("/agents/main", json={"environment": "local"})
-                            self.assertEqual(selected.status_code, 200, selected.text)
+                            self.assertEqual(list(remote_root.rglob("*.stage")), [])
                     finally:
                         gate.set()
 
-    async def test_stopped_file_waiter_blocks_switch_until_shielded_preparation_really_finishes(self):
+    async def test_stopped_file_waiter_does_not_spread_preparation_debt_to_agent_switches(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = configure(Path(directory))
             remote_root = workspace.root / "sandbox"
@@ -763,23 +761,19 @@ class GatewayEntryCapabilityTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(runtime.agent_tasks_pending("main"), [])
                         self.assertEqual(len(owners), 1)
                         self.assertEqual(owners[0].pending_transfer_owners(), {None})
-                        self.assertTrue(runtime.file_transfers_pending("main"))
-                        self.assertTrue(runtime.file_transfers_pending("other"))
+                        self.assertFalse(runtime.file_transfers_pending("main"))
+                        self.assertFalse(runtime.file_transfers_pending("other"))
                         async with httpx.AsyncClient(
                             transport=httpx.ASGITransport(app=create_app(gateway, "dev")),
                             base_url="http://gateway", headers={"Authorization": "Bearer dev"},
                         ) as client:
                             for agent in ("main", "other"):
-                                rejected = await client.patch(f"/agents/{agent}", json={"environment": "local"})
-                                self.assertEqual(rejected.status_code, 409, rejected.text)
-                                self.assertTrue(rejected.json()["error"]["details"]["file_transfers_pending"])
+                                switched = await client.patch(f"/agents/{agent}", json={"environment": "local"})
+                                self.assertEqual(switched.status_code, 200, switched.text)
+                                self.assertEqual(store.agent(agent)["environment"], "local")
                             release.set()
-                            async with asyncio.timeout(5):
-                                while runtime.file_transfers_pending("main"):
-                                    await asyncio.sleep(0.001)
+                            await asyncio.wait_for(asyncio.shield(owners[0]._preparing), 5)
                             self.assertEqual(owners[0].pending_transfer_owners(), set())
-                            selected = await client.patch("/agents/main", json={"environment": "local"})
-                            self.assertEqual(selected.status_code, 200, selected.text)
                             self.assertEqual(list(remote_root.rglob("not-submitted.txt")), [])
                     finally:
                         release.set()

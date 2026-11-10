@@ -980,6 +980,10 @@ class VideoGatewayTests(unittest.IsolatedAsyncioTestCase):
         await stop()
 
     async def test_unexpected_start_error_releases_budget_and_redacts_logs(self):
+        # Recovery/redaction, not startup latency: tolerate CI scheduling jitter.
+        self.streams.config = replace(
+            self.streams.config, video=replace(self.config, start_timeout_s=1)
+        )
         viewer = self.viewer()
         key, secret = read_test_keys(self.keys)
         token = self.streams.tokens.issue("lease", "publisher:lease", publish=True)

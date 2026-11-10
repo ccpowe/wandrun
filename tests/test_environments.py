@@ -32,10 +32,28 @@ class WorkspaceConfigTests(unittest.TestCase):
             self.assertEqual(inspect_skill(workspace.skills_dir, "skill-installer")["status"], "ok")
             config = load_config(workspace.agents_config)
             self.assertEqual(config.main_agent, "main")
-            self.assertEqual(inspect_skill(workspace.skills_dir, "browser")["status"], "ok")
-            self.assertEqual(config.agents[config.main_agent].skills, ("browser", "skill-installer"))
-            self.assertEqual(config.agents["main"].mcp_servers, ("exa",))
-            self.assertEqual(config.agents["main"].environment, "local")
+            self.assertEqual(set(config.agents), {"main"})
+            agent = config.agents["main"]
+            self.assertEqual(agent.name, "wandrun")
+            self.assertEqual((agent.model, agent.reasoning_effort), ("gpt-6.1-terra", "medium"))
+            self.assertEqual(agent.skills, ("browser", "skill-installer", "wandrun-guide"))
+            self.assertEqual(agent.workers, ())
+            self.assertEqual(agent.mcp_servers, ("exa",))
+            self.assertEqual(agent.environment, "local")
+            self.assertEqual({path.name for path in workspace.skills_dir.iterdir()},
+                             {"browser", "skill-installer", "wandrun-guide"})
+            for skill in agent.skills:
+                self.assertEqual(inspect_skill(workspace.skills_dir, skill)["status"], "ok")
+            guide = workspace.skills_dir / "wandrun-guide"
+            self.assertEqual({path.name for path in (guide / "references").iterdir()}, {
+                "start-and-chat.md", "agents-and-teams.md", "browser.md", "schedules.md",
+                "connectors-and-skills.md", "environments-and-server.md", "memory.md",
+            })
+            # Nested resources must be materialized, not links into the package checkout.
+            for resource in guide.rglob("*"):
+                self.assertFalse(resource.is_symlink())
+                if resource.is_file():
+                    resource.read_text(encoding="utf-8")
             self.assertEqual(set(config.mcp_servers), {"exa"})
             self.assertEqual(config.environments["local"].browser.cdp_url, "http://127.0.0.1:9222")
 

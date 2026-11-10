@@ -52,7 +52,6 @@ export const T2Leave: Story = { name: 'T2 视图 · 未确认离开前说明不�
 export const B4Rejected: Story = { name: 'B4 视图 · 明确失败保留文字', args: { state: { ...editing, error: '当前配置不能保存，请检查后重试。' } } };
 export const H1: Story = { name: 'H1 视图 · 删除条件核对中', args: { state: { ...form, status: 'checking-delete', operationId: 'check-1' } } };
 export const H2: Story = { name: 'H2 视图 · 团队关系阻止删除', args: { state: { ...form, status: 'delete-blocked', reasons: blocked } } };
-export const H2Conflict: Story = { name: 'H2 T3 视图 · 网关最终拒绝删除', args: { state: { ...form, status: 'delete-blocked', reasons: [{ kind: 'work', title: '它正在工作', description: '有 1 个任务还在运行。等它结束或先停止。' }] } } };
 export const H3: Story = { name: 'H3 视图 · 删除确认', args: { state: { ...form, status: 'delete-confirm', name: draft.name, error: '' } } };
 export const H4: Story = { name: 'H4 视图 · 删除中', args: { state: { ...form, status: 'deleting', name: draft.name, operationId: 'delete-1' } } };
 export const H5: Story = { name: 'H5 视图 · 删除明确失败', args: { state: { ...form, status: 'delete-confirm', name: draft.name, error: '当前操作不能删除，请稍后重试。' } } };

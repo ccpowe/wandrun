@@ -21,6 +21,7 @@ from langchain.agents.middleware import AgentMiddleware
 from wandrun.config import AgentCatalog, AgentDefinition
 from wandrun.integrations.codex_subscription import CodexSubscriptionModel
 from wandrun.integrations.instabox import InstaboxBackend
+from wandrun.integrations.cleanup import CleanupOperation
 from wandrun.metrics import RunMetrics
 from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
 from wandrun.runtime.agent.conversations import conversation_config
@@ -2060,7 +2061,7 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 backend.close()
 
-    async def test_cleanup_reports_local_and_remote_failures_but_attempts_remaining_environments(self):
+    async def test_cleanup_reports_current_binding_without_visiting_other_agents_roots(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             local = root / "conversations" / "conversation"
@@ -2068,19 +2069,24 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
             remote = root / "remote" / "conversations" / "conversation"
             remote.mkdir(parents=True)
             backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
-            async def unavailable(command):
-                raise TimeoutError("environment unavailable")
+            async def unavailable(command, *, operation):
+                raise OSError("environment unavailable")
+            async def unrelated(command, *, operation):
+                raise AssertionError("must not visit another Agent's root")
             files = TaskFiles(root, None, {"a": ("offline", "/offline"), "b": ("online", str(root / "remote"))},
                               conversation_workdirs=True,
-                              remote_backends={"a": SimpleNamespace(aexecute=unavailable), "b": backend})
+                              remote_backends={"a": SimpleNamespace(cleanup_execute=unavailable),
+                                               "b": SimpleNamespace(cleanup_execute=unrelated)})
             try:
                 with patch("wandrun.runtime.execution.files.os.rmdir", side_effect=PermissionError("denied")):
-                    reports = await files.cleanup_conversation("conversation")
+                    reports = await files.cleanup_conversation(
+                        "conversation", operation=CleanupOperation.begin(), binding=files.cleanup_binding("a"),
+                    )
                 self.assertEqual([item["environment"] for item in reports], ["local", "offline"])
                 self.assertEqual([item["path"] for item in reports],
                                  ["conversations/conversation", "conversations/conversation"])
                 self.assertTrue(local.exists())
-                self.assertFalse(remote.exists())
+                self.assertTrue(remote.exists())
             finally:
                 backend.close()
 
@@ -2089,24 +2095,32 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             files = TaskFiles(root, None, {}, conversation_workdirs=True)
             parent = root / "conversations"
-            await files.cleanup_conversation("missing")
+            await files.cleanup_conversation(
+                "missing", operation=CleanupOperation.begin(), binding=("local", str(root), None),
+            )
             parent.mkdir()
             target = parent / "empty"
             target.mkdir()
-            await files.cleanup_conversation("empty")
+            await files.cleanup_conversation(
+                "empty", operation=CleanupOperation.begin(), binding=("local", str(root), None),
+            )
             self.assertFalse(target.exists())
             for name, member in (("hidden", ".keep"), ("child", "nested")):
                 target = parent / name
                 target.mkdir()
                 path = target / member
                 path.mkdir() if member == "nested" else path.write_text("keep")
-                await files.cleanup_conversation(name)
+                await files.cleanup_conversation(
+                    name, operation=CleanupOperation.begin(), binding=("local", str(root), None),
+                )
                 self.assertTrue(target.exists())
             outside_file = Path(outside) / "protected"
             outside_file.write_text("safe")
             link = parent / "linked"
             link.symlink_to(outside, target_is_directory=True)
-            await files.cleanup_conversation("linked")
+            await files.cleanup_conversation(
+                "linked", operation=CleanupOperation.begin(), binding=("local", str(root), None),
+            )
             self.assertTrue(link.is_symlink())
             self.assertEqual(outside_file.read_text(), "safe")
             linked_workspace = root / "linked-workspace"
@@ -2116,7 +2130,9 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
             (linked_workspace / "conversations").symlink_to(Path(outside) / "remote-root",
                                                                target_is_directory=True)
             linked_files = TaskFiles(linked_workspace, None, {}, conversation_workdirs=True)
-            await linked_files.cleanup_conversation("empty")
+            await linked_files.cleanup_conversation(
+                "empty", operation=CleanupOperation.begin(), binding=("local", str(linked_workspace), None),
+            )
             self.assertTrue((Path(outside) / "remote-root" / "empty").is_dir())
 
     async def test_parent_replacement_cannot_redirect_empty_directory_cleanup(self):
@@ -2138,7 +2154,9 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
 
             files = TaskFiles(root, None, {}, conversation_workdirs=True)
             with patch("wandrun.runtime.execution.files.os.rmdir", side_effect=replace_parent):
-                await files.cleanup_conversation("empty")
+                await files.cleanup_conversation(
+                    "empty", operation=CleanupOperation.begin(), binding=("local", str(root), None),
+                )
             self.assertFalse((root / "original-parent" / "empty").exists())
             self.assertTrue((outside / "empty").is_dir())
 
@@ -2157,7 +2175,7 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
             backend = ManagedShellBackend(root_dir=root, virtual_mode=False)
 
             class ReplacingBackend:
-                async def aexecute(self, command):
+                async def cleanup_execute(self, command, *, operation):
                     args = shlex.split(command)
                     injection = (
                         "import os, pathlib, sys\n"
@@ -2176,7 +2194,9 @@ class ConversationFileTests(unittest.IsolatedAsyncioTestCase):
                     root, None, {"ssh": ("host", str(remote))},
                     remote_backends={"ssh": ReplacingBackend()}, conversation_workdirs=True,
                 )
-                await files.cleanup_conversation("empty")
+                await files.cleanup_conversation(
+                    "empty", operation=CleanupOperation.begin(), binding=files.cleanup_binding("ssh"),
+                )
                 self.assertFalse((root / "original-parent" / "empty").exists())
                 self.assertTrue((outside / "empty").is_dir())
             finally:

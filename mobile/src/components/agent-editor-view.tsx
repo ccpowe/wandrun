@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { ChevronLeft, ChevronRight, CircleAlert, Clock3, Monitor, Search, Users, X } from "lucide-react-native";
+import { ChevronLeft, ChevronRight, CircleAlert, Monitor, Search, Users, X } from "lucide-react-native";
 import { Pressable, ScrollView, View } from "react-native";
 import { KeyboardAwareScrollView, KeyboardAvoidingView } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -137,7 +137,7 @@ export function AgentEditorView(props: AgentEditorViewProps) {
           <ListGroup label={t("执行环境")}>
             <EditorRow testID="editor-environment" label={t("执行环境")}
               value={environmentName}
-              description={t("空闲时可切换；旧文件不会自动迁移。")}
+              description={t("旧文件不会自动迁移。")}
               onPress={draftLocked ? undefined : openEnvironment} />
           </ListGroup>
           {fastModeDisabledReason ? <Text testID="editor-fast-unavailable" className="mx-8 mt-2 text-xs leading-[17px] text-muted-foreground">{fastModeDisabledReason}</Text> : null}
@@ -258,7 +258,7 @@ export function AgentEditorView(props: AgentEditorViewProps) {
             <AlertDialogHeader><AlertDialogTitle>{t("现在不能删除")}</AlertDialogTitle></AlertDialogHeader>
             <View>{deleteReasons.map((reason, index) => (
               <View key={reason.kind} className={cn("flex-row gap-3 py-3", index > 0 && "border-t border-border")}>
-                <Icon as={reason.kind === "members" ? Users : reason.kind === "work" ? Clock3 : Monitor} className="mt-0.5 size-[22px]" />
+                <Icon as={reason.kind === "members" ? Users : Monitor} className="mt-0.5 size-[22px]" />
                 <View className="min-w-0 flex-1 gap-0.5">
                   <Text className="text-[15px] font-semibold">{t(reason.title)}</Text>
                   <Text className="text-sm leading-5 text-muted-foreground">{t(deletionReasonDescription(reason, memberNames))}</Text>

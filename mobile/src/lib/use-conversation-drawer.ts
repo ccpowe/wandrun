@@ -1,11 +1,12 @@
 import { t } from './i18n.ts';
-import { router, useFocusEffect } from 'expo-router';
+import { router, useFocusEffect, useNavigation } from 'expo-router';
 import { useCallback, useMemo, useSyncExternalStore } from 'react';
 import { Keyboard } from 'react-native';
 import { KeyboardController } from 'react-native-keyboard-controller';
 
 import type { DrawerConversation } from '@/components/chat/conversation-drawer.tsx';
 import type { ChatSession } from '@/gateway/session.ts';
+import { newClientId } from '@/gateway/session.ts';
 import { DrawerFlow } from '@/lib/drawer-flow.ts';
 import { chatLocation } from '@/lib/chat-route.ts';
 import { agentDisplayName } from '@/lib/agent-display-name.ts';
@@ -20,6 +21,7 @@ const noSessionVersion = () => 0;
 /** One Flow per route/focus identity; cleanup revokes only this visit's closing/navigation. */
 export function useConversationDrawer(session: ChatSession | null, currentId: string | undefined, agentId: string | undefined, focused: boolean, initialOpen = false, onNavigate?: (id?: string) => void, targetVisits?: { subscribe(changed: () => void): () => void }) {
   const newDraft = useNewConversationStore();
+  const navigation = useNavigation();
   const showTarget = useCallback((id?: string) => {
     if (onNavigate) onNavigate(id);
     else router.replace(chatLocation(id));
@@ -111,7 +113,14 @@ export function useConversationDrawer(session: ChatSession | null, currentId: st
       conversations,
       loadError: session ? [...session.collaborationErrors.values()][0] : undefined,
       onRename: (id: string, title: string) => session?.renameConversation(id, title) ?? Promise.resolve(false),
-      onDelete: (id: string) => session?.deleteConversation(id) ?? Promise.resolve(false),
+      onDelete: (id: string) => {
+        if (!session || !focused) return Promise.resolve(false);
+        const visit = flow.getSnapshot().drawerVisit;
+        const operationId = newClientId();
+        session.cleanupResults.begin(operationId, 'delete-conversation', id,
+          () => flow.getSnapshot().drawerVisit === visit && !session.api.signal.aborted, navigation, id !== currentId);
+        return session.deleteConversation(id, operationId);
+      },
       failureMessage: () => session?.notice ?? null,
       currentId,
       onSelect: (id: string) => { if (focused) flow.select(id, currentId); },

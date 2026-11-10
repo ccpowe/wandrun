@@ -99,9 +99,11 @@ uv run python -m wandrun.gateway --workspace workspace --host 0.0.0.0
 uv run python -m wandrun.gateway pair --workspace workspace --url http://<电脑局域网IP>:8765
 ```
 
-安装 App、扫码，就可以和第一个 Agent 对话了。首次启动会创建 Agent `main`：带 `browser` 和
-`skill-installer` 技能，并接入 [Exa](https://exa.ai) 网页搜索 MCP（默认不需要 API key）。
-仓库自带工作区另附未默认勾选的 `news-brief` 示例技能（其 Reader 等外部依赖需自行配置）；网关自动提供 `wandrun-ui` 富交互协议技能。新建 Agent 不会自动勾选默认 Agent 的技能或 MCP。
+安装 App、扫码，就可以和 `wandrun` 对话：它既教你使用 App，也帮你完成日常任务（技术 id 为 `main`）。
+新工作区默认带 `browser`、`skill-installer`、`wandrun-guide` 三个技能，
+接入 [Exa](https://exa.ai) 网页搜索 MCP（默认不需要 API key），没有团队成员。
+仓库自带工作区也只含这些默认技能，不附开发专用技能；网关自动提供 `wandrun-ui` 富交互协议技能。
+新建 Agent 不会自动勾选默认 Agent 的技能或 MCP；升级不覆盖已有工作区。
 
 要常驻运行、配置 HTTPS、Agent 浏览器和 systemd 服务，请看 **[部署文档](docs/deploy.zh-CN.md)**。
 

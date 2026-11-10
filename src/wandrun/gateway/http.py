@@ -93,7 +93,11 @@ def _browser_rejection(message: str) -> str:
 
 
 def _request_rejection(message: str) -> str:
-    if message == "任务分支正在停止，请等待清理完成后再发送":
+    if message in {
+        "任务分支正在停止，请等待清理完成后再发送",
+        "Agent 正在切换执行环境，请稍后再发送。",
+        "上一轮任务正在停止，请稍后再发送。",
+    }:
         return message
     if message == "任务分支尚未完成停止与清理":
         return "任务仍在停止和清理中，请稍后重试。"
@@ -567,7 +571,10 @@ def create_app(
         identity = request.path_params["id"]
         if request.method == "PATCH":
             agent, event = await gateway.update_agent(identity, await _json(request))
-            return JSONResponse({"agent": agent, "event": event.to_dict() if event else None})
+            result = {"agent": agent, "event": event.to_dict() if event else None}
+            if event and event.data.get("cleanup_unconfirmed"):
+                result["cleanup_unconfirmed"] = event.data["cleanup_unconfirmed"]
+            return JSONResponse(result)
         if request.method != "DELETE":
             raise HTTPException(405)
         event = await gateway.delete_agent(identity)

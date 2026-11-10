@@ -526,3 +526,25 @@ for (const intent of [
   assert.equal(operations.get('browser:lease')?.operationId, 'browser-op');
   assert.equal(writes, 1);
 });
+
+for (const action of ['delete', 'save'] as const) test(`agent-editor.H4/D4 ${action} 等完网关25秒清理期限，不在15秒提前变未知`, async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const held = Promise.withResolvers<Response>();
+  let reads = 0; let writes = 0;
+  const gateway = api(async (_input, init) => {
+    if (init?.method === 'GET') { reads++; return json(detail); }
+    writes++; return held.promise;
+  });
+  const operations = new EditorOperations(gateway, () => true, () => {});
+  t.after(() => { operations.close(); gateway.close(); });
+  const pending = operations.run('agent:a', { operationId: 'management', resource: 'agent', id: 'a', action,
+    ...(action === 'save' ? { fields: { environment: 'cloud' } } : {}) },
+  async () => action === 'delete' ? gateway.deleteAgent('a') : gateway.updateAgent('a', { environment: 'cloud' }));
+  t.mock.timers.tick(25_000); await settle();
+  assert.equal(operations.get('agent:a')?.status, 'pending');
+  const event = { ...receipt('management'), data: { kind: 'agent', id: 'a', op: action === 'delete' ? 'deleted' : 'updated' } };
+  held.resolve(json(action === 'delete' ? { event } : { agent: { ...detail, environment: 'cloud' }, event }));
+  await pending;
+  assert.equal(operations.get('agent:a')?.status, 'confirmed');
+  assert.equal(reads, 0); assert.equal(writes, 1);
+});

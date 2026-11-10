@@ -29,6 +29,7 @@ import { uiDraftReducer } from "../lib/ui-draft.ts";
 import { eventTimelines } from "./timelines.ts";
 import { networkDiagnostic } from "./network-diagnostics.ts";
 import { retryDelay } from "../lib/load-state.ts";
+import { CleanupResults } from "../lib/cleanup-result.ts";
 
 
 export type ConversationView = Omit<Conversation, "last_agent_seq"> & {
@@ -111,6 +112,7 @@ export class ChatSession {
   /** All Agents in confirmed manual order; shared by directory, carousel and entry navigation. */
   readonly agents: AgentList;
   readonly editorOperations: EditorOperations;
+  readonly cleanupResults = new CleanupResults();
   /** Connector metadata/status and used_by invalidation; screens keep editable drafts separate from this revision. */
   connectorRevision = 0;
   /** Skill directories are not watched; only gateway deletes emit events. Screens also refresh on focus. */
@@ -442,6 +444,7 @@ export class ChatSession {
     this.api.close();
     this.agents.close();
     this.editorOperations.close();
+    this.cleanupResults.close();
     this.stream = null;
     this.closing = Promise.all([...this.streams].map((stream) => stream.close()).concat(this.starting ? [this.starting] : [])).then(() => {
       this.streams.clear();
@@ -783,6 +786,7 @@ export class ChatSession {
         for (const [clientId, pending] of this.pending) {
           if (pending.conversationId === id || children.has(pending.conversationId)) this.pending.delete(clientId);
         }
+        this.cleanupResults.observeDeletion(event);
         this.onConversationDeleted?.(id);
         this.agents.conversationChanged(event);
         this.changed();
@@ -828,6 +832,7 @@ export class ChatSession {
         this.scheduleRevision++;
       }
     }
+    this.cleanupResults.observeDeletion(event);
     this.agents.observe(event);
     if (event.type === "conversation.created" && event.client_id && event.conversation_id) {
       this.creationConfirmations.set(event.client_id, { id: event.conversation_id, agentId: event.data.agent_id, title: event.data.title });
@@ -1357,7 +1362,7 @@ export class ChatSession {
   }
 
   /** DELETE 无请求体；响应和另一台设备的事件经同一条删除路径，重复返回原事件。 */
-  async deleteConversation(id: string): Promise<boolean> {
+  async deleteConversation(id: string, cleanupOperationId?: string): Promise<boolean> {
     try {
       const { event } = await this.api.deleteConversation(id);
       if (this.closed) return false;
@@ -1365,6 +1370,8 @@ export class ChatSession {
       return true;
     } catch (error) {
       if (this.closed) return false;
+      const unknown = createResultUnknown(error) || error instanceof GatewayError && error.status === 408;
+      if (!unknown && cleanupOperationId) this.cleanupResults.reject(cleanupOperationId);
       this.notice = describe(error);
       this.changed();
       return false;

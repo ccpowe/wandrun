@@ -6,6 +6,8 @@ import { selectAgentList } from '@/lib/agent-list-state.ts';
 import { ConnectionBanner, useConnectionLabel } from '@/lib/connection-banner.tsx';
 import { useSession } from '@/lib/session-context.tsx';
 import { useFocusedVisit } from '@/lib/use-focused-visit.ts';
+import { CleanupResultNotice } from '@/components/cleanup-result-notice.tsx';
+import { useCleanupResult } from '@/lib/use-cleanup-result.ts';
 
 export default function AgentsRoute() {
   const session = useSession();
@@ -32,6 +34,7 @@ function AgentListContainer({ session }: { session: ChatSession }) {
     agents: list.agents, conversations: session.conversations.values(),
     offline: session.connection !== 'open', focused, loaded: list.loaded, readError: list.error,
   });
+  const cleanupMessage = useCleanupResult(session, session.connection !== 'open' || !!selection.readError);
   useFocusEffect(useCallback(() => {
     list.refresh();
     return closeSwipes;
@@ -55,7 +58,7 @@ function AgentListContainer({ session }: { session: ChatSession }) {
   };
   return <>
     <Stack.Screen options={{ headerShown: false }} />
-    <AgentListView selection={selection} showFeedback={!connectionLabel} connectionBanner={<ConnectionBanner session={session} />}
+    <AgentListView selection={selection} showFeedback={!connectionLabel} connectionBanner={<><ConnectionBanner session={session} /><CleanupResultNotice message={cleanupMessage} /></>}
       onBack={back} onAdd={add} onOpen={open} onEdit={edit} onSwipeChange={swipeChanged} />
   </>;
 }

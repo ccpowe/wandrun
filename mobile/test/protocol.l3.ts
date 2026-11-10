@@ -476,7 +476,7 @@ test("模型目录过滤 ultra、默认设置与用量经过真实网关；空�
   });
   await gateway.kill();
 });
-test("Agent CRUD：创建重放、只编辑允许字段、共享引用校验、删除冲突与事件续传", async () => {
+test("Agent CRUD：创建重放、只编辑允许字段、共享引用校验、删除自动停止与事件续传", async () => {
   const gateway = new StubGateway();
   await gateway.start();
   const api = new GatewayApi({ baseUrl: gateway.url, token: "dev" });
@@ -523,20 +523,10 @@ test("Agent CRUD：创建重放、只编辑允许字段、共享引用校验、�
     typeof error.details === "object" && error.details !== null &&
     "member_of" in error.details && Array.isArray(error.details.member_of) &&
     error.details.member_of.some((member: unknown) => member !== null && typeof member === "object" &&
-      "id" in member && member.id === "assistant" && "name" in member && member.name === "assistant") &&
-    "running_conversations" in error.details && error.details.running_conversations === 0 &&
-    "running_tasks" in error.details && error.details.running_tasks === 0);
+      "id" in member && member.id === "assistant" && "name" in member && member.name === "assistant"));
   const conversation = await api.createConversation(id, "待删的会话", globalThis.crypto.randomUUID());
   await api.sendMessage(conversation.id, "slow-agent-command", "慢");
   await until(async () => (await api.listConversations(id)).conversations.some((item) => item.id === conversation.id && item.status === "working"));
-  await assert.rejects(api.deleteAgent(id), (error: unknown) =>
-    error instanceof GatewayError && error.status === 409 &&
-    typeof error.details === "object" && error.details !== null &&
-    "running_conversations" in error.details && error.details.running_conversations === 1 &&
-    "running_tasks" in error.details && error.details.running_tasks === 1 &&
-    "member_of" in error.details && Array.isArray(error.details.member_of) && error.details.member_of.length === 0);
-  await api.stop(conversation.id, "stop-agent-command");
-  await until(async () => (await api.listConversations(id)).conversations.every((item) => item.status !== "working"));
   const deleted = await api.deleteAgent(id);
   assert.equal(deleted.event.data.op, "deleted");
   assert.equal(deleted.event.data.id, id);

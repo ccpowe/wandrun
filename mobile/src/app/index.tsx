@@ -21,6 +21,8 @@ import { useGateway, useSession } from "@/lib/session-context.tsx";
 import { useNewConversationStore } from "@/lib/new-conversation-context.tsx";
 import { useConversationDrawer } from "@/lib/use-conversation-drawer.ts";
 import { useDelayedNotice } from "@/lib/use-delayed-notice.ts";
+import { CleanupResultNotice } from "@/components/cleanup-result-notice.tsx";
+import { useCleanupResult } from "@/lib/use-cleanup-result.ts";
 
 export default function ChatEntry() {
   const session = useSession();
@@ -52,6 +54,7 @@ export function ChatEntryScreen({ session, lastConversationId, startNew = false 
   }, [id, agentId, draft, session]));
   const unavailable = target.type === "unavailable";
   const showReadError = useDelayedNotice(unavailable ? session.connection === "error" ? "conversations" : "agents" : null);
+  const cleanupMessage = useCleanupResult(session, session.connection !== "open" || unavailable, target.type === "empty");
   return <ConversationDrawer {...drawer.drawerProps} onOpen={drawer.show}>
     <View className="flex-1 bg-background" style={{ paddingBottom: insets.bottom }}>
       <Stack.Screen options={{ headerShown: false }} />
@@ -68,6 +71,9 @@ export function ChatEntryScreen({ session, lastConversationId, startNew = false 
           onAgentPress={() => { if (agent) router.push({ pathname: "/agents/[id]", params: { id: agent.id } }); }} />
         {unavailable && showReadError && <View className="absolute inset-x-0" style={{ top: insets.top + CHAT_LAYOUT.bannerTop }}>
           <StatusBanner icon={AlertCircle} accessibilityRole="alert" title={t(session.connection === "error" ? "无法加载对话列表，正在重试…" : "无法加载 Agent，正在重试…")} />
+        </View>}
+        {cleanupMessage && <View className="absolute inset-x-0" style={{ top: insets.top + CHAT_LAYOUT.bannerTop }}>
+          <CleanupResultNotice message={cleanupMessage} />
         </View>}
       </View>
     </View>

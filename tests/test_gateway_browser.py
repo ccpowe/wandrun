@@ -48,6 +48,7 @@ class FakeBrowser:
         self.takeovers = 0
         self.page_calls = []
         self.closed_tasks = []
+        self.closing = {}
 
     def list_tasks(self, agent_id=None):
         if agent_id is not None and self.lease["agent_id"] != agent_id:
@@ -97,7 +98,19 @@ class FakeBrowser:
                           epoch=self.lease["epoch"] + 1)
         return self._changed()
 
-    async def close_task(self, task_id, reason="任务结束"):
+    def claim_task_close(self, task_id, reason="任务结束", *, operation=None):
+        if task_id not in self.closing:
+            self.closing[task_id] = asyncio.create_task(self._close_task(task_id, reason))
+        return self.closing[task_id]
+
+    def expire_task_close(self, task_id):
+        if (closing := self.closing.get(task_id)) is not None and not closing.done():
+            closing.cancel()
+
+    async def close_task(self, task_id, reason="任务结束", *, operation=None):
+        return await asyncio.shield(self.claim_task_close(task_id, reason, operation=operation))
+
+    async def _close_task(self, task_id, reason):
         self.closed_tasks.append((task_id, reason))
         if task_id == self.lease["task_id"] and self.lease["state"] != "released":
             await self.close(self.lease["id"], reason)
@@ -138,11 +151,12 @@ class GatewayBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.lease = snapshot(self.root)
         self.browser = FakeBrowser(self.lease)
         from wandrun.runtime.session import Runtime
-        self.runtime = SimpleNamespace(
-            browsers={"local": self.browser}, files=None, mcp=None, memory=None,
+        self.runtime = Runtime(
+            workers=self.manager, checkpointer=Checkpointer(), main_agent="entry",
+            agent_models={}, mcp=None, _assembly_for=lambda _identity: None,
+            browsers={"local": self.browser},
         )
-        self.runtime.browser_for_lease = lambda identity: Runtime.browser_for_lease(self.runtime, identity)
-        self.gateway.attach(self.manager, Checkpointer(), runtime=self.runtime)
+        self.gateway.attach(self.manager, self.runtime.checkpointer, runtime=self.runtime)
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=create_app(self.gateway, "secret")),
             base_url="http://gateway", headers={"Authorization": "Bearer secret"},
@@ -421,20 +435,20 @@ class GatewayBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_stop_and_persisted_creates_prevent_browser_claiming_id(self):
         stop_entered, stop_release = asyncio.Event(), asyncio.Event()
 
-        async def paused_cancel(identity):
+        async def paused_cleanup(scope):
             stop_entered.set()
             await stop_release.wait()
-            return {}
+            return []
 
-        with patch.object(self.manager, "cancel", side_effect=paused_cancel):
-            stopping = asyncio.create_task(self.gateway.stop(self.root, "stop-id"))
-            try:
-                await asyncio.wait_for(stop_entered.wait(), 2)
-                with self.assertRaises(ClientIdConflict):
-                    await self.gateway.browser_control("lease-a", "takeover", "stop-id")
-            finally:
-                stop_release.set()
-                await stopping
+        self.manager.add_stop_hook(paused_cleanup)
+        stopping = asyncio.create_task(self.gateway.stop(self.root, "stop-id"))
+        try:
+            await asyncio.wait_for(stop_entered.wait(), 2)
+            with self.assertRaises(ClientIdConflict):
+                await self.gateway.browser_control("lease-a", "takeover", "stop-id")
+        finally:
+            stop_release.set()
+            await stopping
         with self.assertRaises(ClientIdConflict):
             await self.gateway.browser_control("lease-a", "takeover", "stop-id")
 
@@ -482,7 +496,8 @@ class GatewayBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_delete_closes_held_child_lease_and_removes_its_history(self):
         event = await self.gateway.delete_conversation(self.root)
         self.assertEqual(event.type, "conversation.deleted")
-        self.assertEqual(self.browser.closed_tasks, [("task-lease-a", "对话删除")])
+        self.assertEqual(self.browser.lease["state"], "released")
+        self.assertEqual(self.browser.lease["pages"], [])
         self.assertIsNone(self.store.browser_task("lease-a"))
         self.assertEqual((await self.client.get("/browser-tasks/lease-a")).status_code, 404)
         self.assertEqual([e.type for e in self.store.after(0) if e.conversation_id == self.root], [])

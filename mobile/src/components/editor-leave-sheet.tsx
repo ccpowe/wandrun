@@ -12,7 +12,7 @@ import type { AgentEditorSelection } from '@/lib/agent-editor.ts';
 import { EditorLeaveOwner, type LeaveMode, type LeaveTarget } from '@/lib/editor-leave.ts';
 
 /** React Navigation's original action is the continuation: never reconstruct it after a save. */
-export function useEditorLeave(dirty: boolean, busy: boolean, dismiss: () => void, unknown: boolean, save?: () => Promise<boolean>, autoSave = false, requestUnknownLeave?: () => void) {
+export function useEditorLeave(dirty: boolean, busy: boolean, dismiss: () => void, unknown: boolean, save?: () => Promise<boolean>, autoSave = false, requestUnknownLeave?: () => void, confirmEnvironment = false) {
   const navigation = useNavigation();
   const [owner] = useState(() => new EditorLeaveOwner(action => navigation.dispatch(action)));
   const state = useSyncExternalStore(owner.subscribe, owner.snapshot, owner.snapshot);
@@ -20,7 +20,7 @@ export function useEditorLeave(dirty: boolean, busy: boolean, dismiss: () => voi
     owner.enter();
     return owner.exit;
   }, [owner]));
-  const mode: LeaveMode = unknown ? requestUnknownLeave ? 'unknown' : 'continue' : dirty ? autoSave ? 'save' : 'ordinary' : 'continue';
+  const mode: LeaveMode = unknown ? requestUnknownLeave ? 'unknown' : 'continue' : dirty ? autoSave ? confirmEnvironment ? 'confirm-save' : 'save' : 'ordinary' : 'continue';
   const intercept = (target: LeaveTarget, explicitMode = mode) => {
     const current = owner.snapshot();
     if (busy && current.status !== 'saving' && !(current.status === 'requesting' && current.mode === 'continue')) return;
@@ -28,7 +28,7 @@ export function useEditorLeave(dirty: boolean, busy: boolean, dismiss: () => voi
     void owner.intercept(target, explicitMode, save);
     if (owner.snapshot().status === 'confirming' && explicitMode === 'unknown') requestUnknownLeave?.();
   };
-  const protect = dirty || busy || unknown || state.status === 'saving' || state.status === 'requesting' && state.mode === 'save';
+  const protect = dirty || busy || unknown || state.status === 'saving' || state.status === 'requesting' && (state.mode === 'save' || state.mode === 'confirm-save');
   usePreventRemove(protect, ({ data }) => {
     // A current navigator removal is not an obsolete async continuation. Hidden pages must
     // settle it without saving or showing a confirmation behind the focused screen.
@@ -40,7 +40,7 @@ export function useEditorLeave(dirty: boolean, busy: boolean, dismiss: () => voi
   const requestAction = (action: NavigationAction) => intercept({ kind: 'navigation', action });
   const submit = async () => {
     if (busy || owner.snapshot().status !== 'idle' || !save) return;
-    owner.arm('save');
+    owner.arm(confirmEnvironment ? 'confirm-save' : 'save');
     dismiss();
   };
   const complete = () => {
@@ -49,6 +49,7 @@ export function useEditorLeave(dirty: boolean, busy: boolean, dismiss: () => voi
     dismiss();
   };
   return { open: state.status === 'confirming' && state.reason === 'ordinary', request, requestLocal, requestAction,
+    environmentOpen: state.status === 'confirming' && state.reason === 'environment', saveConfirmed: () => { if (!busy) void owner.confirmSave(save); },
     finish: owner.confirm, complete, cancel: owner.cancel, submit };
 }
 
@@ -76,16 +77,16 @@ export function EditorLeaveSheet({ open, changes, busy, onDiscard, onContinue }:
 export type AgentEditorLeaveControl = { back: () => void; submit: () => Promise<void> };
 
 /** Key only this sibling boundary by leaveIdentity: obsolete destinations disappear without remounting the draft or view. */
-export function AgentEditorLeaveBoundary({ selection, changes, save, onMain, ref }: {
+export function AgentEditorLeaveBoundary({ selection, changes, save, confirmEnvironment = false, onMain, ref }: {
   selection: AgentEditorSelection; changes: string[];
-  save: () => Promise<boolean>; onMain: () => void; ref: Ref<AgentEditorLeaveControl>;
+  save: () => Promise<boolean>; confirmEnvironment?: boolean; onMain: () => void; ref: Ref<AgentEditorLeaveControl>;
 }) {
   const [unknownOpen, setUnknownOpen] = useState(false);
   const dismiss = useCallback(() => { if (router.canGoBack()) router.back(); else router.replace('/'); }, []);
   const requestUnknown = useCallback(() => setUnknownOpen(true), []);
   const unknown = selection.leaveKind === 'unknown';
   const leave = useEditorLeave(changes.length > 0, selection.busy, dismiss, unknown || selection.phase === 'gone',
-    save, selection.autoSaveOnLeave, unknown ? requestUnknown : undefined);
+    save, selection.autoSaveOnLeave, unknown ? requestUnknown : undefined, confirmEnvironment);
   const back = useCallback(() => {
     if (!selection.canBack) return;
     if (!unknown && selection.panel !== 'main') onMain();
@@ -99,11 +100,29 @@ export function AgentEditorLeaveBoundary({ selection, changes, save, onMain, ref
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => { back(); return true; });
     return () => subscription.remove();
   }, [back]));
-  return <AgentEditorLeaveSheets ordinaryOpen={leave.open && selection.leaveKind === 'ordinary'}
-    unknownOpen={unknown && unknownOpen} changes={changes} busy={selection.busy}
-    onDiscard={leave.finish} onContinue={leave.cancel}
-    onUnknownStay={() => { setUnknownOpen(false); leave.cancel(); }}
-    onUnknownLeave={() => { setUnknownOpen(false); leave.finish(); }} />;
+  return <>
+    <AgentEditorLeaveSheets ordinaryOpen={leave.open && selection.leaveKind === 'ordinary'}
+      unknownOpen={unknown && unknownOpen} changes={changes} busy={selection.busy}
+      onDiscard={leave.finish} onContinue={leave.cancel}
+      onUnknownStay={() => { setUnknownOpen(false); leave.cancel(); }}
+      onUnknownLeave={() => { setUnknownOpen(false); leave.finish(); }} />
+    <EnvironmentSwitchConfirmation open={leave.environmentOpen} disabled={!selection.canSave}
+      onCancel={leave.cancel} onConfirm={leave.saveConfirmed} />
+  </>;
+}
+
+export function EnvironmentSwitchConfirmation({ open, disabled, onCancel, onConfirm }: {
+  open: boolean; disabled: boolean; onCancel(): void; onConfirm(): void;
+}) {
+  const { t } = useTranslation();
+  const insets = useSafeAreaInsets();
+  return <AlertDialog open={open} onOpenChange={next => { if (!next) onCancel(); }}>
+    <AlertDialogContent testID="environment-switch-confirmation" overlayClassName="justify-end p-0" className="w-full rounded-b-none" style={{ paddingBottom: insets.bottom + 20 }}>
+      <AlertDialogHeader><AlertDialogTitle>{t('切换会停止该 Agent 正在运行的后台命令')}</AlertDialogTitle></AlertDialogHeader>
+      <Button testID="environment-switch-confirm" disabled={disabled} onPress={onConfirm}><Text>{t('确定')}</Text></Button>
+      <Button testID="environment-switch-cancel" intent="soft" onPress={onCancel}><Text>{t('取消')}</Text></Button>
+    </AlertDialogContent>
+  </AlertDialog>;
 }
 
 /** Pure sheets are also used by static view stories; their opening reason is never inferred from a reducer phase. */

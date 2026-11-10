@@ -23,6 +23,7 @@ from wandrun.integrations.mcp_oauth import ConnectorOAuth
 from wandrun.runtime.agent.tool_search import ToolNamespace
 from wandrun.metrics import RunMetrics
 from wandrun.integrations.shell_backend import CleanupUnconfirmedError
+from wandrun.integrations import cleanup
 from wandrun.runtime.execution.environments import (
     Environment, environment_identity, open_environments, open_instabox, open_local,
 )
@@ -30,10 +31,23 @@ from wandrun.runtime.execution.files import ResolvedAttachment, TaskFiles, _curr
 from wandrun.runtime.communication.scheduler_store import SchedulerStore, paired_store_path
 from wandrun.runtime.context.environment_runtime import recovery_feedback_applies
 from wandrun.runtime.context.memory import MemoryStore
-from wandrun.runtime.browser.leases import BrowserLeases, UnknownBrowserTask
+from wandrun.runtime.browser.leases import BrowserLeases, BrowserRejected, UnknownBrowserTask
+from wandrun.runtime.browser.cdp import CDPError
 from wandrun.runtime.agent.conversations import conversation_config
 from wandrun.runtime.communication.workers import WorkerManager
 from wandrun.runtime.execution.workspace import Workspace
+
+
+@dataclass(frozen=True)
+class StopClaims:
+    """Admission's sealed snapshot; execution may only await these exact owners."""
+
+    scope: frozenset[str]
+    results: dict[str, asyncio.Future]
+    files: asyncio.Future | None = None
+
+    def subset(self, scope: set[str]) -> "StopClaims":
+        return StopClaims(frozenset(scope), {task: self.results[task] for task in scope})
 
 
 @dataclass
@@ -54,15 +68,176 @@ class Runtime:
     _refresh_mcp: Callable[[str], Awaitable[None]] | None = None
     # 是否还有待交付结果的后台执行；入口据此判断等待中的任务是否仍有工作在进行（ADR-0017）。
     processes_pending: Callable[[], bool] = lambda: False
-    # 包括已结束模型轮次仍负责的命令；不主动停止或释放这些 owner。
+    # Management ignores historical remote cleanup debt; these expose real activity.
     agent_tasks_pending: Callable[[str], list[str]] = lambda agent: []
-    # 仍负责的文件传输/清理；无法归属的内部资源只保守阻止当前共享该环境的角色。
     file_transfers_pending: Callable[[str], bool] = lambda agent: False
+    _stop_commands: Callable[[set[str]], Awaitable[list[str]]] | None = None
+    _local_resources_pending: Callable[[set[str]], bool] = lambda owners: False
     # Configuration aliases borrow the same physical environment's browser owner.
     browsers: dict[str, BrowserLeases] = field(default_factory=dict)
     on_browser_event: Callable[[str, dict], None] | None = None
     memory: MemoryStore | None = None
     environment_definitions: dict[str, EnvironmentDefinition] = field(default_factory=dict)
+    # The actual task identity owns its stop result across overlapping Agent batches.
+    # A new execution (no longer stopped) starts a fresh lifecycle.
+    _task_stops: dict[str, tuple[cleanup.CleanupOperation, asyncio.Future]] = field(default_factory=dict)
+    _stop_drivers: set[asyncio.Task] = field(default_factory=set)
+
+    def claim_stop(
+        self, scope: set[str], *, operation: cleanup.CleanupOperation, agent: str | None = None,
+    ) -> StopClaims:
+        """Publish the whole known range and synchronously revoke Worker dispatch."""
+        claims = {}
+        created = []
+        for task in scope:
+            previous = self._task_stops.get(task)
+            if previous is not None:
+                result = previous[1]
+                # Completed reports are remote facts; local failures are not.
+                # A later independent admission must recheck local settlement.
+                if not result.done() or (
+                    self.workers.is_stopped(task) and not result.cancelled() and result.exception() is None
+                ):
+                    claims[task] = result
+                    continue
+            future = asyncio.get_running_loop().create_future()
+            future.add_done_callback(cleanup._consume)
+            self._task_stops[task] = operation, future
+            operation.batch.track(operation, future)
+            claims[task] = future
+            created.append((task, future))
+        # No await or eager cleanup is allowed between the snapshot and sealing it.
+        self.workers.revoke_tasks(scope)
+        for task, future in created:
+            for browser in dict.fromkeys(self.browsers.values()):
+                browser.claim_task_close(task, operation=operation, reason="任务停止")
+            asyncio.get_running_loop().call_soon(self._start_stop, task, future, operation)
+        file_stop = None
+        if agent is not None and self.files is not None:
+            callers = self.files.agent_file_callers(agent)
+            async def stop_files():
+                await asyncio.sleep(0)
+                return await self.files.stop_agent_files(agent, operation=operation, callers=callers)
+            file_stop = asyncio.create_task(stop_files())
+            operation.batch.track(operation, file_stop)
+            self._stop_drivers.add(file_stop)
+            file_stop.add_done_callback(self._stop_drivers.discard)
+        return StopClaims(frozenset(scope), claims, file_stop)
+
+    def _start_stop(self, task, future, operation):
+        async def stop():
+            try:
+                reports = await self._stop_owned_task(task, operation=operation)
+            except BaseException as error:
+                future.set_exception(error)
+            else:
+                future.set_result(reports)
+        driver = asyncio.create_task(stop(), name=f"cleanup-task:{task}")
+        self._stop_drivers.add(driver)
+        driver.add_done_callback(self._stop_drivers.discard)
+
+    def agent_stop_scope(self, agent: str) -> set[str]:
+        scope = set()
+        for task in self.workers.agent_tasks(agent):
+            scope.update(self.workers.branch_threads(task))
+        for browser in dict.fromkeys(self.browsers.values()):
+            scope.update(browser.owned_tasks(agent))
+        return scope
+
+    def conversation_stop_scope(self, conversation: str) -> set[str]:
+        scope = self.workers.branch_threads(conversation)
+        for browser in dict.fromkeys(self.browsers.values()):
+            scope.update(lease["task_id"] for lease in browser.list_tasks()
+                         if lease["root_id"] == conversation)
+        return scope
+
+    async def _stop_owned_task(self, task: str, *, operation: cleanup.CleanupOperation) -> list[dict]:
+        """One owner does remote work once; local Worker settlement stays independent."""
+        reports = []
+        scope = {task}
+        stopping = self.workers.stop_tasks(scope)
+
+        async def finish(awaitable, stage):
+            try:
+                result = await operation.wait(awaitable)
+                if result:
+                    reports.append({"stage": stage, "error": "CleanupUnconfirmed"})
+            except* (BrowserRejected, CDPError, TimeoutError):
+                reports.append({"stage": stage, "error": "CleanupUnconfirmed"})
+
+        operations = [finish(asyncio.shield(stopping), "execution")]
+        if self._stop_commands is not None:
+            operations.append(finish(self._stop_commands(scope), "execution"))
+        operations.append(finish(self.close_browser_tasks(scope, operation=operation), "browser"))
+        await asyncio.gather(*operations)
+        if reports:
+            if self._local_resources_pending(scope):
+                raise RuntimeError("本机执行资源尚未释放")
+            remote = {
+                owner for owner in scope if self.workers.has_task(owner)
+                and self.files is not None
+                and self.workers.agent_name(owner) in self.files.remote_backends
+            }
+            self.workers.settle_remote_stop(scope, remote)
+        if self.workers.has_task(task):
+            agent = self.workers.agent_name(task)
+            return [{**report, "agent_id": agent} for report in reports]
+        return reports
+
+    async def stop_agent(
+        self, agent: str, *, operation: cleanup.CleanupOperation, claims: StopClaims,
+    ) -> list[dict]:
+        """Await only this admission's sealed owners; never rediscover resources."""
+        reports = []
+        results = await asyncio.gather(*(asyncio.shield(future) for future in claims.results.values()))
+        for result in results:
+            for report in result:
+                item = {"agent_id": agent, **report}
+                if item not in reports:
+                    reports.append(item)
+        if claims.files is not None:
+            reports.extend(await asyncio.shield(claims.files))
+        return reports
+
+    async def stop_conversation(
+        self, conversation: str, *, operation: cleanup.CleanupOperation, claims: StopClaims,
+    ) -> dict:
+        """Project the same resource outcomes into the conversation API."""
+        results = await asyncio.gather(*(asyncio.shield(future) for future in claims.results.values()))
+        reports = []
+        for result in results:
+            for report in result:
+                item = {
+                    **report,
+                    "stage": "branch" if report["stage"] == "execution" else report["stage"],
+                    "task_id": conversation,
+                }
+                if item not in reports:
+                    reports.append(item)
+        return {"stopped": sorted(claims.scope), "cleanup_unconfirmed": reports}
+
+    async def close_browser_tasks(
+        self, scope: set[str], *, operation: cleanup.CleanupOperation,
+    ) -> None:
+        """Borrow owner terminals concurrently; never borrow a historical operation."""
+        results = await asyncio.gather(*(
+            browser.close_task(task, reason="任务停止", operation=operation)
+            for browser in dict.fromkeys(self.browsers.values()) for task in scope
+        ), return_exceptions=True)
+        failures = []
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, Exception):
+                failures.append(result)
+        if failures:
+            raise ExceptionGroup("浏览器任务关闭未确认", failures)
+
+    def forget_stopped_root(self, conversation: str, *, claims: StopClaims) -> None:
+        """Dispose task stop ownership with the actual local task identities."""
+        self.workers.forget_stopped_root(conversation)
+        for task in claims.scope:
+            self._task_stops.pop(task, None)
 
     def browser_for_lease(self, lease_id: str) -> BrowserLeases:
         """Resolve immutable lease ownership, never the Agent's current environment."""
@@ -496,6 +671,7 @@ async def open_runtime(
 
 
         async def run_worker(prompts, task_id):
+            manager.ensure_active(task_id)
             name = manager.agent_name(task_id)
             assembly = agents.get(name)
             if assembly is None:
@@ -557,9 +733,11 @@ async def open_runtime(
         for table in tables:
             manager.add_stop_hook(table.stop_owners)
         async def close_browser_tasks(scope):
+            # Normal Worker cancellation uses the resource owner's existing close
+            # (management has already claimed it); there is no implicit request D.
             await asyncio.gather(*(
-                browser.close_task(task_id, reason="任务结束")
-                for browser in browser_owners.values() for task_id in scope
+                browser.close_task(task, reason="任务停止")
+                for browser in dict.fromkeys(runtime.browsers.values()) for task in scope
             ))
         manager.add_cancel_hook(close_browser_tasks)
         searchable = {
@@ -581,17 +759,25 @@ async def open_runtime(
         def transfer_pending(agent: str) -> bool:
             if agent in files.pending_transfer_agents():
                 return True
-            binding = files.environments.get(agent)
             for environment in environments:
                 if environment.type != "instabox":
                     continue
                 for owner in environment.backend.pending_transfer_owners():
-                    if owner is not None and manager.has_task(owner):
-                        if manager.agent_name(owner) == agent:
-                            return True
-                    elif binding is not None and binding[0] == environment.name:
+                    if owner is not None and manager.has_task(owner) and manager.agent_name(owner) == agent:
                         return True
             return False
+
+        async def stop_commands(scope):
+            reports = []
+            for environment in environments:
+                table = environment.processes
+                if table is None:
+                    continue
+                result = await table.stop_owners(scope)
+                if result and environment.type == "local":
+                    raise RuntimeError("本机执行未释放：" + "；".join(result))
+                reports.extend(result)
+            return reports
 
         def build_catalog(
             catalog_config, catalog_models, catalog_tools, catalog_namespaces,
@@ -634,7 +820,8 @@ async def open_runtime(
             }
             for name, definition in candidate.agents.items():
                 previous = config.agents.get(name)
-                if previous is not None and definition.environment != previous.environment:
+                if (previous is not None and definition.environment != previous.environment
+                        and not manager.agent_held(name)):
                     if busy_tasks(name) or transfer_pending(name):
                         raise AgentEnvironmentBusy(name)
                     for browser in browser_owners.values():
@@ -775,7 +962,8 @@ async def open_runtime(
                 nonlocal config, agents, models, by_server, context_windows, role_environments
                 for name, definition in candidate.agents.items():
                     previous = config.agents.get(name)
-                    if previous is not None and previous.environment != definition.environment:
+                    if (previous is not None and previous.environment != definition.environment
+                            and not manager.agent_held(name)):
                         if (busy_tasks(name) or transfer_pending(name)
                                 or any(browser.pending_tasks(name) for browser in browser_owners.values())):
                             raise AgentEnvironmentBusy(name)
@@ -849,6 +1037,12 @@ async def open_runtime(
             processes_pending=lambda: any(table.pending() for table in tables),
             agent_tasks_pending=busy_tasks,
             file_transfers_pending=transfer_pending,
+            _stop_commands=stop_commands,
+            _local_resources_pending=lambda scope: any(
+                environment.type == "local" and environment.processes is not None
+                and bool(environment.processes.pending_owners() & scope)
+                for environment in environments
+            ),
             browsers=browsers,
             memory=memory,
             files=files,

@@ -1,11 +1,11 @@
 import type { NavigationAction } from 'expo-router/react-navigation';
 
 export type LeaveTarget = { kind: 'navigation'; action: NavigationAction } | { kind: 'local'; run: () => void };
-export type LeaveMode = 'ordinary' | 'unknown' | 'save' | 'continue';
+export type LeaveMode = 'ordinary' | 'unknown' | 'save' | 'confirm-save' | 'continue';
 export type EditorLeaveState =
   | { status: 'inactive' | 'idle' | 'consumed' }
   | { status: 'requesting'; mode: LeaveMode }
-  | { status: 'confirming'; target: LeaveTarget; reason: 'ordinary' | 'unknown' }
+  | { status: 'confirming'; target: LeaveTarget; reason: 'ordinary' | 'unknown' | 'environment' }
   | { status: 'saving'; target: LeaveTarget; operation: number };
 export type EditorLeaveEvent =
   | { type: 'enter' | 'exit' | 'cancel' | 'consumed' }
@@ -31,7 +31,7 @@ export function editorLeaveReducer(state: EditorLeaveState, event: EditorLeaveEv
       if (event.type === 'consumed') return { status: 'consumed' };
       if (event.type !== 'intercept') return state;
       if (event.mode === 'save') return { status: 'saving', operation: event.operation, target: event.target };
-      return { status: 'confirming', target: event.target, reason: event.mode === 'unknown' ? 'unknown' : 'ordinary' };
+      return { status: 'confirming', target: event.target, reason: event.mode === 'confirm-save' ? 'environment' : event.mode === 'unknown' ? 'unknown' : 'ordinary' };
     case 'saving':
       if (event.type === 'exit') return { status: 'inactive' };
       // A later navigation replaces the destination, not the in-flight write.
@@ -71,6 +71,10 @@ export class EditorLeaveOwner {
     this.execute(target);
     return true;
   };
+  async confirmSave(save?: () => Promise<boolean>): Promise<void> {
+    if (this.state.status !== 'confirming' || this.state.reason !== 'environment') return;
+    await this.intercept(this.state.target, 'save', save);
+  }
   async intercept(target: LeaveTarget, mode: LeaveMode, save?: () => Promise<boolean>): Promise<void> {
     if (this.state.status === 'inactive' || this.state.status === 'consumed') return;
     if (this.state.status === 'requesting') mode = this.state.mode;

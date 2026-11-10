@@ -200,6 +200,8 @@ test('agent-editor.D2 D3 D4 机器部分失败仍可选择，恢复目录不覆�
   expect(screen.getByTestId('editor-environment-cloud-b')).toHaveProp('accessibilityState', expect.objectContaining({ selected: true }));
   await fireEvent.press(screen.getByTestId('editor-done')); await tick();
   await fireEvent.press(screen.getByTestId('editor-save')); await tick();
+  expect(peer.gateway.state.agentDetails.get('planner')!.environment).toBe('cloud-a');
+  await fireEvent.press(screen.getByTestId('environment-switch-confirm')); await tick();
   expect(peer.gateway.state.agentDetails.get('planner')!.environment).toBe('cloud-b');
 });
 

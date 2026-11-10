@@ -18,6 +18,8 @@ import { useMemory } from "@/lib/use-memory.ts";
 import { useFocusedVisit, useVisitNotice } from "@/lib/use-focused-visit.ts";
 import { useNewConversationStore } from "@/lib/new-conversation-context.tsx";
 import { userErrorMessage } from "@/lib/user-error.ts";
+import { CleanupResultNotice } from "@/components/cleanup-result-notice.tsx";
+import { useCleanupResult } from "@/lib/use-cleanup-result.ts";
 
 export default function AgentProfile() {
   const { id, tab } = useLocalSearchParams<{ id: string; tab?: string }>();
@@ -90,13 +92,14 @@ function ProfileContainer({ id, initialTab, session }: { id: string; initialTab:
   const feedback = offline ? null : state.tab === "schedules" && selection.scheduleUnknown ? t("保存结果未确认，正在核对…")
     : state.tab === "schedules" && toggleResult.notice ? t("无法更新定时：{error}", { error: t(toggleResult.notice) })
       : selection.feedback;
+  const cleanupMessage = useCleanupResult(session, offline || !!read.error || !!feedback, !selection.gone);
   if (selection.gone) return <Redirect href="/" />;
   return <>
     <Stack.Screen options={{ headerShown: false }} />
     {state.tab === "members" && selection.missingMembers ? <MissingMembersRefresh session={session} /> : null}
     <AgentProfileView selection={selection} name={agentDisplayName(session.agents, id, read.data?.name)}
       status={selection.agent ? showOffline ? t("状态暂不可用") : profileStatus(id, session.conversations.values()) : null}
-      detailFailed={!!read.error} feedback={feedback} scheduleUpdateFailed={!offline && state.tab === "schedules" && !selection.scheduleUnknown && !!toggleResult.notice} connectionBanner={<ConnectionBanner session={session} />}
+      detailFailed={!!read.error} feedback={feedback} scheduleUpdateFailed={!offline && state.tab === "schedules" && !selection.scheduleUnknown && !!toggleResult.notice} connectionBanner={<><ConnectionBanner session={session} /><CleanupResultNotice message={cleanupMessage} /></>}
       workMemory={work} sharedMemory={profile} browserContent={viewport => <AgentComputerTab id={id} session={session} viewport={viewport} />}
       onClose={() => router.back()} onEdit={() => { if (selection.canEdit && session.connection === "open") router.push({ pathname: "/agent-editor", params: { id } }); }}
       onTab={tab => dispatch({ type: "tab", tab })} onMember={agent => {

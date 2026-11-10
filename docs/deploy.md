@@ -85,8 +85,8 @@ subsequent authenticated request work, not that token bytes stay unchanged.
 ## 4. Workspace
 
 Create an empty workspace. On first start the gateway writes default
-`.wandrun/agents.toml`, `mcps.toml` and `environments.toml` plus the built-in `browser` and
-`skill-installer` skills:
+`.wandrun/agents.toml`, `mcps.toml` and `environments.toml` plus the complete default
+skill packages listed below:
 
 ```bash
 install -d -m 700 ~/wandrun-workspace
@@ -100,7 +100,7 @@ What you get by default:
 
 | | |
 | --- | --- |
-| Agent | `main`: skills `browser` and `skill-installer`, MCP server `exa` |
+| Agent | `wandrun` (id `main`): app guide and everyday assistant, `gpt-6.1-terra / medium`, skills `browser`, `skill-installer`, `wandrun-guide`, MCP `exa`, no team members |
 | MCP | `exa`: [Exa](https://exa.ai) web search and page content, no API key needed by default |
 | Environment | `local`: browser at `http://127.0.0.1:9222`, the Chrome service in the next section |
 
@@ -121,7 +121,7 @@ idle_timeout = 900 # idle browser-lease expiry, not machine suspension; 0 disabl
 ```
 
 `max_pages` is the shared budget for the environment's Chrome, including pages being created or not yet confirmed closed; excess requests fail immediately rather than queue. Human-controlled leases and leases with viewers do not expire under this idle rule.
-An empty workspace copies only the two default skills. The checked-in workspace also includes an unselected `news-brief` example with separately configured Reader and other dependencies. The gateway's automatic `wandrun-ui` protocol skill is not written into this skill directory.
+An empty workspace and the checked-in sample contain only the default skills listed above, including their scripts and reference files; no development examples are included. Existing workspaces are not overwritten. The gateway's automatic `wandrun-ui` protocol skill is not written into this skill directory.
 
 Agents you create later need the `browser` skill selected in the app to use web pages.
 

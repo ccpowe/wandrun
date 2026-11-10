@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from contextvars import Context, ContextVar
@@ -19,6 +20,8 @@ from wandrun.runtime.communication.messages import AgentOutput, runtime_message
 from wandrun.runtime.communication.scheduler_store import SchedulerStore, TaskSnapshot
 from wandrun.runtime.communication.preview import PreviewExecution, PreviewPersistenceError, current_preview
 
+logger = logging.getLogger(__name__)
+
 current_execution_generation: ContextVar[int | None] = ContextVar(
     "worker_execution_generation", default=None,
 )
@@ -26,6 +29,10 @@ current_execution_generation: ContextVar[int | None] = ContextVar(
 
 class SchedulerFailure(RuntimeError):
     """调度存储提交失败，运行已停止；入口据此报告，而不是当作普通拒绝。"""
+
+
+class AgentSwitching(ValueError):
+    """A temporary configuration cutover refused this new execution."""
 
 
 class CollaborationStopped(ValueError):
@@ -144,6 +151,9 @@ class WorkerManager:
         self._restart_stopped: set[str] = set()
         self._cancelled_by: dict[asyncio.Task, str | None] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        # Settled remote results no longer count as active work, but the local
+        # graph must exit before another invocation can use the same checkpoint.
+        self._retiring_tasks: dict[str, asyncio.Task] = {}
         self._closed = False
         self._inbox: dict[str, list[HumanMessage]] = {}
         # 已交给图、但本次图调用尚未正常返回的消息，包含 before_model 取出的补充。
@@ -166,6 +176,7 @@ class WorkerManager:
         self._cancel_hooks: list[Callable[[set[str]], Awaitable[None]]] = []
         # 删除意图由入口持久化并在启动时重放；只封锁该角色，不取消其他根分支。
         self._retired_agents: set[str] = set()
+        self._switching_agents: set[str] = set()
         # Only an explicitly admitted direct-user root turn can maintain the profile.
         # Neither task identity nor this transient authorization survives restart.
         self._interactive_roots: set[str] = set()
@@ -217,6 +228,77 @@ class WorkerManager:
                 self._revoke_execution(task_id)
                 self._interactive_roots.discard(task_id)
         self._retired_agents.add(agent)
+
+    @contextmanager
+    def hold_agent(self, agent: str):
+        """Fence new activity and revoke old execution generations through cutover."""
+        retired = agent in self._retired_agents
+        if not retired:
+            self._switching_agents.add(agent)
+        self.retire_agent(agent)
+        try:
+            yield
+        finally:
+            if not retired:
+                self._switching_agents.discard(agent)
+                self._retired_agents.discard(agent)
+
+    def agent_tasks(self, agent: str) -> set[str]:
+        """All known owners, not only currently running model turns."""
+        return {task for task, bound in self._task_agents.items() if bound == agent}
+
+    def agent_held(self, agent: str) -> bool:
+        return agent in self._retired_agents
+
+    def revoke_tasks(self, scope: set[str]) -> None:
+        """Synchronously revoke execution and child delivery before deferred cleanup."""
+        with self._transition():
+            self._seal_branch(scope, None)
+
+    def stop_tasks(self, scope: set[str]) -> asyncio.Task:
+        """Synchronously seal a known scope before any stopping wait can expire."""
+        return self._stop_scope(scope, self._running(scope), None, name="stop-operation")
+
+    def settle_remote_stop(self, scope: set[str], remote_tasks: set[str]) -> None:
+        """Settle revoked remote executions as unknown without claiming their processes exited.
+
+        Local executions must have finished normally; their real resource errors
+        cannot become a successful remote-uncertainty result.
+        """
+        for task_id in scope - remote_tasks:
+            task = self._tasks.get(task_id)
+            if task is not None and not task.done():
+                raise RuntimeError("本机执行尚未完成停止")
+        with self._transition():
+            for task_id in remote_tasks & scope:
+                task = self._tasks.get(task_id)
+                if task is not None and not task.done():
+                    self._retiring_tasks[task_id] = task
+                    started = asyncio.get_running_loop().time()
+
+                    def retired(finished, identity=task_id, since=started):
+                        if self._retiring_tasks.get(identity) is finished:
+                            self._retiring_tasks.pop(identity)
+                        if not finished.cancelled():
+                            finished.exception()
+                        logger.warning("旧图已退场 (thread=%s, elapsed=%.3fs)",
+                                       identity, asyncio.get_running_loop().time() - since)
+
+                    task.add_done_callback(retired)
+                    self._tasks.pop(task_id)
+                    self._unsettled.discard(task)
+                    self._cancelled_by.pop(task, None)
+                    self._interrupting.pop(task_id, None)
+                    preview = self._previews.pop(task, None)
+                    if preview is not None:
+                        preview.close()
+                    self._restored[task_id] = ("cancelled", None)
+                    self._notify_completion(task_id, "cancelled")
+                    self._observe(task_id, "cancelled", None)
+            for stopping, pending in tuple(self._branch_stops.items()):
+                if pending & scope:
+                    stopping.cancel()
+                    self._branch_stops.pop(stopping, None)
 
     @contextmanager
     def _transition(self):
@@ -424,8 +506,15 @@ class WorkerManager:
             raise ValueError(f"未知 Agent: {target_agent}")
         if task_id in self._task_agents and self.agent_name(task_id) != target_agent:
             raise ValueError("to 与目标任务绑定的 Agent 不匹配")
+        if target_agent in self._switching_agents:
+            # chat.G7: distinguish temporary cutover from permanent retirement.
+            raise AgentSwitching("Agent 正在切换执行环境，请稍后再发送。")
         if target_agent in self._retired_agents:
             raise ValueError(f"Agent 正在删除或已删除: {target_agent}")
+        retiring = self._retiring_tasks.get(task_id)
+        if retiring is not None and not retiring.done():
+            # chat.G6: only this actual local invocation, never remote cleanup debt.
+            raise ValueError("上一轮任务正在停止，请稍后再发送。")
         if task_id in self._stopped:
             if not user_resume and sender_id != self._callers.get(task_id):
                 raise ValueError("目标任务已停止，只能由创建它的上级恢复；重新委派请用 task_id=null")
@@ -763,10 +852,7 @@ class WorkerManager:
         其他意外异常中断投递时，中断处那条结果未知，之后的消息未处理，再向上抛出异常。
         只要有消息被接收，就一定有回执。回执记下来源响应 ID，续聊时据此判断该响应是否被接收（ADR-0009）。
         """
-        if self._closed or sender_id in self._stopped or sender_id in self._interrupting:
-            # 下层吞掉取消后仍可能走到这里；按取消结束本次执行，不投递（包括 human）
-            # 也不留下回执，否则失败回执会让模型继续调用，并在恢复时注入过期内容。
-            raise asyncio.CancelledError()
+        self.ensure_active(sender_id)
         receipts = [
             {"to": m.to, "task_id": m.task_id, "attachments": [
                 {"path": path, "accepted": False, "error": "消息未投递"} for path in m.attachments
@@ -1179,7 +1265,7 @@ class WorkerManager:
         return [item for report in reports for item in report] + self._retry_prepared_cleanup(scope)
 
     def _branch_stopped(self, stopping: asyncio.Task) -> None:
-        del self._branch_stops[stopping]
+        self._branch_stops.pop(stopping, None)
         if not stopping.cancelled():
             stopping.exception()  # 等待者可能已离开；失败由仍在等待的 cancel 调用方报告
 
@@ -1193,7 +1279,10 @@ class WorkerManager:
 
     def ensure_active(self, task_id: str) -> None:
         """后台执行只能由仍在运行的任务启动；关闭、已停止或正被打断的旧执行按取消处理（同 dispatch）。"""
-        if self._closed or task_id in self._stopped or task_id in self._interrupting:
+        generation = current_execution_generation.get()
+        if (self._closed or task_id in self._stopped or task_id in self._interrupting
+                or self._task_agents.get(task_id) in self._retired_agents
+                or generation is not None and self._execution_generations.get(task_id) != generation):
             raise asyncio.CancelledError()
 
     @_transitional

@@ -4,6 +4,10 @@ Only real I/O prepares the machine. Preparation is owned by the backend, not by 
 individual waiter; cancellation cannot abandon an accepted resume. A new session
 never replays old commands or claims their processes survived (or were rebooted).
 Credentials and provider response bodies are deliberately absent from errors.
+
+Mechanical cleanup uses an explicit request deadline and one batch-owned machine
+decision. Its private SSH session never replaces business state or wakes a
+machine; the batch releases it locally after the last participating deadline.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from deepagents.backends.protocol import (
 from deepagents.backends.sandbox import BaseSandbox
 
 from wandrun.integrations.browser_relay import InstaboxBrowserTransport
+from wandrun.integrations import cleanup
 from wandrun.integrations.instabox_identity import validate_machine_id
 from wandrun.integrations.remote_processes import RemoteProcessTable
 from wandrun.integrations.shell_backend import CleanupUnconfirmedError
@@ -222,6 +227,11 @@ class InstaboxBackend(BaseSandbox):
         """Close the exec for the original host URL, without preparing the machine."""
         if self._browser is not None:
             await self._browser.close_endpoint(url)
+
+    def expire_browser_endpoint(self, url: str) -> None:
+        """Revoke old relay I/O locally when its management deadline expires."""
+        if self._browser is not None:
+            self._browser.expire_endpoint(url)
 
     async def _request(self, api, method, path, **kwargs):
         try:
@@ -457,6 +467,89 @@ class InstaboxBackend(BaseSandbox):
             return ExecuteResponse(output=str(error), exit_code=None, truncated=False)
         except CleanupUnconfirmedError:
             return ExecuteResponse(output=self._unconfirmed_preparation_error(), exit_code=None, truncated=False)
+
+    async def cleanup_execute(self, command: str, *, operation: cleanup.CleanupOperation):
+        """Borrow one batch decision, but bound each directory by its own request."""
+        factory = functools.partial(self._cleanup_backend, batch=operation.batch)
+        try:
+            backend = await operation.wait(operation.decide(self.id, factory))
+        except (InstaboxError, CleanupUnconfirmedError, OSError, TimeoutError, asyncssh.Error) as error:
+            raise OSError("远端连接失败；放弃本次清理") from error
+        if not operation.remote or operation.remaining() <= 0:
+            raise OSError("远端清理已跳过，可能残留目录或进程")
+        try:
+            return await backend.cleanup_execute(command, operation=operation)
+        except TimeoutError as error:
+            raise OSError("远端空目录清理超时") from error
+
+    async def _cleanup_backend(self, deadline: float, *, batch: cleanup.Batch):
+        """Decide without joining preparation or publishing a business connection."""
+        if self._closed:
+            raise OSError("执行环境已关闭，跳过远端清理")
+        backend = self._backend
+        if (backend is not None and not backend._channel.broken
+                and self._connection is not None and not self._connection.is_closed()):
+            return backend
+        if self._preparing is not None and not self._preparing.done():
+            raise OSError("业务连接正在准备，跳过远端清理")
+
+        def close(result):
+            backend, connection = result
+            backend._channel.seal()
+            connection.close()
+
+        def close_late(opening):
+            if not opening.cancelled() and opening.exception() is None:
+                close(opening.result())
+
+        opening = asyncio.create_task(self._open_cleanup_backend(deadline), name="instabox-cleanup-connect")
+        try:
+            result = await cleanup.CleanupOperation(deadline).wait(asyncio.shield(opening))
+        except BaseException:
+            opening.cancel()
+            opening.add_done_callback(close_late)
+            raise
+        if asyncio.get_running_loop().time() >= deadline:
+            close(result)
+            raise TimeoutError("远端清理连接期限已耗尽")
+        batch.retain(functools.partial(close, result))
+        return result[0]
+
+    async def _open_cleanup_backend(self, deadline: float):
+        """Open a private non-waking session; late ownership remains local-only."""
+        connection = None
+        published = False
+        try:
+            key = os.environ.get(self._api_key_env)
+            if not key:
+                raise OSError("宿主未配置远端凭据")
+            async with httpx.AsyncClient(
+                base_url=API_URL, headers={"X-API-Key": key}, timeout=25,
+                follow_redirects=False, trust_env=False,
+            ) as api:
+                machine = await self._request(api, "GET", f"/v1/machines/{self._machine_id}")
+                if (machine.get("id") != self._machine_id
+                        or machine.get("state") != "running"
+                        or machine.get("runtime", {}).get("ready") is not True):
+                    raise OSError("机器未就绪；清理不恢复或启动机器")
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("远端清理连接期限已耗尽")
+                connection = await self._connect_ssh(api)
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("远端清理连接期限已耗尽")
+            backend = await SSHBackend.start(
+                connection, label=self.id, workdir=self._workdir,
+                timeout=self._timeout, termination_grace=self._termination_grace,
+            )
+            if self._ever_connected:
+                self._recovery_pending = True
+                self._recovery_revision += 1
+                self._recovery_note = "执行环境的 SSH 连接或执行通道已重建；" + RECOVERY_CAUTION
+            published = True
+            return backend, connection
+        finally:
+            if connection is not None and not published:
+                connection.close()
 
     def _blocking(self, coroutine):
         try:

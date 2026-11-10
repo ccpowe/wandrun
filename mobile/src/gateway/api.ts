@@ -286,8 +286,6 @@ export type AgentUsageReport = { days: number; agents: AgentUsage[] };
 
 export type AgentDeleteConflictDetails = {
   member_of: { id: string; name: string }[];
-  running_conversations: number;
-  running_tasks: number;
 };
 
 
@@ -1065,7 +1063,7 @@ export class GatewayApi {
 
   /** 删除按资源幂等：已删除资源重放原事件，不发送请求体。 */
   deleteConversation(id: string): Promise<{ event: GatewayEvent }> {
-    return this.request("DELETE", `/conversations/${encodeURIComponent(id)}`);
+    return this.request("DELETE", `/conversations/${encodeURIComponent(id)}`, undefined, undefined, false, 35_000);
   }
 
 

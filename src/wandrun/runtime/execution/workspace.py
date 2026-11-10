@@ -48,7 +48,7 @@ class Workspace:
         return self.runtime_dir / "environments.toml"
 
     def ensure_config(self) -> bool:
-        """.wandrun 不存在时生成默认配置与内置技能（browser、skill-installer），返回是否生成。
+        """.wandrun 不存在时生成默认引导 Agent 配置与完整内置技能资源，返回是否生成。
 
         已存在时原样使用，缺少的必需文件由加载配置时报错，不补写。
         """

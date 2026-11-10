@@ -44,3 +44,4 @@ export const G2Empty: Story = { name: 'G2 没有系统能力', args: { state: 'c
 export const H2Conflict: Story = { name: 'H2 T3 确认删除后网关拒绝', args: { state: 'delete-conflict' } };
 export const B7: Story = { name: 'B7 名字改为研究员后保存 · 名字下提示重名', args: { state: 'name-conflict' } };
 export const B7Create: Story = { name: 'B7 新建填写研究员后创建 · 名字下提示重名', args: { creating: true, state: 'name-conflict' } };
+export const D4Cleanup: Story = { name: 'D1 D4 切换确认与成功残留告知 · 切换后保存', args: { state: 'cleanup-residual' } };

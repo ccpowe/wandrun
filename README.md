@@ -101,10 +101,14 @@ uv run python -m wandrun.gateway --workspace workspace --host 0.0.0.0
 uv run python -m wandrun.gateway pair --workspace workspace --url http://<your-lan-ip>:8765
 ```
 
-Install the app, scan the QR code, and start talking to your first agent. The first start creates
-the agent `main` with the `browser` and `skill-installer` skills and the [Exa](https://exa.ai) web
-search MCP server (no API key needed by default).
-The checked-in workspace also includes the unselected `news-brief` example skill (configure its Reader and other external dependencies separately); the gateway supplies the built-in `wandrun-ui` protocol skill. New agents do not automatically select the default agent's skills or MCP servers.
+Install the app, scan the QR code, and start talking to `wandrun`, your guide to the app
+and everyday assistant (agent id `main`). A new workspace includes the `browser`,
+`skill-installer` and `wandrun-guide` skills and the [Exa](https://exa.ai) web search MCP
+server (no API key needed by default), with no team members.
+The checked-in workspace uses the same default skills; it contains no development-only
+skills. The gateway supplies the built-in `wandrun-ui` protocol skill. New agents do not
+automatically select the default agent's skills or MCP servers. Existing workspaces are
+not overwritten on upgrade.
 
 For an always-on server with HTTPS, the agent browser and systemd services, follow the
 **[deployment guide](docs/deploy.md)**.

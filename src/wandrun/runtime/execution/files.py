@@ -23,6 +23,7 @@ from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
 from wandrun.integrations.ssh_backend import remote_script
+from wandrun.integrations import cleanup
 from wandrun.runtime.browser.leases import BrowserRejected
 
 logger = logging.getLogger(__name__)
@@ -239,13 +240,40 @@ class TaskFiles:
         self.manager = manager
         self.environments = environments  # role -> (environment identity, execution root)
         self.remote_backends = remote_backends or {}
-        self._remote_cleanup = {
-            (identity, root): self.remote_backends[role]
-            for role, (identity, root) in environments.items() if role in self.remote_backends
-        }
         self.conversation_workdirs = conversation_workdirs
         self._upload_resolver = None
         self._file_operations: dict[str, tuple[frozenset[str], tuple[object, ...], str, bool]] = {}
+        self._file_callers: dict[str, asyncio.Task] = {}
+
+
+    def agent_file_callers(self, agent: str) -> set[asyncio.Task]:
+        """Capture this admission's actual file participants, not a later range."""
+        return {
+            task for identity, task in self._file_callers.items()
+            if agent in self._file_operations[identity][0] and task is not asyncio.current_task()
+        }
+
+    async def stop_agent_files(
+        self, agent: str, *, operation: cleanup.CleanupOperation,
+        callers: set[asyncio.Task],
+    ) -> list[dict]:
+        operations = callers
+        for task in operations:
+            task.cancel()
+        if not operations:
+            return []
+        pending = operations
+        try:
+            _, pending = await asyncio.wait(
+                operations, timeout=operation.remaining(),
+            )
+        finally:
+            # Binding commit must not race a second timer cancelling local settlement.
+            for identity, task in tuple(self._file_callers.items()):
+                if task in pending:
+                    roles, backends, owner, _ = self._file_operations[identity]
+                    self._file_operations[identity] = (roles, backends, owner, False)
+        return [{"stage": "transfer", "agent_id": agent, "error": "CleanupUnconfirmed"}] if pending else []
 
     def update_environments(
         self, environments: dict[str, tuple[str, str]], remote_backends: dict[str, object],
@@ -256,13 +284,9 @@ class TaskFiles:
                 raise ValueError("附件传输或文件发布尚未释放，不能切换执行环境")
         self.environments = environments
         self.remote_backends = remote_backends
-        self._remote_cleanup.update({
-            (identity, root): remote_backends[role]
-            for role, (identity, root) in environments.items() if role in remote_backends
-        })
 
     def pending_transfer_agents(self) -> set[str]:
-        """Freeze both bindings through I/O and any backend-owned unconfirmed cleanup."""
+        """Freeze actual file operations, not historical backend cleanup debt."""
         busy = set()
         for identity, (roles, backends, owner, active) in list(self._file_operations.items()):
             outstanding = any(
@@ -270,9 +294,9 @@ class TaskFiles:
                 for backend in backends
                 for pending in [backend.pending_transfer_owners()]
             )
-            if active or outstanding:
+            if active:
                 busy.update(roles)
-            else:
+            elif not outstanding:
                 del self._file_operations[identity]
         return busy
 
@@ -284,10 +308,12 @@ class TaskFiles:
         ))
         scope = frozenset(roles)
         self._file_operations[identity] = (scope, backends, owner, True)
+        self._file_callers[identity] = asyncio.current_task()
         try:
             yield
         finally:
             self._file_operations[identity] = (scope, backends, owner, False)
+            self._file_callers.pop(identity, None)
             self.pending_transfer_agents()
 
     async def prepare_file_output(self, task_id: str) -> None:
@@ -565,11 +591,18 @@ class TaskFiles:
         else:
             self._prepare_local_directory(Path(self.directory(task_id)))
 
-    async def cleanup_conversation(self, conversation_id: str) -> list[dict]:
-        """Remove empty roots; report unconfirmed filesystem cleanup without blocking local deletion.
+    def cleanup_binding(self, agent: str) -> tuple[str, str, object | None]:
+        """Freeze only the trusted current Agent/root, never an environment history."""
+        identity, root = self.environments[agent]
+        return identity, root, self.remote_backends.get(agent)
 
-        Reports identify the environment/path, never claim removal, and are persisted by the
-        gateway's deletion tombstone. Each environment is attempted; there is no background retry.
+    async def cleanup_conversation(
+        self, conversation_id: str, *, operation: cleanup.CleanupOperation, binding,
+    ) -> list[dict]:
+        """Try the admitted current root once, before checkpoint/local commit.
+
+        Gateway copies are local. Only this conversation's Agent binding may
+        supply a remote root; members and former bindings are not a cleanup list.
         """
         if not self.conversation_workdirs:
             return []
@@ -602,10 +635,17 @@ else:
     finally:
         os.close(parent_fd)
 """
-        for (identity, root), backend in self._remote_cleanup.items():
+        identity, root, backend = binding
+        if backend is None:
+            if Path(root).resolve() != self.workspace:
+                self._cleanup_local_conversation(conversation_id, root=Path(root))
+            return unconfirmed
+        if backend is not None:
             path = posixpath.join(root, "conversations", conversation_id)
             try:
-                result = await backend.aexecute(remote_script('python3 -c "$1" "$2"', script, path))
+                result = await backend.cleanup_execute(
+                    remote_script('python3 -c "$1" "$2"', script, path), operation=operation,
+                )
                 if result.exit_code != 0:
                     raise OSError(f"远端空目录清理失败 ({identity}, {path}): {result.output}")
             except OSError as error:
@@ -617,8 +657,8 @@ else:
                 })
         return unconfirmed
 
-    def _cleanup_local_conversation(self, conversation_id: str) -> None:
-        parent = self.workspace / "conversations"
+    def _cleanup_local_conversation(self, conversation_id: str, *, root: Path | None = None) -> None:
+        parent = (root if root is not None else self.workspace) / "conversations"
         try:
             parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError as error:

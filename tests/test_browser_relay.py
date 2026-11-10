@@ -216,9 +216,6 @@ class RelayProtocolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CleanupUnconfirmedError):
             await self.relay.aclose()
         self.assertFalse(self.relay.confirmed)
-        self.relay.process.hide_status = False
-        await self.relay.aclose()
-        self.assertTrue(self.relay.confirmed)
 
     async def test_lost_host_eof_resets_an_incomplete_live_stream_and_exits(self):
         reader, writer = await asyncio.open_connection("127.0.0.1", urlsplit(self.url).port)

@@ -1062,7 +1062,8 @@ class GatewayStore:
             return detail, event, True
 
     def update_agent(
-        self, identity: str, definition: AgentDefinition, name: str, avatar: int
+        self, identity: str, definition: AgentDefinition, name: str, avatar: int,
+        *, cleanup_unconfirmed: list[dict] | None = None,
     ) -> tuple[dict, Event | None]:
         """修改可编辑定义及关系；调用方已确保环境切换没有在途任务。"""
         _validate_avatar(avatar)
@@ -1107,7 +1108,9 @@ class GatewayStore:
                     "INSERT INTO agent_workers (agent_id, worker_id, position) VALUES (?, ?, ?)",
                     [(identity, worker, position) for position, worker in enumerate(definition.workers)],
                 )
-            return self.agent(identity), self._resource_changed(identity, "updated")
+            return self.agent(identity), self._resource_changed(
+                identity, "updated", cleanup_unconfirmed=cleanup_unconfirmed,
+            )
 
     def memory_author(self, identity: str | None, version: str) -> str | None:
         """仅在该归属的文档版本仍与最后一次受管写入匹配时归属修改者。"""

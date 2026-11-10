@@ -40,6 +40,7 @@ from wandrun.runtime.execution.files import TaskFiles
 from wandrun.runtime.agent.capabilities import ResolvedCapabilities, resolve_capabilities
 from wandrun.runtime.communication.workers import WorkerManager
 from wandrun.runtime.browser.leases import UnknownBrowserTask
+from wandrun.runtime.session import Runtime
 
 def codex_upstream(request):
     """Only the Codex HTTP boundary is faked; gateway routes and SQLite remain real."""
@@ -250,16 +251,16 @@ async def main(database: str, port: int) -> None:
         notify_human_of_roots=False, attachment_resolver=files.resolve_attachments)
     files.manager = manager
     servers, descriptions = mcp_config(store.connector_definitions())
-    class StubRuntime:
-        """桩执行沿用真实目录校验和 MCP 连接池，不构造模型图。"""
-
-        default_environment = "local"
+    class StubRuntime(Runtime):
+        """桩执行沿用真实目录校验、管理停止与 MCP 连接池，不构造模型图。"""
 
         def __init__(self, mcp):
-            self.browsers = {}
-            self.mcp = mcp
-            self.memory = memory
-            self.files = files
+            super().__init__(
+                workers=manager, checkpointer=checkpointer,
+                main_agent=store.agent_catalog().main_agent, agent_models={},
+                mcp=mcp, _assembly_for=self._assembly_for, files=files, memory=memory,
+                agent_tasks_pending=manager.running_tasks,
+            )
             self.config = RuntimeConfig(
                 main_agent=store.agent_catalog().main_agent,
                 agents=store.agent_catalog().agents,
@@ -268,8 +269,6 @@ async def main(database: str, port: int) -> None:
                 environments={"local": EnvironmentDefinition(type="local")},
             )
             self.environment_definitions = self.config.environments
-            self.agent_tasks_pending = manager.running_tasks
-            self.file_transfers_pending = lambda _agent: False
             self._entry_capabilities = gateway_capabilities(gateway)
             self._assemblies = self._snapshots(self.config.agents)
 

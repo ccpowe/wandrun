@@ -21,7 +21,7 @@ import socket
 import time
 from collections import deque
 from collections.abc import AsyncIterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,15 +57,16 @@ from wandrun.gateway.ui_blocks import delivery_blocks, frozen_preview_text, imag
 from wandrun.gateway.subscription import SubscriptionData, SubscriptionUnavailable
 from wandrun.runtime.agent.capabilities import EntryCapabilityDefinition
 from wandrun.integrations.mcp import MCPConnectionError
+from wandrun.integrations import cleanup
 from wandrun.runtime.context.memory import (
     MEMORY_LIMIT, MEMORY_DETAIL_LIMIT, InvalidMemory, MemoryChange, MemoryConflict,
     MemoryDetailSnapshot, MemoryRetired, MemorySnapshot, MemoryStore,
 )
 from wandrun.runtime.communication.preview import PreviewPersistenceError
-from wandrun.runtime.session import AgentEnvironmentBusy, Runtime
+from wandrun.runtime.session import AgentEnvironmentBusy, Runtime, StopClaims
 from wandrun.gateway.uploads import DEFAULT_MAX_UPLOAD_SIZE, UploadError, Uploads
 from wandrun.runtime.execution.files import ResolvedAttachment, TaskFiles, open_delivery_file
-from wandrun.runtime.communication.workers import SchedulerFailure, WorkerManager
+from wandrun.runtime.communication.workers import AgentSwitching, SchedulerFailure, WorkerManager
 from wandrun.runtime.browser.leases import BrowserRejected, UnknownBrowserTask
 from wandrun.runtime.browser.cdp import CDPError
 
@@ -214,6 +215,7 @@ class Gateway:
         self._failed_connector_creations: set[str] = set()
         # 由 Gateway 持有，等待方取消不会中断已持久化的删除操作。
         self._deleting: dict[str, asyncio.Task[Event]] = {}
+        self._cleanup_batches: dict[str, cleanup.Batch] = {}
         self.checkpointer: AsyncSqliteSaver | None = None
         self.runtime: Runtime | None = None
         self.skills_dir: Path | None = None
@@ -374,17 +376,17 @@ class Gateway:
                 logger.warning("定时投递失败（%s）", conversation["id"], exc_info=True)
                 self._persist(
                     self.store.finish_schedule_run, conversation["id"], "failed",
-                    "定时任务无法启动，请检查 Agent 状态后重试。",
+                    str(error) if isinstance(error, AgentSwitching) else "定时任务无法启动，请检查 Agent 状态后重试。",
                 )
                 self._wake()
 
 
     async def resume_deletions(self) -> None:
-        """启动前续完本地删除；外部清理未确认记入墓碑，不阻止服务启动。"""
+        """Finish local deletion intents without contacting old execution resources."""
         for identity in self._persist(self.store.pending_deletions):
-            await self.delete_conversation(identity)
+            await self.delete_conversation(identity, remote=False)
         for identity in self._persist(self.store.pending_agent_deletions):
-            await self.delete_agent(identity)
+            await self.delete_agent(identity, remote=False)
 
     async def drain_deletions(self) -> None:
         """服务退出时等待自持操作，再关闭运行时和存储；失败由 reporting_failure 报告。"""
@@ -1174,44 +1176,6 @@ class Gateway:
             "next_cursor": next_cursor,
         }
 
-    async def _check_environment_switch(self, identity: str) -> None:
-        tasks = (
-            self.runtime.agent_tasks_pending(identity) if self.runtime is not None
-            else self.manager.running_tasks(identity)
-        )
-        if tasks:
-            raise AgentConflict("Agent 有在途任务，不能切换执行环境", {
-                "agent_id": identity, "running_tasks": len(tasks),
-            })
-        if self.runtime is not None and self.runtime.file_transfers_pending(identity):
-            raise AgentConflict("Agent 文件传输或清理尚未结算，不能切换执行环境", {
-                "agent_id": identity, "file_transfers_pending": True,
-            })
-        if self.runtime is not None:
-            browsers = tuple(dict.fromkeys(self.runtime.browsers.values()))
-            try:
-                for browser in browsers:
-                    await browser.revoke_idle_endpoints(identity)
-            except BrowserRejected as error:
-                raise AgentConflict("Agent 浏览器接入点关闭未确认，不能切换执行环境", {
-                    "agent_id": identity,
-                }) from error
-            browser_tasks = {
-                task for browser in browsers for task in browser.pending_tasks(identity)
-            }
-            if browser_tasks:
-                raise AgentConflict("Agent 仍持有浏览器资源，请先关闭浏览器或停止相关对话再切换执行环境", {
-                    "agent_id": identity, "browser_tasks": len(browser_tasks),
-                })
-            tasks = self.runtime.agent_tasks_pending(identity)
-            if tasks:
-                raise AgentConflict("Agent 有在途任务，不能切换执行环境", {
-                    "agent_id": identity, "running_tasks": len(tasks),
-                })
-            if self.runtime.file_transfers_pending(identity):
-                raise AgentConflict("Agent 文件传输或清理尚未结算，不能切换执行环境", {
-                    "agent_id": identity, "file_transfers_pending": True,
-                })
 
     async def _prepare_agents(self, catalog: AgentCatalog, snapshot: dict | None = None):
         if self.runtime is None:
@@ -1339,11 +1303,8 @@ class Gateway:
             definition, avatar = self._agent_fields(fields, catalog.agents[identity])
             self.store.check_agent_name(definition.name or identity, identity)
             switching = definition.environment != current["environment"]
-            if switching:
-                await self._check_environment_switch(identity)
             snapshot = None
             if (definition.model, definition.reasoning_effort) != (current["model"], current["reasoning_effort"]):
-                # 最新组合与已保存的组合不同才查询；锁内快照和准备使用同一份定义。
                 snapshot = await self.subscription.models()
                 self._validate_model(definition.model, definition.reasoning_effort, snapshot)
             if definition.name == identity:
@@ -1352,25 +1313,54 @@ class Gateway:
             if definition == catalog.agents[identity] and avatar == current["avatar"]:
                 return current, None
             candidate = replace(catalog, agents={**catalog.agents, identity: definition})
-            if switching:
-                await self._check_environment_switch(identity)
-            commit = await self._prepare_agents(candidate, snapshot)
-            self._require_serving()
-            if switching:
-                # Preparing graphs can await MCP; a task may have started in the meantime.
-                await self._check_environment_switch(identity)
-            self._persist(
-                self.store.save_environment_definitions,
-                {definition.environment: self.runtime.environment_definitions[definition.environment]},
-            )
-            result = self._persist(
-                self.store.update_agent, identity, definition, definition.name or identity, avatar
-            )
-            self._persist(commit)
-            self._wake()
-            return result
+            # Hold the Agent across every await and the synchronous binding commit.
+            # Cancellation leaves it stopped but does not install a different binding.
+            admission = self._admit_cleanup(identity) if switching else nullcontext()
+            with admission as operation, self.manager.hold_agent(identity) if switching else nullcontext():
+                unconfirmed = []
+                if switching:
+                    claims = self.runtime.claim_stop(
+                        self.runtime.agent_stop_scope(identity), operation=operation, agent=identity,
+                    )
+                    unconfirmed = await self.runtime.stop_agent(identity, operation=operation, claims=claims)
+                if switching and self.runtime.environment_definitions[current["environment"]].type != "local":
+                    unconfirmed.append({
+                        "stage": "environment", "agent_id": identity,
+                        "environment": current["environment"], "error": "OldDirectoriesNotCleaned",
+                    })
+                commit = await self._prepare_agents(candidate, snapshot)
+                self._require_serving()
+                self._persist(
+                    self.store.save_environment_definitions,
+                    {definition.environment: self.runtime.environment_definitions[definition.environment]},
+                )
+                result = self._persist(
+                    self.store.update_agent, identity, definition, definition.name or identity,
+                    avatar, cleanup_unconfirmed=unconfirmed,
+                )
+                self._persist(commit)
+                self._wake()
+                return result
 
-    async def delete_agent(self, identity: str) -> Event:
+    @contextmanager
+    def _admit_cleanup(self, agent: str, *, remote: bool = True):
+        batch = self._cleanup_batches.get(agent)
+        if batch is None:
+            batch = cleanup.Batch()
+            self._cleanup_batches[agent] = batch
+            def finished():
+                if self._cleanup_batches.get(agent) is batch:
+                    del self._cleanup_batches[agent]
+            batch.on_empty = finished
+        operation = cleanup.CleanupOperation.begin(remote=remote, batch=batch)
+        batch.join(operation)
+        try:
+            yield operation
+        finally:
+            operation.batch.leave(operation)
+
+
+    async def delete_agent(self, identity: str, *, remote: bool = True) -> Event:
         """意图发布后禁止新对话、编辑和新增成员引用；断线不取消，跨库失败由重启续删。"""
         async with self._catalog_lock:
             self._require_serving()
@@ -1389,25 +1379,38 @@ class Gateway:
                             {"id": parent, "name": self.store.agent(parent)["name"]}
                             for parent in agent["member_of"]
                         ],
-                        "running_conversations": sum(
-                            conversation["status"] == "working"
-                            for conversation in self.store.conversations(identity)
-                        ),
-                        "running_tasks": len(self.manager.running_tasks(identity)),
                     }
-                    if (details["member_of"] or details["running_conversations"]
-                            or details["running_tasks"]):
-                        raise AgentConflict("Agent 被成员引用或有在途任务，不能删除", details)
-                    if self.runtime.file_transfers_pending(identity):
-                        raise AgentConflict("Agent 文件传输或清理尚未结算，不能删除", {
-                            "agent_id": identity, "file_transfers_pending": True,
-                        })
+                    if details["member_of"]:
+                        raise AgentConflict("Agent 被成员引用，不能删除", details)
                     self._persist(self.store.begin_delete_agent, identity)
                 if self.runtime.memory is not None:
                     self._persist(self.runtime.memory.retire, identity)
                 self.manager.retire_agent(identity)
-                operation = asyncio.create_task(self._delete_agent(identity), name=f"delete-agent:{identity}")
-                self._deleting_agents[identity] = operation
+                with self._admit_cleanup(identity, remote=remote) as cleanup_operation:
+                    snapshots = self.store.conversations(identity)
+                    scopes = {
+                        conversation["id"]: self.runtime.conversation_stop_scope(conversation["id"])
+                        for conversation in snapshots
+                    }
+                    scope = self.runtime.agent_stop_scope(identity)
+                    for branch in scopes.values():
+                        scope.update(branch)
+                    claims = self.runtime.claim_stop(
+                        scope, operation=cleanup_operation, agent=identity,
+                    )
+                    conversations = [
+                        self._claim_conversation_delete(
+                            conversation["id"], cleanup_operation,
+                            claims=claims.subset(scopes[conversation["id"]]),
+                        )
+                        for conversation in snapshots
+                    ]
+                    operation = asyncio.create_task(
+                        self._delete_agent(identity, cleanup_operation, conversations, claims),
+                        name=f"delete-agent:{identity}",
+                    )
+                    self._deleting_agents[identity] = operation
+                    cleanup_operation.batch.track(cleanup_operation, operation)
 
                 def finished(task: asyncio.Task) -> None:
                     self._deleting_agents.pop(identity, None)
@@ -1417,19 +1420,24 @@ class Gateway:
                 operation.add_done_callback(finished)
         return await asyncio.shield(operation)
 
-    async def _delete_agent(self, identity: str) -> Event:
+    async def _delete_agent(
+        self, identity: str, operation: cleanup.CleanupOperation,
+        conversations: list[asyncio.Task], claims: StopClaims,
+    ) -> Event:
+        await asyncio.sleep(0)  # Admission completes even with eager_task_factory.
         try:
-            cleanup_unconfirmed = []
-            for browser in dict.fromkeys(self.runtime.browsers.values()):
-                try:
-                    await browser.close_agent(identity, reason="Agent 删除")
-                except* (BrowserRejected, CDPError, OSError):
-                    logger.warning("Agent 浏览器清理未确认 (%s)", identity, exc_info=True)
-                    cleanup_unconfirmed.append({"stage": "browser", "agent_id": identity,
-                                                "error": "CleanupUnconfirmed"})
-            for conversation in self.store.conversations(identity):
-                deleted = await self.delete_conversation(conversation["id"])
-                cleanup_unconfirmed.extend(deleted.data.get("cleanup_unconfirmed", []))
+            cleanup_unconfirmed = await self.runtime.stop_agent(identity, operation=operation, claims=claims)
+            for deleted in await asyncio.gather(*(asyncio.shield(task) for task in conversations)):
+                for report in deleted.data.get("cleanup_unconfirmed", []):
+                    # A shared Agent-wide stop is already represented without
+                    # the conversation's presentation-only task_id.
+                    shared = {key: value for key, value in report.items() if key != "task_id"}
+                    if shared["stage"] == "branch":
+                        shared["stage"] = "execution"
+                    if shared["stage"] != "directory":
+                        shared.setdefault("agent_id", identity)
+                    if shared not in cleanup_unconfirmed and report not in cleanup_unconfirmed:
+                        cleanup_unconfirmed.append(report)
             async with self._catalog_lock:
                 # 清理期间可能有人编辑无关定义，结束时才取最新 catalog。
                 catalog = self.store.agent_catalog()
@@ -2395,8 +2403,17 @@ class Gateway:
             self.manager.get(identity)["status"] == "running"
             for identity in self.manager.branch_threads(conversation_id)
         )
-        operation = asyncio.ensure_future(self._stop(conversation_id, client_id, was_working, task=task))
-        self._stopping[client_id] = (conversation_id, operation)
+        agent = (
+            self.manager.agent_name(conversation_id) if self.manager.has_task(conversation_id)
+            else self.store.conversation(conversation_id)["agent_id"]
+        )
+        with self._admit_cleanup(agent) as cleanup_operation:
+            claims = self._claim_conversation_stop(conversation_id, cleanup_operation)
+            operation = asyncio.create_task(self._stop(
+                conversation_id, client_id, was_working, operation=cleanup_operation, claims=claims, task=task,
+            ))
+            self._stopping[client_id] = (conversation_id, operation)
+            cleanup_operation.batch.track(cleanup_operation, operation)
 
         def finished(task: asyncio.Task) -> None:
             self._stopping.pop(client_id, None)
@@ -2408,8 +2425,10 @@ class Gateway:
 
     async def _stop(
         self, conversation_id: str, client_id: str, was_working: bool, *, task: bool = False,
+        operation: cleanup.CleanupOperation, claims: StopClaims,
     ) -> tuple[Event, bool]:
-        result = await self.manager.cancel(conversation_id)
+        await asyncio.sleep(0)  # Publish the self-owned Stop before eager execution.
+        result = await self._finish_conversation_stop(conversation_id, operation, claims)
         data = {"was_working": was_working}
         if result.get("cleanup_unconfirmed"):
             data["cleanup_unconfirmed"] = result["cleanup_unconfirmed"]
@@ -2431,7 +2450,7 @@ class Gateway:
             self._wake()
         return conversation, event
 
-    async def delete_conversation(self, conversation_id: str) -> Event:
+    async def delete_conversation(self, conversation_id: str, *, remote: bool = True) -> Event:
         """幂等完成本地删除，外部清理未确认随墓碑返回，不阻塞删除或停止网关。
 
         本地跨库失败保留删除意图并停服，重启续删。外部未确认只记录、不后台重试。
@@ -2442,79 +2461,116 @@ class Gateway:
             return deleted
         if conversation_id in self._deleting:
             return await asyncio.shield(self._deleting[conversation_id])
-        if self._persist(self.store.conversation, conversation_id) is None:
+        conversation = self._persist(self.store.conversation, conversation_id)
+        if conversation is None:
             raise UnknownConversation(conversation_id)
         if self.manager is None or self.checkpointer is None or self.manager.snapshot()["closed"]:
             raise RuntimeError("运行时尚未就绪或已停止")
+        with self._admit_cleanup(conversation["agent_id"], remote=remote) as operation:
+            deleting = self._claim_conversation_delete(conversation_id, operation)
+        return await asyncio.shield(deleting)
+
+    def _claim_conversation_stop(self, conversation: str, operation: cleanup.CleanupOperation) -> StopClaims:
+        if self.runtime is not None:
+            return self.runtime.claim_stop(
+                self.runtime.conversation_stop_scope(conversation), operation=operation,
+            )
+        # Embedded manager-only gateways have no execution environment. Their
+        # local Worker scope is still frozen and sealed at admission.
+        scope = self.manager.branch_threads(conversation)
+        self.manager.revoke_tasks(scope)
+        async def stop_local():
+            await asyncio.sleep(0)
+            return await self.manager.stop_tasks(scope)
+        stopping = asyncio.create_task(stop_local())
+        operation.batch.track(operation, stopping)
+        return StopClaims(frozenset(scope), {conversation: stopping})
+
+    async def _finish_conversation_stop(
+        self, conversation: str, operation: cleanup.CleanupOperation, claims: StopClaims,
+    ) -> dict:
+        if self.runtime is not None:
+            return await self.runtime.stop_conversation(conversation, operation=operation, claims=claims)
+        results = await asyncio.gather(*(asyncio.shield(future) for future in claims.results.values()))
+        reports = [{
+            "stage": "branch", "task_id": conversation, "error": "CleanupUnconfirmed",
+        }] if any(results) else []
+        return {"stopped": sorted(claims.scope), "cleanup_unconfirmed": reports}
+
+    def _claim_conversation_delete(
+        self, conversation_id: str, operation: cleanup.CleanupOperation, *, claims: StopClaims | None = None,
+    ) -> asyncio.Task:
+        """The deletion Task owns stop, current directory and local commit exactly once."""
+        if conversation_id in self._deleting:
+            return self._deleting[conversation_id]
+        conversation = self._persist(self.store.conversation, conversation_id)
         if self._persist(self.store.deletion_threads, conversation_id) is None:
             self._persist(self.store.begin_delete, conversation_id, self.manager.branch_threads(conversation_id))
-        operation = asyncio.create_task(self._delete(conversation_id), name=f"delete-conversation:{conversation_id}")
-        self._deleting[conversation_id] = operation
+        pending_stops = tuple(
+            (owner, task) for owner, task in self._stopping.values()
+            if owner == conversation_id or self.manager.root_of(owner) == conversation_id
+        )
+        if claims is None:
+            claims = self._claim_conversation_stop(conversation_id, operation)
+        agent = conversation["agent_id"]
+        binding = (
+            self.runtime.files.cleanup_binding(agent)
+            if self.runtime is not None and self.runtime.files is not None else None
+        )
+        deleting = asyncio.create_task(
+            self._delete(conversation_id, operation, binding, claims=claims, pending_stops=pending_stops),
+            name=f"delete-conversation:{conversation_id}",
+        )
+        self._deleting[conversation_id] = deleting
+        operation.batch.track(operation, deleting)
 
         def finished(task: asyncio.Task) -> None:
             self._deleting.pop(conversation_id, None)
             if not task.cancelled():
                 task.exception()
+        deleting.add_done_callback(finished)
+        return deleting
 
-        operation.add_done_callback(finished)
-        return await asyncio.shield(operation)
-
-    async def _delete(self, conversation_id: str) -> Event:
+    async def _delete(
+        self, conversation_id: str, operation: cleanup.CleanupOperation, binding,
+        *, claims: StopClaims, pending_stops: tuple[tuple[str, asyncio.Task], ...],
+    ) -> Event:
+        await asyncio.sleep(0)  # All admission claims precede the first network await.
         try:
             cleanup_unconfirmed = []
-            async def finish_stop(owner, operation):
-                try:
-                    event, _ = await asyncio.shield(operation)
-                    unconfirmed = bool(event.data.get("cleanup_unconfirmed"))
-                except* (BrowserRejected, CDPError, OSError):
-                    # The same external result has the same boundary whether DELETE or STOP awaited it.
-                    # Local persistence failures are already GatewayFailure / SchedulerFailure.
-                    logger.warning("已有停止的分支清理未确认 (%s)", owner, exc_info=True)
-                    unconfirmed = True
-                if unconfirmed:
-                    cleanup_unconfirmed.append({"stage": "branch", "task_id": owner,
-                                                "error": "CleanupUnconfirmed"})
-
-            # An in-flight stop may persist turn.stopped, or report unconfirmed external cleanup.
-            # Classify each result independently so one external failure cannot skip the other stops.
-            await asyncio.gather(*(
-                finish_stop(owner, operation) for owner, operation in self._stopping.values()
-                if owner == conversation_id or self.manager.root_of(owner) == conversation_id
-            ))
-            if self.runtime is not None:
-                for browser in dict.fromkeys(self.runtime.browsers.values()):
-                    for snapshot in browser.list_tasks():
-                        if snapshot["root_id"] == conversation_id and snapshot["state"] != "released":
-                            try:
-                                await browser.close_task(snapshot["task_id"], reason="对话删除")
-                            except* (BrowserRejected, CDPError, OSError):
-                                logger.warning("对话浏览器清理未确认 (%s)", conversation_id, exc_info=True)
-                                cleanup_unconfirmed.append({
-                                    "stage": "browser", "task_id": snapshot["task_id"],
-                                    "error": "CleanupUnconfirmed",
-                                })
-            try:
-                result = await self.manager.cancel(conversation_id)
-            except* (BrowserRejected, CDPError, OSError):
-                # Manager has sealed the branch and settled Workers before reporting resource errors.
-                # SchedulerFailure / GatewayFailure are deliberately outside this external boundary.
-                logger.warning("对话分支清理未确认 (%s)", conversation_id, exc_info=True)
-                result = {"stopped": sorted(self.manager.branch_threads(conversation_id)),
-                          "cleanup_unconfirmed": ["执行环境资源关闭未确认"]}
+            result = await self._finish_conversation_stop(conversation_id, operation, claims)
             self._persist(self.store.extend_delete_threads, conversation_id, result["stopped"])
             if result.get("cleanup_unconfirmed"):
                 logger.warning("对话分支清理未确认 (%s): %s", conversation_id, result["cleanup_unconfirmed"])
-                cleanup_unconfirmed.append({"stage": "branch", "task_id": conversation_id,
-                                            "error": "CleanupUnconfirmed"})
+                cleanup_unconfirmed.extend(result["cleanup_unconfirmed"])
+            if self.runtime is not None and self.runtime.files is not None:
+                cleanup_unconfirmed.extend(await self.runtime.files.cleanup_conversation(
+                    conversation_id, operation=operation, binding=binding,
+                ))
+            # Existing Stop has already owned its remote attempt. Its remaining
+            # local event commit must not delay this request's directory attempt,
+            # nor be cancelled by a remote deadline.
+            async def finish_stop(owner, stopping):
+                reports = []
+                try:
+                    event, _ = await asyncio.shield(stopping)
+                    reports = event.data.get("cleanup_unconfirmed", [])
+                except* (BrowserRejected, CDPError, TimeoutError):
+                    reports = [{"stage": "branch", "task_id": owner, "error": "CleanupUnconfirmed"}]
+                for report in reports:
+                    if report not in cleanup_unconfirmed:
+                        cleanup_unconfirmed.append(report)
+            await asyncio.gather(*(finish_stop(owner, task) for owner, task in pending_stops))
             self._persist(self.store.finish_schedule_run, conversation_id, "cancelled", "conversation_deleted")
             # SQLite saver adelete_thread also removes the linked delta writes;
             # empty conversations may still need aget_tuple to initialize tables.
             await self.checkpointer.aget_tuple({"configurable": {"thread_id": conversation_id}})
             for thread_id in self._persist(self.store.deletion_threads, conversation_id):
                 await self.checkpointer.adelete_thread(thread_id)
-            if self.runtime is not None and self.runtime.files is not None:
-                cleanup_unconfirmed.extend(await self.runtime.files.cleanup_conversation(conversation_id))
-            self.manager.forget_stopped_root(conversation_id)
+            if self.runtime is not None:
+                self.runtime.forget_stopped_root(conversation_id, claims=claims)
+            else:
+                self.manager.forget_stopped_root(conversation_id)
             event = self._persist(self.store.finish_delete, conversation_id, cleanup_unconfirmed)
             self._running.pop(conversation_id, None)
             self._root_result.pop(conversation_id, None)

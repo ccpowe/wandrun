@@ -65,7 +65,9 @@ export class EditorOperations {
     // Connector open+cleanup readiness (50s), optional challenge probe (15s), final cleanup (20s), plus margin.
     // The catalog lock has no total deadline; expiry still means unknown and is recovered by exact client_id.
     // Testing an existing owner can additionally retire it (20s), reopen (50s), then list tools (30s).
-    const timeout = connectorCreation ? 90_000 : intent.resource === 'connector' && intent.action === 'test' ? 120_000 : 15_000;
+    // Management cleanup owns up to 25s; leave response/commit margin before declaring an unknown write.
+    const management = intent.resource === 'agent' && (intent.action === 'delete' || intent.fields?.environment !== undefined);
+    const timeout = management ? 35_000 : connectorCreation ? 90_000 : intent.resource === 'connector' && intent.action === 'test' ? 120_000 : 15_000;
     const timer = setTimeout(() => deadline.reject(new GatewayError(0, 'timeout', '操作结果未确认')), timeout);
     this.deadlines.add(timer);
     try {

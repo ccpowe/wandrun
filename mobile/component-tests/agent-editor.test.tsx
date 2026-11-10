@@ -4,8 +4,10 @@ import AgentEditorRoute from '../src/app/agent-editor';
 import AgentsRoute from '../src/app/agents';
 import AgentProfileRoute from '../src/app/agents/[id]';
 import ChatRoute from '../src/app/chat';
+import ChatEntryRoute from '../src/app/index';
 import { FakeGateway, jsonResponse } from '../src/dev/fake-gateway';
 import { renderGateway, seedGatewayAgent, tickGateway as tick } from './gateway-harness';
+import type { GatewayEvent } from '../src/gateway/api';
 
 jest.mock('react-native-keyboard-controller', () => jest.requireActual('react-native-keyboard-controller/jest'));
 jest.mock('react-native-webview', () => ({ __esModule: true, default: jest.requireActual('react-native').View }));
@@ -110,4 +112,76 @@ test.each([false, true])('agent-editor.B7 T4 %s 新建 / 改名重名后名字�
   await fireEvent.press(screen.getByTestId('editor-save')); await tick();
   expect([...peer.state.agentDetails.values()].find(row => row.name === 'Unique')).toMatchObject({ description: '修改其他字段' });
   expect(screen.queryByTestId('editor-name')).toBeNull();
+});
+
+test('切换环境先确认，取消不提交；成功返回资料页只告知一次并在五秒后消失', async () => {
+  peer.state.environments.push({ id: 'cloud', name: '测试工作机', type: 'instabox', status: 'running' });
+  let writes = 0;
+  peer.overrides['PATCH /agents/:id'] = async (_context, respond) => {
+    writes++;
+    const response = await respond();
+    const payload = await response.json();
+    payload.event.data.cleanup_unconfirmed = [{ resource: 'directories', error: 'OldDirectoriesNotCleaned' }];
+    return jsonResponse(payload);
+  };
+  await renderGateway(peer, AgentsRoute, '/', routes);
+  await tick();
+  await fireEvent.press(screen.getByTestId('agent-row-research')); await tick();
+  await fireEvent.press(screen.getByTestId('profile-edit')); await tick();
+  await fireEvent.press(screen.getByTestId('editor-environment')); await tick();
+  await fireEvent.press(screen.getByTestId('editor-environment-cloud'));
+  await fireEvent.press(screen.getByTestId('editor-done'));
+  await fireEvent.press(screen.getByTestId('editor-save')); await tick();
+  expect(screen.getByTestId('environment-switch-confirmation')).toBeOnTheScreen();
+  expect(writes).toBe(0);
+  await fireEvent.press(screen.getByTestId('environment-switch-cancel')); await tick();
+  expect(peer.state.agentDetails.get('research')!.environment).toBe('local');
+  await fireEvent.press(screen.getByTestId('editor-save')); await tick();
+  await fireEvent.press(screen.getByTestId('environment-switch-confirm')); await tick();
+  expect(writes).toBe(1);
+  expect(peer.state.agentDetails.get('research')!.environment).toBe('cloud');
+  expect(screen.getByTestId('profile-name')).toBeOnTheScreen();
+  expect(screen.getAllByTestId('cleanup-result-notice')).toHaveLength(1);
+  await tick(5000);
+  expect(screen.queryByTestId('cleanup-result-notice')).toBeNull();
+  await fireEvent.press(screen.getByTestId('profile-edit')); await tick();
+  await fireEvent.press(screen.getByTestId('editor-back')); await tick();
+  expect(screen.queryByTestId('cleanup-result-notice')).toBeNull();
+});
+
+test('本设备删除回执先经 SSE 到达，零 Agent 最终落点仍告知一次，重放不再弹', async () => {
+  let receipt: GatewayEvent | undefined;
+  peer.overrides['DELETE /agents/:id'] = ({ params }) => {
+    peer.state.agents = peer.state.agents.filter(row => row.id !== params.id);
+    peer.state.agentDetails.delete(params.id);
+    receipt = peer.event('resource.changed', { kind: 'agent', id: params.id, op: 'deleted', cleanup_unconfirmed: [{ resource: 'branch', error: 'TimeoutError' }] });
+    peer.emit(receipt);
+    return jsonResponse({ event: receipt });
+  };
+  await renderGateway(peer, ChatEntryRoute, '/', routes, '/agent-editor?id=research');
+  await fireEvent.press(screen.getByTestId('editor-delete')); await tick();
+  await fireEvent.press(screen.getByTestId('editor-delete-confirm')); await tick();
+  expect(screen.getByTestId('chat-entry-create-agent')).toBeOnTheScreen();
+  expect(screen.getAllByTestId('cleanup-result-notice')).toHaveLength(1);
+  await tick(5000);
+  await act(() => peer.emit(receipt!)); await tick();
+  expect(screen.queryByTestId('cleanup-result-notice')).toBeNull();
+});
+
+test('CleanupResultNotice.once 本机删除明确 409 后，其他设备删同一 Agent 不冒认成功告知', async () => {
+  peer.overrides['DELETE /agents/:id'] = () => jsonResponse({
+    error: { code: 'conflict', message: 'Agent 被成员引用，不能删除', details: { member_of: [{ id: 'parent', name: '主助手' }] } },
+  }, 409);
+  await renderGateway(peer, ChatEntryRoute, '/', routes, '/agent-editor?id=research');
+  await fireEvent.press(screen.getByTestId('editor-delete')); await tick();
+  await fireEvent.press(screen.getByTestId('editor-delete-confirm')); await tick();
+  await fireEvent.press(screen.getByTestId('editor-delete-blocked-ack')); await tick();
+  await act(() => {
+    peer.state.agents = [];
+    peer.state.agentDetails.delete('research');
+    peer.emit(peer.event('resource.changed', { kind: 'agent', id: 'research', op: 'deleted',
+      cleanup_unconfirmed: [{ stage: 'execution', error: 'CleanupUnconfirmed' }] }));
+  }); await tick();
+  expect(screen.getByTestId('chat-entry-create-agent')).toBeOnTheScreen();
+  expect(screen.queryByTestId('cleanup-result-notice')).toBeNull();
 });

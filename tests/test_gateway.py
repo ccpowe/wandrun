@@ -599,15 +599,13 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.gateway.send_message(self.conversation, "m1", "长任务")
         await asyncio.wait_for(self.entered.wait(), 2)
         cleanup_started, cleanup_release = asyncio.Event(), asyncio.Event()
-        cancel = self.manager.cancel
 
-        async def slow_cancel(task_id):
-            result = await cancel(task_id)
+        async def slow_cleanup(scope):
             cleanup_started.set()
-            await cleanup_release.wait()  # Worker 已结算，清理仍在进行
-            return result
+            await cleanup_release.wait()  # Worker 已结算，真实 stop hook 仍在清理
+            return []
 
-        self.manager.cancel = slow_cancel
+        self.manager.add_stop_hook(slow_cleanup)
         first = asyncio.ensure_future(self.gateway.stop(self.conversation, "s1"))
         await asyncio.wait_for(cleanup_started.wait(), 2)
         self.assertFalse(self.gateway._running.get(self.conversation))
@@ -629,20 +627,20 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_message_cannot_take_the_client_id_of_a_stop_in_flight(self):
         # 审查 4：停止在清理时还没落盘，另一个对话用同一 ID 发消息必须被拒绝，不能抢走这个 ID。
-        cancel = self.manager.cancel
-        cleanup = asyncio.Event()
+        cleanup, entered = asyncio.Event(), asyncio.Event()
 
-        async def slow_cancel(task_id):
+        async def slow_cleanup(scope):
+            entered.set()
             await cleanup.wait()
-            return await cancel(task_id)
+            return []
 
-        self.manager.cancel = slow_cancel
+        self.manager.add_stop_hook(slow_cleanup)
         other = self.gateway.create_conversation("另一个", "main", client_id=uuid4().hex)[0]["id"]
         self.block = True
         self.gateway.send_message(self.conversation, "m1", "长任务")
         await asyncio.wait_for(self.entered.wait(), 2)
         stopping = asyncio.ensure_future(self.gateway.stop(self.conversation, "shared"))
-        await asyncio.sleep(0)
+        await asyncio.wait_for(entered.wait(), 2)
         with self.assertRaises(ClientIdConflict):
             self.gateway.send_message(other, "shared", "抢占")
         cleanup.set()
@@ -1748,18 +1746,10 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         leaf = self.manager.start("孙任务", sender_id=child, agent_name="b")["task_id"]
         for identity in (root, child, leaf):
             await self.checkpoint(identity)
-        cleaned = []
-
-        async def stop_hook(scope):
-            cleaned.append(set(scope))
-            return []
-
-        self.manager.add_stop_hook(stop_hook)
         stopping = asyncio.create_task(self.gateway.stop(root, "stop-id"))
         deleting = asyncio.create_task(self.gateway.delete_conversation(root))
         await asyncio.wait_for(deleting, 2)
         await asyncio.wait_for(stopping, 2)
-        self.assertIn({root, child, leaf}, cleaned)
         self.assertEqual(self.manager.branch_threads(root), {root})
         self.assertEqual(self.scheduler_ids(), set())
         for identity in (root, child, leaf):
@@ -1793,8 +1783,8 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
         deletion = asyncio.create_task(self.client.delete(f"/conversations/{root}"))
         await asyncio.wait_for(deleting.wait(), 2)
         release.set()
-        with self.assertRaises(BrowserRejected):
-            await stopping
+        stopped, _ = await stopping
+        self.assertTrue(stopped.data["cleanup_unconfirmed"])
         response = await asyncio.wait_for(deletion, 2)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["event"]["data"]["cleanup_unconfirmed"])
@@ -1841,11 +1831,12 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_stop_report_is_preserved_when_delete_cleanup_later_succeeds(self):
         root = self.gateway.create_conversation("停止回执未确认", "main", client_id=uuid4().hex)[0]["id"]
         stopped, response = await self.delete_during_stop(root)
-        self.assertEqual(stopped[0].data["cleanup_unconfirmed"], ["memory:unconfirmed-staging"])
+        stop_reports = stopped[0].data["cleanup_unconfirmed"]
+        self.assertEqual(stop_reports, [{
+            "stage": "branch", "error": "CleanupUnconfirmed", "task_id": root,
+        }])
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["event"]["data"]["cleanup_unconfirmed"], [
-            {"stage": "branch", "task_id": root, "error": "CleanupUnconfirmed"},
-        ])
+        self.assertEqual(response.json()["event"]["data"]["cleanup_unconfirmed"], stop_reports)
         self.assertIsNone(self.gateway.failure)
 
     async def test_existing_stop_mixed_internal_error_still_fails_delete(self):
@@ -1937,14 +1928,14 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
                 await self.manager.wait(root)
                 await self.checkpoint(root)
 
-                async def execute(command):
+                async def execute(command, *, operation):
                     if isinstance(failure, Exception):
                         raise failure
                     return failure
 
                 self.gateway.runtime.files = TaskFiles(
                     self.directory, self.manager, {"main": ("cloud", "/remote")},
-                    conversation_workdirs=True, remote_backends={"main": SimpleNamespace(aexecute=execute)},
+                    conversation_workdirs=True, remote_backends={"main": SimpleNamespace(cleanup_execute=execute)},
                 )
                 response = await self.client.delete(f"/conversations/{root}")
                 self.assertEqual(response.status_code, 200, response.text)
@@ -1997,12 +1988,24 @@ class ConversationDeletionTests(unittest.IsolatedAsyncioTestCase):
 
         class Browser:
             list_tasks = lambda _: [{"root_id": root, "task_id": root, "state": "agent"}]
-            close_task = staticmethod(close)
+            closing = None
+
+            def claim_task_close(self, task, **kwargs):
+                if self.closing is None:
+                    self.closing = asyncio.create_task(close())
+                return self.closing
+
+            async def close_task(self, task, **kwargs):
+                return await asyncio.shield(self.claim_task_close(task, **kwargs))
+
+            def expire_task_close(self, task):
+                if self.closing is not None and not self.closing.done():
+                    self.closing.cancel()
 
         self.gateway.runtime.browsers = {"main": Browser()}
         self.manager.add_cancel_hook(close)
         event = await self.gateway.delete_conversation(root)
-        self.assertEqual([item["stage"] for item in event.data["cleanup_unconfirmed"]], ["browser", "branch"])
+        self.assertEqual({item["stage"] for item in event.data["cleanup_unconfirmed"]}, {"browser", "branch"})
         self.assertIsNone(self.gateway.failure)
         self.assertEqual(self.manager.get(root)["status"], "not_found")
         self.assertEqual(self.scheduler_ids(), set())

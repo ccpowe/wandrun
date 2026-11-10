@@ -69,7 +69,7 @@ export function toggleSelection(items: readonly string[], item: string): string[
 }
 
 /** Present each gateway deletion constraint as its own reason in the blocked sheet. */
-export type DeletionReason = { kind: "members" | "work" | "other"; title: string; description: string; members?: { id: string; name: string }[] };
+export type DeletionReason = { kind: "members" | "other"; title: string; description: string; members?: { id: string; name: string }[] };
 const memberRemovalDescription = (names: string[]) =>
   t("{names}。先在它们的“团队成员”里移除它。", { names: names.join("、") });
 
@@ -86,13 +86,6 @@ export function deletionReasons(details: Partial<AgentDeleteConflictDetails>): D
     members,
     description: memberRemovalDescription(members.map((member) => member.name)),
   });
-  if ((details.running_conversations ?? 0) > 0) reasons.push({
-    kind: "work", title: t("它正在工作"),
-    description: t("有 {count} 个对话还在运行{tasks}。等它结束或先停止。", { count: details.running_conversations!, tasks: (details.running_tasks ?? 0) > 0 ? t("（{count} 个任务）", { count: details.running_tasks! }) : "" }),
-  });
-  else if ((details.running_tasks ?? 0) > 0) reasons.push({
-    kind: "work", title: t("它正在工作"), description: t("有 {count} 个任务还在运行。等它结束或先停止。", { count: details.running_tasks! }),
-  });
   return reasons;
 }
 
@@ -104,8 +97,6 @@ export function deletionConflictDetails(value: unknown): Partial<AgentDeleteConf
     : [];
   return {
     member_of,
-    running_conversations: typeof details.running_conversations === "number" ? details.running_conversations : 0,
-    running_tasks: typeof details.running_tasks === "number" ? details.running_tasks : 0,
   };
 }
 

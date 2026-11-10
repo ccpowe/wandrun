@@ -5,7 +5,7 @@ import type { SessionRuntime } from '../lib/session-context';
 import { FakeGateway, jsonResponse, unavailable, type GatewayOverrides } from './fake-gateway';
 import { createSceneRuntime } from './scene-session';
 
-export type EditorScene = 'normal' | 'loading' | 'read-failure' | 'read-stale' | 'offline' | 'save-failure' | 'name-conflict' | 'unknown' | 'unknown-applied' | 'catalog-failure' | 'catalog-loading' | 'empty-catalogs' | 'many-members' | 'member-empty' | 'member-failure' | 'member-loading' | 'missing-selections' | 'environment-partial' | 'environment-unknown' | 'model-unlisted' | 'fast-unsupported' | 'delete-blocked' | 'delete-conflict' | 'delete-failure' | 'delete-unknown' | 'capabilities' | 'capabilities-empty' | 'capabilities-failure' | 'capabilities-loading' | 'ended' | 'weekly' | 'cron' | 'runs' | 'runs-many' | 'runs-failure' | 'runs-loading' | 'external-update' | 'external-agent';
+export type EditorScene = 'cleanup-residual' | 'normal' | 'loading' | 'read-failure' | 'read-stale' | 'offline' | 'save-failure' | 'name-conflict' | 'unknown' | 'unknown-applied' | 'catalog-failure' | 'catalog-loading' | 'empty-catalogs' | 'many-members' | 'member-empty' | 'member-failure' | 'member-loading' | 'missing-selections' | 'environment-partial' | 'environment-unknown' | 'model-unlisted' | 'fast-unsupported' | 'delete-blocked' | 'delete-conflict' | 'delete-failure' | 'delete-unknown' | 'capabilities' | 'capabilities-empty' | 'capabilities-failure' | 'capabilities-loading' | 'ended' | 'weekly' | 'cron' | 'runs' | 'runs-many' | 'runs-failure' | 'runs-loading' | 'external-update' | 'external-agent';
 export type EditorScenario = {
   readonly session: ChatSession; runtime: SessionRuntime; gateway: FakeGateway; start: (session?: ChatSession) => Promise<void>; stop: () => void; recover: () => void;
   release: () => void; updateSchedule: (name: string) => void; updateAgent: (fields: Partial<AgentDetail>) => void;
@@ -52,6 +52,12 @@ export function editorScenario(scene: EditorScene = 'normal'): EditorScenario {
     if (scene === 'save-failure' && !recovered) return jsonResponse({ error: { code: 'invalid_request', message: '当前配置不能保存，请检查后重试。' } }, 400);
     if (scene === 'unknown-applied' && !recovered) { await respond(); return unavailable(); }
     if (scene === 'unknown' && !recovered) return unavailable();
+    if (scene === 'cleanup-residual') {
+      const response = await respond();
+      const payload = await response.json();
+      payload.event.data.cleanup_unconfirmed = [{ resource: 'directory', error: 'OldDirectoriesNotCleaned' }];
+      return jsonResponse(payload);
+    }
   };
   const remove: NonNullable<GatewayOverrides['DELETE /agents/:id']> = () => {
     wrote = true;

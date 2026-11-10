@@ -330,6 +330,33 @@ class ScheduleHttpTests(unittest.IsolatedAsyncioTestCase):
             payload["timezone"] = "Etc/UTC"
             self.assertEqual((await self.client.post("/agents/a/schedules", json=payload)).status_code, 201)
 
+    async def test_switching_rejection_is_scoped_and_scheduled_run_records_the_reason(self):
+        async def run(prompts, identity):
+            return AgentOutput(messages=[], next="done")
+
+        manager = WorkerManager(run, agent_workers={"a": ()}, default_agent="a",
+                                on_task=self.gateway.on_task, notify_human_of_roots=False)
+        self.gateway.manager = manager
+        self.addAsyncCleanup(manager.close)
+        fields = schedule_fields({
+            "name": "切换期间触发", "content": "执行", "timezone": "Etc/UTC",
+            "rule": {"kind": "daily", "time": "00:00"},
+        }, now=stamp("2023-01-01T00:00:00"))
+        detail, _, _ = self.gateway.store.create_schedule("switch", "a", fields, "switch-create")
+        root = self.gateway.create_conversation("existing", "a", client_id="existing")[0]["id"]
+        with manager.hold_agent("a"):
+            with self.assertRaises(ValueError) as refused:
+                self.gateway.send_message(root, "while-switching", "发送")
+            self.assertIn("切换", str(refused.exception))
+            with patch("wandrun.gateway.service.time.time", return_value=detail["next_run_at"]):
+                self.gateway._consume_due(detail["next_run_at"], recovery=False)
+        record = self.gateway.store.schedule_runs("switch")[0]
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("切换", record["reason"])
+        self.gateway.send_message(root, "after-switching", "继续")
+        self.assertEqual((await manager.wait(root))["status"], "completed")
+        self.assertEqual(self.gateway.store.schedule_runs("switch")[0]["status"], "failed")
+
     async def test_startup_boundary_and_stop_before_next_poll(self):
         fields = schedule_fields({
             "name": "每分钟", "content": "执行", "timezone": "Etc/UTC",
@@ -365,18 +392,12 @@ class ScheduleHttpTests(unittest.IsolatedAsyncioTestCase):
         due = detail["next_run_at"]
         conversation, _ = self.gateway.store.consume_schedule("daily", due, now=due + 1)
 
-        class Manager:
-            def snapshot(self):
-                return {"closed": False}
+        async def run(prompts, identity):
+            return AgentOutput(messages=[], next="wait")
 
-            def branch_threads(self, root):
-                return {root}
-
-            async def cancel(self, root):
-                return {"stopped": [root]}
-
-            def forget_stopped_root(self, root):
-                pass
+        manager = WorkerManager(run, agent_workers={"a": ()}, default_agent="a",
+                                on_task=self.gateway.on_task, notify_human_of_roots=False)
+        self.addAsyncCleanup(manager.close)
 
         class Checkpointer:
             async def aget_tuple(self, config):
@@ -385,7 +406,7 @@ class ScheduleHttpTests(unittest.IsolatedAsyncioTestCase):
             async def adelete_thread(self, identity):
                 pass
 
-        self.gateway.manager = Manager()
+        self.gateway.manager = manager
         self.gateway.checkpointer = Checkpointer()
         await self.gateway.delete_conversation(conversation["id"])
         run = self.gateway.store.schedule_runs("daily")[0]

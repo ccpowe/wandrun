@@ -720,30 +720,28 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
             }))
             await asyncio.wait_for(self.entered.wait(), 5)
             cleanup_started, cleanup_release = asyncio.Event(), asyncio.Event()
-            original_cancel = self.runtime.workers.cancel
 
-            async def slow_cancel(task_id):
-                result = await original_cancel(task_id)
+            async def slow_cleanup(scope):
                 cleanup_started.set()
                 await cleanup_release.wait()
-                return result
+                return []
 
-            with patch.object(self.runtime.workers, "cancel", slow_cancel):
-                stopping = asyncio.create_task(self.client.post(
-                    f"/conversations/{root}/stop", json={"client_id": "shared"},
-                ))
-                try:
-                    await asyncio.wait_for(cleanup_started.wait(), 5)
-                    self.release.set()
-                    rejected = await asyncio.wait_for(creating, 5)
-                    self.assertEqual((rejected.status_code, rejected.json()["error"]["code"]),
-                                     (409, "client_id_reused"))
-                    self.assertEqual(len(self.store.agents()), 2)
-                finally:
-                    self.release.set()
-                    cleanup_release.set()
-                    model_release.set()
-                stopped = await asyncio.wait_for(stopping, 5)
+            self.runtime.workers.add_stop_hook(slow_cleanup)
+            stopping = asyncio.create_task(self.client.post(
+                f"/conversations/{root}/stop", json={"client_id": "shared"},
+            ))
+            try:
+                await asyncio.wait_for(cleanup_started.wait(), 5)
+                self.release.set()
+                rejected = await asyncio.wait_for(creating, 5)
+                self.assertEqual((rejected.status_code, rejected.json()["error"]["code"]),
+                                 (409, "client_id_reused"))
+                self.assertEqual(len(self.store.agents()), 2)
+            finally:
+                self.release.set()
+                cleanup_release.set()
+                model_release.set()
+            stopped = await asyncio.wait_for(stopping, 5)
         self.assertEqual(stopped.status_code, 202, stopped.text)
         self.assertEqual(stopped.json()["event"]["type"], "turn.stopped")
         self.assertEqual(self.store.by_client_id("shared").type, "turn.stopped")

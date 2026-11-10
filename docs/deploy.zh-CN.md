@@ -80,7 +80,7 @@ CODEX_HOME=~/.local/share/wandrun/codex-home \
 ## 4. 工作区
 
 创建一个空工作区。网关首次启动时会写入默认的 `.wandrun/agents.toml`、`mcps.toml`、
-`environments.toml` 和内置技能 `browser`、`skill-installer`：
+`environments.toml`，以及下表所列的完整默认技能包：
 
 ```bash
 install -d -m 700 ~/wandrun-workspace
@@ -94,7 +94,7 @@ install -d -m 700 ~/wandrun-workspace
 
 | | |
 | --- | --- |
-| Agent | `main`：技能 `browser`、`skill-installer`，MCP `exa` |
+| Agent | `wandrun`（id `main`）：使用向导兼日常助手，`gpt-6.1-terra / medium`，技能 `browser`、`skill-installer`、`wandrun-guide`，MCP `exa`，无团队成员 |
 | MCP | `exa`：[Exa](https://exa.ai) 网页搜索与网页内容读取，默认不需要 API key |
 | 执行环境 | `local`：浏览器连接 `http://127.0.0.1:9222`，即下一节的 Chrome 服务 |
 
@@ -115,7 +115,7 @@ idle_timeout = 900 # 浏览器租约空闲释放期限；不是云机器暂停�
 ```
 
 `max_pages` 是该执行环境 Chrome 的共享总预算，包含创建中与未确认关闭的页面；超限立即拒绝，不排队。人工接管或有观看连接的租约不按上述空闲规则释放。
-空工作区只复制两个默认技能；仓库自带 workspace 另附未勾选的 `news-brief` 示例，其 Reader 等依赖需自行接入。`wandrun-ui` 是网关自动提供的协议技能，不写入该技能目录。
+空工作区与仓库自带示例均只含上表的默认技能及其脚本、参考文件，不附开发示例；已有工作区不自动覆盖。`wandrun-ui` 是网关自动提供的协议技能，不写入该技能目录。
 
 之后新建的 Agent 如果要操作网页，在 App 里勾选 `browser` 技能。
 
