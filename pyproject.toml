@@ -1,6 +1,6 @@
 [project]
 name = "wandrun"
-version = "0.3.0"
+version = "0.3.1"
 description = "Self-hosted multi-agent runtime you drive from your phone"
 readme = "README.md"
 authors = [
